@@ -2,8 +2,8 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::fs;
-use std::io::Write;
+use std::fs::{self, TryLockError};
+use std::io::{ErrorKind as IoErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -341,6 +341,23 @@ fn check_column_memory(c: &Checked, p: &Plan, e: &Opened) -> Result<()> {
     )
 }
 
+/// Locks the output for this process; the lock goes with the process, so a killed run leaves none behind
+fn lock_output(attempts: &fs::File, out: &Path) -> Result<()> {
+    match attempts.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => {
+            bail!("{} is in use by another fibrs predict run; wait for it to end or use another --out", out.display())
+        }
+        // a filesystem without locks still runs, as the Python version does, but unguarded
+        Err(TryLockError::Error(e)) if e.kind() == IoErrorKind::Unsupported => {
+            let out = out.display();
+            eprintln!("fibrs predict: warning: cannot lock {out} ({e}); run one fibrs predict on it at a time");
+            Ok(())
+        }
+        Err(TryLockError::Error(e)) => bail!("cannot lock {}: {e}", out.display()),
+    }
+}
+
 fn run(c: Checked) -> Result<()> {
     if c.a.dry_run {
         return dry_run(&c);
@@ -351,12 +368,12 @@ fn run(c: Checked) -> Result<()> {
     let started = Instant::now();
     // every attempt is recorded at its start, before the model loads, so a capped or killed run still shows it
     fs::create_dir_all(&a.out)?;
+    let mut attempts = fs::OpenOptions::new().create(true).append(true).open(a.out.join("attempts.jsonl"))?;
+    // held until the run ends: two runs on one output, on different --only-columns say, would each rewrite the
+    // chunks their columns share from what they read, losing the other's columns while both record progress
+    lock_output(&attempts, &a.out)?;
     let attempt = py_dumps(&json!({"attempt": t_start, "start": t_start}), JsonStyle::DEFAULT);
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(a.out.join("attempts.jsonl"))?
-        .write_all(format!("{attempt}\n").as_bytes())?;
+    attempts.write_all(format!("{attempt}\n").as_bytes())?;
 
     let progress = a.out.join("progress.jsonl");
     let p = plan(&c, &progress)?;

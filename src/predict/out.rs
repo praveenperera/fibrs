@@ -198,8 +198,9 @@ impl Output {
             return Ok(Self { semantic, tracing });
         }
 
-        if !same_json(&saved["inference"], &attrs["inference"]) {
-            bail!("output exists with different provenance; use a new output");
+        let changed = changed_keys(&saved["inference"], &attrs["inference"]);
+        if !changed.is_empty() {
+            bail!("output exists with different provenance ({}); use a new output", changed.join(", "));
         }
         Ok(Self { semantic: OutArray::open(&out.join("semantic"))?, tracing: OutArray::open(&out.join("tracing"))? })
     }
@@ -234,6 +235,22 @@ fn holds_prediction(out: &Path) -> Result<bool> {
 }
 
 /// JSON equality as Python's `==` on the parsed values, where `1 == 1.0`
+/// The provenance keys whose values differ between `saved` and `now`, in order, so a refusal can say what changed
+fn changed_keys(saved: &Value, now: &Value) -> Vec<String> {
+    let (Value::Object(saved), Value::Object(now)) = (saved, now) else {
+        return vec!["inference".into()];
+    };
+
+    let mut keys: Vec<String> = saved.keys().chain(now.keys()).cloned().collect();
+    keys.sort();
+    keys.dedup();
+    keys.retain(|k| match (saved.get(k), now.get(k)) {
+        (Some(a), Some(b)) => !same_json(a, b),
+        _ => true,
+    });
+    keys
+}
+
 fn same_json(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64() && (x.is_f64() || y.is_f64() || x == y),
@@ -347,11 +364,12 @@ fn write_column(output: &Output, progress: &Path, job: Finished) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use serde_json::{Map, Value, json};
 
     use super::{OutArray, Output};
+    use crate::input::blosc_decompress;
 
     fn attrs() -> Map<String, Value> {
         let mut a = Map::new();
@@ -364,6 +382,47 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The `(2, chunk, chunk, chunk)` voxels of one stored chunk, or `None` when it is not stored
+    fn chunk(array: &Path, name: &str) -> Option<Vec<u8>> {
+        let bytes = fs::read(array.join(name)).ok()?;
+        Some(blosc_decompress(&bytes).unwrap())
+    }
+
+    /// A `(2, dims)` region holding `v[0]` in channel 0 and `v[1]` in channel 1
+    fn region(dims: [usize; 3], v: [u8; 2]) -> Vec<u8> {
+        let plane: usize = dims.iter().product();
+        [vec![v[0]; plane], vec![v[1]; plane]].concat()
+    }
+
+    #[test]
+    fn neighbouring_columns_share_a_chunk_and_a_cleared_chunk_is_removed() {
+        let out = fresh("write");
+        let dir = out.join("semantic");
+        // two 4-wide chunks along x; the columns meet inside the first, as 480-wide columns meet in 128 chunks
+        let array = OutArray::create(&dir, [4, 4, 8], 4).unwrap();
+        array.write([0, 0, 0], [4, 4, 3], &region([4, 4, 3], [1, 2])).unwrap();
+        array.write([0, 0, 3], [4, 4, 5], &region([4, 4, 5], [3, 4])).unwrap();
+
+        let first = chunk(&dir, "0.0.0.0").unwrap();
+        assert_eq!(first.len(), 2 * 64);
+        for (c, (left, right)) in [(1, 3), (2, 4)].into_iter().enumerate() {
+            let rows: Vec<&[u8]> = first[c * 64..(c + 1) * 64].chunks(4).collect();
+            assert!(rows.iter().all(|row| row == &[left, left, left, right]), "channel {c}: {rows:?}");
+        }
+        assert_eq!(chunk(&dir, "0.0.0.1").unwrap(), region([4, 4, 4], [3, 4]));
+
+        // clearing the second column keeps the first column's voxels and drops the chunk it covered whole
+        array.write([0, 0, 3], [4, 4, 5], &region([4, 4, 5], [0, 0])).unwrap();
+        assert!(chunk(&dir, "0.0.0.1").is_none());
+        let first = chunk(&dir, "0.0.0.0").unwrap();
+        for (c, v) in [1, 2].into_iter().enumerate() {
+            assert!(first[c * 64..(c + 1) * 64].chunks(4).all(|row| row == [v, v, v, 0]), "channel {c}");
+        }
+        array.write([0, 0, 0], [4, 4, 3], &region([4, 4, 3], [0, 0])).unwrap();
+        assert!(chunk(&dir, "0.0.0.0").is_none());
+        fs::remove_dir_all(out).unwrap();
     }
 
     #[test]
@@ -390,6 +449,21 @@ mod tests {
             assert!(!out.join(".zattrs").exists());
             fs::remove_dir_all(out).unwrap();
         }
+    }
+
+    #[test]
+    fn a_resume_with_other_cudnn_algorithms_is_refused_by_name() {
+        let out = fresh("algos");
+        let with = |algo: &str| {
+            let mut a = Map::new();
+            a.insert("inference".into(), json!({"engine": "fibrs-predict", "cudnn_algos": [algo], "gpu": "x"}));
+            a
+        };
+        Output::open_or_create(&out, 4, 4, 4, &with("IMPLICIT_PRECOMP_GEMM")).unwrap();
+        Output::open_or_create(&out, 4, 4, 4, &with("IMPLICIT_PRECOMP_GEMM")).unwrap();
+        let err = Output::open_or_create(&out, 4, 4, 4, &with("WINOGRAD_NONFUSED")).err().unwrap();
+        assert!(err.to_string().contains("different provenance (cudnn_algos)"), "{err}");
+        fs::remove_dir_all(out).unwrap();
     }
 
     #[test]
