@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use crate::afv::{ExportOptions, MinLength, Summary, export_afv};
 use crate::axes::{Lapack, direction_field, find_lapack};
-use crate::fields::{FamilyFields, Presence, catalogue, centrality};
+use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
 use crate::input::Predictions;
 use crate::kernels::{Coverage, Fields, RawCurve, Scratch, trace_seed};
@@ -568,6 +568,10 @@ pub fn run(args: Args) -> Result<Summary> {
     Ok(summary)
 }
 
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 fn family_dir(work: &Path, family: usize) -> PathBuf {
     work.join(format!("family-{family}"))
 }
@@ -586,7 +590,10 @@ fn load_tracing(native: &Predictions, supplied: Option<&Predictions>) -> Result<
     let tgrid = [0, 1, 2].map(|a| shape[a].div_ceil(tile[a]));
     let mut out = [Vol::new(shape, 0u8), Vol::new(shape, 0u8)];
     let brick_rows = out[0].grid()[0];
-    let slab = (tile[0] / EDGE).max(1);
+    // a slab spans whole tiles where it can, so no tile is decoded for two slabs; lcm(tile, 16) is at most four
+    // tiles deep when the tile is a multiple of 4 planes, and other tiles fall back to one brick row at a time
+    let aligned = tile[0] / gcd(tile[0], EDGE) * EDGE;
+    let slab = if aligned <= 4 * tile[0].max(EDGE) { aligned / EDGE } else { tile[0] / EDGE }.max(1);
     let mut bz = 0;
     while bz < brick_rows {
         let rows = bz..(bz + slab).min(brick_rows);
@@ -782,15 +789,16 @@ fn trace_family(
     let pres = Presence::new(tracing, family);
     let FamilyFields { cent, seeds } = centrality(&pres, nx, ny);
     log!("{label} centrality: {:.1} s", t.elapsed().as_secs_f64());
-    debug_mem(label, &[("cent", cent.resident_bytes()), ("seeds", seeds.len() * 16)]);
+    debug_mem(label, &[("cent", cent.resident_bytes()), ("seeds", seeds.len() * std::mem::size_of::<Seed>())]);
     let t = Instant::now();
     let cat = catalogue(&seeds, &cent);
     debug_dump(&folder, "presence", || pres.read_block([0, 0, 0], pres.shape()))?;
     debug_dump(&folder, "centrality", || cent.read_block([0, 0, 0], cent.shape()))?;
     debug_dump(&folder, "seeds", || {
         let mut dense = Vol::new(cent.shape(), 0u8);
-        for &([z, y, x], v) in &seeds {
-            dense.set(z as usize, y as usize, x as usize, v);
+        for &seed in &seeds {
+            let [z, y, x] = seed.coords(cent.shape());
+            dense.set(z as usize, y as usize, x as usize, seed.priority());
         }
         dense.read_block([0, 0, 0], dense.shape())
     })?;

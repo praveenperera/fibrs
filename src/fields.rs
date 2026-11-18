@@ -16,7 +16,32 @@ pub struct FamilyFields {
     pub cent: Vol<u16>,
     /// Every voxel of seed priority 1 or 2, in C order over the volume; a list, because seeds are a few voxels
     /// in every brick and a volume of them would allocate nearly all of the family's bricks
-    pub seeds: Vec<([i32; 3], u8)>,
+    pub seeds: Vec<Seed>,
+}
+
+/// A seed voxel's C-order index in the volume and its priority, packed in 8 bytes: the index in the high 56
+/// bits, so seeds sort in C order, and the priority in the low 8
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Seed(u64);
+
+impl Seed {
+    /// Volumes up to this many voxels have every index fit in 56 bits
+    const MAX_VOXELS: usize = 1 << 56;
+
+    fn new(at: Shape, shape: Shape, priority: u8) -> Self {
+        let index = (at[0] * shape[1] + at[1]) * shape[2] + at[2];
+        Self((index as u64) << 8 | u64::from(priority))
+    }
+
+    /// The seed's z, y, x in a volume of `shape`
+    pub fn coords(self, shape: Shape) -> [i32; 3] {
+        let index = (self.0 >> 8) as usize;
+        [index / (shape[1] * shape[2]), index / shape[2] % shape[1], index % shape[2]].map(|v| v as i32)
+    }
+
+    pub fn priority(self) -> u8 {
+        self.0 as u8
+    }
 }
 
 /// Presence of `family` (1 = V, 2 = H): `min(own + other, 255)`, zero where `own < other`
@@ -106,6 +131,10 @@ type TileFields = (Shape, Shape, Vec<u16>, Vec<u8>);
 /// Centrality and seeds over the reference's 128³ tiles with an 8-voxel halo, tiles in parallel
 pub fn centrality(pres: &Presence, nx: &Vol<u8>, ny: &Vol<u8>) -> FamilyFields {
     let shape = pres.shape();
+    assert!(
+        shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d)).is_some_and(|n| n <= Seed::MAX_VOXELS),
+        "volume of {shape:?} voxels is too large to index seeds"
+    );
     let jobs = tiles(shape, TILE);
     let mut cent = Vol::new(shape, 0u16);
     let mut seeds = Vec::new();
@@ -121,7 +150,7 @@ pub fn centrality(pres: &Presence, nx: &Vol<u8>, ny: &Vol<u8>) -> FamilyFields {
                 for y in 0..inner[1] {
                     for x in 0..inner[2] {
                         if s[i] != 0 {
-                            seeds.push(([start[0] + z, start[1] + y, start[2] + x].map(|v| v as i32), s[i]));
+                            seeds.push(Seed::new([start[0] + z, start[1] + y, start[2] + x], shape, s[i]));
                         }
                         i += 1;
                     }
@@ -129,8 +158,8 @@ pub fn centrality(pres: &Presence, nx: &Vol<u8>, ny: &Vol<u8>) -> FamilyFields {
             }
         }
     }
-    // the catalogue reads seeds in C order over the whole volume; coordinates are unique, so any sort agrees
-    seeds.sort_unstable_by_key(|&(c, _)| c);
+    // the catalogue reads seeds in C order over the whole volume; indices are unique, so any sort agrees
+    seeds.sort_unstable();
     FamilyFields { cent, seeds }
 }
 
@@ -172,12 +201,13 @@ pub struct Catalogue {
 
 /// `prepare_seeds` (prepare.py:162): priority 2 then 1, each in descending centrality (reversed
 /// unstable argsort), then a stable sort by region
-pub fn catalogue(seeds: &[([i32; 3], u8)], cent: &Vol<u16>) -> Catalogue {
+pub fn catalogue(seeds: &[Seed], cent: &Vol<u16>) -> Catalogue {
     let shape = cent.shape();
     let mut by_priority: [Vec<[i32; 3]>; 2] = [Vec::new(), Vec::new()];
-    for &(c, v) in seeds {
+    for &seed in seeds {
+        let v = seed.priority();
         if v == 2 || v == 1 {
-            by_priority[(v == 1) as usize].push(c);
+            by_priority[(v == 1) as usize].push(seed.coords(shape));
         }
     }
     let n_primary = by_priority[0].len();

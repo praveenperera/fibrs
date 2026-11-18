@@ -12,7 +12,7 @@ use rayon::prelude::*;
 ///
 /// A brick is allocated whole for its first non-default voxel, so smaller bricks hold less air where data ends:
 /// 16³ took 0.5 GiB (4%) less peak memory than 32³ on a 1024-plane PHerc0826 window, at the same speed, while
-/// the table of brick slots (16 bytes each) stays near 35 MB for that window
+/// the table of brick slots (8 bytes each) stays near 17 MB for that window
 pub const SHIFT: usize = 4;
 /// Brick edge in voxels
 pub const EDGE: usize = 1 << SHIFT;
@@ -28,7 +28,7 @@ pub struct Vol<T> {
     shape: Shape,
     grid: Shape,
     default: T,
-    bricks: Vec<Option<Box<[T]>>>,
+    bricks: Vec<Option<Box<[T; BRICK]>>>,
 }
 
 impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
@@ -46,6 +46,16 @@ impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
     /// Brick grid size in z, y, x
     pub fn grid(&self) -> Shape {
         self.grid
+    }
+
+    /// A brick with every voxel set to `default`; a fixed-size box is one pointer wide, so each slot of the
+    /// table is 8 bytes instead of 16
+    fn new_brick(default: T) -> Box<[T; BRICK]> {
+        // through a Vec, which allocates zeroed bricks with calloc so untouched pages are never resident
+        let Ok(b) = vec![default; BRICK].into_boxed_slice().try_into() else {
+            unreachable!("the Vec has BRICK voxels")
+        };
+        b
     }
 
     #[inline(always)]
@@ -73,7 +83,7 @@ impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
     #[inline(always)]
     pub fn locate(&self, z: usize, y: usize, x: usize) -> (Option<&[T]>, usize) {
         debug_assert!(z < self.shape[0] && y < self.shape[1] && x < self.shape[2]);
-        (self.bricks[self.brick_index(z, y, x)].as_deref(), Self::offset(z, y, x))
+        (self.bricks[self.brick_index(z, y, x)].as_deref().map(|b| b.as_slice()), Self::offset(z, y, x))
     }
 
     /// The value at a voxel given as signed coordinates, which must be in bounds
@@ -91,7 +101,7 @@ impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
             Some(b) => b[Self::offset(z, y, x)] = value,
             slot @ None => {
                 if value != default {
-                    let mut b = vec![default; BRICK].into_boxed_slice();
+                    let mut b = Self::new_brick(default);
                     b[Self::offset(z, y, x)] = value;
                     *slot = Some(b);
                 }
@@ -184,7 +194,7 @@ impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
                 *slot = None;
                 return;
             }
-            let mut b = vec![default; BRICK].into_boxed_slice();
+            let mut b = Self::new_brick(default);
             for z in 0..dims[0] {
                 for y in 0..dims[1] {
                     let src = &dense[(z * dims[1] + y) * dims[2]..][..dims[2]];
