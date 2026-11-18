@@ -58,6 +58,8 @@ impl Precision {
 }
 
 /// One column's outputs, `None` when no tile ran
+// built only by the GPU engine, which other targets lack
+#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
 pub struct ColumnOut {
     pub semantic: Option<Vec<u8>>,
     pub tracing: Option<Vec<u8>>,
@@ -72,6 +74,8 @@ pub trait Engine {
 }
 
 /// What the run needs to know about the opened engine
+// built only by the GPU engine, which other targets lack
+#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
 pub struct Opened {
     pub engine: Box<dyn Engine>,
     /// The GPU's name
