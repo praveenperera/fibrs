@@ -4,10 +4,10 @@
 # usage: install-dropin.sh VENV [BINARY]
 #        install-dropin.sh --restore VENV
 # BINARY defaults to the fibrs beside this script's directory (the release archive's layout), then to
-# the one on PATH. The reference entry script moves to
-# VENV/bin/avf-spline-generator.reference; the native binary is copied to VENV/bin/fibrs and
-# avf-spline-generator becomes a symlink to it; NOTICE and licenses/ go to VENV/share/fibrs. The
-# binary finds numpy's OpenBLAS through its own path (VENV/bin/.. /lib/python*/site-packages/numpy.libs, or the
+# the one on PATH. The reference entry script moves to VENV/bin/avf-spline-generator.reference; the native
+# binary is copied to VENV/bin/fibrs and avf-spline-generator becomes a symlink to it; NOTICE and licenses/ go
+# to VENV/share/fibrs. --restore puts the reference entry back and keeps a VENV/bin/fibrs that the fibrs wheel
+# installed. The binary finds numpy's OpenBLAS through its own path (VENV/bin/.. /lib/python*/site-packages/numpy.libs, or the
 # scipy-openblas64 package's lib/ on macOS, where numpy links Accelerate instead), so
 # callers that run Path(sys.executable).parent / "avf-spline-generator" need no other change
 set -euo pipefail
@@ -18,7 +18,10 @@ if [[ ${1:-} == --restore ]]; then
   [[ -e $ref || -L $ref ]] || { echo "no $ref to restore" >&2; exit 1; }
   rm -f "$venv/bin/avf-spline-generator"
   mv "$ref" "$venv/bin/avf-spline-generator"
-  rm -f "$venv/bin/fibrs"
+  # pip installs bin/fibrs with the wheel, which lists it in its RECORD; remove only a copy this script installed
+  if ! grep -qs -E '^(\.\./)+bin/fibrs,' "$venv"/lib/python*/site-packages/fibrs-*.dist-info/RECORD; then
+    rm -f "$venv/bin/fibrs"
+  fi
   rm -rf "$venv/share/fibrs"
   echo "restored the reference avf-spline-generator in $venv"
   exit 0
