@@ -12,6 +12,7 @@ import hashlib
 import json
 import sqlite3
 import sys
+from pathlib import Path
 
 QUERIES = {
     "fibers": "SELECT * FROM fibers ORDER BY id",
@@ -21,11 +22,13 @@ QUERIES = {
 
 
 def open_ro(path):
-    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    # as_uri percent-encodes the path, so a '#' or '?' in it can't end the path early or drop mode=ro
+    return sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True)
 
 
 def metadata(db):
-    meta = {k: json.loads(v) for k, v in db.execute("SELECT key, value FROM metadata")}
+    # canonical JSON text keeps the value types apart, where Python's == would take true for 1 and 1.0 for 1
+    meta = {k: json.dumps(json.loads(v), sort_keys=True) for k, v in db.execute("SELECT key, value FROM metadata")}
     meta.pop("uuid", None)
     return meta
 
