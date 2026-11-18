@@ -15,8 +15,9 @@ use serde_json::Value;
 
 use crate::input::{Compressor, decode};
 
-/// Decoded chunks kept: 1 GiB of 128^3 chunks, a few columns' worth of tile rows
-const CACHE_CHUNKS: usize = 512;
+/// Decoded chunks kept, by size: 1 GiB, which is 512 of the usual 128^3 chunks (a few columns' worth of tile rows)
+/// and fewer of larger ones
+const CACHE_BYTES: usize = 1 << 30;
 
 type Chunk = Arc<Vec<u8>>;
 
@@ -24,6 +25,7 @@ type Chunk = Arc<Vec<u8>>;
 struct Cache {
     chunks: HashMap<[usize; 3], Chunk>,
     order: VecDeque<[usize; 3]>,
+    bytes: usize,
 }
 
 /// A 3D uint8 Zarr v2 array
@@ -117,10 +119,14 @@ impl Ct {
         let mut cache = self.cache.lock().map_err(|_| eyre!("CT cache poisoned"))?;
         if cache.chunks.insert(key, chunk.clone()).is_none() {
             cache.order.push_back(key);
+            cache.bytes += chunk.len();
         }
-        while cache.order.len() > CACHE_CHUNKS {
+        // the newest chunk stays, however large
+        while cache.bytes > CACHE_BYTES && cache.order.len() > 1 {
             let old = cache.order.pop_front().expect("non-empty");
-            cache.chunks.remove(&old);
+            if let Some(c) = cache.chunks.remove(&old) {
+                cache.bytes -= c.len();
+            }
         }
         Ok(chunk)
     }

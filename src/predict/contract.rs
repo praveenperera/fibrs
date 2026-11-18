@@ -25,7 +25,7 @@ pub const STRIDE: usize = TILE - OVERLAP;
 pub const CORE: usize = TILE - 2 * BORDER;
 /// Voxels in one tile
 pub const TILE_VOXELS: usize = TILE * TILE * TILE;
-pub const MODEL_FILES: [&str; 3] = ["model.py", "plans.json", "checkpoint_final.pth"];
+pub const MODEL_FILES: [&str; 4] = ["model.py", "plans.json", "dataset.json", "checkpoint_final.pth"];
 pub const REFERENCE: &str = "villa lasagna/qualzz_inference.py @ 7e6b82164";
 pub const DROP_IN_FOR: &str = "AFV v2 reference predict.py @ 498ca259 (sha256 12784d48d98e\u{2026}ce916)";
 
@@ -165,14 +165,32 @@ fn files_below(root: &Path, dir: &Path, out: &mut Vec<(Vec<String>, PathBuf)>) -
             files_below(root, &path, out)?;
         } else if path.is_file() {
             let rel = path.strip_prefix(root)?;
-            let parts = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
-            out.push((parts, path));
+            let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+            if chunk_row(&parts).is_some() {
+                out.push((parts, path));
+            }
         }
     }
     Ok(())
 }
 
-/// sha256 of the CT array's `.zarray` and the names and sizes of its chunk files in the band's chunk rows
+/// The z row of a 3D chunk key's parts (`["z.y.x"]` flat, `["z", "y", "x"]` nested); `None` for any other file
+fn chunk_row(parts: &[String]) -> Option<usize> {
+    let indices: Vec<&str> = match parts {
+        [name] => name.split('.').collect(),
+        _ => parts.iter().map(String::as_str).collect(),
+    };
+    let digits = |s: &&str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if indices.len() != 3 || !indices.iter().all(digits) {
+        return None;
+    }
+    indices[0].parse().ok()
+}
+
+/// sha256 of the CT array's `.zarray` and the names and sizes of its chunk files in the band's chunk rows; other
+/// files in the array (a README, say) are not part of it. Chunk contents are not read, which would mean reading
+/// the whole band before every run, so an in-place edit that keeps chunk sizes is not detected; a changed CT
+/// needs a fresh output
 pub fn ct_identity(ct: &Path, z0: usize, z1: usize) -> Result<String> {
     let zarray = fs::read(ct.join(".zarray"))?;
     let meta: Value = serde_json::from_slice(&zarray)?;
@@ -191,13 +209,12 @@ pub fn ct_identity(ct: &Path, z0: usize, z1: usize) -> Result<String> {
         for entry in fs::read_dir(ct)? {
             let path = entry?.path();
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            if !path.is_file() || name.starts_with('.') {
+            if !path.is_file() {
                 continue;
             }
-            let row: usize =
-                name.split('.').next().unwrap_or("").parse().map_err(|_| eyre!("{name}: not a chunk key"))?;
-            if rows.contains(&row) {
-                files.push((vec![name], path));
+            let parts = vec![name];
+            if chunk_row(&parts).is_some_and(|row| rows.contains(&row)) {
+                files.push((parts, path));
             }
         }
     }
@@ -227,6 +244,16 @@ pub fn prediction_identity(out: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_chunk_keys_count_toward_the_ct_identity() {
+        let parts = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(chunk_row(&parts(&["12.3.4"])), Some(12));
+        assert_eq!(chunk_row(&parts(&["7", "0", "1"])), Some(7));
+        for other in [&["README"][..], &["_SUCCESS"], &[".zarray"], &["1.2"], &["1.2.x"], &["0", "1", "2", "3"]] {
+            assert_eq!(chunk_row(&parts(other)), None, "{other:?}");
+        }
+    }
 
     #[test]
     fn reflect_is_numpy_reflect() {

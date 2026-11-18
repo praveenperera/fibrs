@@ -153,7 +153,8 @@ float32 order. Tiles are read on several threads ahead of the GPU, and one threa
 
 ### Requirements
 
-- Linux x86-64 and an NVIDIA GPU with a driver for CUDA 12 or later. The binary needs only the driver
+- Linux x86-64 and an NVIDIA GPU of compute capability 8.0 or later (RTX 30 series, A100 and newer; not the
+  T4 or the RTX 20 series), with a driver for CUDA 12 or later. The binary needs only the driver
   (`libcuda.so.1`), not a CUDA toolkit.
 - cuDNN 9 (`libcudnn.so.9`) and cuBLAS 12 (`libcublas.so.12`). `pip install "fibrs[predict]"` installs them
   from NVIDIA's pip packages (`nvidia-cudnn-cu12`, `nvidia-cublas-cu12`); a system install works too.
@@ -168,7 +169,7 @@ run stops with an error naming what it needs. The tracer is unaffected.
 pip install "fibrs[predict]"   # or: pip install fibrs, with cuDNN 9 and cuBLAS 12 installed system-wide
 ```
 
-Download the model snapshot (`model.py`, `plans.json`, `checkpoint_final.pth`) from
+Download the model snapshot (`model.py`, `plans.json`, `dataset.json`, `checkpoint_final.pth`) from
 [Qualzz20/afv_fiber_9um_v2](https://huggingface.co/Qualzz20/afv_fiber_9um_v2); `--model-dir` is that directory.
 
 ```sh
@@ -184,6 +185,8 @@ python -m fibrs predict ARGS   # the same, from Python
 `--ct` is a level-0 uint8 zarr v2 array (the `/0` directory of an OME-Zarr). `--device` is `cuda` or `cuda:N`.
 Run the same command again on the same `--out` to resume a capped (`--max-minutes`) or interrupted run at the
 first unfinished column; the resume must use the same settings, binary and GPU model, or it refuses the output.
+It recognises the CT by its metadata and the names and sizes of its chunk files, not their contents, so a chunk
+rewritten in place at the same size is not detected: after changing the CT, use a fresh `--out`.
 `--expect-sha256` refuses a checkpoint with another hash. `--dry-run` reads the CT and prints, per column, the
 tile batches a run would send to the GPU and how many tiles it would skip, without a GPU and without writing.
 

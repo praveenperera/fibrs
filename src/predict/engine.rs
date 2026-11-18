@@ -233,7 +233,9 @@ mod libs {
     const PIP: [(&[&str], &str); 2] =
         [(&["libcublasLt.so.12", "libcublas.so.12"], "nvidia/cublas/lib"), (&["libcudnn.so.9"], "nvidia/cudnn/lib")];
 
-    /// The site-packages directories of the environment this binary is installed in
+    /// The site-packages directories of the environment this binary is installed in: the one whose
+    /// `fibrs-*.dist-info` installed it first, when a prefix holds several Python versions, so a binary installed
+    /// by one Python does not load another's libraries
     fn site_packages() -> Vec<PathBuf> {
         let mut prefixes = Vec::new();
         if let Some(prefix) = std::env::current_exe().ok().and_then(|e| e.parent()?.parent().map(Path::to_path_buf)) {
@@ -253,7 +255,8 @@ mod libs {
                     .map(|p| p.join("site-packages"))
                     .filter(|p| p.is_dir())
                     .collect();
-                found.sort();
+                // the installing Python's site-packages first, then the rest in a fixed order
+                found.sort_by_key(|p| (!installed_fibrs(p), p.clone()));
                 for p in found {
                     if !out.contains(&p) {
                         out.push(p);
@@ -264,18 +267,34 @@ mod libs {
         out
     }
 
-    /// Loads the pip copies of cuDNN and cuBLAS from this binary's environment, when it has them
+    /// Whether `site` holds the `fibrs` wheel's install record
+    fn installed_fibrs(site: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(site) else { return false };
+        entries.filter_map(Result::ok).any(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with("fibrs-") && name.ends_with(".dist-info")
+        })
+    }
+
+    /// Whether `site` holds all of a pip package's files
+    fn holds(site: &Path, (files, sub): (&[&str], &str)) -> bool {
+        files.iter().all(|f| site.join(sub).join(f).is_file())
+    }
+
+    /// Loads the pip copies of cuDNN and cuBLAS from this binary's environment, when it has them; both from one
+    /// site-packages when one holds both, so they come from the same install
     pub fn prefer_environment() {
         if std::env::var("FIBRS_CUDA_LIBS").is_ok_and(|v| v == "system") {
             return;
         }
 
         let sites = site_packages();
+        let both = sites.iter().find(|s| PIP.iter().all(|&p| holds(s, p)));
         for (files, sub) in PIP {
-            let Some(dir) = sites.iter().map(|s| s.join(sub)).find(|d| files.iter().all(|f| d.join(f).is_file()))
-            else {
+            let Some(site) = both.or_else(|| sites.iter().find(|s| holds(s, (files, sub)))) else {
                 continue;
             };
+            let dir = site.join(sub);
             for f in files {
                 let path = dir.join(f);
                 // SAFETY: cuDNN's and cuBLAS's initialisers have no preconditions; the handle is kept for the

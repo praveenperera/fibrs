@@ -175,6 +175,8 @@ struct Plan {
     cols: Columns,
     todo: Todo,
     selection: Option<Arc<VillaSelection>>,
+    /// The length of progress.jsonl's complete records, when a torn last record follows them
+    progress_complete: Option<u64>,
 }
 
 fn plan(c: &Checked, progress: &Path) -> Result<Plan> {
@@ -203,8 +205,16 @@ fn plan(c: &Checked, progress: &Path) -> Result<Plan> {
 
     let nz = z1 - z0;
     let mut done = HashSet::new();
+    let mut progress_complete = None;
     if progress.exists() {
-        for line in fs::read_to_string(progress)?.lines().filter(|l| !l.is_empty()) {
+        let text = fs::read_to_string(progress)?;
+        // every record is written with its newline, so text after the last newline is a record torn by a crash or
+        // a full disk: its column has not been recorded and runs again
+        let complete = text.rfind('\n').map_or(0, |i| i + 1);
+        if complete < text.len() {
+            progress_complete = Some(complete as u64);
+        }
+        for line in text[..complete].lines().filter(|l| !l.is_empty()) {
             let rec: Value = serde_json::from_str(line)?;
             let col: Vec<usize> = serde_json::from_value(rec["col"].clone())?;
             done.insert(col);
@@ -239,7 +249,7 @@ fn plan(c: &Checked, progress: &Path) -> Result<Plan> {
         Mode::Villa => Some(Arc::new(VillaSelection::new(&a.ct, ct.shape)?)),
         Mode::Band => None,
     };
-    Ok(Plan { ct, z0, z1, nz, ny, nx, cols, todo, selection })
+    Ok(Plan { ct, z0, z1, nz, ny, nx, cols, todo, selection, progress_complete })
 }
 
 fn start_feed(c: &Checked, p: &Plan) -> Result<TileFeed> {
@@ -418,6 +428,10 @@ fn run(c: Checked) -> Result<()> {
     let output = Output::open_or_create(&a.out, p.nz, p.ny, p.nx, &attrs)?;
 
     let feed = start_feed(&c, &p)?;
+    if let Some(len) = p.progress_complete {
+        // the torn record goes before this run appends its own
+        fs::OpenOptions::new().write(true).open(&progress)?.set_len(len)?;
+    }
     let mut writer = ColumnWriter::start(output, progress.clone())?;
     let stopped = columns(&c, &p, e.engine.as_mut(), &feed, &writer, t_start, started);
     drop(feed);

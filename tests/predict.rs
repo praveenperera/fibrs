@@ -89,7 +89,9 @@ fn a_resumed_run_skips_the_columns_its_progress_names() {
     let columns = case["columns"].as_array().unwrap();
     let out = scratch("resume");
     let done: Vec<String> = [0, 3].iter().map(|&i| json!({"col": columns[i]["col"]}).to_string()).collect();
-    fs::write(out.join("progress.jsonl"), done.join("\n") + "\n").unwrap();
+    // a record torn part way through its write (a crash or a full disk) does not count, nor stop the resume
+    let torn = format!("{{\"col\": {}", columns[5]["col"]);
+    fs::write(out.join("progress.jsonl"), done.join("\n") + "\n" + &torn).unwrap();
     let got = dry_run(&fixtures().join("band.zarr"), case, &out);
     let want: Vec<Value> =
         columns.iter().enumerate().filter(|(i, _)| ![0, 3].contains(i)).map(|(_, c)| c.clone()).collect();
@@ -165,7 +167,7 @@ fn a_ct_that_is_not_3d_uint8_is_refused() {
 #[test]
 fn every_attempt_is_recorded_before_the_checkpoint_is_checked() {
     let model = scratch("model");
-    for name in ["model.py", "plans.json", "checkpoint_final.pth"] {
+    for name in ["model.py", "plans.json", "dataset.json", "checkpoint_final.pth"] {
         fs::write(model.join(name), name).unwrap();
     }
     let out = scratch("attempt");
@@ -186,7 +188,7 @@ fn every_attempt_is_recorded_before_the_checkpoint_is_checked() {
 fn a_model_folder_whose_loader_would_pick_another_checkpoint_is_refused() {
     let model = scratch("fold-model");
     fs::create_dir_all(model.join("fold_0")).unwrap();
-    for name in ["model.py", "plans.json", "checkpoint_final.pth", "fold_0/checkpoint_final.pth"] {
+    for name in ["model.py", "plans.json", "dataset.json", "checkpoint_final.pth", "fold_0/checkpoint_final.pth"] {
         fs::write(model.join(name), name).unwrap();
     }
     let out = scratch("fold-out");
