@@ -104,7 +104,7 @@ impl Dtype {
 
 /// A Zarr v2 compressor this reader decodes
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Compressor {
+pub(crate) enum Compressor {
     Raw,
     Blosc,
     Zstd,
@@ -323,8 +323,23 @@ fn fortran_to_c(data: &[u8], dims: [usize; 4], es: usize) -> Vec<u8> {
     out
 }
 
+impl Compressor {
+    /// The compressor a `.zarray` names
+    pub(crate) fn of(meta: &Value) -> Result<Self> {
+        Ok(match meta["compressor"]["id"].as_str() {
+            None => Self::Raw,
+            Some("blosc") => Self::Blosc,
+            Some("zstd") => Self::Zstd,
+            Some("zlib") => Self::Zlib,
+            Some("gzip") => Self::Gzip,
+            Some("lz4") => Self::Lz4,
+            Some(other) => bail!("unsupported Zarr compressor {other}"),
+        })
+    }
+}
+
 /// One chunk file through its compressor; `n` is the decoded size
-fn decode(compressor: Compressor, bytes: Vec<u8>, n: usize) -> Result<Vec<u8>> {
+pub(crate) fn decode(compressor: Compressor, bytes: Vec<u8>, n: usize) -> Result<Vec<u8>> {
     Ok(match compressor {
         Compressor::Raw => bytes,
         Compressor::Blosc => blosc_decompress(&bytes)?,
@@ -350,7 +365,7 @@ fn decode(compressor: Compressor, bytes: Vec<u8>, n: usize) -> Result<Vec<u8>> {
 }
 
 /// Decompress one Blosc 1 frame with c-blosc
-fn blosc_decompress(src: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn blosc_decompress(src: &[u8]) -> Result<Vec<u8>> {
     let mut nbytes = 0usize;
     // SAFETY: c-blosc reads at most `src.len()` bytes of the header to validate it
     let valid = unsafe { blosc_src::blosc_cbuffer_validate(src.as_ptr().cast(), src.len(), &mut nbytes) };
@@ -429,15 +444,7 @@ fn open_zarr(path: &Path, key: Option<&str>) -> Result<(Store, Vec<usize>, Dtype
         Some("/") => '/',
         _ => '.',
     };
-    let compressor = match meta["compressor"]["id"].as_str() {
-        None => Compressor::Raw,
-        Some("blosc") => Compressor::Blosc,
-        Some("zstd") => Compressor::Zstd,
-        Some("zlib") => Compressor::Zlib,
-        Some("gzip") => Compressor::Gzip,
-        Some("lz4") => Compressor::Lz4,
-        Some(other) => bail!("unsupported Zarr compressor {other}"),
-    };
+    let compressor = Compressor::of(&meta)?;
     let fill = dtype.encode(fill_value(&meta["fill_value"])?);
     let chunks = [chunks[0], chunks[1], chunks[2], chunks[3]];
     Ok((Store::Zarr { dir, chunks, sep, fill, compressor, fortran }, shape, dtype))

@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+- `fibrs predict` runs Qual's AFV fibre model V2 over a CT on an NVIDIA GPU and writes the probability zarr that
+  villa's `lasagna.qualzz_inference` writes (`--mode villa`), or a resumable z band of it (band mode). It is native,
+  in the `fibrs` binary on Linux x86-64, with no PyTorch: the network runs on volkit's `AfvV2`.
+  `pip install "fibrs[predict]"` adds NVIDIA's cuDNN 9 and cuBLAS 12 pip packages, which the binary finds in its
+  own environment; a system cuDNN and cuBLAS work too. On other platforms `fibrs predict` only plans a run
+  (`--dry-run`).
+
 ## [0.1.1] - 2026-11-18
 
 - `scripts/install-dropin.sh --restore` puts back the `fibrs` that the wheel installed. It used to remove it, which

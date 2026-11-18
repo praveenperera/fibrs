@@ -1,0 +1,1297 @@
+{
+ "band:band:4-36:c192:b3": {
+  "ct": "band.zarr",
+  "mode": "band",
+  "z0": 4,
+  "z1": 36,
+  "column": 192,
+  "batch": 3,
+  "columns": [
+   {
+    "index": 0,
+    "col": [
+     0,
+     192,
+     0,
+     192
+    ],
+    "tiles": 4,
+    "tiles_air": 0,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        0,
+        0
+       ],
+       [
+        0,
+        0,
+        96
+       ],
+       [
+        0,
+        96,
+        0
+       ]
+      ],
+      "sha256": "86dde98ee56b97687c3a91f40562be53925a0d64e827c8ae8f970ab5d596a88b"
+     },
+     {
+      "origins": [
+       [
+        0,
+        96,
+        96
+       ]
+      ],
+      "sha256": "cfce024d152b78fbe2a88c3595536fbb300fd2172549dd93117d02861039dbe9"
+     }
+    ]
+   },
+   {
+    "index": 1,
+    "col": [
+     0,
+     192,
+     192,
+     384
+    ],
+    "tiles": 6,
+    "tiles_air": 2,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        0,
+        192
+       ],
+       [
+        0,
+        0,
+        288
+       ],
+       [
+        0,
+        96,
+        192
+       ]
+      ],
+      "sha256": "397a19a7e233562642c06ad1d4b4fe8f500183647701ad2e07bebf5a7cb0bada"
+     },
+     {
+      "origins": [
+       [
+        0,
+        96,
+        288
+       ]
+      ],
+      "sha256": "d54c685f28e90fa5c8f2712f7ea2651a1d8b5ee05aa35854b53a6d8b344e3882"
+     }
+    ]
+   },
+   {
+    "index": 2,
+    "col": [
+     0,
+     192,
+     384,
+     430
+    ],
+    "tiles": 2,
+    "tiles_air": 2,
+    "batches": []
+   },
+   {
+    "index": 3,
+    "col": [
+     192,
+     384,
+     0,
+     192
+    ],
+    "tiles": 4,
+    "tiles_air": 3,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        192,
+        96
+       ]
+      ],
+      "sha256": "e70f30287be3a7c574b213ebf124bc7cb577b84c90d7a7e1dedaa454ab034926"
+     }
+    ]
+   },
+   {
+    "index": 4,
+    "col": [
+     192,
+     384,
+     192,
+     384
+    ],
+    "tiles": 6,
+    "tiles_air": 5,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        192,
+        192
+       ]
+      ],
+      "sha256": "321a47e9b70b29e13b0c1a7ded6f9af90bf9d2b5415681ee3c6c6e332c945d44"
+     }
+    ]
+   },
+   {
+    "index": 5,
+    "col": [
+     192,
+     384,
+     384,
+     430
+    ],
+    "tiles": 2,
+    "tiles_air": 2,
+    "batches": []
+   },
+   {
+    "index": 6,
+    "col": [
+     384,
+     576,
+     0,
+     192
+    ],
+    "tiles": 6,
+    "tiles_air": 6,
+    "batches": []
+   },
+   {
+    "index": 7,
+    "col": [
+     384,
+     576,
+     192,
+     384
+    ],
+    "tiles": 9,
+    "tiles_air": 9,
+    "batches": []
+   },
+   {
+    "index": 8,
+    "col": [
+     384,
+     576,
+     384,
+     430
+    ],
+    "tiles": 3,
+    "tiles_air": 3,
+    "batches": []
+   },
+   {
+    "index": 9,
+    "col": [
+     576,
+     620,
+     0,
+     192
+    ],
+    "tiles": 2,
+    "tiles_air": 2,
+    "batches": []
+   },
+   {
+    "index": 10,
+    "col": [
+     576,
+     620,
+     192,
+     384
+    ],
+    "tiles": 3,
+    "tiles_air": 3,
+    "batches": []
+   },
+   {
+    "index": 11,
+    "col": [
+     576,
+     620,
+     384,
+     430
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   }
+  ]
+ },
+ "band:band:0-40:c96:b4": {
+  "ct": "band.zarr",
+  "mode": "band",
+  "z0": 0,
+  "z1": 40,
+  "column": 96,
+  "batch": 4,
+  "columns": [
+   {
+    "index": 0,
+    "col": [
+     0,
+     96,
+     0,
+     96
+    ],
+    "tiles": 1,
+    "tiles_air": 0,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        0,
+        0
+       ]
+      ],
+      "sha256": "2fc809000916d723d6f6e78dd397a94916a41aea6e84c7de5a206befbf32ff5b"
+     }
+    ]
+   },
+   {
+    "index": 1,
+    "col": [
+     0,
+     96,
+     96,
+     192
+    ],
+    "tiles": 1,
+    "tiles_air": 0,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        0,
+        96
+       ]
+      ],
+      "sha256": "555d6da1f6794c2302a06b4992a96fd53f20d713b8e15ede64bc2ac47b6442e5"
+     }
+    ]
+   },
+   {
+    "index": 2,
+    "col": [
+     0,
+     96,
+     192,
+     288
+    ],
+    "tiles": 1,
+    "tiles_air": 0,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        0,
+        192
+       ]
+      ],
+      "sha256": "cacfb806da1775c350a163a0209e4cfe19867c8676e557f4e29820f85951bc22"
+     }
+    ]
+   },
+   {
+    "index": 3,
+    "col": [
+     0,
+     96,
+     288,
+     384
+    ],
+    "tiles": 2,
+    "tiles_air": 1,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        0,
+        288
+       ]
+      ],
+      "sha256": "98560559e4b5ec6e075e9a2456906d7454b07be53230dbeb7220c9ba5d380892"
+     }
+    ]
+   },
+   {
+    "index": 4,
+    "col": [
+     0,
+     96,
+     384,
+     430
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   },
+   {
+    "index": 5,
+    "col": [
+     96,
+     192,
+     0,
+     96
+    ],
+    "tiles": 1,
+    "tiles_air": 0,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        96,
+        0
+       ]
+      ],
+      "sha256": "31fcb8b37d45f992c424b7f8beea6293da75532d7ef5070c932a7d331e0b7114"
+     }
+    ]
+   },
+   {
+    "index": 6,
+    "col": [
+     96,
+     192,
+     96,
+     192
+    ],
+    "tiles": 1,
+    "tiles_air": 0,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        96,
+        96
+       ]
+      ],
+      "sha256": "4b90a8786a8b0dcf0e9e9cad9a9a2ec18fd93dc7b7a75056db34084917b3ba00"
+     }
+    ]
+   },
+   {
+    "index": 7,
+    "col": [
+     96,
+     192,
+     192,
+     288
+    ],
+    "tiles": 1,
+    "tiles_air": 0,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        96,
+        192
+       ]
+      ],
+      "sha256": "3b44204f0b72854482621575e2d13279b95a7ac75ed7e42f0990f28a33e7c6f4"
+     }
+    ]
+   },
+   {
+    "index": 8,
+    "col": [
+     96,
+     192,
+     288,
+     384
+    ],
+    "tiles": 2,
+    "tiles_air": 1,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        96,
+        288
+       ]
+      ],
+      "sha256": "a084a9fcfcfa13376cf1062df12a8aa6ec650e2bfeb87d33116849452f5bf53c"
+     }
+    ]
+   },
+   {
+    "index": 9,
+    "col": [
+     96,
+     192,
+     384,
+     430
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   },
+   {
+    "index": 10,
+    "col": [
+     192,
+     288,
+     0,
+     96
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   },
+   {
+    "index": 11,
+    "col": [
+     192,
+     288,
+     96,
+     192
+    ],
+    "tiles": 1,
+    "tiles_air": 0,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        192,
+        96
+       ]
+      ],
+      "sha256": "904158d238beb74b571e7ba57f869ef68d92b3cd49580b5f6bf0c92c53f11a10"
+     }
+    ]
+   },
+   {
+    "index": 12,
+    "col": [
+     192,
+     288,
+     192,
+     288
+    ],
+    "tiles": 1,
+    "tiles_air": 0,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        192,
+        192
+       ]
+      ],
+      "sha256": "0314a8ce74e5c70c94add4fe050d3c73fc7c16765de6c9f39a37948f6a1f463a"
+     }
+    ]
+   },
+   {
+    "index": 13,
+    "col": [
+     192,
+     288,
+     288,
+     384
+    ],
+    "tiles": 2,
+    "tiles_air": 2,
+    "batches": []
+   },
+   {
+    "index": 14,
+    "col": [
+     192,
+     288,
+     384,
+     430
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   },
+   {
+    "index": 15,
+    "col": [
+     288,
+     384,
+     0,
+     96
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   },
+   {
+    "index": 16,
+    "col": [
+     288,
+     384,
+     96,
+     192
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   },
+   {
+    "index": 17,
+    "col": [
+     288,
+     384,
+     192,
+     288
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   },
+   {
+    "index": 18,
+    "col": [
+     288,
+     384,
+     288,
+     384
+    ],
+    "tiles": 2,
+    "tiles_air": 2,
+    "batches": []
+   },
+   {
+    "index": 19,
+    "col": [
+     288,
+     384,
+     384,
+     430
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   },
+   {
+    "index": 20,
+    "col": [
+     384,
+     480,
+     0,
+     96
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   },
+   {
+    "index": 21,
+    "col": [
+     384,
+     480,
+     96,
+     192
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   },
+   {
+    "index": 22,
+    "col": [
+     384,
+     480,
+     192,
+     288
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   },
+   {
+    "index": 23,
+    "col": [
+     384,
+     480,
+     288,
+     384
+    ],
+    "tiles": 2,
+    "tiles_air": 2,
+    "batches": []
+   },
+   {
+    "index": 24,
+    "col": [
+     384,
+     480,
+     384,
+     430
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   },
+   {
+    "index": 25,
+    "col": [
+     480,
+     576,
+     0,
+     96
+    ],
+    "tiles": 2,
+    "tiles_air": 2,
+    "batches": []
+   },
+   {
+    "index": 26,
+    "col": [
+     480,
+     576,
+     96,
+     192
+    ],
+    "tiles": 2,
+    "tiles_air": 2,
+    "batches": []
+   },
+   {
+    "index": 27,
+    "col": [
+     480,
+     576,
+     192,
+     288
+    ],
+    "tiles": 2,
+    "tiles_air": 2,
+    "batches": []
+   },
+   {
+    "index": 28,
+    "col": [
+     480,
+     576,
+     288,
+     384
+    ],
+    "tiles": 4,
+    "tiles_air": 4,
+    "batches": []
+   },
+   {
+    "index": 29,
+    "col": [
+     480,
+     576,
+     384,
+     430
+    ],
+    "tiles": 2,
+    "tiles_air": 2,
+    "batches": []
+   },
+   {
+    "index": 30,
+    "col": [
+     576,
+     620,
+     0,
+     96
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   },
+   {
+    "index": 31,
+    "col": [
+     576,
+     620,
+     96,
+     192
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   },
+   {
+    "index": 32,
+    "col": [
+     576,
+     620,
+     192,
+     288
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   },
+   {
+    "index": 33,
+    "col": [
+     576,
+     620,
+     288,
+     384
+    ],
+    "tiles": 2,
+    "tiles_air": 2,
+    "batches": []
+   },
+   {
+    "index": 34,
+    "col": [
+     576,
+     620,
+     384,
+     430
+    ],
+    "tiles": 1,
+    "tiles_air": 1,
+    "batches": []
+   }
+  ]
+ },
+ "band:band:10-12:c480:b4:only0": {
+  "ct": "band.zarr",
+  "mode": "band",
+  "z0": 10,
+  "z1": 12,
+  "column": 480,
+  "batch": 4,
+  "only": [
+   0
+  ],
+  "columns": [
+   {
+    "index": 0,
+    "col": [
+     0,
+     480,
+     0,
+     430
+    ],
+    "tiles": 25,
+    "tiles_air": 25,
+    "batches": []
+   }
+  ]
+ },
+ "villa:villa:0-150:c192:b1": {
+  "ct": "villa.zarr",
+  "mode": "villa",
+  "z0": 0,
+  "z1": 150,
+  "column": 192,
+  "batch": 1,
+  "columns": [
+   {
+    "index": 0,
+    "col": [
+     0,
+     192,
+     0,
+     192
+    ],
+    "tiles": 8,
+    "tiles_air": 1,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        0,
+        0
+       ]
+      ],
+      "sha256": "7270bb49624bd92d642f17e8fa2e8f81f271c5940b1103c7375efcb29c20a7c0"
+     },
+     {
+      "origins": [
+       [
+        0,
+        0,
+        96
+       ]
+      ],
+      "sha256": "f2630b6f04b06a1436de09a4fbae1e2ea94a9e2ad4fc2bc3617d8e027c998a72"
+     },
+     {
+      "origins": [
+       [
+        0,
+        96,
+        96
+       ]
+      ],
+      "sha256": "5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee"
+     },
+     {
+      "origins": [
+       [
+        54,
+        0,
+        0
+       ]
+      ],
+      "sha256": "76e257649778869d1426d060dfab6c2d8b352b34e64ce24b219e398e61475792"
+     },
+     {
+      "origins": [
+       [
+        54,
+        0,
+        96
+       ]
+      ],
+      "sha256": "31e482e0502f521a7e3a44e36afef285e54002bf82c2e5ee54501db474de6451"
+     },
+     {
+      "origins": [
+       [
+        54,
+        96,
+        0
+       ]
+      ],
+      "sha256": "e3de714f02fe76761d7b06280fc19e044c16daa0d12649c91691a5a772bc1e34"
+     },
+     {
+      "origins": [
+       [
+        54,
+        96,
+        96
+       ]
+      ],
+      "sha256": "c23acdea30074a42c2cafb6021cd0a83e79e6a70dcb9e3e9c34ffaec5d3ada89"
+     }
+    ]
+   },
+   {
+    "index": 1,
+    "col": [
+     0,
+     192,
+     192,
+     330
+    ],
+    "tiles": 8,
+    "tiles_air": 0,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        0,
+        192
+       ]
+      ],
+      "sha256": "756b9b59a4361f0a32a386d27ef09fede5fdc963166fb33a364cea948bbe80f6"
+     },
+     {
+      "origins": [
+       [
+        0,
+        0,
+        234
+       ]
+      ],
+      "sha256": "1f98f2e677a43423aa3f103f86d7ef154ec7c692b38f1a49273dafed90c43925"
+     },
+     {
+      "origins": [
+       [
+        0,
+        96,
+        192
+       ]
+      ],
+      "sha256": "c3b2630898688663cba3e450c7d943a89621f2e08ee0320fbe3a856be1a66107"
+     },
+     {
+      "origins": [
+       [
+        0,
+        96,
+        234
+       ]
+      ],
+      "sha256": "6703c544b8e7487e066c6ece6e6de3ef4d59d4fe178d5127c90f904c6d7097a0"
+     },
+     {
+      "origins": [
+       [
+        54,
+        0,
+        192
+       ]
+      ],
+      "sha256": "d2a0e2ff9bc16c6d3f273f2adbf8f405bb30bf72a1dc01197727867606ed7846"
+     },
+     {
+      "origins": [
+       [
+        54,
+        0,
+        234
+       ]
+      ],
+      "sha256": "11ed1e2b8de83bf84cb19be98a665384706877d3df720201abd4c02eacfca82c"
+     },
+     {
+      "origins": [
+       [
+        54,
+        96,
+        192
+       ]
+      ],
+      "sha256": "f925b7672df586a95a2d5c975a5600b10dc139f263e000b0018641929319d7ba"
+     },
+     {
+      "origins": [
+       [
+        54,
+        96,
+        234
+       ]
+      ],
+      "sha256": "2017a9470fa24ded334d7fb07482e0bc264514d0e12de527725fd4db51ff5bfc"
+     }
+    ]
+   },
+   {
+    "index": 2,
+    "col": [
+     192,
+     384,
+     0,
+     192
+    ],
+    "tiles": 12,
+    "tiles_air": 10,
+    "batches": [
+     {
+      "origins": [
+       [
+        54,
+        192,
+        0
+       ]
+      ],
+      "sha256": "57531c9c0c3e9992e5e8f4ad1139df0a22c7f36feab2426e688716a88634b0e6"
+     },
+     {
+      "origins": [
+       [
+        54,
+        192,
+        96
+       ]
+      ],
+      "sha256": "6c0d881e9de5e8a8d7788b2423ff071f4fd1f7f6fecad1cfb5c612e4a0911fa8"
+     }
+    ]
+   },
+   {
+    "index": 3,
+    "col": [
+     192,
+     384,
+     192,
+     330
+    ],
+    "tiles": 12,
+    "tiles_air": 10,
+    "batches": [
+     {
+      "origins": [
+       [
+        54,
+        192,
+        192
+       ]
+      ],
+      "sha256": "5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee"
+     },
+     {
+      "origins": [
+       [
+        54,
+        192,
+        234
+       ]
+      ],
+      "sha256": "5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee"
+     }
+    ]
+   },
+   {
+    "index": 4,
+    "col": [
+     384,
+     420,
+     0,
+     192
+    ],
+    "tiles": 4,
+    "tiles_air": 4,
+    "batches": []
+   },
+   {
+    "index": 5,
+    "col": [
+     384,
+     420,
+     192,
+     330
+    ],
+    "tiles": 4,
+    "tiles_air": 4,
+    "batches": []
+   }
+  ]
+ },
+ "villa:band:20-120:c288:b16": {
+  "ct": "villa.zarr",
+  "mode": "band",
+  "z0": 20,
+  "z1": 120,
+  "column": 288,
+  "batch": 16,
+  "columns": [
+   {
+    "index": 0,
+    "col": [
+     0,
+     288,
+     0,
+     288
+    ],
+    "tiles": 24,
+    "tiles_air": 12,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        0,
+        0
+       ],
+       [
+        0,
+        0,
+        96
+       ],
+       [
+        0,
+        0,
+        192
+       ],
+       [
+        0,
+        0,
+        234
+       ],
+       [
+        0,
+        96,
+        192
+       ],
+       [
+        0,
+        96,
+        234
+       ],
+       [
+        4,
+        0,
+        0
+       ],
+       [
+        4,
+        0,
+        96
+       ],
+       [
+        4,
+        0,
+        192
+       ],
+       [
+        4,
+        0,
+        234
+       ],
+       [
+        4,
+        96,
+        192
+       ],
+       [
+        4,
+        96,
+        234
+       ]
+      ],
+      "sha256": "3ddbf41c358f402720f9ae9f4abb420728dc87d37132fd2f8b1f50ef105e5045"
+     }
+    ]
+   },
+   {
+    "index": 1,
+    "col": [
+     0,
+     288,
+     288,
+     330
+    ],
+    "tiles": 6,
+    "tiles_air": 2,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        0,
+        234
+       ],
+       [
+        0,
+        96,
+        234
+       ],
+       [
+        4,
+        0,
+        234
+       ],
+       [
+        4,
+        96,
+        234
+       ]
+      ],
+      "sha256": "1151f762dca88692a79aaab3889afd9e4310d45fbaafa069b248d878279921c5"
+     }
+    ]
+   },
+   {
+    "index": 2,
+    "col": [
+     288,
+     420,
+     0,
+     288
+    ],
+    "tiles": 16,
+    "tiles_air": 16,
+    "batches": []
+   },
+   {
+    "index": 3,
+    "col": [
+     288,
+     420,
+     288,
+     330
+    ],
+    "tiles": 4,
+    "tiles_air": 4,
+    "batches": []
+   }
+  ]
+ },
+ "tiny:band:0-6:c480:b4": {
+  "ct": "tiny.zarr",
+  "mode": "band",
+  "z0": 0,
+  "z1": 6,
+  "column": 480,
+  "batch": 4,
+  "columns": [
+   {
+    "index": 0,
+    "col": [
+     0,
+     50,
+     0,
+     70
+    ],
+    "tiles": 1,
+    "tiles_air": 0,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        0,
+        0
+       ]
+      ],
+      "sha256": "dbe7fd94fca2dc7fd08ce7730270c602574badd63f2f3b6ed714c2de939ac713"
+     }
+    ]
+   }
+  ]
+ },
+ "tiny:villa:0-6:c96:b1": {
+  "ct": "tiny.zarr",
+  "mode": "villa",
+  "z0": 0,
+  "z1": 6,
+  "column": 96,
+  "batch": 1,
+  "columns": [
+   {
+    "index": 0,
+    "col": [
+     0,
+     50,
+     0,
+     70
+    ],
+    "tiles": 1,
+    "tiles_air": 0,
+    "batches": [
+     {
+      "origins": [
+       [
+        0,
+        0,
+        0
+       ]
+      ],
+      "sha256": "dbe7fd94fca2dc7fd08ce7730270c602574badd63f2f3b6ed714c2de939ac713"
+     }
+    ]
+   }
+  ]
+ }
+}
