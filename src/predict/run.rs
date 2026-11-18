@@ -78,8 +78,8 @@ pub struct Args {
     /// Tile reader threads (output unchanged)
     #[arg(long, default_value_t = 4, allow_negative_numbers = true)]
     readers: i64,
-    /// fp32 is the reference contract (TF32 convolutions, as torch's defaults); bf16 is faster and changes the
-    /// output
+    /// fp32 (default): float32 tensors with TF32 tensor-core convolutions, the precision PyTorch uses for the
+    /// reference by default. bf16 (opt-in): faster, small output differences
     #[arg(long, default_value = "fp32")]
     precision: String,
     /// Comma list of column indices (in column order) to run; for timing subsets

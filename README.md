@@ -216,10 +216,18 @@ mode's output unchanged; in band mode it is part of the run's settings, as in th
 
 ### Precision
 
-`--precision fp32` (the default) is the reference contract: float32 tensors with TF32 convolution and GEMM math,
-as PyTorch runs the model by default on CUDA. `--precision bf16` runs the network and its seg head in bf16, as
-PyTorch's bf16 autocast rounds them, with the normalisation, softmax and blend still in float32; it is faster and
-changes the output. PyTorch's `fp32-ieee` and `fp16` modes are not offered.
+By default `fibrs predict` keeps parity with the current best implementation, villa's
+`lasagna.qualzz_inference` on PyTorch: it runs at that reference's own precision, and bf16 is only ever opt-in.
+
+- `--precision fp32` (default): float32 tensors with TF32 tensor-core convolutions, the precision PyTorch uses for
+  the reference by default.
+- `--precision bf16` (opt-in): faster, small output differences. The network and its seg head run in bf16, with
+  the normalisation, softmax and blend still in float32. Against fp32, on 512-plane bands of PHerc0826 and
+  PHerc0813 traced with `fibrs`, the traced fibre length agreed to about 99% (99.2–99.4%, V and H fibres),
+  97.0–97.8% of fibres matched, and the fibre counts were within 0.3%; the 99.9th percentile of the probability
+  differences over the foreground was 11 and 9 of 255 on PHerc0826 and 8 and 7 on PHerc0813.
+
+PyTorch's `fp32-ieee` and `fp16` modes are not offered.
 
 ### Limits
 
