@@ -171,7 +171,8 @@ pip install "fibrs[predict]"   # or: pip install fibrs, with cuDNN 9 and cuBLAS 
 ```
 
 Download the model snapshot (`model.py`, `plans.json`, `dataset.json`, `checkpoint_final.pth`) from
-[Qualzz20/afv_fiber_9um_v2](https://huggingface.co/Qualzz20/afv_fiber_9um_v2); `--model-dir` is that directory.
+[Qualzz20/afv_fiber_9um_v2](https://huggingface.co/Qualzz20/afv_fiber_9um_v2); `--model-dir` is that directory, which
+must not hold a `fold_0` checkpoint or be named `fold_*`, as the loader would then read other files.
 
 ```sh
 # villa's output, for a whole CT array

@@ -374,6 +374,15 @@ fn run(c: Checked) -> Result<()> {
 
     let progress = a.out.join("progress.jsonl");
     let p = plan(&c, &progress)?;
+    // the loader takes a fold_* folder's plans.json and dataset.json from its parent, so those hashed here
+    // would not be the ones it runs with
+    if a.model_dir.file_name().is_some_and(|n| n.to_string_lossy().starts_with("fold_")) {
+        bail!(
+            "{} is named like a fold folder, so its plans.json and dataset.json would be read from its parent; \
+             pass the model folder that holds model.py",
+            a.model_dir.display()
+        );
+    }
     let mut hashes = Map::new();
     for name in MODEL_FILES {
         hashes.insert(name.into(), json!(sha256(&a.model_dir.join(name))?));

@@ -203,6 +203,21 @@ fn an_output_in_use_by_another_run_is_refused() {
 }
 
 #[test]
+fn a_fold_folder_as_the_model_folder_is_refused() {
+    let model = scratch("fold_1");
+    for name in ["model.py", "plans.json", "dataset.json", "checkpoint_final.pth"] {
+        fs::write(model.join(name), name).unwrap();
+    }
+    let out = scratch("fold-dir-out");
+    let ct = fixtures().join("band.zarr");
+    let args = ["--ct", ct.to_str().unwrap(), "--z0", "0", "--z1", "8", "--model-dir", model.to_str().unwrap()];
+    let run = predict(&[&args[..], &["--out", out.to_str().unwrap()]].concat());
+    assert_eq!(run.status.code(), Some(1));
+    assert!(text(&run).contains("is named like a fold folder"), "{}", text(&run));
+    assert!(!out.join("semantic").exists());
+}
+
+#[test]
 fn a_model_folder_whose_loader_would_pick_another_checkpoint_is_refused() {
     let model = scratch("fold-model");
     fs::create_dir_all(model.join("fold_0")).unwrap();
