@@ -13,5 +13,6 @@ avf-spline-generator --predictions predictions.zarr --array semantic --channel-o
   --storage compressed --device cpu --threads 4 --output reference.afv --work-dir work
 ```
 
-CI traces the same input with fibrs, through the drop-in and through `python -m fibrs`, and
+CI traces the same input with fibrs and `--threads 2`, which gives the same output, through the drop-in and
+through `python -m fibrs`, and
 `scripts/compare_afv.py` must find every table and every metadata value but the per-run uuid identical.

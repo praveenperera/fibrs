@@ -130,10 +130,12 @@ jobs:
           fixture="$GITHUB_WORKSPACE/tests/fixtures/synthetic"
           for entry in "venv-ref/bin/avf-spline-generator" "venv-ref/bin/python -m fibrs"; do
             rm -rf trace
+            # the macOS runners have 3 cores, and --threads can't exceed the core count; the output doesn't
+            # depend on it
             # shellcheck disable=SC2086
             $entry --predictions "$fixture/predictions.zarr" --array semantic --channel-order VH \
               --tracing-predictions "$fixture/predictions.zarr" --tracing-array tracing --voxel-size-um 9.362 \
-              --storage compressed --device cpu --threads 4 --output trace/fibers.afv --work-dir trace/work
+              --storage compressed --device cpu --threads 2 --output trace/fibers.afv --work-dir trace/work
             venv-ref/bin/python -I "$GITHUB_WORKSPACE/scripts/compare_afv.py" trace/fibers.afv "$fixture/reference.afv"
           done
           bash fibrs-*-"$TARGET"/scripts/install-dropin.sh --restore venv-ref
