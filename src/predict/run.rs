@@ -19,7 +19,7 @@ use super::contract::{
     positions, prediction_identity, sha256,
 };
 use super::ct::Ct;
-use super::engine::{self, Engine, MAX_BATCH, Opened, Precision, Weights};
+use super::engine::{self, Engine, MAX_BATCH, Opened, Precision};
 use super::feed::{FeedPlan, Item, Rule, TileFeed};
 use super::out::{ColumnWriter, Finished, Output, now_unix};
 use super::villa::{self, VillaSelection};
@@ -88,10 +88,6 @@ pub struct Args {
     /// GPU
     #[arg(long)]
     dry_run: bool,
-    /// Load this afv-v2 .safetensors export (with its .json sidecar) instead of reading the checkpoint; it must
-    /// be of --model-dir's checkpoint
-    #[arg(long, hide = true)]
-    export: Option<PathBuf>,
 }
 
 /// The arguments after the checks argparse makes in the reference
@@ -354,18 +350,7 @@ fn run(c: Checked) -> Result<()> {
     {
         bail!("checkpoint sha256 {checkpoint} != {want}");
     }
-    let weights = match &a.export {
-        Some(export) => {
-            // the export must be of the checkpoint the run names, or the provenance would misstate the weights
-            let of = engine::export_checkpoint(export)?;
-            if of.as_deref() != Some(checkpoint.as_str()) {
-                bail!("export {} is of checkpoint {of:?}, --model-dir holds {checkpoint}", export.display());
-            }
-            Weights::Export(export.clone())
-        }
-        None => Weights::ModelDir(a.model_dir.clone()),
-    };
-    let mut e = engine::open(&weights, c.device, c.precision)?;
+    let mut e = engine::open(&a.model_dir, c.device, c.precision)?;
     check_column_memory(&c, &p, &e)?;
 
     let villa = p.selection.is_some();

@@ -4,7 +4,7 @@
 //! volkit is CUDA-only and is built in for Linux x86_64 only; elsewhere `fibrs predict` plans (`--dry-run`) but
 //! refuses to run
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use color_eyre::eyre::Result;
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -90,16 +90,6 @@ pub struct Opened {
     pub libraries: Vec<String>,
 }
 
-/// Where the weights come from
-// read only by the GPU engine, which other targets lack
-#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
-pub enum Weights {
-    /// The nnU-Net model folder, read by volkit's torch-free `.pth` reader
-    ModelDir(PathBuf),
-    /// A `.safetensors` export with its `.json` sidecar (`export_nnunet.py --recipe afv-v2`)
-    Export(PathBuf),
-}
-
 /// Most tiles one `add` takes
 pub const MAX_BATCH: usize = 16;
 
@@ -110,35 +100,28 @@ pub fn device_index(device: &str) -> Result<usize, String> {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub fn open(weights: &Weights, device: usize, precision: Precision) -> Result<Opened> {
-    native::open(weights, device, precision)
+pub fn open(model_dir: &Path, device: usize, precision: Precision) -> Result<Opened> {
+    native::open(model_dir, device, precision)
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-pub fn open(_weights: &Weights, _device: usize, _precision: Precision) -> Result<Opened> {
+pub fn open(_model_dir: &Path, _device: usize, _precision: Precision) -> Result<Opened> {
     bail!(
         "fibrs predict needs an NVIDIA GPU on Linux x86_64; this build has no GPU engine (--dry-run plans a run \
          without one)"
     )
 }
 
-/// The checkpoint sha256 an export's sidecar says it was made from
-pub fn export_checkpoint(export: &Path) -> Result<Option<String>> {
-    let sidecar: Value = serde_json::from_slice(&std::fs::read(export.with_extension("json"))?)?;
-    Ok(sidecar["checkpoint_sha256"].as_str().map(str::to_owned))
-}
-
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod native {
-    use std::path::PathBuf;
+    use std::path::Path;
 
     use color_eyre::eyre::{Result, WrapErr};
-    use serde_json::{Map, Value, json};
+    use serde_json::{Map, json};
     use volkit::dnn::Pick;
     use volkit::nnunet::afv2::{AfvPrecision, AfvV2, Options};
 
-    use super::{ColumnOut, Engine, Opened, Origin, Precision, Weights};
-    use crate::predict::contract::sha256;
+    use super::{ColumnOut, Engine, Opened, Origin, Precision};
 
     /// The engine library this build links, for the provenance
     const LIBRARY: &str = concat!(env!("FIBRS_VOLKIT"), ", AfvV2");
@@ -160,23 +143,20 @@ mod native {
         }
     }
 
-    pub fn open(weights: &Weights, device: usize, precision: Precision) -> Result<Opened> {
+    pub fn open(model_dir: &Path, device: usize, precision: Precision) -> Result<Opened> {
         super::libs::prefer_environment();
         let precision_ = match precision {
             Precision::Fp32 => AfvPrecision::Fp32,
             Precision::Bf16 => AfvPrecision::Bf16,
         };
         let opts = Options { device, pick: Pick::Find, precision: precision_ };
-        let (path, record) = match weights {
-            Weights::ModelDir(dir) => (dir.clone(), json!("checkpoint_final.pth, read without torch")),
-            Weights::Export(p) => (p.clone(), json!({"export": abs(p), "export_sha256": sha256(p)?})),
-        };
-        let net = AfvV2::open(&path, &opts).wrap_err_with(|| format!("load AFV v2 from {}", path.display()))?;
+        let net =
+            AfvV2::open(model_dir, &opts).wrap_err_with(|| format!("load AFV v2 from {}", model_dir.display()))?;
         let free = free_bytes(device)?;
         let load = &net.load;
         let mut provenance = Map::new();
         provenance.insert("network".into(), json!(LIBRARY));
-        provenance.insert("weights".into(), record);
+        provenance.insert("weights".into(), json!("checkpoint_final.pth, read without torch"));
         provenance.insert("cudnn".into(), json!(load.cudnn));
         provenance.insert("ptx_tier".into(), json!(load.ptx_tier));
         provenance.insert("algo".into(), json!("find"));
@@ -190,10 +170,6 @@ mod native {
             provenance,
             libraries: super::libs::mapped(),
         })
-    }
-
-    fn abs(p: &std::path::Path) -> Value {
-        json!(std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p)).to_string_lossy())
     }
 
     /// Free device memory, through the device's primary context (the one the engine runs in)
