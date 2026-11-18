@@ -173,16 +173,21 @@ impl Output {
     /// Opens the group at `out`, creating it with `attrs` when it is not yet created; an existing output must
     /// carry the same `inference` provenance, or the run would mix two predictions
     ///
-    /// The group's `inference` attribute is written last, so it marks a finished creation: a run stopped part way
-    /// through creating the output leaves no `inference`, and the next run creates it again
+    /// The group's `inference` attribute is written last, so it marks a finished creation. A group without it is
+    /// created again only while it holds no prediction yet (no chunks and no progress), as a run stopped part way
+    /// through creating it leaves; anything else would put this run's provenance on data it did not write
     pub fn open_or_create(out: &Path, nz: usize, ny: usize, nx: usize, attrs: &Map<String, Value>) -> Result<Self> {
         fs::create_dir_all(out)?;
         // `attrs.update(...)` merges into what the group already holds
         let mut saved = match fs::read(out.join(".zattrs")) {
             Ok(b) => serde_json::from_slice::<Map<String, Value>>(&b)?,
-            Err(_) => Map::new(),
+            Err(e) if e.kind() == ErrorKind::NotFound => Map::new(),
+            Err(e) => bail!("{}: {e}", out.join(".zattrs").display()),
         };
         if !saved.contains_key("inference") {
+            if holds_prediction(out)? {
+                bail!("{} holds a prediction without fibrs predict's provenance; use a new output", out.display());
+            }
             if !out.join(".zgroup").exists() {
                 write_atomic(&out.join(".zgroup"), py_dumps(&json!({"zarr_format": 2}), ZARR_JSON).as_bytes())?;
             }
@@ -198,6 +203,30 @@ impl Output {
         }
         Ok(Self { semantic: OutArray::open(&out.join("semantic"))?, tracing: OutArray::open(&out.join("tracing"))? })
     }
+}
+
+/// Whether `out` holds any prediction: progress records, or array files besides the arrays' own metadata (and
+/// its temporary files)
+fn holds_prediction(out: &Path) -> Result<bool> {
+    let progress = out.join("progress.jsonl");
+    if fs::metadata(&progress).is_ok_and(|m| m.len() > 0) {
+        return Ok(true);
+    }
+
+    for array in ["semantic", "tracing"] {
+        let entries = match fs::read_dir(out.join(array)) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => bail!("{}: {e}", out.join(array).display()),
+        };
+        for entry in entries {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if name != ".zarray" && !(name.starts_with('.') && name.ends_with(".partial")) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// JSON equality as Python's `==` on the parsed values, where `1 == 1.0`
@@ -309,4 +338,53 @@ fn write_column(output: &Output, progress: &Path, job: Finished) -> Result<()> {
     f.write_all(format!("{line}\n").as_bytes())?;
     println!("{line}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use serde_json::{Map, Value, json};
+
+    use super::{OutArray, Output};
+
+    fn attrs() -> Map<String, Value> {
+        let mut a = Map::new();
+        a.insert("inference".into(), json!({"engine": "fibrs-predict"}));
+        a
+    }
+
+    fn fresh(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fibrs-predict-out-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_output_whose_creation_stopped_is_created_again() {
+        let out = fresh("stopped");
+        OutArray::create(&out.join("semantic"), [4, 4, 4], 128).unwrap();
+        Output::open_or_create(&out, 4, 4, 4, &attrs()).unwrap();
+        let saved: Value = serde_json::from_slice(&fs::read(out.join(".zattrs")).unwrap()).unwrap();
+        assert_eq!(saved["inference"]["engine"], "fibrs-predict");
+        assert!(out.join("tracing/.zarray").exists());
+        fs::remove_dir_all(out).unwrap();
+    }
+
+    #[test]
+    fn a_prediction_without_provenance_is_refused() {
+        let chunk = fresh("chunk");
+        OutArray::create(&chunk.join("semantic"), [4, 4, 4], 128).unwrap();
+        fs::write(chunk.join("semantic/0.0.0.0"), b"x").unwrap();
+        let progress = fresh("progress");
+        fs::write(progress.join("progress.jsonl"), "{}\n").unwrap();
+        for out in [chunk, progress] {
+            let err = Output::open_or_create(&out, 4, 4, 4, &attrs()).err().unwrap();
+            assert!(err.to_string().contains("without fibrs predict's provenance"), "{err}");
+            assert!(!out.join(".zattrs").exists());
+            fs::remove_dir_all(out).unwrap();
+        }
+    }
 }
