@@ -200,8 +200,9 @@ name; `FIBRS_CUDA_LIBS=system` skips the pip copies. The engine asks for the unv
 not 12.x, and its provenance records the cuBLAS and cuDNN versions. To use cuBLAS 12 on such a machine, put a
 directory holding `libcublas.so -> libcublas.so.12` and `libcudnn.so -> libcudnn.so.9` symlinks first on
 `LD_LIBRARY_PATH`, or keep the CUDA 13 library directories off the loader's path. Each run's `summary-*.json`
-lists the cuDNN and cuBLAS files it loaded. cuDNN algorithm choices are timed on the first run and cached under `~/.cache` (see volkit's
-documentation for the cache variables).
+lists the cuDNN and cuBLAS files it loaded. cuDNN's convolution algorithms are timed on the first run and cached
+under `~/.cache` (see volkit's documentation for the cache variables). They set the rounding, so the provenance
+lists them and a resume that picks others is refused: keep the cache between a run and its resume.
 
 ### Modes
 

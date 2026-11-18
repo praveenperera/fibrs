@@ -168,6 +168,9 @@ mod native {
         provenance.insert("cublas".into(), json!(load.cublas));
         provenance.insert("ptx_tier".into(), json!(load.ptx_tier));
         provenance.insert("algo".into(), json!("find"));
+        // the convolution algorithms cuDNN chose, one per distinct convolution in forward order: they set the
+        // rounding, so a resume whose choices differ (another cache, cuDNN or driver) is refused
+        provenance.insert("cudnn_algos".into(), json!(load.algos));
         // acc (2 x float32), wsum (float32), semantic (2 x uint8) and tracing (2 x uint8 at 1/8)
         let column_bytes_per_voxel = 8.0 + 4.0 + 2.0 + 0.25;
         Ok(Opened {

@@ -983,7 +983,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "volkit"
 version = "0.1.0"
-source = "git+https://github.com/praveenperera/volkit?rev=158a7c8ffb21bfc898852d7138ac8bf521b8ff0a#158a7c8ffb21bfc898852d7138ac8bf521b8ff0a"
+source = "git+https://github.com/praveenperera/volkit?rev=21081b99abe74c9d820b0a78123f151c34ce247d#21081b99abe74c9d820b0a78123f151c34ce247d"
 dependencies = [
  "color-eyre",
  "cudakit",
