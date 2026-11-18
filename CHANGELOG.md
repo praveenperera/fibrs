@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+- `scripts/install-dropin.sh --restore` keeps the `fibrs` that the wheel installed. It used to remove it, which
+  broke the `fibrs` command and `python -m fibrs` in that environment until the wheel was reinstalled.
+- CI traces a synthetic input with each build's wheel, through the drop-in and `python -m fibrs`, and requires
+  the same `.afv` as the original wrote for it (`tests/fixtures/synthetic`, `scripts/compare_afv.py`).
+
 ## [0.1.0] - 2026-11-18
 
 The first release.
