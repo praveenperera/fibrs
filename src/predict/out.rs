@@ -209,8 +209,12 @@ impl Output {
 /// its temporary files)
 fn holds_prediction(out: &Path) -> Result<bool> {
     let progress = out.join("progress.jsonl");
-    if fs::metadata(&progress).is_ok_and(|m| m.len() > 0) {
-        return Ok(true);
+    match fs::metadata(&progress) {
+        Ok(m) if m.len() > 0 => return Ok(true),
+        Ok(_) => {}
+        // absent, and not a link to something absent, which could hold records again later
+        Err(e) if e.kind() == ErrorKind::NotFound && fs::symlink_metadata(&progress).is_err() => {}
+        Err(e) => bail!("cannot check {}: {e}", progress.display()),
     }
 
     for array in ["semantic", "tracing"] {
@@ -386,5 +390,15 @@ mod tests {
             assert!(!out.join(".zattrs").exists());
             fs::remove_dir_all(out).unwrap();
         }
+    }
+
+    #[test]
+    fn progress_that_cannot_be_checked_is_not_taken_as_empty() {
+        let out = fresh("dangling");
+        std::os::unix::fs::symlink(out.join("elsewhere.jsonl"), out.join("progress.jsonl")).unwrap();
+        let err = Output::open_or_create(&out, 4, 4, 4, &attrs()).err().unwrap();
+        assert!(err.to_string().contains("cannot check"), "{err}");
+        assert!(!out.join(".zattrs").exists());
+        fs::remove_dir_all(out).unwrap();
     }
 }

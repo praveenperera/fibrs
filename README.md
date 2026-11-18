@@ -216,8 +216,10 @@ mode's output unchanged; in band mode it is part of the run's settings, as in th
 
 ### Precision
 
-By default `fibrs predict` keeps parity with the current best implementation, villa's
-`lasagna.qualzz_inference` on PyTorch: it runs at that reference's own precision, and bf16 is only ever opt-in.
+By default `fibrs predict` runs at the precision of the current best implementation, villa's
+`lasagna.qualzz_inference` on PyTorch, to keep parity with it; `--mode villa` also computes the same tiles over the
+whole array, while band mode differs at the band's edges and in skipping all-zero tiles (see Modes). bf16 is
+opt-in, never the default and never used for the published fibre sets.
 
 - `--precision fp32` (default): float32 tensors with TF32 tensor-core convolutions, the precision PyTorch uses for
   the reference by default.
@@ -225,7 +227,8 @@ By default `fibrs predict` keeps parity with the current best implementation, vi
   the normalisation, softmax and blend still in float32. Against fp32, on 512-plane bands of PHerc0826 and
   PHerc0813 traced with `fibrs`, the traced fibre length agreed to about 99% (99.2–99.4%, V and H fibres),
   97.0–97.8% of fibres matched, and the fibre counts were within 0.3%; the 99.9th percentile of the probability
-  differences over the foreground was 11 and 9 of 255 on PHerc0826 and 8 and 7 on PHerc0813.
+  differences over the foreground was 11 (`semantic`) and 9 (`tracing`) of 255 on PHerc0826, and 8 and 7 on
+  PHerc0813.
 
 PyTorch's `fp32-ieee` and `fp16` modes are not offered.
 

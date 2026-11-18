@@ -79,7 +79,7 @@ pub struct Args {
     #[arg(long, default_value_t = 4, allow_negative_numbers = true)]
     readers: i64,
     /// fp32 (default): float32 tensors with TF32 tensor-core convolutions, the precision PyTorch uses for the
-    /// reference by default. bf16 (opt-in): faster, small output differences
+    /// reference by default. bf16 (opt-in): faster, small output differences (measured in the README)
     #[arg(long, default_value = "fp32")]
     precision: String,
     /// Comma list of column indices (in column order) to run; for timing subsets
