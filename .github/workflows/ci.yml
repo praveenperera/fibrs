@@ -60,7 +60,7 @@ jobs:
       - name: Tests
         run: cargo test --release --locked
 
-      # the runners have no NVIDIA driver and these weights are placeholders: a real run must stop at the engine
+      # the runners have no NVIDIA driver: a real run must stop there, before it reads the (placeholder) weights,
       # with an error, not a panic, and leave no output array behind
       - name: Predict without a GPU
         shell: bash
@@ -77,7 +77,11 @@ jobs:
           grep -q '^fibrs predict: ' predict.log
           ! grep -q 'panicked' predict.log
           test ! -e ci-pred/semantic
-          if [ "$RUNNER_OS" = macOS ]; then grep -q 'needs an NVIDIA GPU on Linux x86_64' predict.log; fi
+          if [ "$RUNNER_OS" = macOS ]; then
+            grep -q 'needs an NVIDIA GPU on Linux x86_64' predict.log
+          else
+            grep -q 'no NVIDIA driver found' predict.log
+          fi
 
   python-lint:
     name: Python lints

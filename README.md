@@ -202,16 +202,17 @@ documentation for the cache variables).
 
 | Mode | What it computes |
 |---|---|
-| `--mode villa` | the whole array, as villa main's `lasagna.qualzz_inference` computes it: one tile per forward, and villa's rule for which tiles run (from the input's stored chunks) |
-| band mode (the default) | a z band `[z0, z1)`, reflected at the band's own edges, 4 tiles per forward (`--batch`, up to 16), tiles whose input is all zero skipped |
+| `--mode villa` | the whole array, as villa main's `lasagna.qualzz_inference` computes it, with villa's rule for which tiles run (from the input's stored chunks) |
+| band mode (the default) | a z band `[z0, z1)`, reflected at the band's own edges, tiles whose input is all zero skipped |
 
 Use `--mode villa` when you want villa's output. Band mode is for splitting a scroll into z bands that run
-separately and resume: it does not reproduce villa's output, because villa runs the whole volume, forwards one tile
-at a time (convolutions round slightly differently at other batch sizes) and also runs tiles of stored zeros.
+separately and resume: it does not reproduce villa's output, because villa runs the whole volume, so its tiles near
+a band's edges see the planes beyond it, and it also runs tiles of stored zeros.
 
-`--readers` (tile reader threads, default 4) changes the speed, not the output. `--column` (the size of the y–x
-columns a run is split into, default 480) does the same in villa mode; in band mode the batches are formed within
-each column, so the column size is part of what a band-mode output is.
+The network runs on one tile at a time in both modes. `--batch` (band mode, default 4, at most 16) is how many
+tiles go to the GPU together, and `--readers` (tile reader threads, default 4) how many read ahead; both change
+the speed, not the output. `--column` (the size of the y–x columns a run is split into, default 480) leaves villa
+mode's output unchanged; in band mode it is part of the run's settings, as in the Python version.
 
 ### Precision
 
@@ -224,9 +225,10 @@ changes the output. PyTorch's `fp32-ieee` and `fp16` modes are not offered.
 
 - The output's `voxel_size_um` attribute is always 9.362, the PHerc0826 CT's voxel size. If your CT has another
   voxel size, pass the real one to the tracer (`--voxel-size-um`), which reads its own flag, not the attribute.
-- A column's accumulators span the whole band height on the GPU, about 14 bytes per voxel, so a 480 × 480 column
-  of 12,500 planes needs about 38 GiB. A run whose pending columns don't fit in the free GPU memory stops before it
-  starts and names a `--column` that does; in villa mode the column size leaves the output unchanged.
+- A column's accumulators span the whole band height on the GPU, about 14 bytes per voxel (a 480 × 480 column of
+  8,000 planes needs about 24 GiB), and the engine takes at most 2^31 − 1 voxels in one column (a 480 × 480 column
+  of up to 9,320 planes). A run whose pending columns don't fit, in the free GPU memory or in that limit, stops
+  before it starts and names a `--column` that does; in villa mode the column size leaves the output unchanged.
 - Villa mode reads which chunks are stored from the input's directory listing, so the input must be a zarr v2
   directory store (`.` or `/` chunk separator).
 - Outputs from different GPU models, or with different cuDNN versions, can differ slightly, as the model's own

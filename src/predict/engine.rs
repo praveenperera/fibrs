@@ -93,6 +93,10 @@ pub struct Opened {
 /// Most tiles one `add` takes
 pub const MAX_BATCH: usize = 16;
 
+/// Most voxels one column may have: the engine indexes its two-channel accumulators with 32-bit integers and
+/// refuses a column of more than `u32::MAX / 2` voxels when it begins it
+pub const MAX_COLUMN_VOXELS: usize = u32::MAX as usize / 2;
+
 /// The CUDA ordinal of `--device` (`cuda`, `cuda:N` or `N`)
 pub fn device_index(device: &str) -> Result<usize, String> {
     let n = if device == "cuda" { "0" } else { device.strip_prefix("cuda:").unwrap_or(device) };
@@ -116,7 +120,7 @@ pub fn open(_model_dir: &Path, _device: usize, _precision: Precision) -> Result<
 mod native {
     use std::path::Path;
 
-    use color_eyre::eyre::{Result, WrapErr};
+    use color_eyre::eyre::{Result, WrapErr, bail};
     use serde_json::{Map, json};
     use volkit::dnn::Pick;
     use volkit::nnunet::afv2::{AfvPrecision, AfvV2, Options};
@@ -150,6 +154,8 @@ mod native {
             Precision::Bf16 => AfvPrecision::Bf16,
         };
         let opts = Options { device, pick: Pick::Find, precision: precision_ };
+        // before the checkpoint is read: without a driver or the device there is nothing to load it for
+        probe(device)?;
         let net =
             AfvV2::open(model_dir, &opts).wrap_err_with(|| format!("load AFV v2 from {}", model_dir.display()))?;
         let free = free_bytes(device)?;
@@ -188,6 +194,16 @@ mod native {
                  libcublas.so.12 and libcudnn.so -> libcudnn.so.9 symlinks first on LD_LIBRARY_PATH"
             );
         }
+    }
+
+    /// Checks that the NVIDIA driver loads and has device `device`; cudarc would panic on a missing driver
+    fn probe(device: usize) -> Result<()> {
+        // SAFETY: the driver library's initialisers have no preconditions
+        if !unsafe { cudarc::driver::sys::is_culib_present() } {
+            bail!("no NVIDIA driver found (libcuda.so); fibrs predict needs an NVIDIA GPU and its driver");
+        }
+        cudarc::driver::CudaContext::new(device).wrap_err_with(|| format!("open CUDA device {device}"))?;
+        Ok(())
     }
 
     /// Free device memory, through the device's primary context (the one the engine runs in)

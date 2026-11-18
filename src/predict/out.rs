@@ -170,27 +170,29 @@ pub struct Output {
 }
 
 impl Output {
-    /// Opens the group at `out`, creating it with `attrs` when it has no `semantic` array yet; an existing
-    /// output must carry the same `inference` provenance, or the run would mix two predictions
+    /// Opens the group at `out`, creating it with `attrs` when it is not yet created; an existing output must
+    /// carry the same `inference` provenance, or the run would mix two predictions
+    ///
+    /// The group's `inference` attribute is written last, so it marks a finished creation: a run stopped part way
+    /// through creating the output leaves no `inference`, and the next run creates it again
     pub fn open_or_create(out: &Path, nz: usize, ny: usize, nx: usize, attrs: &Map<String, Value>) -> Result<Self> {
         fs::create_dir_all(out)?;
-        if !out.join(".zgroup").exists() {
-            write_atomic(&out.join(".zgroup"), py_dumps(&json!({"zarr_format": 2}), ZARR_JSON).as_bytes())?;
-        }
-        if !out.join("semantic").join(".zarray").exists() {
+        // `attrs.update(...)` merges into what the group already holds
+        let mut saved = match fs::read(out.join(".zattrs")) {
+            Ok(b) => serde_json::from_slice::<Map<String, Value>>(&b)?,
+            Err(_) => Map::new(),
+        };
+        if !saved.contains_key("inference") {
+            if !out.join(".zgroup").exists() {
+                write_atomic(&out.join(".zgroup"), py_dumps(&json!({"zarr_format": 2}), ZARR_JSON).as_bytes())?;
+            }
             let semantic = OutArray::create(&out.join("semantic"), [nz, ny, nx], 128)?;
             let tracing = OutArray::create(&out.join("tracing"), [nz / 2, ny / 2, nx / 2], 64)?;
-            // `attrs.update(...)` merges into what the group already holds
-            let mut merged = match fs::read(out.join(".zattrs")) {
-                Ok(b) => serde_json::from_slice::<Map<String, Value>>(&b)?,
-                Err(_) => Map::new(),
-            };
-            merged.extend(attrs.clone());
-            write_atomic(&out.join(".zattrs"), py_dumps(&Value::Object(merged), ZARR_JSON).as_bytes())?;
+            saved.extend(attrs.clone());
+            write_atomic(&out.join(".zattrs"), py_dumps(&Value::Object(saved), ZARR_JSON).as_bytes())?;
             return Ok(Self { semantic, tracing });
         }
 
-        let saved: Value = serde_json::from_slice(&fs::read(out.join(".zattrs"))?)?;
         if !same_json(&saved["inference"], &attrs["inference"]) {
             bail!("output exists with different provenance; use a new output");
         }

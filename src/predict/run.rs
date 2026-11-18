@@ -19,7 +19,7 @@ use super::contract::{
     positions, prediction_identity, sha256,
 };
 use super::ct::Ct;
-use super::engine::{self, Engine, MAX_BATCH, Opened, Precision};
+use super::engine::{self, Engine, MAX_BATCH, MAX_COLUMN_VOXELS, Opened, Precision};
 use super::feed::{FeedPlan, Item, Rule, TileFeed};
 use super::out::{ColumnWriter, Finished, Output, now_unix};
 use super::villa::{self, VillaSelection};
@@ -62,7 +62,8 @@ pub struct Args {
     /// Output column edge, an even multiple of 96 (band mode's output depends on it)
     #[arg(long, default_value_t = 480, allow_negative_numbers = true)]
     column: i64,
-    /// Tiles per forward (band mode, default 4, at most 16; villa mode: 1)
+    /// Tiles sent to the GPU at a time (band mode, default 4, at most 16; villa mode: 1); the engine runs the
+    /// network on one tile at a time, so this changes the speed, not the output
     #[arg(long, allow_negative_numbers = true)]
     batch: Option<i64>,
     /// Stop between columns after this long; 0 = no cap
@@ -287,19 +288,23 @@ fn dry_run(c: &Checked) -> Result<()> {
 /// accumulators span the whole band height, so a tall volume needs a narrower column. The estimate leaves out
 /// the network's activations, which the engine has already allocated
 fn check_column_memory(c: &Checked, p: &Plan, e: &Opened) -> Result<()> {
-    let bytes = |h: usize, w: usize| e.column_bytes_per_voxel * (p.nz * h * w) as f64;
+    let voxels = |h: usize, w: usize| p.nz * h * w;
+    let bytes = |h: usize, w: usize| e.column_bytes_per_voxel * voxels(h, w) as f64;
+    let free = e.free_bytes as f64;
+    // a column must fit in the free device memory and within the engine's 32-bit indexing
+    let fits = |h: usize, w: usize| bytes(h, w) <= free && voxels(h, w) <= MAX_COLUMN_VOXELS;
     let Some([y0, y1, x0, x1]) = p.todo.iter().map(|t| t.1).max_by_key(|c| (c[1] - c[0]) * (c[3] - c[2])) else {
         return Ok(());
     };
-    let (need, free) = (bytes(y1 - y0, x1 - x0), e.free_bytes as f64);
-    if need <= free {
+    let (h, w) = (y1 - y0, x1 - x0);
+    if fits(h, w) {
         return Ok(());
     }
 
     // the largest column size whose widest column fits; sizes are multiples of the tile core, and a column is
     // cut short where the volume ends
     let top = p.ny.max(p.nx).div_ceil(CORE) * CORE;
-    let fits = (1..=top / CORE).rev().map(|k| k * CORE).find(|&n| bytes(n.min(p.ny), n.min(p.nx)) <= free);
+    let fits = (1..=top / CORE).rev().map(|k| k * CORE).find(|&n| fits(n.min(p.ny), n.min(p.nx)));
     let hint = match (c.a.mode, fits) {
         (Mode::Villa, Some(n)) => format!("pass --column {n} or less, which leaves villa mode's output unchanged"),
         (Mode::Villa, None) => format!("no column of {} planes fits", p.nz),
@@ -310,12 +315,17 @@ fn check_column_memory(c: &Checked, p: &Plan, e: &Opened) -> Result<()> {
         (Mode::Band, None) => "run a shorter band".to_string(),
     };
     let gib = |b: f64| b / (1u64 << 30) as f64;
+    let nz = p.nz;
+    if voxels(h, w) > MAX_COLUMN_VOXELS {
+        bail!(
+            "a {h} x {w} column of {nz} planes has {} voxels, more than the {MAX_COLUMN_VOXELS} the engine takes \
+             in one column; {hint}",
+            voxels(h, w)
+        );
+    }
     bail!(
-        "a {} x {} column of {} planes needs about {:.1} GiB on {}, which has {:.1} GiB free; {hint}",
-        y1 - y0,
-        x1 - x0,
-        p.nz,
-        gib(need),
+        "a {h} x {w} column of {nz} planes needs about {:.1} GiB on {}, which has {:.1} GiB free; {hint}",
+        gib(bytes(h, w)),
         c.a.device,
         gib(free)
     )
@@ -350,6 +360,17 @@ fn run(c: Checked) -> Result<()> {
     {
         bail!("checkpoint sha256 {checkpoint} != {want}");
     }
+    // the loader reads fold_0's checkpoint, when there is one, before the top-level one hashed above (villa's
+    // `load_model` order), so a run with one would check and record other weights than it runs
+    for name in ["fold_0/checkpoint_final.pth", "fold_0/checkpoint_best.pth"] {
+        if a.model_dir.join(name).exists() {
+            bail!(
+                "{} holds {name}, which would be loaded in place of the checkpoint_final.pth beside model.py; \
+                 pass a model folder without it",
+                a.model_dir.display()
+            );
+        }
+    }
     let mut e = engine::open(&a.model_dir, c.device, c.precision)?;
     check_column_memory(&c, &p, &e)?;
 
@@ -374,7 +395,7 @@ fn run(c: Checked) -> Result<()> {
     ] {
         prov.insert(k.into(), v);
     }
-    prov.extend(std::mem::take(&mut e.provenance));
+    prov.extend(e.provenance.clone());
     prov.insert("channel_order".into(), json!("VH"));
     prov.insert("reference".into(), json!(if villa { villa::REFERENCE } else { REFERENCE }));
     prov.insert("engine".into(), json!("fibrs-predict"));
