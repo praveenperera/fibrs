@@ -591,10 +591,11 @@ fn load_tracing(native: &Predictions, supplied: Option<&Predictions>) -> Result<
     let tgrid = [0, 1, 2].map(|a| shape[a].div_ceil(tile[a]));
     let mut out = [Vol::new(shape, 0u8), Vol::new(shape, 0u8)];
     let brick_rows = out[0].grid()[0];
-    // a slab spans whole tiles where it can, so no tile is decoded for two slabs; lcm(tile, 16) is at most four
-    // tiles deep when the tile is a multiple of 4 planes, and other tiles fall back to one brick row at a time
+    // a slab spans whole tiles where that is at most two tiles deep (lcm(tile, 16) for tiles such as 24 or 40
+    // planes), so no tile is decoded for two slabs. Deeper alignments fall back to the brick rows within one tile,
+    // which can decode a tile twice but never hold more than the two tiles a straddling slab reads
     let aligned = tile[0] / gcd(tile[0], EDGE) * EDGE;
-    let slab = if aligned <= 4 * tile[0].max(EDGE) { aligned / EDGE } else { tile[0] / EDGE }.max(1);
+    let slab = if aligned <= 2 * tile[0].max(EDGE) { aligned / EDGE } else { tile[0] / EDGE }.max(1);
     let mut bz = 0;
     while bz < brick_rows {
         let rows = bz..(bz + slab).min(brick_rows);
@@ -765,10 +766,12 @@ fn release_freed() {
 /// arenas instead, where they fragment and stay resident as they are evicted and freed on other threads: on a
 /// 512-plane 0826 band the peak varied from 8.9 to 10.8 GiB between runs without this and was 8.8 GiB in each
 /// of three runs with it, at the same speed. Setting the threshold also stops glibc's adjustment.
-/// `MALLOC_MMAP_THRESHOLD_` in the environment still takes precedence
+/// A threshold set in the environment, by `MALLOC_MMAP_THRESHOLD_` or `GLIBC_TUNABLES`, still takes precedence
 fn fix_mmap_threshold() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none() {
+    if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none()
+        && !std::env::var("GLIBC_TUNABLES").is_ok_and(|t| t.contains("glibc.malloc.mmap_threshold"))
+    {
         // SAFETY: mallopt only changes how later allocations are served; it touches no live allocation
         unsafe {
             libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);

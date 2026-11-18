@@ -160,6 +160,8 @@ pub fn centrality(pres: &Presence, nx: &Vol<u8>, ny: &Vol<u8>) -> FamilyFields {
     }
     // the catalogue reads seeds in C order over the whole volume; indices are unique, so any sort agrees
     seeds.sort_unstable();
+    // the list grew by doubling and is held through the catalogue; drop the unused half
+    seeds.shrink_to_fit();
     FamilyFields { cent, seeds }
 }
 
