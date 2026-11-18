@@ -1,4 +1,4 @@
-inkrs-afv-trace
+fibrs
 
 This crate is a Rust port of AVF_SPLINE_GENERATOR 0.2.0
 (https://github.com/Qualzz/AVF_SPLINE_GENERATOR, commit bee798f7), licensed under the

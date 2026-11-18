@@ -1,4 +1,4 @@
-//! `inkrs-afv-trace`: a native, multi-threaded drop-in for `avf-spline-generator` 0.2.0
+//! `fibrs`: a native, multi-threaded drop-in for `avf-spline-generator` 0.2.0
 //! (Qualzz/AVF_SPLINE_GENERATOR @ bee798f7, Apache-2.0) that writes the same `.afv`
 
 mod afv;

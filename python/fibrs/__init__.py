@@ -1,11 +1,11 @@
-"""inkrs-afv-trace from Python: the native drop-in for ``avf-spline-generator`` 0.2.0
+"""fibrs from Python: the native drop-in for ``avf-spline-generator`` 0.2.0
 
-    python -m inkrs_afv_trace --predictions P --output fibers.afv --work-dir work ...
-    from inkrs_afv_trace import run; run(["--predictions", P, ...])  # returns the exit status
+    python -m fibrs --predictions P --output fibers.afv --work-dir work ...
+    from fibrs import run; run(["--predictions", P, ...])  # returns the exit status
 
 Takes the reference CLI's arguments unchanged (``avf_spline_generator.cli.parser``) and writes the same ``.afv``.
-The native binary is found through ``INKRS_AFV_TRACE_BIN``, then ``bin/inkrs-afv-trace`` next to this package,
-then the environment's scripts directory (where the wheel installs it), then ``PATH``. When ``INKRS_AFV_LAPACK`` is
+The native binary is found through ``FIBRS_BIN``, then ``bin/fibrs`` next to this package,
+then the environment's scripts directory (where the wheel installs it), then ``PATH``. When ``FIBRS_LAPACK`` is
 unset, the OpenBLAS that supplies the binary's ``dsyevd`` is numpy's bundled copy (Linux), else the
 ``scipy-openblas64`` package's (macOS, whose numpy wheels link Accelerate)
 """
@@ -24,29 +24,29 @@ __all__ = ["binary", "main", "run"]
 
 def binary() -> str:
     """Path of the native executable"""
-    explicit = os.environ.get("INKRS_AFV_TRACE_BIN")
+    explicit = os.environ.get("FIBRS_BIN")
     if explicit:
         return explicit
-    bundled = Path(__file__).resolve().parent / "bin" / "inkrs-afv-trace"
+    bundled = Path(__file__).resolve().parent / "bin" / "fibrs"
     if bundled.is_file():
         return str(bundled)
     # the wheel installs the binary as a script; a venv's python run without activating the venv has no PATH to it
-    scripts = Path(sysconfig.get_path("scripts")) / "inkrs-afv-trace"
+    scripts = Path(sysconfig.get_path("scripts")) / "fibrs"
     if scripts.is_file():
         return str(scripts)
-    found = shutil.which("inkrs-afv-trace")
+    found = shutil.which("fibrs")
     if found:
         return found
-    raise FileNotFoundError("inkrs-afv-trace not found; set INKRS_AFV_TRACE_BIN or put it on PATH")
+    raise FileNotFoundError("fibrs not found; set FIBRS_BIN or put it on PATH")
 
 
 def _environment() -> dict[str, str]:
     env = dict(os.environ)
-    if "INKRS_AFV_LAPACK" in env:
+    if "FIBRS_LAPACK" in env:
         return env
     lib = _openblas()
     if lib:
-        env["INKRS_AFV_LAPACK"] = lib
+        env["FIBRS_LAPACK"] = lib
     # otherwise the binary looks next to its own path and in $VIRTUAL_ENV
     return env
 
@@ -73,7 +73,7 @@ def _openblas() -> str | None:
 
 def run(argv: list[str]) -> int:
     """Run the tracer with ``argv`` (no program name) and return its exit status"""
-    return subprocess.run([binary(), *map(str, argv)], env=_environment()).returncode
+    return subprocess.run([binary(), *map(str, argv)], env=_environment(), check=False).returncode
 
 
 def main() -> None:
