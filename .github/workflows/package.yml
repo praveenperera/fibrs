@@ -131,7 +131,7 @@ jobs:
             uv pip install --dry-run --python venv-3.13/bin/python "fibrs[predict] @ file://$whl"
           else
             mkdir -p model
-            touch model/model.py model/plans.json model/checkpoint_final.pth
+            touch model/model.py model/plans.json model/dataset.json model/checkpoint_final.pth
             if venv-3.13/bin/fibrs predict --ct "$fixture/band.zarr" --z0 4 --z1 36 --model-dir model \
               --out predict-out 2> refused.txt; then
               echo "fibrs predict ran without a GPU engine" >&2; exit 1
