@@ -135,14 +135,14 @@ impl Lapack {
     }
 }
 
-/// Find numpy's OpenBLAS: `INKRS_AFV_LAPACK`, else the venv this executable was started from
+/// Find numpy's OpenBLAS: `FIBRS_LAPACK`, else the venv this executable was started from
 /// (`VENV/bin/avf-spline-generator`), else `$VIRTUAL_ENV`
 ///
 /// In each venv, numpy's bundled copy (`numpy.libs`, Linux wheels) comes first, then the `scipy-openblas64`
 /// package's, which is the same OpenBLAS build as a standalone wheel. macOS numpy wheels link Accelerate instead
 /// and bundle no OpenBLAS, so there the wheel of this tool depends on `scipy-openblas64`
 pub fn find_lapack() -> Result<PathBuf> {
-    if let Some(p) = std::env::var_os("INKRS_AFV_LAPACK") {
+    if let Some(p) = std::env::var_os("FIBRS_LAPACK") {
         return Ok(PathBuf::from(p));
     }
     let mut roots = Vec::new();
@@ -169,7 +169,7 @@ pub fn find_lapack() -> Result<PathBuf> {
     }
     bail!(
         "cannot find numpy's OpenBLAS (numpy.libs/libscipy_openblas64_*.so, or the scipy-openblas64 package); \
-         install this executable into the venv's bin directory or set INKRS_AFV_LAPACK"
+         install this executable into the venv's bin directory or set FIBRS_LAPACK"
     )
 }
 

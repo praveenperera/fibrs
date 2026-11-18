@@ -1,0 +1,289 @@
+# Builds and checks the fibrs wheels and CLI archives on every push and pull request, and publishes them from a
+# version tag
+#
+# To release:
+#   1. set the version in Cargo.toml (pyproject.toml takes it from there)
+#   2. in CHANGELOG.md, give the version's entry its release date ("## [X.Y.Z] - YYYY-MM-DD", replacing
+#      "Unreleased") and its link at the bottom
+#   3. merge, then tag the merge commit and push the tag:
+#        git tag vX.Y.Z
+#        git push origin vX.Y.Z
+#
+# The tag waits for a reviewer of the pypi environment, then publishes the wheels to PyPI and makes a GitHub release
+# with the tag's CHANGELOG.md entry as its notes and the wheels, CLI archives and SHA256SUMS-* files attached. PyPI
+# trusts this workflow and its environment through OIDC, so no token is stored. A tag whose version or changelog
+# entry is wrong fails before anything is published, and every publish skips what is already uploaded, so
+# "Re-run failed jobs" finishes a partial release. Third-party actions are pinned to commit SHAs, since these jobs
+# build and publish the release files; the trailing comment names the version
+
+name: Package
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+# a new push to a pull request supersedes its running checks; a tag's run is never cancelled
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  MATURIN: maturin==1.16.0
+
+jobs:
+  # one wheel per platform with the binary as its script, the CLI archive made from that wheel's binary, and both
+  # installed and run. The Linux wheel links glibc 2.28 through zig; the macOS wheel keeps the arm64 floor of 11.0
+  wheels:
+    name: Wheel and CLI (${{ matrix.name }})
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            build: --zig --compatibility manylinux_2_28
+            tag: manylinux_2_28_x86_64
+          - name: macOS arm64
+            os: macos-26
+            target: aarch64-apple-darwin
+            build: ""
+            tag: macosx_11_0_arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: -D warnings
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: Build the wheel
+        shell: bash
+        env:
+          BUILD: ${{ matrix.build }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # zig links the Linux build against glibc 2.28, the manylinux_2_28 floor
+          from="$MATURIN"
+          if [ -n "$BUILD" ]; then from="maturin[zig]==${MATURIN#maturin==}"; fi
+          # shellcheck disable=SC2086
+          uvx --from "$from" maturin build --release --locked --target "$TARGET" $BUILD --out dist
+          ls dist/*-${{ matrix.tag }}.whl
+          # no SBOM ([tool.maturin.sbom] in pyproject.toml), and the README, NOTICE and every licence text inside
+          unzip -Z1 dist/*.whl | tee members.txt
+          if grep -q '/sboms/' members.txt; then echo "the wheel carries an SBOM" >&2; exit 1; fi
+          for f in LICENSE NOTICE licenses/apache-2.0.txt licenses/numpy.txt; do grep -q "dist-info/licenses/$f\$" members.txt; done
+
+      - name: Build the CLI archive
+        shell: bash
+        run: scripts/release-archive.sh dist "${{ matrix.target }}"
+
+      # the wheel on the oldest and a current CPython, then the drop-in into a venv with the original installed from
+      # its tagged source, so VENV/bin/avf-spline-generator runs the binary
+      - name: Install the wheel and the drop-in
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        env:
+          DIST: ${{ github.workspace }}/dist
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          for python in 3.9 3.13; do
+            uv venv -q --python "$python" "venv-$python"
+            uv pip install -q --python "venv-$python/bin/python" "$DIST"/fibrs-*.whl
+            test "$("venv-$python/bin/fibrs" --version)" = 0.2.0
+            test "$("venv-$python/bin/python" -m fibrs --version)" = 0.2.0
+            "venv-$python/bin/python" -I -c 'import fibrs; print(fibrs.binary())'
+          done
+          uv venv -q --python 3.12 venv-ref
+          uv pip install -q --python venv-ref/bin/python numpy==2.4.6 scipy==1.18.1 numba==0.64.0 llvmlite==0.46.0 \
+            zarr==2.18.7 numcodecs==0.15.2 \
+            "avf-spline-generator @ git+https://github.com/Qualzz/AVF_SPLINE_GENERATOR@bee798f72751169065fe020d4ad02c52519c2d2b"
+          uv pip install -q --python venv-ref/bin/python "$DIST"/fibrs-*.whl
+          tar -xzf "$DIST"/fibrs-*-"$TARGET".tar.gz
+          bash fibrs-*-"$TARGET"/scripts/install-dropin.sh venv-ref fibrs-*-"$TARGET"/fibrs
+          test -e venv-ref/bin/avf-spline-generator.reference
+          test "$(venv-ref/bin/avf-spline-generator --version)" = 0.2.0
+          bash fibrs-*-"$TARGET"/scripts/install-dropin.sh --restore venv-ref
+          venv-ref/bin/avf-spline-generator --version
+
+      - name: Upload the wheel and CLI archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS-*
+
+  # the tag must name the version Cargo.toml carries, and CHANGELOG.md needs a dated entry for it, which becomes
+  # the GitHub release notes
+  release-check:
+    name: Check the tag
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # the GitHub release reads its notes with parse-changelog, so the same parser checks the entry here
+      - name: Install parse-changelog
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: parse-changelog
+
+      - name: Check the version and changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          crate_version="$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[0].version')"
+          if [ "$crate_version" != "$version" ]; then
+            echo "Cargo.toml is $crate_version but the tag is $GITHUB_REF_NAME"
+            exit 1
+          fi
+          # an entry still marked "Unreleased" has not been given its date
+          title="$(parse-changelog CHANGELOG.md --title "$version")"
+          if ! [[ "$title" =~ ^\[${version//./\\.}\]\ -\ [0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "the CHANGELOG.md heading for $version is \"$title\"; it needs \"[$version] - YYYY-MM-DD\""
+            exit 1
+          fi
+          if [ -z "$(parse-changelog CHANGELOG.md "$version")" ]; then
+            echo "the CHANGELOG.md entry for $version is empty"
+            exit 1
+          fi
+
+  # the pypi environment's reviewer approves the release here, before anything is published
+  pypi-publish:
+    name: Publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release-check, wheels]
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/fibrs/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download the wheels
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: all
+          merge-multiple: true
+
+      - name: Check the wheels match the tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir dist
+          mv all/*.whl dist/
+          ls -la dist
+          # the Linux and macOS wheels; the source is this repository, so no sdist
+          test "$(find dist -type f | wc -l)" -eq 2
+          for file in dist/*; do
+            case "$(basename "$file")" in
+              "fibrs-${version}"-*.whl) ;;
+              *) echo "$file does not match tag $GITHUB_REF_NAME"; exit 1 ;;
+            esac
+          done
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          skip-existing: true
+
+  # the release starts as a draft and is published only once its files are attached
+  github-release:
+    name: GitHub release
+    needs: pypi-publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Download the wheels, CLI archives and checksums
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      # create-gh-release-action deletes a release that already exists, so a rerun leaves a published release alone
+      # and finishes a draft instead of recreating it
+      - name: Check for an existing release
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if draft="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2> view.err)"; then
+            if [ "$draft" = true ]; then state=draft; else state=published; fi
+          elif grep -q 'release not found' view.err; then
+            state=none
+          else
+            # any other failure could hide a release the next step would delete
+            cat view.err >&2
+            exit 1
+          fi
+          echo "the $GITHUB_REF_NAME release is $state"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Create a draft release
+        if: steps.existing.outputs.state == 'none'
+        uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1.11.0
+        with:
+          draft: true
+          # the tag's CHANGELOG.md entry becomes the release notes
+          changelog: CHANGELOG.md
+
+      # --clobber replaces files a failed run already attached. The release becomes latest only when no published
+      # stable release has a higher version
+      - name: Attach the wheels, CLI archives and checksums, then publish
+        if: steps.existing.outputs.state != 'published'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la dist
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+
+          version="${GITHUB_REF_NAME#v}"
+          latest=false
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            releases="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+              --limit 1000 --json tagName --jq '.[].tagName')"
+            newest="$(
+              printf '%s\n' "$releases" "$GITHUB_REF_NAME" \
+                | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1
+            )"
+            if [ "$newest" = "$version" ]; then latest=true; fi
+          fi
+          echo "marking $GITHUB_REF_NAME latest: $latest"
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest="$latest" --repo "$GITHUB_REPOSITORY"

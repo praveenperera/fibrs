@@ -427,7 +427,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "inkrs-afv-trace"
+name = "fibrs"
 version = "0.1.0"
 dependencies = [
  "blosc-src",

@@ -3,16 +3,16 @@ requires = ["maturin>=1.9,<2"]
 build-backend = "maturin"
 
 [project]
-name = "inkrs-afv-trace"
+name = "fibrs"
 # the version of Cargo.toml
 dynamic = ["version"]
-description = "Native drop-in for AVF_SPLINE_GENERATOR 0.2.0: traces AFV V/H fibre predictions into the same .afv"
+description = "Native drop-in for Qual's AVF_SPLINE_GENERATOR 0.2.0: traces AFV V/H fibre predictions into the same .afv"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
-license-files = ["NOTICE", "licenses/*.txt"]
+license-files = ["LICENSE", "NOTICE", "licenses/*.txt"]
 authors = [{ name = "Praveen Perera", email = "me@praveenperera.com" }]
-keywords = ["vesuvius-challenge", "herculaneum", "papyrus", "fibre-tracing", "afv"]
+keywords = ["vesuvius-challenge", "herculaneum", "papyrus", "fibre-tracing", "afv", "avf-spline-generator"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Science/Research",
@@ -27,12 +27,22 @@ classifiers = [
 # numpy 2.4.6's Linux wheel comes from scipy-openblas64
 dependencies = ["numpy>=2", "scipy-openblas64==0.3.31.188.0; sys_platform == 'darwin'"]
 
+[project.urls]
+Repository = "https://github.com/praveenperera/fibrs"
+
 [tool.maturin]
-# the wheel installs the binary as the inkrs-afv-trace script, next to the environment's python, plus the Python
-# entry (python -m inkrs_afv_trace) that finds it
+# the wheel installs the binary as the fibrs script, next to the environment's python, plus the Python
+# entry (python -m fibrs) that finds it
 bindings = "bin"
 python-source = "python"
-module-name = "inkrs_afv_trace"
-python-packages = ["inkrs_afv_trace"]
+module-name = "fibrs"
+python-packages = ["fibrs"]
 # the release profile keeps line tables for profiling; the wheel does not need them
 strip = true
+
+# no CycloneDX SBOM in the wheel: maturin's records the absolute path of the checkout the wheel was built in
+[tool.maturin.sbom]
+rust = false
+
+[tool.ruff]
+line-length = 120

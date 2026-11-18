@@ -491,7 +491,7 @@ pub fn run(args: Args) -> Result<Summary> {
     }
     if args.device == Device::Cuda {
         // centrality is the only CUDA stage in the reference; this port computes it on the CPU only
-        bail!("inkrs-afv-trace computes centrality on the CPU; use --device cpu");
+        bail!("fibrs computes centrality on the CPU; use --device cpu");
     }
     fs::create_dir_all(&work)?;
     let _lock = WorkLock::acquire(&work.join(".lock"))?;
@@ -517,7 +517,7 @@ pub fn run(args: Args) -> Result<Summary> {
         "volume_shape_zyx": domain,
         "coordinate_space": args.coordinate_space,
         "input_signatures": signatures,
-        "native": {"tool": "inkrs-afv-trace", "version": env!("CARGO_PKG_VERSION"), "checkpoint": 1},
+        "native": {"tool": "fibrs", "version": env!("CARGO_PKG_VERSION"), "checkpoint": 1},
     });
     let manifest = work.join("run.json");
     if manifest.exists() {
@@ -705,10 +705,10 @@ fn trace_families(
     Ok(())
 }
 
-/// With `INKRS_AFV_DEBUG_FIELDS` set, write a field densely as raw little-endian `NAME.raw` for comparison
+/// With `FIBRS_DEBUG_FIELDS` set, write a field densely as raw little-endian `NAME.raw` for comparison
 /// with the reference's work arrays; only sensible for small crops
 fn debug_dump<T: Copy + PartialEq + Send + Sync + ToLe>(dir: &Path, name: &str, vol: &Vol<T>) -> Result<()> {
-    if std::env::var_os("INKRS_AFV_DEBUG_FIELDS").is_none() {
+    if std::env::var_os("FIBRS_DEBUG_FIELDS").is_none() {
         return Ok(());
     }
     let dense = vol.read_block([0, 0, 0], vol.shape());
@@ -750,9 +750,9 @@ fn release_freed() {
     }
 }
 
-/// With `INKRS_AFV_DEBUG_MEM` set, log named resident sizes and the process RSS
+/// With `FIBRS_DEBUG_MEM` set, log named resident sizes and the process RSS
 fn debug_mem(stage: &str, parts: &[(&str, usize)]) {
-    if std::env::var_os("INKRS_AFV_DEBUG_MEM").is_none() {
+    if std::env::var_os("FIBRS_DEBUG_MEM").is_none() {
         return;
     }
     let rss =
@@ -790,7 +790,7 @@ fn trace_family(
     debug_dump(&folder, "presence", &pres)?;
     debug_dump(&folder, "centrality", &cent)?;
     debug_dump(&folder, "seeds", &seeds)?;
-    if std::env::var_os("INKRS_AFV_DEBUG_FIELDS").is_some() {
+    if std::env::var_os("FIBRS_DEBUG_FIELDS").is_some() {
         let bytes: Vec<u8> = cat.coords.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
         fs::write(folder.join("coordinates.i4"), bytes)?;
     }
@@ -803,9 +803,9 @@ fn trace_family(
     let finish_pool = rayon::ThreadPoolBuilder::new().num_threads(threads.saturating_sub(1).max(1)).build()?;
     let path = folder.join("curves.bin");
     let mut writer = CurveWriter::create(&path)?;
-    // INKRS_AFV_DEBUG_RAW=1 also keeps the raw curves (family-N/raw.bin, same format) to compare with the
+    // FIBRS_DEBUG_RAW=1 also keeps the raw curves (family-N/raw.bin, same format) to compare with the
     // reference's part files stage by stage
-    let mut raw_writer = match std::env::var_os("INKRS_AFV_DEBUG_RAW") {
+    let mut raw_writer = match std::env::var_os("FIBRS_DEBUG_RAW") {
         Some(_) => Some(CurveWriter::create(&folder.join("raw.bin"))?),
         None => None,
     };
