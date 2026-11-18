@@ -105,6 +105,18 @@ impl Ct {
         let sep = if self.nested { "/" } else { "." };
         let name = format!("{}{sep}{}{sep}{}", key[0], key[1], key[2]);
         let n: usize = self.chunks.iter().product();
+        // room for this chunk before it decodes, so the cache and the chunk together stay within the bound; a
+        // chunk larger than the bound empties the cache and is then kept alone, as decoding it for every tile
+        // would cost more than holding it
+        {
+            let mut cache = self.cache.lock().map_err(|_| eyre!("CT cache poisoned"))?;
+            while cache.bytes + n > CACHE_BYTES {
+                let Some(old) = cache.order.pop_front() else { break };
+                if let Some(c) = cache.chunks.remove(&old) {
+                    cache.bytes -= c.len();
+                }
+            }
+        }
         let data = match fs::read(self.dir.join(&name)) {
             Ok(bytes) => {
                 let out = decode(self.compressor, bytes, n).map_err(|e| eyre!("CT chunk {name}: {e}"))?;
@@ -121,7 +133,7 @@ impl Ct {
             cache.order.push_back(key);
             cache.bytes += chunk.len();
         }
-        // the newest chunk stays, however large
+        // another reader's chunk may have landed meanwhile; the newest stays
         while cache.bytes > CACHE_BYTES && cache.order.len() > 1 {
             let old = cache.order.pop_front().expect("non-empty");
             if let Some(c) = cache.chunks.remove(&old) {

@@ -281,19 +281,24 @@ mod libs {
         files.iter().all(|f| site.join(sub).join(f).is_file())
     }
 
-    /// Loads the pip copies of cuDNN and cuBLAS from this binary's environment, when it has them; both from one
-    /// site-packages when one holds both, so they come from the same install
+    /// Loads the pip copies of cuDNN and cuBLAS from this binary's environment, when it has them, all from one
+    /// site-packages: the first that holds both, else the first that holds either (the one that installed fibrs
+    /// comes first), whose missing library then comes from the system, never from another install
     pub fn prefer_environment() {
         if std::env::var("FIBRS_CUDA_LIBS").is_ok_and(|v| v == "system") {
             return;
         }
 
         let sites = site_packages();
-        let both = sites.iter().find(|s| PIP.iter().all(|&p| holds(s, p)));
+        let site = sites
+            .iter()
+            .find(|s| PIP.iter().all(|&p| holds(s, p)))
+            .or_else(|| sites.iter().find(|s| PIP.iter().any(|&p| holds(s, p))));
+        let Some(site) = site else { return };
         for (files, sub) in PIP {
-            let Some(site) = both.or_else(|| sites.iter().find(|s| holds(s, (files, sub)))) else {
+            if !holds(site, (files, sub)) {
                 continue;
-            };
+            }
             let dir = site.join(sub);
             for f in files {
                 let path = dir.join(f);

@@ -53,7 +53,7 @@ pub struct Args {
     /// End plane of the band, exclusive
     #[arg(long, allow_negative_numbers = true)]
     z1: Option<i64>,
-    /// The model's Hugging Face snapshot (plans.json, checkpoint_final.pth, model.py)
+    /// The model's Hugging Face snapshot (model.py, plans.json, dataset.json, checkpoint_final.pth)
     #[arg(long)]
     model_dir: PathBuf,
     /// The output zarr group
