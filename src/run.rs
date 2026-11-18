@@ -1176,4 +1176,71 @@ mod tests {
         assert_eq!(result.map_err(|e| e.to_string()), Err("trace failed".to_string()));
         assert_eq!(seen, [1, 2]);
     }
+
+    /// Write a C-order, uncompressed `|u1` Zarr v2 array of shape (2, z, y, x) with chunks (2, depth, 16, 16);
+    /// `value(c, z, y, x)` gives each voxel, and chunk files are written only when `value` is given
+    fn write_zarr(dir: &Path, shape: Shape, depth: usize, value: Option<&dyn Fn(usize, usize, usize, usize) -> u8>) {
+        let chunk = [depth, 16, 16];
+        fs::create_dir_all(dir).unwrap();
+        let meta = json!({
+            "zarr_format": 2, "shape": [2, shape[0], shape[1], shape[2]], "chunks": [2, depth, 16, 16],
+            "dtype": "|u1", "compressor": null, "fill_value": 0, "order": "C", "filters": null,
+        });
+        fs::write(dir.join(".zarray"), meta.to_string()).unwrap();
+        let Some(value) = value else { return };
+        let grid = [0, 1, 2].map(|a| shape[a].div_ceil(chunk[a]));
+        for (gz, gy, gx) in
+            (0..grid[0]).flat_map(|z| (0..grid[1]).flat_map(move |y| (0..grid[2]).map(move |x| (z, y, x))))
+        {
+            let mut bytes = Vec::with_capacity(2 * chunk.iter().product::<usize>());
+            for c in 0..2 {
+                for z in gz * chunk[0]..(gz + 1) * chunk[0] {
+                    for y in gy * chunk[1]..(gy + 1) * chunk[1] {
+                        for x in gx * chunk[2]..(gx + 1) * chunk[2] {
+                            let inside = z < shape[0] && y < shape[1] && x < shape[2];
+                            bytes.push(if inside { value(c, z, y, x) } else { 0 });
+                        }
+                    }
+                }
+            }
+            fs::write(dir.join(format!("0.{gz}.{gy}.{gx}")), bytes).unwrap();
+        }
+    }
+
+    /// The loaded tracing fields hold exactly the supplied array for chunk depths that take each slab path: whole
+    /// chunks per slab (8, 24, 64 planes), brick rows within a chunk (17, 60), a partial final slab (150 planes is
+    /// a multiple of none of them) and slabs whose chunks are all zero
+    #[test]
+    fn tracing_loads_the_supplied_array_at_any_chunk_depth() {
+        let shape = [150, 40, 36];
+        let root = std::env::temp_dir().join(format!("fibrs-load-tracing-{}", std::process::id()));
+        let native_dir = root.join("native");
+        write_zarr(&native_dir, shape.map(|n| 2 * n), 64, None);
+        let native = Predictions::open(&native_dir, None, "VH").unwrap();
+        let value = |c: usize, z: usize, y: usize, x: usize| -> u8 {
+            if (40..80).contains(&z) || (z / 5 + y / 7 + x / 3).is_multiple_of(4) {
+                return 0;
+            }
+            ((c * 31 + z * 7 + y * 3 + x) % 255 + 1) as u8
+        };
+        for depth in [8, 17, 24, 60, 64] {
+            let dir = root.join(format!("tracing-{depth}"));
+            write_zarr(&dir, shape, depth, Some(&value));
+            let supplied = Predictions::open(&dir, None, "VH").unwrap();
+            let fields = load_tracing(&native, Some(&supplied)).unwrap();
+            for (c, field) in fields.iter().enumerate() {
+                let got = field.read_block([0, 0, 0], shape);
+                let mut i = 0;
+                for z in 0..shape[0] {
+                    for y in 0..shape[1] {
+                        for x in 0..shape[2] {
+                            assert_eq!(got[i], value(c, z, y, x), "depth {depth}, channel {c} at {z}, {y}, {x}");
+                            i += 1;
+                        }
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
 }
