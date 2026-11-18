@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.1] - Unreleased
 
 - `scripts/install-dropin.sh --restore` puts back the `fibrs` that the wheel installed. It used to remove it, which
   broke the `fibrs` command and `python -m fibrs` in that environment until the wheel was reinstalled. A drop-in
@@ -19,4 +19,5 @@ The first release.
   Python module, and a CLI archive for each with `scripts/install-dropin.sh`
 - `--version` prints `0.2.0`, the original's version, as a drop-in has to
 
+[0.1.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.1.1
 [0.1.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.1.0
