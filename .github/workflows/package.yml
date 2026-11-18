@@ -93,7 +93,9 @@ jobs:
           # no SBOM ([tool.maturin.sbom] in pyproject.toml), and the README, NOTICE and every licence text inside
           unzip -Z1 dist/*.whl | tee members.txt
           if grep -q '/sboms/' members.txt; then echo "the wheel carries an SBOM" >&2; exit 1; fi
-          for f in LICENSE NOTICE licenses/apache-2.0.txt licenses/numpy.txt; do grep -q "dist-info/licenses/$f\$" members.txt; done
+          for f in LICENSE NOTICE licenses/apache-2.0.txt licenses/numpy.txt licenses/nvidia-gpu-kernels.txt; do
+            grep -q "dist-info/licenses/$f\$" members.txt
+          done
 
       - name: Build the CLI archive
         shell: bash

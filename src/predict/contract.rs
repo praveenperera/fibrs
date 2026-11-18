@@ -10,7 +10,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use color_eyre::eyre::{Result, bail, eyre};
+use color_eyre::eyre::{Result, bail, ensure, eyre};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -195,6 +195,7 @@ pub fn ct_identity(ct: &Path, z0: usize, z1: usize) -> Result<String> {
     let zarray = fs::read(ct.join(".zarray"))?;
     let meta: Value = serde_json::from_slice(&zarray)?;
     let cz = meta["chunks"][0].as_u64().ok_or_else(|| eyre!("{}: no chunk shape", ct.display()))? as usize;
+    ensure!(z0 < z1 && cz > 0, "{}: an empty band ({z0}..{z1}) has no identity", ct.display());
     let rows = z0 / cz..=(z1 - 1) / cz;
     let mut files = Vec::new();
     if meta.get("dimension_separator").and_then(Value::as_str) == Some("/") {

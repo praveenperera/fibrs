@@ -6,9 +6,9 @@ same flags and writes the same `.afv`: every metadata value except the per-run u
 point block and spatial-index row. The tracing algorithm, the AFV format and the fibre model whose
 predictions it reads are Qual's; this port changes how fast the tracer runs, not what it writes.
 
-On a 512 × 8169 × 8169 band of PHerc0826, with `--threads 4` for both tools, it took 191 s where the
-original took 11,840 s: 62 times faster, with about 23 times less CPU time, and the same `.afv`. Tracing
-runs on the CPU and needs no GPU.
+On a 512 × 8169 × 8169 band of PHerc0826, with `--threads 4` for both tools, it traces 27×–62× faster
+across two measured runs (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU and needs
+no GPU.
 
 `fibrs predict` runs the step before: Qual's AFV fibre model V2 over a CT volume on an NVIDIA GPU, without
 PyTorch, writing the probability zarr the tracer reads, as villa's inference writes it (see
@@ -97,19 +97,26 @@ through the drop-in and through `python -m fibrs`. Both must write what the orig
 
 ## Speed
 
-The same band, on an Intel Core Ultra 7 270K Plus (24 cores), with `--threads 4` for both tools and other
-work running on the machine (one-minute load average 17.5–18.8):
+Two runs on the same band, on an Intel Core Ultra 7 270K Plus (24 cores), with `--threads 4` for both tools and
+other work running on the machine each time:
 
-| Run | Wall | CPU time | Peak memory |
-|---|---|---|---|
-| `avf-spline-generator` 0.2.0 | 11,840 s (3.3 h) | about 11,940 s | 4.6 GiB |
-| `fibrs` 0.1.1 | 191 s | 516 s | 12.4 GiB |
-| Speedup | **62×** | **about 23×** | |
+| Run | Tool | Wall | CPU time | Peak memory |
+|---|---|---|---|---|
+| 1 | `avf-spline-generator` 0.2.0 | 11,840 s (3.3 h) | about 11,940 s | 4.6 GiB |
+| 1 | `fibrs` 0.1.1 | 191 s | 516 s | 12.4 GiB |
+| 2 | `avf-spline-generator` 0.2.0 | 4,686 s (1.3 h) | not measured | 4.6 GiB |
+| 2 | `fibrs` 0.1.0 | 172 s | not measured | 10.8 GiB |
+| Speedup | | **27×–62×** | **about 23× (run 1 only)** | |
 
-The original uses about one core whatever `--threads` says, and the port keeps about 2.7 busy. The
-original's run was interrupted by a reboot and finished with `--resume`. Its wall time is the sum of the two
-parts, and the first part's CPU time is estimated from the second part's CPU-to-wall ratio (1.01). An
-earlier uninterrupted run of the original on the same band took 12,728 s.
+- Run 1: the one-minute load average was 17.5–18.8. The original's run was interrupted by a reboot and
+  finished with `--resume`. Its wall time is the sum of the two parts, and the first part's CPU time is
+  estimated from the second part's CPU-to-wall ratio (1.01). An earlier uninterrupted run of the original on
+  the same band took 12,728 s.
+- Run 2: the one-minute load average averaged 13.9 during the original's run and 8.8 during fibrs's. The two
+  `.afv` files held the same 149,680 fibres (compared logically, as each holds its own run uuid).
+
+The ratio varies with the run and with the machine's load: the range is the lowest and highest of the measured
+runs. The original uses about one core whatever `--threads` says, and the port keeps about 2.7 busy (run 1).
 
 ## Differences from the original
 

@@ -103,6 +103,7 @@ impl Ct {
             bail!("expected a 3D uint8 CT array, got {}", describe(&meta));
         }
         ensure!(chunks.iter().all(|&c| c > 0), "{}: Zarr chunks must be positive", dir.display());
+        ensure!(shape.iter().all(|&n| n > 0), "{}: the CT is empty (shape {shape:?})", dir.display());
         ensure!(meta["filters"].as_array().is_none_or(Vec::is_empty), "{}: Zarr filters are not read", dir.display());
         let fortran = match meta["order"].as_str() {
             Some("C") => false,
@@ -128,32 +129,30 @@ impl Ct {
 
     /// The decoded chunk `key`, C order, or the fill value when its file is absent
     fn chunk(&self, key: [usize; 3]) -> Result<Chunk> {
-        if let Some(c) = self.cache.lock().map_err(|_| eyre!("CT cache poisoned"))?.chunks.get(&key) {
-            return Ok(c.clone());
-        }
-
         let sep = if self.nested { "/" } else { "." };
         let name = format!("{}{sep}{}{sep}{}", key[0], key[1], key[2]);
         let n: usize = self.chunks.iter().product();
         // room for this chunk, and for the others being decoded, before it decodes, so the cache and the decodes
         // in flight never pass the bound: a reader waits while the decodes already running leave no room. A
         // chunk larger than the bound decodes alone and is then kept alone, as decoding it for every tile costs
-        // more than holding it
+        // more than holding it. A Fortran-order chunk is decoded, then copied to C order, so it holds two
+        // buffers at once
+        let share = if self.fortran { 2 * n } else { n };
         let decoding = {
             let mut cache = self.cache.lock().map_err(|_| eyre!("CT cache poisoned"))?;
             loop {
-                cache.make_room(n);
-                if cache.decoding == 0 || cache.bytes + cache.decoding + n <= CACHE_BYTES {
+                // cached already, or by another reader while this one waited
+                if let Some(c) = cache.chunks.get(&key) {
+                    return Ok(c.clone());
+                }
+                cache.make_room(share);
+                if cache.decoding == 0 || cache.bytes + cache.decoding + share <= CACHE_BYTES {
                     break;
                 }
                 cache = self.room.wait(cache).map_err(|_| eyre!("CT cache poisoned"))?;
             }
-            // another reader may have decoded it while this one waited
-            if let Some(c) = cache.chunks.get(&key) {
-                return Ok(c.clone());
-            }
-            cache.decoding += n;
-            Decoding(self, n)
+            cache.decoding += share;
+            Decoding(self, share)
         };
         let data = match fs::read(self.dir.join(&name)) {
             Ok(bytes) => {

@@ -341,6 +341,24 @@ fn check_column_memory(c: &Checked, p: &Plan, e: &Opened) -> Result<()> {
     )
 }
 
+/// `path` made absolute with its links resolved, as far as it exists: the part that does not exist yet is kept as
+/// given, so an output that is not created yet compares with the CT too
+fn resolved(path: &Path) -> Result<PathBuf> {
+    let path = std::path::absolute(path)?;
+    let mut missing = Vec::new();
+    let mut existing = path.as_path();
+    loop {
+        if let Ok(real) = existing.canonicalize() {
+            return Ok(missing.iter().rev().fold(real, |p: PathBuf, part| p.join(part)));
+        }
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return Ok(path);
+        };
+        missing.push(name.to_os_string());
+        existing = parent;
+    }
+}
+
 /// Locks the output for this process; the lock goes with the process, so a killed run leaves none behind
 fn lock_output(attempts: &fs::File, out: &Path) -> Result<()> {
     match attempts.try_lock() {
@@ -363,6 +381,11 @@ fn run(c: Checked) -> Result<()> {
     let a = &c.a;
     let t_start = now_unix();
     let started = Instant::now();
+    // before the first write: an output in, at or around the CT would write into the input store
+    let (ct, out) = (resolved(&a.ct)?, resolved(&a.out)?);
+    if out.starts_with(&ct) || ct.starts_with(&out) {
+        bail!("--out {} overlaps --ct {}; write the output outside the input", a.out.display(), a.ct.display());
+    }
     // every attempt is recorded at its start, before the model loads, so a capped or killed run still shows it
     fs::create_dir_all(&a.out)?;
     let mut attempts = fs::OpenOptions::new().create(true).append(true).open(a.out.join("attempts.jsonl"))?;

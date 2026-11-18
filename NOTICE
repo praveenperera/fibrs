@@ -43,3 +43,9 @@ of tiles and output chunks follow villa's lasagna.qualzz_inference and
 lasagna.tiled_predict3d (https://github.com/ScrollPrize/villa, commit 97fb9336c);
 src/predict/villa.rs reimplements villa's tile-selection rule. villa is MIT licensed,
 Copyright (c) 2024 Vesuvius Challenge; the full text is in licenses/villa-MIT.txt.
+
+On Linux x86-64 the binary includes fibrs predict's engine, volkit, whose embedded GPU kernels
+contain compiled code from NVIDIA libdevice (CUDA Toolkit 13.2), distributed under the NVIDIA
+CUDA Toolkit End User License Agreement and not under this crate's licence, and code compiled
+from NVIDIA's cuda-oxide device crate (Apache-2.0, Copyright (c) 2024-2026 NVIDIA CORPORATION
+& AFFILIATES). licenses/nvidia-gpu-kernels.txt gives the details and the terms that apply.

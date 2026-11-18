@@ -203,6 +203,31 @@ fn an_output_in_use_by_another_run_is_refused() {
 }
 
 #[test]
+fn an_output_that_overlaps_the_ct_is_refused() {
+    let model = scratch("overlap-model");
+    for name in ["model.py", "plans.json", "dataset.json", "checkpoint_final.pth"] {
+        fs::write(model.join(name), name).unwrap();
+    }
+    let ct = scratch("overlap-ct").join("band.zarr");
+    fs::create_dir_all(&ct).unwrap();
+    for entry in fs::read_dir(fixtures().join("band.zarr")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            fs::copy(entry.path(), ct.join(entry.file_name())).unwrap();
+        }
+    }
+    let before: Vec<_> = fs::read_dir(&ct).unwrap().map(|e| e.unwrap().file_name()).collect();
+    for out in [ct.clone(), ct.join("pred.zarr"), ct.parent().unwrap().to_path_buf()] {
+        let args = ["--ct", ct.to_str().unwrap(), "--z0", "0", "--z1", "8", "--model-dir", model.to_str().unwrap()];
+        let run = predict(&[&args[..], &["--out", out.to_str().unwrap()]].concat());
+        assert_eq!(run.status.code(), Some(1));
+        assert!(text(&run).contains("overlaps --ct"), "{}", text(&run));
+    }
+    let after: Vec<_> = fs::read_dir(&ct).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(before, after);
+}
+
+#[test]
 fn a_fold_folder_as_the_model_folder_is_refused() {
     let model = scratch("fold_1");
     for name in ["model.py", "plans.json", "dataset.json", "checkpoint_final.pth"] {
