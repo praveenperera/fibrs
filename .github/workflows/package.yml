@@ -100,8 +100,10 @@ jobs:
         run: scripts/release-archive.sh dist "${{ matrix.target }}"
 
       # the wheel on the oldest and a current CPython, then the drop-in into a venv with the original installed from
-      # its tagged source, so VENV/bin/avf-spline-generator runs the binary
-      - name: Install the wheel and the drop-in
+      # its tagged source, so VENV/bin/avf-spline-generator runs the binary. The synthetic fixture is traced through
+      # the drop-in and through python -m fibrs, and both must write what the original wrote for it
+      # (tests/fixtures/synthetic/reference.afv); --restore must leave the wheel's fibrs in place
+      - name: Install the wheel and the drop-in, and trace the fixture
         shell: bash
         working-directory: ${{ runner.temp }}
         env:
@@ -125,8 +127,21 @@ jobs:
           bash fibrs-*-"$TARGET"/scripts/install-dropin.sh venv-ref fibrs-*-"$TARGET"/fibrs
           test -e venv-ref/bin/avf-spline-generator.reference
           test "$(venv-ref/bin/avf-spline-generator --version)" = 0.2.0
+          fixture="$GITHUB_WORKSPACE/tests/fixtures/synthetic"
+          for entry in "venv-ref/bin/avf-spline-generator" "venv-ref/bin/python -m fibrs"; do
+            rm -rf trace
+            # the macOS runners have 3 cores, and --threads can't exceed the core count; the output doesn't
+            # depend on it
+            # shellcheck disable=SC2086
+            $entry --predictions "$fixture/predictions.zarr" --array semantic --channel-order VH \
+              --tracing-predictions "$fixture/predictions.zarr" --tracing-array tracing --voxel-size-um 9.362 \
+              --storage compressed --device cpu --threads 2 --output trace/fibers.afv --work-dir trace/work
+            venv-ref/bin/python -I "$GITHUB_WORKSPACE/scripts/compare_afv.py" trace/fibers.afv "$fixture/reference.afv"
+          done
           bash fibrs-*-"$TARGET"/scripts/install-dropin.sh --restore venv-ref
           venv-ref/bin/avf-spline-generator --version
+          test "$(venv-ref/bin/fibrs --version)" = 0.2.0
+          test "$(venv-ref/bin/python -m fibrs --version)" = 0.2.0
 
       - name: Upload the wheel and CLI archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

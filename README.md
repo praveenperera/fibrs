@@ -80,10 +80,14 @@ from it; `cargo test` checks every case.
 ## Same output
 
 On that PHerc0826 band (z 12032–12544), the port's `.afv` is identical to the original's: 149,780 fibres,
-161,887 point blocks and 161,887 spatial-index rows, plus the metadata and schema. Each release is also
-checked on a 512³ crop of the band: the wheel and the drop-in are installed into a fresh environment beside
-the original, and the crop is traced through `avf-spline-generator` and through `python -m fibrs`. Both
-outputs must be identical to the original's `.afv`.
+161,887 point blocks and 161,887 spatial-index rows, plus the metadata and schema. The 0.1.0 build was also
+checked on a 512³ crop of the band: the wheel and the drop-in were installed into a fresh environment beside
+the original, and the crop was traced through `avf-spline-generator` and through `python -m fibrs`. Both
+outputs were identical to the original's `.afv`.
+
+CI traces a small synthetic input (`tests/fixtures/synthetic`) with every build's wheel on Linux and macOS,
+through the drop-in and through `python -m fibrs`. Both must write what the original wrote for it, compared by
+`scripts/compare_afv.py`: every metadata value except the per-run uuid, the schema and every table row.
 
 ## Speed
 
