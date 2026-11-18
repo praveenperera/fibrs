@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use crate::afv::{ExportOptions, MinLength, Summary, export_afv};
 use crate::axes::{Lapack, direction_field, find_lapack};
-use crate::fields::{FamilyFields, catalogue, centrality, presence};
+use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
 use crate::input::Predictions;
 use crate::kernels::{Coverage, Fields, RawCurve, Scratch, trace_seed};
@@ -423,6 +423,7 @@ pub fn run(args: Args) -> Result<Summary> {
     if args.origin_xyz.iter().min().copied().unwrap_or(0) < 0 || args.native_cache_mib < 1 || args.cuda_device < 0 {
         bail!("Invalid origin, cache size or CUDA device");
     }
+    fix_mmap_threshold();
     let max_threads = numba_max_threads();
     let threads = args.threads.unwrap_or(8.min(max_threads));
     if threads < 1 || threads > max_threads {
@@ -568,6 +569,10 @@ pub fn run(args: Args) -> Result<Summary> {
     Ok(summary)
 }
 
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 fn family_dir(work: &Path, family: usize) -> PathBuf {
     work.join(format!("family-{family}"))
 }
@@ -586,7 +591,11 @@ fn load_tracing(native: &Predictions, supplied: Option<&Predictions>) -> Result<
     let tgrid = [0, 1, 2].map(|a| shape[a].div_ceil(tile[a]));
     let mut out = [Vol::new(shape, 0u8), Vol::new(shape, 0u8)];
     let brick_rows = out[0].grid()[0];
-    let slab = (tile[0] / EDGE).max(1);
+    // a slab spans whole tiles where that is at most two tiles deep (lcm(tile, 16) for tiles such as 24 or 40
+    // planes), so no tile is decoded for two slabs. Deeper alignments fall back to the brick rows within one tile,
+    // which can decode a tile twice but never hold more than the two tiles a straddling slab reads
+    let aligned = tile[0] / gcd(tile[0], EDGE) * EDGE;
+    let slab = if aligned <= 2 * tile[0].max(EDGE) { aligned / EDGE } else { tile[0] / EDGE }.max(1);
     let mut bz = 0;
     while bz < brick_rows {
         let rows = bz..(bz + slab).min(brick_rows);
@@ -693,8 +702,8 @@ fn trace_families(
     let lapack = Lapack::init(&find_lapack()?)?;
     let (nx, ny) = direction_field(&tracing, lapack)?;
     release_freed();
-    debug_dump(work, "nx", &nx)?;
-    debug_dump(work, "ny", &ny)?;
+    debug_dump(work, "nx", || nx.read_block([0, 0, 0], nx.shape()))?;
+    debug_dump(work, "ny", || ny.read_block([0, 0, 0], ny.shape()))?;
     log!("Direction field: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem("direction field", &[("tracing", resident), ("nx", nx.resident_bytes()), ("ny", ny.resident_bytes())]);
     let cache = NativeCache::new(native, cache_bytes);
@@ -707,11 +716,11 @@ fn trace_families(
 
 /// With `FIBRS_DEBUG_FIELDS` set, write a field densely as raw little-endian `NAME.raw` for comparison
 /// with the reference's work arrays; only sensible for small crops
-fn debug_dump<T: Copy + PartialEq + Send + Sync + ToLe>(dir: &Path, name: &str, vol: &Vol<T>) -> Result<()> {
+fn debug_dump<T: Copy + ToLe>(dir: &Path, name: &str, dense: impl FnOnce() -> Vec<T>) -> Result<()> {
     if std::env::var_os("FIBRS_DEBUG_FIELDS").is_none() {
         return Ok(());
     }
-    let dense = vol.read_block([0, 0, 0], vol.shape());
+    let dense = dense();
     let bytes: Vec<u8> = dense.iter().flat_map(|v| v.to_le()).collect();
     fs::write(dir.join(format!("{name}.raw")), bytes)?;
     Ok(())
@@ -737,7 +746,7 @@ impl ToLe for u16 {
 /// Hand the heap pages freed since the last call back to the system
 ///
 /// Each stage frees what the next does not read (the direction field's and centrality's tile results, the seed
-/// field, a finished family's presence, centrality and coverage), but glibc keeps freed memory in the arena of
+/// field, a finished family's centrality and coverage), but glibc keeps freed memory in the arena of
 /// the thread that freed it and only trims the top of each heap. The next stage allocates from other threads'
 /// arenas (coverage grows on the tracing thread, the next family's fields on the pool's), so without this the
 /// freed bytes stay resident beside the new ones: on a 0826 band the H family peaked 1.7 GiB above V with the
@@ -747,6 +756,26 @@ fn release_freed() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::malloc_trim(0);
+    }
+}
+
+/// Serve every allocation of 1 MiB or more with its own mapping, which goes back to the system when freed
+///
+/// glibc starts at 128 KiB but raises the threshold to the size of each mapped block freed, up to 32 MiB, so
+/// after the first few the chunk cache's 4 MiB chunks and the stages' tile buffers come from the per-thread
+/// arenas instead, where they fragment and stay resident as they are evicted and freed on other threads: on a
+/// 512-plane 0826 band the peak varied from 8.9 to 10.8 GiB between runs without this and was 8.8 GiB in each
+/// of three runs with it, at the same speed. Setting the threshold also stops glibc's adjustment.
+/// A threshold set in the environment, by `MALLOC_MMAP_THRESHOLD_` or `GLIBC_TUNABLES`, still takes precedence
+fn fix_mmap_threshold() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none()
+        && !std::env::var("GLIBC_TUNABLES").is_ok_and(|t| t.contains("glibc.malloc.mmap_threshold"))
+    {
+        // SAFETY: mallopt only changes how later allocations are served; it touches no live allocation
+        unsafe {
+            libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
+        }
     }
 }
 
@@ -779,17 +808,22 @@ fn trace_family(
     let folder = family_dir(work, family);
     fs::create_dir_all(&folder)?;
     let t = Instant::now();
-    let FamilyFields { pres, cent, seeds } = centrality(presence(tracing, family), nx, ny);
+    let pres = Presence::new(tracing, family);
+    let FamilyFields { cent, seeds } = centrality(&pres, nx, ny);
     log!("{label} centrality: {:.1} s", t.elapsed().as_secs_f64());
-    debug_mem(
-        label,
-        &[("pres", pres.resident_bytes()), ("cent", cent.resident_bytes()), ("seeds", seeds.resident_bytes())],
-    );
+    debug_mem(label, &[("cent", cent.resident_bytes()), ("seeds", seeds.len() * std::mem::size_of::<Seed>())]);
     let t = Instant::now();
     let cat = catalogue(&seeds, &cent);
-    debug_dump(&folder, "presence", &pres)?;
-    debug_dump(&folder, "centrality", &cent)?;
-    debug_dump(&folder, "seeds", &seeds)?;
+    debug_dump(&folder, "presence", || pres.read_block([0, 0, 0], pres.shape()))?;
+    debug_dump(&folder, "centrality", || cent.read_block([0, 0, 0], cent.shape()))?;
+    debug_dump(&folder, "seeds", || {
+        let mut dense = Vol::new(cent.shape(), 0u8);
+        for &seed in &seeds {
+            let [z, y, x] = seed.coords(cent.shape());
+            dense.set(z as usize, y as usize, x as usize, seed.priority());
+        }
+        dense.read_block([0, 0, 0], dense.shape())
+    })?;
     if std::env::var_os("FIBRS_DEBUG_FIELDS").is_some() {
         let bytes: Vec<u8> = cat.coords.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
         fs::write(folder.join("coordinates.i4"), bytes)?;
@@ -840,8 +874,7 @@ fn trace_family(
         if !batch.is_empty() {
             let _ = tx.send(batch);
         }
-        let cov_bytes = [&cov.cnt, &cov.nx, &cov.ny].map(Vol::resident_bytes);
-        debug_mem(label, &[("coverage", cov_bytes.iter().sum()), ("cache", cache.bytes()), ("catalogue", 12 * total)]);
+        debug_mem(label, &[("coverage", cov.resident_bytes()), ("cache", cache.bytes()), ("catalogue", 12 * total)]);
         Ok(count)
     };
     let consume = |batch: Vec<RawCurve>| -> Result<()> {
@@ -1142,5 +1175,72 @@ mod tests {
         });
         assert_eq!(result.map_err(|e| e.to_string()), Err("trace failed".to_string()));
         assert_eq!(seen, [1, 2]);
+    }
+
+    /// Write a C-order, uncompressed `|u1` Zarr v2 array of shape (2, z, y, x) with chunks (2, depth, 16, 16);
+    /// `value(c, z, y, x)` gives each voxel, and chunk files are written only when `value` is given
+    fn write_zarr(dir: &Path, shape: Shape, depth: usize, value: Option<&dyn Fn(usize, usize, usize, usize) -> u8>) {
+        let chunk = [depth, 16, 16];
+        fs::create_dir_all(dir).unwrap();
+        let meta = json!({
+            "zarr_format": 2, "shape": [2, shape[0], shape[1], shape[2]], "chunks": [2, depth, 16, 16],
+            "dtype": "|u1", "compressor": null, "fill_value": 0, "order": "C", "filters": null,
+        });
+        fs::write(dir.join(".zarray"), meta.to_string()).unwrap();
+        let Some(value) = value else { return };
+        let grid = [0, 1, 2].map(|a| shape[a].div_ceil(chunk[a]));
+        for (gz, gy, gx) in
+            (0..grid[0]).flat_map(|z| (0..grid[1]).flat_map(move |y| (0..grid[2]).map(move |x| (z, y, x))))
+        {
+            let mut bytes = Vec::with_capacity(2 * chunk.iter().product::<usize>());
+            for c in 0..2 {
+                for z in gz * chunk[0]..(gz + 1) * chunk[0] {
+                    for y in gy * chunk[1]..(gy + 1) * chunk[1] {
+                        for x in gx * chunk[2]..(gx + 1) * chunk[2] {
+                            let inside = z < shape[0] && y < shape[1] && x < shape[2];
+                            bytes.push(if inside { value(c, z, y, x) } else { 0 });
+                        }
+                    }
+                }
+            }
+            fs::write(dir.join(format!("0.{gz}.{gy}.{gx}")), bytes).unwrap();
+        }
+    }
+
+    /// The loaded tracing fields hold exactly the supplied array for chunk depths that take each slab path: whole
+    /// chunks per slab (8, 24, 64 planes), brick rows within a chunk (17, 60), a partial final slab (150 planes is
+    /// a multiple of none of them) and slabs whose chunks are all zero
+    #[test]
+    fn tracing_loads_the_supplied_array_at_any_chunk_depth() {
+        let shape = [150, 40, 36];
+        let root = std::env::temp_dir().join(format!("fibrs-load-tracing-{}", std::process::id()));
+        let native_dir = root.join("native");
+        write_zarr(&native_dir, shape.map(|n| 2 * n), 64, None);
+        let native = Predictions::open(&native_dir, None, "VH").unwrap();
+        let value = |c: usize, z: usize, y: usize, x: usize| -> u8 {
+            if (40..80).contains(&z) || (z / 5 + y / 7 + x / 3).is_multiple_of(4) {
+                return 0;
+            }
+            ((c * 31 + z * 7 + y * 3 + x) % 255 + 1) as u8
+        };
+        for depth in [8, 17, 24, 60, 64] {
+            let dir = root.join(format!("tracing-{depth}"));
+            write_zarr(&dir, shape, depth, Some(&value));
+            let supplied = Predictions::open(&dir, None, "VH").unwrap();
+            let fields = load_tracing(&native, Some(&supplied)).unwrap();
+            for (c, field) in fields.iter().enumerate() {
+                let got = field.read_block([0, 0, 0], shape);
+                let mut i = 0;
+                for z in 0..shape[0] {
+                    for y in 0..shape[1] {
+                        for x in 0..shape[2] {
+                            assert_eq!(got[i], value(c, z, y, x), "depth {depth}, channel {c} at {z}, {y}, {x}");
+                            i += 1;
+                        }
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(&root).unwrap();
     }
 }

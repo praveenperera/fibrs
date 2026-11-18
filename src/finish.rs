@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use color_eyre::eyre::Result;
 
+use crate::fields::Presence;
 use crate::input::Predictions;
 use crate::kernels::{evaluate_curve, fit_curve};
 use crate::vol::{Shape, Vol};
@@ -192,7 +193,7 @@ fn sample_tracing(tracing: &[Vol<u8>; 2], p: [f32; 3]) -> [f32; 2] {
 /// What finishing reads: the pooled predictions, the family's presence and the native predictions
 pub struct FinishCtx<'a> {
     pub tracing: &'a [Vol<u8>; 2],
-    pub pres: &'a Vol<u8>,
+    pub pres: &'a Presence<'a>,
     /// 1 = V, 2 = H
     pub family: usize,
 }

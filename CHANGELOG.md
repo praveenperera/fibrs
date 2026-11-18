@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Tracing holds less in memory, with the same `.afv`. Presence is computed from the two prediction fields as it
+  is read instead of being stored, centrality is written tile batch by tile batch, coverage takes two bytes a
+  voxel instead of three, seeds are kept as a packed list, and fields are stored in 16³ bricks instead of 32³.
+  On Linux, allocations of 1 MiB or more get their own mapping, so the chunk cache's evicted chunks go back to
+  the system. On a 1024 × 8169 × 8169 window of PHerc0826 the peak fell from 17.4 GiB to 13.3 GiB, and on a
+  512-plane band from 8.9–10.8 GiB to 8.8 GiB.
+
 ## [0.1.1] - 2026-11-18
 
 - `scripts/install-dropin.sh --restore` puts back the `fibrs` that the wheel installed. It used to remove it, which
