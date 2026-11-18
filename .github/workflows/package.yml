@@ -118,6 +118,26 @@ jobs:
             test "$("venv-$python/bin/python" -m fibrs --version)" = 0.2.0
             "venv-$python/bin/python" -I -c 'import fibrs; print(fibrs.binary())'
           done
+          # fibrs predict through the installed wheel: its command line, and a dry run of a fixture's plan (the
+          # runners have no GPU). On Linux the predict extra (cuDNN and cuBLAS from pip) must resolve; elsewhere a
+          # real run must refuse with the platform it needs
+          fixture="$GITHUB_WORKSPACE/tests/fixtures/predict"
+          venv-3.13/bin/fibrs predict --help > /dev/null
+          venv-3.13/bin/python -m fibrs predict --help > /dev/null
+          venv-3.13/bin/fibrs predict --dry-run --ct "$fixture/band.zarr" --z0 4 --z1 36 --column 192 --batch 3 \
+            --model-dir "$fixture" --out predict-dry | tail -1
+          whl="$(ls "$DIST"/fibrs-*.whl)"
+          if [ "$RUNNER_OS" = Linux ]; then
+            uv pip install --dry-run --python venv-3.13/bin/python "fibrs[predict] @ file://$whl"
+          else
+            mkdir -p model
+            touch model/model.py model/plans.json model/checkpoint_final.pth
+            if venv-3.13/bin/fibrs predict --ct "$fixture/band.zarr" --z0 4 --z1 36 --model-dir model \
+              --out predict-out 2> refused.txt; then
+              echo "fibrs predict ran without a GPU engine" >&2; exit 1
+            fi
+            grep -q "needs an NVIDIA GPU on Linux x86_64" refused.txt
+          fi
           uv venv -q --python 3.12 venv-ref
           uv pip install -q --python venv-ref/bin/python numpy==2.4.6 scipy==1.18.1 numba==0.64.0 llvmlite==0.46.0 \
             zarr==2.18.7 numcodecs==0.15.2 \

@@ -59,33 +59,67 @@ def blobs(rng, shape, n, region=None):
 def write_ct(path: Path, data: np.ndarray, chunks, compressor, nested: bool, drop_zero_chunks: bool):
     if path.exists():
         shutil.rmtree(path)
-    z = zarr.open_array(str(path), mode="w", shape=data.shape, chunks=chunks, dtype="u1", compressor=compressor,
-                        fill_value=0, dimension_separator="/" if nested else ".",
-                        write_empty_chunks=not drop_zero_chunks)
+    z = zarr.open_array(
+        str(path),
+        mode="w",
+        shape=data.shape,
+        chunks=chunks,
+        dtype="u1",
+        compressor=compressor,
+        fill_value=0,
+        dimension_separator="/" if nested else ".",
+        write_empty_chunks=not drop_zero_chunks,
+    )
     z[:] = data
 
 
 CASES = [
     # name, shape, chunks, compressor, nested, drop all-zero chunks, blobs, dry-run arguments
-    dict(name="band", shape=(40, 620, 430), region=(40, 250, 200), chunks=(16, 64, 64), compressor=numcodecs.Zstd(level=3), nested=True,
-         drop=True, blobs=6, runs=[
-             dict(mode="band", z0=4, z1=36, column=192, batch=3),
-             dict(mode="band", z0=0, z1=40, column=96, batch=4),
-             dict(mode="band", z0=10, z1=12, column=480, batch=4, only=[0]),
-         ]),
+    {
+        "name": "band",
+        "shape": (40, 620, 430),
+        "region": (40, 250, 200),
+        "chunks": (16, 64, 64),
+        "compressor": numcodecs.Zstd(level=3),
+        "nested": True,
+        "drop": True,
+        "blobs": 6,
+        "runs": [
+            {"mode": "band", "z0": 4, "z1": 36, "column": 192, "batch": 3},
+            {"mode": "band", "z0": 0, "z1": 40, "column": 96, "batch": 4},
+            {"mode": "band", "z0": 10, "z1": 12, "column": 480, "batch": 4, "only": [0]},
+        ],
+    },
     # stored chunks that are all zero still run in villa mode
-    dict(name="villa", shape=(150, 420, 330), region=(150, 200, 260), chunks=(64, 64, 64),
-         compressor=numcodecs.Blosc(cname="lz4", clevel=5, shuffle=numcodecs.Blosc.SHUFFLE), nested=False,
-         drop=True, blobs=4, sparse=True, runs=[
-             dict(mode="villa", z0=0, z1=150, column=192, batch=1),
-             dict(mode="band", z0=20, z1=120, column=288, batch=16),
-         ]),
+    {
+        "name": "villa",
+        "shape": (150, 420, 330),
+        "region": (150, 200, 260),
+        "chunks": (64, 64, 64),
+        "compressor": numcodecs.Blosc(cname="lz4", clevel=5, shuffle=numcodecs.Blosc.SHUFFLE),
+        "nested": False,
+        "drop": True,
+        "blobs": 4,
+        "sparse": True,
+        "runs": [
+            {"mode": "villa", "z0": 0, "z1": 150, "column": 192, "batch": 1},
+            {"mode": "band", "z0": 20, "z1": 120, "column": 288, "batch": 16},
+        ],
+    },
     # every axis shorter than a tile: one tile, reflected on every side, more than once in z
-    dict(name="tiny", shape=(6, 50, 70), chunks=(4, 32, 32), compressor=numcodecs.Zstd(level=1), nested=False,
-         drop=True, blobs=3, runs=[
-             dict(mode="band", z0=0, z1=6, column=480, batch=4),
-             dict(mode="villa", z0=0, z1=6, column=96, batch=1),
-         ]),
+    {
+        "name": "tiny",
+        "shape": (6, 50, 70),
+        "chunks": (4, 32, 32),
+        "compressor": numcodecs.Zstd(level=1),
+        "nested": False,
+        "drop": True,
+        "blobs": 3,
+        "runs": [
+            {"mode": "band", "z0": 0, "z1": 6, "column": 480, "batch": 4},
+            {"mode": "villa", "z0": 0, "z1": 6, "column": 96, "batch": 1},
+        ],
+    },
 ]
 
 
@@ -99,8 +133,9 @@ def feed(ref, ct_path: Path, run: dict) -> list[dict]:
     pz_all = contract.positions(nz)
     todo = [(i, col, cols.tiles(col, pz_all)) for i, col in enumerate(cols.cols) if only is None or i in only]
     runs = villa.VillaSelection(ct_path, ct.shape).tile_runs if run["mode"] == "villa" else None
-    f = pipeline.TileFeed(_FakeTorch, str(ct_path), z0, z1, [(i, t) for i, _, t in todo], run["batch"], 3,
-                          pin=False, runs=runs)
+    f = pipeline.TileFeed(
+        _FakeTorch, str(ct_path), z0, z1, [(i, t) for i, _, t in todo], run["batch"], 3, pin=False, runs=runs
+    )
     out = []
     try:
         for i, col, tiles in todo:
@@ -111,8 +146,10 @@ def feed(ref, ct_path: Path, run: dict) -> list[dict]:
                 if isinstance(item, pipeline.ColumnEnd):
                     break
                 x = np.ascontiguousarray(item.x.numpy()[:, 0])
-                batches.append(dict(origins=[list(t) for t in item.tiles], sha256=hashlib.sha256(x.tobytes()).hexdigest()))
-            out.append(dict(index=i, col=list(col), tiles=len(tiles), tiles_air=item.air, batches=batches))
+                batches.append(
+                    {"origins": [list(t) for t in item.tiles], "sha256": hashlib.sha256(x.tobytes()).hexdigest()}
+                )
+            out.append({"index": i, "col": list(col), "tiles": len(tiles), "tiles_air": item.air, "batches": batches})
     finally:
         f.close()
     return out
