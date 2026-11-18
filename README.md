@@ -107,14 +107,14 @@ earlier uninterrupted run of the original on the same band took 12,728 s.
 
 ## Differences from the original
 
-- Fields live in memory as sparse 16³ bricks instead of a Zarr work store, so peak memory is higher and
-  grows with how much of the band holds fibres: about 10.4 GiB against the original's 4.6 GiB on a 512 ×
-  8169 × 8169 band of PHerc0826, and 13.3 GiB on 1024 × 8169 × 8169 of the same scroll. The peak varies by
-  about a gigabyte between runs of the same band, with thread timing. With `--field-cache-mib 4096`, 4.1 GiB
-  of that is the chunk cache; a smaller cache lowers the peak by the difference but decodes chunks again (at
-  a 1 GiB cache the 1024-plane window peaked at 9.8 GiB and traced about 19% slower; at 16 MiB tracing took
-  about 60% longer). Memory each stage frees goes back to the system before the next stage allocates.
-  `FIBRS_DEBUG_MEM=1` logs each stage's field sizes and resident memory.
+- Fields live in memory as sparse 16³ bricks instead of a Zarr work store, so peak memory is higher and grows
+  with how much of the band holds fibres: 8.8 GiB against the original's 4.6 GiB on a 512 × 8169 × 8169 band
+  of PHerc0826, and 13.3 GiB on 1024 × 8169 × 8169 of the same scroll. With `--field-cache-mib 4096`, 4.1 GiB
+  of that is the chunk cache; a smaller cache lowers the peak by the difference but decodes chunks again (at a
+  1 GiB cache the 1024-plane window peaked at 9.8 GiB and traced about 19% slower; at 16 MiB tracing took
+  about 60% longer). Memory each stage frees goes back to the system before the next stage allocates, and on
+  Linux each allocation of 1 MiB or more (a decoded chunk, a tile's results) has its own mapping, so evicted
+  chunks do not stay resident. `FIBRS_DEBUG_MEM=1` logs each stage's field sizes and resident memory.
 - The work directory holds `run.json` (with a `native` key, so neither tool resumes the other's
   directory) and one finished curve file per family. An interrupted family is traced again from its first
   seed on `--resume`, instead of from the last 16-seed batch.

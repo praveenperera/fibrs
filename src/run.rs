@@ -423,6 +423,7 @@ pub fn run(args: Args) -> Result<Summary> {
     if args.origin_xyz.iter().min().copied().unwrap_or(0) < 0 || args.native_cache_mib < 1 || args.cuda_device < 0 {
         bail!("Invalid origin, cache size or CUDA device");
     }
+    fix_mmap_threshold();
     let max_threads = numba_max_threads();
     let threads = args.threads.unwrap_or(8.min(max_threads));
     if threads < 1 || threads > max_threads {
@@ -754,6 +755,24 @@ fn release_freed() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::malloc_trim(0);
+    }
+}
+
+/// Serve every allocation of 1 MiB or more with its own mapping, which goes back to the system when freed
+///
+/// glibc starts at 128 KiB but raises the threshold to the size of each mapped block freed, up to 32 MiB, so
+/// after the first few the chunk cache's 4 MiB chunks and the stages' tile buffers come from the per-thread
+/// arenas instead, where they fragment and stay resident as they are evicted and freed on other threads: on a
+/// 512-plane 0826 band the peak varied from 8.9 to 10.8 GiB between runs without this and was 8.8 GiB in each
+/// of three runs with it, at the same speed. Setting the threshold also stops glibc's adjustment.
+/// `MALLOC_MMAP_THRESHOLD_` in the environment still takes precedence
+fn fix_mmap_threshold() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none() {
+        // SAFETY: mallopt only changes how later allocations are served; it touches no live allocation
+        unsafe {
+            libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
+        }
     }
 }
 
