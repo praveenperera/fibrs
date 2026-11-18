@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, TryLockError};
-use std::io::{ErrorKind as IoErrorKind, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -348,13 +348,10 @@ fn lock_output(attempts: &fs::File, out: &Path) -> Result<()> {
         Err(TryLockError::WouldBlock) => {
             bail!("{} is in use by another fibrs predict run; wait for it to end or use another --out", out.display())
         }
-        // a filesystem without locks still runs, as the Python version does, but unguarded
-        Err(TryLockError::Error(e)) if e.kind() == IoErrorKind::Unsupported => {
-            let out = out.display();
-            eprintln!("fibrs predict: warning: cannot lock {out} ({e}); run one fibrs predict on it at a time");
-            Ok(())
+        // unguarded, two runs would lose each other's columns, so a filesystem without locks is refused
+        Err(TryLockError::Error(e)) => {
+            bail!("cannot lock {} ({e}); fibrs predict needs an output on a filesystem with file locks", out.display())
         }
-        Err(TryLockError::Error(e)) => bail!("cannot lock {}: {e}", out.display()),
     }
 }
 

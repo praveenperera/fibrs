@@ -122,7 +122,8 @@ earlier uninterrupted run of the original on the same band took 12,728 s.
   Linux each allocation of 1 MiB or more (a decoded chunk, a tile's results) has its own mapping, so evicted
   chunks do not stay resident. `FIBRS_DEBUG_MEM=1` logs each stage's field sizes and resident memory.
 - The work directory holds `run.json` (with a `native` key, so neither tool resumes the other's
-  directory) and one finished curve file per family. An interrupted family is traced again from its first
+  directory, and only the fibrs version that started it resumes it) and one finished curve file per
+  family. An interrupted family is traced again from its first
   seed on `--resume`, instead of from the last 16-seed batch.
 - `--storage` and `--field-cache-mib` are validated, and `--storage` is recorded in `run.json` as the
   original records it, but neither selects anything. The chunk cache is bounded by `--native-cache-mib`

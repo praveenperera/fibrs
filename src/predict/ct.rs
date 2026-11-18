@@ -26,6 +26,31 @@ struct Cache {
     chunks: HashMap<[usize; 3], Chunk>,
     order: VecDeque<[usize; 3]>,
     bytes: usize,
+    /// Bytes of the chunks being decoded, which count against the bound before they land
+    decoding: usize,
+}
+
+impl Cache {
+    /// Evicts the oldest chunks until `extra` more bytes fit, or none are left
+    fn make_room(&mut self, extra: usize) {
+        while self.bytes + self.decoding + extra > CACHE_BYTES {
+            let Some(old) = self.order.pop_front() else { return };
+            if let Some(c) = self.chunks.remove(&old) {
+                self.bytes -= c.len();
+            }
+        }
+    }
+}
+
+/// A decode's share of the cache bound, given back when the decode ends, whether it succeeded or not
+struct Decoding<'a>(&'a Mutex<Cache>, usize);
+
+impl Drop for Decoding<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut cache) = self.0.lock() {
+            cache.decoding -= self.1;
+        }
+    }
 }
 
 /// A 3D uint8 Zarr v2 array
@@ -105,18 +130,17 @@ impl Ct {
         let sep = if self.nested { "/" } else { "." };
         let name = format!("{}{sep}{}{sep}{}", key[0], key[1], key[2]);
         let n: usize = self.chunks.iter().product();
-        // room for this chunk before it decodes, so the cache and the chunk together stay within the bound; a
-        // chunk larger than the bound empties the cache and is then kept alone, as decoding it for every tile
-        // would cost more than holding it
-        {
+        // room for this chunk, and for the others being decoded, before it decodes, so the cache and the
+        // decodes in flight together stay within the bound. When they cannot (chunks larger than the bound, or
+        // more decodes than fit) the cache empties, and each --readers thread holds only the chunk it decodes;
+        // a chunk larger than the bound is then kept alone, as decoding it for every tile costs more than
+        // holding it
+        let decoding = {
             let mut cache = self.cache.lock().map_err(|_| eyre!("CT cache poisoned"))?;
-            while cache.bytes + n > CACHE_BYTES {
-                let Some(old) = cache.order.pop_front() else { break };
-                if let Some(c) = cache.chunks.remove(&old) {
-                    cache.bytes -= c.len();
-                }
-            }
-        }
+            cache.make_room(n);
+            cache.decoding += n;
+            Decoding(&self.cache, n)
+        };
         let data = match fs::read(self.dir.join(&name)) {
             Ok(bytes) => {
                 let out = decode(self.compressor, bytes, n).map_err(|e| eyre!("CT chunk {name}: {e}"))?;
@@ -126,6 +150,7 @@ impl Ct {
             Err(e) if e.kind() == ErrorKind::NotFound => vec![self.fill; n],
             Err(e) => bail!("{}: {e}", self.dir.join(&name).display()),
         };
+        drop(decoding);
 
         let chunk = Arc::new(data);
         let mut cache = self.cache.lock().map_err(|_| eyre!("CT cache poisoned"))?;
@@ -134,7 +159,7 @@ impl Ct {
             cache.bytes += chunk.len();
         }
         // another reader's chunk may have landed meanwhile; the newest stays
-        while cache.bytes > CACHE_BYTES && cache.order.len() > 1 {
+        while cache.bytes + cache.decoding > CACHE_BYTES && cache.order.len() > 1 {
             let old = cache.order.pop_front().expect("non-empty");
             if let Some(c) = cache.chunks.remove(&old) {
                 cache.bytes -= c.len();

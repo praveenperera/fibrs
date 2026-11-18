@@ -90,6 +90,8 @@ RTX 5090:
 - **GPUs and cuDNN:** outputs from different GPU models or cuDNN versions can differ slightly, as the model's own
   outputs do under PyTorch.
 - **Precision modes:** PyTorch's `fp32-ieee` and `fp16` modes aren't offered.
+- **Tracer resume across versions:** a tracer work directory started by fibrs 0.1.x resumes only with 0.1.x.
+  Finish it with that version, or start again in a new work directory.
 
 ## [0.1.1] - 2026-11-18
 
