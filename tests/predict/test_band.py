@@ -122,3 +122,23 @@ def test_changed_provenance_is_refused(ct, stub_snapshot, tmp_path):
                        env=dict(os.environ, CUDA_VISIBLE_DEVICES=""), capture_output=True, text=True, timeout=600,
                        check=False)
     assert p.returncode != 0 and "different provenance" in p.stderr
+
+
+def test_band_outside_the_ct_is_refused(ct, stub_snapshot, tmp_path):
+    """Negative bounds would index the CT from its end and record a negative origin"""
+    out = tmp_path / "afv.zarr"
+    args = ["--ct", str(ct), "--z0", "-96", "--z1", "-32", "--model-dir", str(stub_snapshot), "--out", str(out),
+            "--device", "cpu"]
+    p = subprocess.run(python_cmd() + ["-m", "fibrs.predict", *args], env=dict(os.environ, CUDA_VISIBLE_DEVICES=""),
+                       capture_output=True, text=True, timeout=600, check=False)
+    assert p.returncode != 0 and "must lie within the CT's 128 planes" in p.stderr
+    assert not (out / "semantic").exists()
+
+
+def test_cap_reached_before_the_first_column(ct, stub_snapshot, tmp_path):
+    """A cap that setup alone exceeds stops before any column and still writes the summary"""
+    out = tmp_path / "afv.zarr"
+    afv_run(ct, stub_snapshot, out, ["--max-minutes", "0.00001"])
+    summary = json.loads(next(out.glob("summary-*.json")).read_text())
+    assert summary["stopped_early"] and summary["columns_done"] == 0 and not summary["complete"]
+    assert not (out / "progress.jsonl").exists()

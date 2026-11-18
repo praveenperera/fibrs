@@ -12,6 +12,7 @@ import numpy as np
 
 from .contract import (
     BORDER,
+    CORE,
     DROP_IN_FOR,
     MODEL_FILES,
     OVERLAP,
@@ -53,6 +54,36 @@ TIMING = dict(
            "exceeds the run's time and is not comparable with the band reference's",
     this_run_wall_s="end to end, the comparable figure",
 )
+
+
+# bytes per voxel of one column on the device at its peak, in ColumnAccumulator.finish: the float32 sums (acc's two
+# channels and wsum, 12), then quantize's clamped float32 copy and finite mask beside acc (8 + 2 with acc's 8)
+COLUMN_BYTES_PER_VOXEL = 18
+
+
+def check_column_memory(torch, device, nz: int, ny: int, nx: int, column: int, villa: bool) -> None:
+    """Refuse, before any column runs, a column the CUDA device can't hold. A column's accumulator spans the whole
+    band height, so a tall volume needs a narrower column. The estimate leaves out the network's activations"""
+    if device.type != "cuda":
+        return
+    free, _ = torch.cuda.mem_get_info(device)
+    cy, cx = min(column, ny), min(column, nx)
+    need = COLUMN_BYTES_PER_VOXEL * nz * cy * cx
+    if need <= free:
+        return
+
+    # column sizes are multiples of the tile core (Columns)
+    fits = int((free / (COLUMN_BYTES_PER_VOXEL * nz)) ** 0.5) // CORE * CORE
+    if villa:
+        hint = (f"pass --column {fits} or less, which leaves villa mode's output unchanged" if fits >= CORE
+                else f"no column of {nz} planes fits")
+    else:
+        # in band mode the column size is part of the output, so a shorter band is the other way
+        hint = f"run a shorter band, or pass --column {fits} or less (band mode's output depends on it)"
+        if fits < CORE:
+            hint = "run a shorter band"
+    raise SystemExit(f"fibrs predict: a {cy} x {cx} column of {nz} planes needs about {need / 2**30:.1f} GiB on "
+                     f"{device}, which has {free / 2**30:.1f} GiB free; {hint}")
 
 
 def code_hashes() -> dict[str, str]:
@@ -119,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:
         if (a.z0, a.z1) not in ((None, None), (0, ct.shape[0])):
             raise ValueError(f"villa mode runs the whole array: --z0/--z1 must be left out or be 0 {ct.shape[0]}")
         a.z0, a.z1 = 0, int(ct.shape[0])
+    elif not 0 <= a.z0 < a.z1 <= ct.shape[0]:
+        raise ValueError(f"the band [{a.z0}, {a.z1}) must lie within the CT's {ct.shape[0]} planes")
     elif (a.z1 - a.z0) % 2:
         raise ValueError("band height must be even")
     hashes = {n: sha256(a.model_dir / n) for n in MODEL_FILES}
@@ -134,12 +167,16 @@ def main(argv: list[str] | None = None) -> int:
     label, short, amp_dtype = PRECISION[a.precision]
 
     nz, ny, nx = a.z1 - a.z0, ct.shape[1], ct.shape[2]
+    check_column_memory(torch, device, nz, ny, nx, a.column, villa)
     provenance = dict(model_sha256=hashes, code_sha256=code_hashes(), ct=str(a.ct.resolve()),
                       ct_identity=ct_identity(a.ct, a.z0, a.z1), z0=a.z0, z1=a.z1, tile=TILE, overlap=OVERLAP,
                       border=BORDER, column=a.column, batch=a.batch, precision=label,
                       normalization="model.py:normalize_ct per tile", air_tiles="skipped (all-zero input)",
                       torch=torch.__version__, cuda=torch.version.cuda, channel_order="VH", reference=REFERENCE,
                       engine="fibrs-predict", drop_in_for=DROP_IN_FOR)
+    # CPU, CUDA and MPS round differently, as can different GPUs, so a resume must run where the output started
+    provenance.update(device=device.type,
+                      gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None)
     selection = None
     if villa:
         # band mode's record stays exactly as it was; villa mode names itself and its reference instead
@@ -228,7 +265,9 @@ def main(argv: list[str] | None = None) -> int:
         feed.close()
         writer.drain()
 
-    recs = [json.loads(line) for line in progress_f.read_text().splitlines() if line]
+    # a cap reached during setup stops before any column, so a fresh output may have no progress yet
+    lines = progress_f.read_text().splitlines() if progress_f.exists() else []
+    recs = [json.loads(line) for line in lines if line]
     # the band reference's timing fields, with the meanings they take in an overlapped run
     summary = dict(model="AFV v2", precision=short, attempt=t_start, end=time.time(),
                    complete=len(recs) == len(cols.cols), identity=prediction_identity(a.out),
