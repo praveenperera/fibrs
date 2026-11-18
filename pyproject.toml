@@ -6,13 +6,13 @@ build-backend = "maturin"
 name = "fibrs"
 # the version of Cargo.toml
 dynamic = ["version"]
-description = "Native drop-in for Qual's AVF_SPLINE_GENERATOR 0.2.0: traces AFV V/H fibre predictions into the same .afv"
+description = "Native drop-in for Qual's AVF_SPLINE_GENERATOR 0.2.0: traces AFV V/H fibre predictions into the same .afv, and with the predict extra runs the AFV fibre model V2 faster"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "licenses/*.txt"]
 authors = [{ name = "Praveen Perera", email = "me@praveenperera.com" }]
-keywords = ["vesuvius-challenge", "herculaneum", "papyrus", "fibre-tracing", "afv", "avf-spline-generator"]
+keywords = ["vesuvius-challenge", "herculaneum", "papyrus", "fibre-tracing", "afv", "avf-spline-generator", "inference"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Science/Research",
@@ -26,6 +26,19 @@ classifiers = [
 # the reference does. macOS numpy wheels link Accelerate and bundle no OpenBLAS, so there the same OpenBLAS build as
 # numpy 2.4.6's Linux wheel comes from scipy-openblas64
 dependencies = ["numpy>=2", "scipy-openblas64==0.3.31.188.0; sys_platform == 'darwin'"]
+
+[project.optional-dependencies]
+# fibrs.predict, the AFV fibre model V2 inference, at the versions its same-output checks ran with (villa's own run
+# used its pinned environment): torch 2.14.1 with numpy 2.4.6, and torch 2.15.0 with numpy 2.5.4 (CPU crops,
+# identical); zarr 2.18.7, numcodecs 0.15.2 and the model repository's dynamic-network-architectures pin. torch stops
+# before 2.16, which no check has run; zarr 2 because the output is a zarr v2 group written through its API. torch
+# 2.14 needs Python 3.10 or later
+predict = [
+  "torch>=2.14.1,<2.16",
+  "zarr>=2.18,<3",
+  "numcodecs>=0.15,<0.16",
+  "dynamic-network-architectures==0.4.4",
+]
 
 [project.urls]
 Repository = "https://github.com/praveenperera/fibrs"
@@ -46,3 +59,7 @@ rust = false
 
 [tool.ruff]
 line-length = 120
+
+# fibrs.predict is kept as it was when its output was compared with villa's, so a style-only rule does not change it
+[tool.ruff.lint.per-file-ignores]
+"python/fibrs/predict/*" = ["C408"]

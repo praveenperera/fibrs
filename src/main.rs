@@ -7,6 +7,7 @@ mod fields;
 mod finish;
 mod input;
 mod kernels;
+mod predict;
 mod pyfmt;
 mod run;
 mod vol;
@@ -41,11 +42,16 @@ extern "C" fn on_interrupt(_: libc::c_int) {
 }
 
 fn main() {
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    // before the tracer's environment and signal handler, which the Python process must not inherit
+    if predict::requested(&argv) {
+        predict::exec(&argv[2..]);
+    }
+
     // numpy's OpenBLAS is loaded only for 3x3 eigenproblems; its own thread pool would only add threads
     // beyond --threads. Set before any thread exists
     unsafe { std::env::set_var("OPENBLAS_NUM_THREADS", "1") };
     unsafe { libc::signal(libc::SIGINT, on_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t) };
-    let argv: Vec<OsString> = std::env::args_os().collect();
     // argparse runs the help and version actions as it meets them, before it checks required flags
     let args = match run::prescan(&argv[1..]) {
         run::Prescan::Help => {

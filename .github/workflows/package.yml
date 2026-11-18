@@ -143,6 +143,24 @@ jobs:
           test "$(venv-ref/bin/fibrs --version)" = 0.2.0
           test "$(venv-ref/bin/python -m fibrs --version)" = 0.2.0
 
+      # fibrs predict from the wheel's predict extra, with the CPU build of torch: tests/predict runs a stub network
+      # on the CPU, from a copy outside the checkout so it imports the installed package; its comparison with villa
+      # needs a villa environment and skips here
+      - name: Test fibrs predict
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        env:
+          DIST: ${{ github.workspace }}/dist
+        run: |
+          set -euo pipefail
+          uv venv -q --python 3.12 venv-predict
+          wheel=$(ls "$DIST"/fibrs-*.whl)
+          uv pip install -q --python venv-predict/bin/python --torch-backend cpu "${wheel}[predict]" pytest
+          venv-predict/bin/fibrs predict --help
+          venv-predict/bin/python -m fibrs predict --help >/dev/null
+          cp -r "$GITHUB_WORKSPACE/tests/predict" predict-tests
+          venv-predict/bin/python -B -m pytest -p no:cacheprovider -rA predict-tests
+
       - name: Upload the wheel and CLI archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

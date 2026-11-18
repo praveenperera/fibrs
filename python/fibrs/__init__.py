@@ -2,6 +2,7 @@
 
     python -m fibrs --predictions P --output fibers.afv --work-dir work ...
     from fibrs import run; run(["--predictions", P, ...])  # returns the exit status
+    python -m fibrs predict --ct CT --model-dir SNAPSHOT --out OUT.zarr ...  # fibrs.predict, the predict extra
 
 Takes the reference CLI's arguments unchanged (``avf_spline_generator.cli.parser``) and writes the same ``.afv``.
 The native binary is found through ``FIBRS_BIN``, then ``bin/fibrs`` next to this package,
@@ -77,5 +78,11 @@ def run(argv: list[str]) -> int:
 
 
 def main() -> None:
-    """Console entry: the process exits with the tracer's status"""
-    raise SystemExit(run(sys.argv[1:]))
+    """Console entry: ``predict`` runs fibrs.predict in this interpreter, anything else the tracer; the process
+    exits with its status"""
+    argv = sys.argv[1:]
+    if argv[:1] == ["predict"]:
+        from .predict import main as predict
+
+        raise SystemExit(predict(argv[1:]))
+    raise SystemExit(run(argv))

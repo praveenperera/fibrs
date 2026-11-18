@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+- `fibrs predict` (and `python -m fibrs.predict`) runs Qual's AFV fibre model V2 over a CT and writes the
+  probability zarr that villa's `lasagna.qualzz_inference` writes, faster; in its CPU checks, `--mode villa` wrote
+  the same arrays as villa. Its dependencies (torch, zarr 2) come with the `predict` extra,
+  `pip install "fibrs[predict]"`, so the tracer's install is unchanged.
+
 ## [0.1.1] - 2026-11-18
 
 - `scripts/install-dropin.sh --restore` puts back the `fibrs` that the wheel installed. It used to remove it, which
