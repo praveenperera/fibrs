@@ -64,17 +64,36 @@ PyTorch.
 
 ### Speed
 
-⟦SPEED⟧ The figures come from interleaved (ABBA) runs on the same 726-tile crop of PHerc0826, end to end, on one
-RTX 5090:
+Against villa's `lasagna.qualzz_inference` on PyTorch, the current best implementation, at its default
+precision (float32 with TF32 tensor-core convolutions). Both ran the same 726-tile crop of PHerc0826 (z
+12032–12544, y 4096–5120, x 1536–2560) on one RTX 5090 (driver 595.112.07). The runs alternated (ABBA), with 6
+timed pairs per precision after 2 warm-up pairs, and each time is the whole command's wall time. The speedup is
+the mean of the per-pair ratios:
 
-| Precision | villa `lasagna.qualzz_inference` | `fibrs predict --mode villa` | Speedup |
+| `fibrs predict --mode villa` precision | villa, PyTorch fp32 (median) | fibrs (median) | Speedup, mean (95% CI) |
 |---|---|---|---|
-| fp32 | ⟦⟧ | ⟦⟧ | ⟦⟧ |
-| bf16 | ⟦⟧ | ⟦⟧ | ⟦⟧ |
+| fp32 (default) | 45.37 s | 26.77 s | 1.72× (1.66–1.78×) |
+| bf16 (opt-in) | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) |
+
+fibrs ran with cuDNN 9.27.0 and cuBLAS 13.4.1.3. villa ran PyTorch 2.14.1 (CUDA 13.0) with cuDNN 9.24, at
+`0bddf2757`.
 
 ### Parity
 
-⟦PARITY⟧
+- **fp32 (default)**, `fibrs predict --mode villa` against villa main's `lasagna.qualzz_inference` (`0bddf2757`)
+  on the same crop:
+  - the 99.9th percentile of the probability differences over the foreground is 1 of 255 in each channel;
+  - the largest difference is 3 of 255;
+  - the most likely class agrees at 99.97% of voxels in `semantic` and 99.973% in `tracing`;
+  - both cover all 256 output chunks, and leave nothing uncovered.
+
+  The outputs aren't identical, as expected from a different implementation. The differences are of the same
+  order as two runs of villa itself with `cudnn.benchmark` on (99.9th percentile 1).
+  Scoring the timed runs' outputs against the same bar is still in progress.
+- **Band mode** matches the reference engine value for value on a full PHerc0826 band, with 0 differences at
+  fp32 and at bf16. fibrs doesn't store chunks that are entirely zero, so its output is smaller on disk; zarr
+  reads a missing chunk as zero.
+- **bf16 (opt-in)** against fp32: the figures under Precision.
 
 ### Known limitations
 
