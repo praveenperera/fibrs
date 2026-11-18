@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use crate::afv::{ExportOptions, MinLength, Summary, export_afv};
 use crate::axes::{Lapack, direction_field, find_lapack};
-use crate::fields::{FamilyFields, catalogue, centrality, presence};
+use crate::fields::{FamilyFields, Presence, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
 use crate::input::Predictions;
 use crate::kernels::{Coverage, Fields, RawCurve, Scratch, trace_seed};
@@ -693,8 +693,8 @@ fn trace_families(
     let lapack = Lapack::init(&find_lapack()?)?;
     let (nx, ny) = direction_field(&tracing, lapack)?;
     release_freed();
-    debug_dump(work, "nx", &nx)?;
-    debug_dump(work, "ny", &ny)?;
+    debug_dump(work, "nx", || nx.read_block([0, 0, 0], nx.shape()))?;
+    debug_dump(work, "ny", || ny.read_block([0, 0, 0], ny.shape()))?;
     log!("Direction field: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem("direction field", &[("tracing", resident), ("nx", nx.resident_bytes()), ("ny", ny.resident_bytes())]);
     let cache = NativeCache::new(native, cache_bytes);
@@ -707,11 +707,11 @@ fn trace_families(
 
 /// With `FIBRS_DEBUG_FIELDS` set, write a field densely as raw little-endian `NAME.raw` for comparison
 /// with the reference's work arrays; only sensible for small crops
-fn debug_dump<T: Copy + PartialEq + Send + Sync + ToLe>(dir: &Path, name: &str, vol: &Vol<T>) -> Result<()> {
+fn debug_dump<T: Copy + ToLe>(dir: &Path, name: &str, dense: impl FnOnce() -> Vec<T>) -> Result<()> {
     if std::env::var_os("FIBRS_DEBUG_FIELDS").is_none() {
         return Ok(());
     }
-    let dense = vol.read_block([0, 0, 0], vol.shape());
+    let dense = dense();
     let bytes: Vec<u8> = dense.iter().flat_map(|v| v.to_le()).collect();
     fs::write(dir.join(format!("{name}.raw")), bytes)?;
     Ok(())
@@ -737,7 +737,7 @@ impl ToLe for u16 {
 /// Hand the heap pages freed since the last call back to the system
 ///
 /// Each stage frees what the next does not read (the direction field's and centrality's tile results, the seed
-/// field, a finished family's presence, centrality and coverage), but glibc keeps freed memory in the arena of
+/// field, a finished family's centrality and coverage), but glibc keeps freed memory in the arena of
 /// the thread that freed it and only trims the top of each heap. The next stage allocates from other threads'
 /// arenas (coverage grows on the tracing thread, the next family's fields on the pool's), so without this the
 /// freed bytes stay resident beside the new ones: on a 0826 band the H family peaked 1.7 GiB above V with the
@@ -779,17 +779,21 @@ fn trace_family(
     let folder = family_dir(work, family);
     fs::create_dir_all(&folder)?;
     let t = Instant::now();
-    let FamilyFields { pres, cent, seeds } = centrality(presence(tracing, family), nx, ny);
+    let pres = Presence::new(tracing, family);
+    let FamilyFields { cent, seeds } = centrality(&pres, nx, ny);
     log!("{label} centrality: {:.1} s", t.elapsed().as_secs_f64());
-    debug_mem(
-        label,
-        &[("pres", pres.resident_bytes()), ("cent", cent.resident_bytes()), ("seeds", seeds.resident_bytes())],
-    );
+    debug_mem(label, &[("cent", cent.resident_bytes()), ("seeds", seeds.len() * 16)]);
     let t = Instant::now();
     let cat = catalogue(&seeds, &cent);
-    debug_dump(&folder, "presence", &pres)?;
-    debug_dump(&folder, "centrality", &cent)?;
-    debug_dump(&folder, "seeds", &seeds)?;
+    debug_dump(&folder, "presence", || pres.read_block([0, 0, 0], pres.shape()))?;
+    debug_dump(&folder, "centrality", || cent.read_block([0, 0, 0], cent.shape()))?;
+    debug_dump(&folder, "seeds", || {
+        let mut dense = Vol::new(cent.shape(), 0u8);
+        for &([z, y, x], v) in &seeds {
+            dense.set(z as usize, y as usize, x as usize, v);
+        }
+        dense.read_block([0, 0, 0], dense.shape())
+    })?;
     if std::env::var_os("FIBRS_DEBUG_FIELDS").is_some() {
         let bytes: Vec<u8> = cat.coords.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
         fs::write(folder.join("coordinates.i4"), bytes)?;
@@ -840,8 +844,7 @@ fn trace_family(
         if !batch.is_empty() {
             let _ = tx.send(batch);
         }
-        let cov_bytes = [&cov.cnt, &cov.nx, &cov.ny].map(Vol::resident_bytes);
-        debug_mem(label, &[("coverage", cov_bytes.iter().sum()), ("cache", cache.bytes()), ("catalogue", 12 * total)]);
+        debug_mem(label, &[("coverage", cov.resident_bytes()), ("cache", cache.bytes()), ("catalogue", 12 * total)]);
         Ok(count)
     };
     let consume = |batch: Vec<RawCurve>| -> Result<()> {

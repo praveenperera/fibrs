@@ -64,6 +64,14 @@ impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
         }
     }
 
+    /// The allocated brick holding an in-bounds voxel, or None where every voxel of the brick reads as the
+    /// default, and the voxel's offset in it
+    #[inline(always)]
+    pub fn locate(&self, z: usize, y: usize, x: usize) -> (Option<&[T]>, usize) {
+        debug_assert!(z < self.shape[0] && y < self.shape[1] && x < self.shape[2]);
+        (self.bricks[self.brick_index(z, y, x)].as_deref(), Self::offset(z, y, x))
+    }
+
     /// The value at a voxel given as signed coordinates, which must be in bounds
     #[inline(always)]
     pub fn at(&self, z: i64, y: i64, x: i64) -> T {
@@ -120,28 +128,8 @@ impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
         out
     }
 
-    /// Visit every voxel whose value differs from the default, in C order over the whole volume
-    pub fn for_each_set(&self, mut f: impl FnMut(usize, usize, usize, T)) {
-        for z in 0..self.shape[0] {
-            for y in 0..self.shape[1] {
-                for bx in 0..self.grid[2] {
-                    let Some(b) = &self.bricks[((z >> SHIFT) * self.grid[1] + (y >> SHIFT)) * self.grid[2] + bx] else {
-                        continue;
-                    };
-                    let row = Self::offset(z, y, 0);
-                    let width = EDGE.min(self.shape[2] - bx * EDGE);
-                    for (dx, &v) in b[row..row + width].iter().enumerate() {
-                        if v != self.default {
-                            f(z, y, bx * EDGE + dx, v);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Whether any voxel of the block `[lo, lo + dims)` differs from the default
-    pub fn any_set_in(&self, lo: Shape, dims: Shape, pred: impl Fn(T) -> bool) -> bool {
+    /// Whether `f(z, y, x)` holds at any voxel of the block `[lo, lo + dims)` that lies in an allocated brick
+    pub fn any_allocated_in(&self, lo: Shape, dims: Shape, f: impl Fn(usize, usize, usize) -> bool) -> bool {
         let first = lo.map(|v| v >> SHIFT);
         let last = [0, 1, 2].map(|a| (lo[a] + dims[a] - 1) >> SHIFT);
         for bz in first[0]..=last[0] {
@@ -156,7 +144,7 @@ impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
                     for z in a0[0]..a1[0] {
                         for y in a0[1]..a1[1] {
                             for x in a0[2]..a1[2] {
-                                if pred(self.get(z, y, x)) {
+                                if f(z, y, x) {
                                     return true;
                                 }
                             }
@@ -168,16 +156,9 @@ impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
         false
     }
 
-    /// Fill bricks in parallel: `f(brick_lo, brick_dims, out)` writes one brick's voxels in C order
-    /// (dims clipped at the volume edge) and returns whether any differs from the default
-    pub fn fill_bricks<F>(&mut self, f: F)
-    where
-        F: Fn(Shape, Shape, &mut [T]) -> bool + Sync,
-    {
-        self.fill_brick_rows(0..self.grid[0], f);
-    }
-
-    /// `fill_bricks` for the bricks whose z index lies in `rows`; the others are left as they are
+    /// Fill the bricks whose z index lies in `rows` in parallel, leaving the others as they are:
+    /// `f(brick_lo, brick_dims, out)` writes one brick's voxels in C order (dims clipped at the volume edge) and
+    /// returns whether any differs from the default
     pub fn fill_brick_rows<F>(&mut self, rows: Range<usize>, f: F)
     where
         F: Fn(Shape, Shape, &mut [T]) -> bool + Sync,

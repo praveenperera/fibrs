@@ -283,13 +283,17 @@ pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<(Vol<u
     let grid = shape.map(|n| n.div_ceil(CORE));
     let tiles: Vec<Shape> =
         (0..grid[0]).flat_map(|z| (0..grid[1]).flat_map(move |y| (0..grid[2]).map(move |x| [z, y, x]))).collect();
-    let results: Vec<Result<Option<TileAxes>>> = tiles.par_iter().map(|&t| tile_axes(tracing, t, lapack)).collect();
     let mut nx = Vol::new(shape, 128u8);
     let mut ny = Vol::new(shape, 128u8);
-    for r in results {
-        let Some((lo, dims, xx, yy)) = r? else { continue };
-        nx.write_block(lo, dims, &xx);
-        ny.write_block(lo, dims, &yy);
+    // tiles run a few per thread at a time and are written before the next run, so the dense tile results held
+    // at once stay small; tile cores are disjoint, so the order they are written in does not matter
+    for part in tiles.chunks(4 * rayon::current_num_threads()) {
+        let results: Vec<Result<Option<TileAxes>>> = part.par_iter().map(|&t| tile_axes(tracing, t, lapack)).collect();
+        for r in results {
+            let Some((lo, dims, xx, yy)) = r? else { continue };
+            nx.write_block(lo, dims, &xx);
+            ny.write_block(lo, dims, &yy);
+        }
     }
     Ok((nx, ny))
 }

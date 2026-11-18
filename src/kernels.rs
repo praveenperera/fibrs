@@ -305,36 +305,51 @@ pub fn ortho_basis(ux: f64, uy: f64, uz: f64) -> [f64; 6] {
     [e1x, e1y, e1z, e2x, e2y, e2z]
 }
 
-/// Mutable coverage of one family: count (0, 1, 2) and the first marking direction
-pub struct Coverage {
-    pub cnt: Vol<u8>,
-    pub nx: Vol<u8>,
-    pub ny: Vol<u8>,
-}
+/// Mutable coverage of one family: the reference's count (0, 1, 2) and first marking direction, packed in one
+/// `u16` per voxel
+///
+/// 0 is a count of 0 and 1 a count of 2, whose direction the reference never reads; a count of 1 stores the
+/// direction as `nx << 8 | ny`, which is at least 256 because `encode_dir` never returns a 0 byte. One volume
+/// instead of three saves a byte per covered voxel
+pub struct Coverage(Vol<u16>);
+
+const UNCOVERED: u16 = 0;
+const COVERED_TWICE: u16 = 1;
 
 impl Coverage {
     pub fn new(shape: [usize; 3]) -> Self {
-        Self { cnt: Vol::new(shape, 0), nx: Vol::new(shape, 0), ny: Vol::new(shape, 0) }
+        Self(Vol::new(shape, UNCOVERED))
+    }
+
+    /// Whether a voxel has been marked at all
+    #[inline]
+    pub fn is_covered(&self, z: i64, y: i64, x: i64) -> bool {
+        self.0.at(z, y, x) != UNCOVERED
+    }
+
+    /// Bytes held by allocated bricks
+    pub fn resident_bytes(&self) -> usize {
+        self.0.resident_bytes()
     }
 
     /// `is_covered_same_dir` (core.py:237)
     #[inline]
     pub fn covered_same_dir(&self, x: f64, y: f64, z: f64, tx: f64, ty: f64, tz: f64) -> bool {
-        let [d, h, w] = self.cnt.dims();
+        let [d, h, w] = self.0.dims();
         let ix = (x + 0.5) as i64;
         let iy = (y + 0.5) as i64;
         let iz = (z + 0.5) as i64;
         if ix < 0 || ix >= w || iy < 0 || iy >= h || iz < 0 || iz >= d {
             return false;
         }
-        let c = self.cnt.at(iz, iy, ix);
-        if c == 0 {
+        let c = self.0.at(iz, iy, ix);
+        if c == UNCOVERED {
             return false;
         }
-        if c >= 2 {
+        if c == COVERED_TWICE {
             return true;
         }
-        let [ux, uy, uz] = decode_dir(self.nx.at(iz, iy, ix), self.ny.at(iz, iy, ix));
+        let [ux, uy, uz] = decode_dir((c >> 8) as u8, c as u8);
         (ux * tx + uy * ty + uz * tz).abs() > 0.86
     }
 
@@ -345,7 +360,7 @@ impl Coverage {
         pts: &[[f32; 3]],
         tans: &[[f32; 3]],
     ) {
-        let [d, h, w] = self.cnt.dims();
+        let [d, h, w] = self.0.dims();
         let core_r2 = (2.05f64 * 2.05) as f32 as f64;
         for (p, t) in pts.iter().zip(tans) {
             let [px, py, pz] = p.map(|v| v as f64);
@@ -392,15 +407,19 @@ impl Coverage {
                             continue;
                         }
                         let (zu, yu, xu) = (zz as usize, yy as usize, xx as usize);
-                        if self.cnt.get(zu, yu, xu) == 0 {
-                            self.cnt.set(zu, yu, xu, 1);
-                            self.nx.set(zu, yu, xu, bnx);
-                            self.ny.set(zu, yu, xu, bny);
+                        let c = self.0.get(zu, yu, xu);
+                        if c == UNCOVERED {
+                            debug_assert!(bnx != 0);
+                            self.0.set(zu, yu, xu, (bnx as u16) << 8 | bny as u16);
                             continue;
                         }
-                        let [ux0, uy0, uz0] = decode_dir(self.nx.get(zu, yu, xu), self.ny.get(zu, yu, xu));
+                        // a count of 2 stays 2 whichever way the new direction points
+                        if c == COVERED_TWICE {
+                            continue;
+                        }
+                        let [ux0, uy0, uz0] = decode_dir((c >> 8) as u8, c as u8);
                         if (ux0 * tx + uy0 * ty + uz0 * tz).abs() <= 0.85 {
-                            self.cnt.set(zu, yu, xu, 2);
+                            self.0.set(zu, yu, xu, COVERED_TWICE);
                         }
                     }
                 }
@@ -729,7 +748,7 @@ pub fn trace_seed<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>>(
     out: &mut Vec<RawCurve>,
 ) -> Result<()> {
     let [sz, sy, sx] = seed.map(|v| v as i64);
-    if !primary && cov.cnt.at(sz, sy, sx) > 0 {
+    if !primary && cov.is_covered(sz, sy, sx) {
         return Ok(());
     }
     let [ux, uy, uz] = f.dir_at(sz, sy, sx);
