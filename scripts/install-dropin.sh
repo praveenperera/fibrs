@@ -6,11 +6,16 @@
 # BINARY defaults to the fibrs beside this script's directory (the release archive's layout), then to
 # the one on PATH. The reference entry script moves to VENV/bin/avf-spline-generator.reference; the native
 # binary is copied to VENV/bin/fibrs and avf-spline-generator becomes a symlink to it; NOTICE and licenses/ go
-# to VENV/share/fibrs. --restore puts the reference entry back and keeps a VENV/bin/fibrs that the fibrs wheel
-# installed. The binary finds numpy's OpenBLAS through its own path (VENV/bin/.. /lib/python*/site-packages/numpy.libs, or the
+# to VENV/share/fibrs. When the fibrs wheel installed VENV/bin/fibrs, a different BINARY replaces it and the wheel's
+# moves to VENV/bin/fibrs.wheel. --restore puts the reference entry and the wheel's fibrs back. The binary finds numpy's OpenBLAS through its own path (VENV/bin/.. /lib/python*/site-packages/numpy.libs, or the
 # scipy-openblas64 package's lib/ on macOS, where numpy links Accelerate instead), so
 # callers that run Path(sys.executable).parent / "avf-spline-generator" need no other change
 set -euo pipefail
+
+# pip lists the files it installed in the wheel's RECORD, bin/fibrs as ../../../bin/fibrs
+wheel_owns_fibrs() {
+  grep -qs -E '^(\.\./)+bin/fibrs,' "$venv"/lib/python*/site-packages/fibrs-*.dist-info/RECORD
+}
 
 if [[ ${1:-} == --restore ]]; then
   venv=${2:?usage: install-dropin.sh --restore VENV}
@@ -18,8 +23,10 @@ if [[ ${1:-} == --restore ]]; then
   [[ -e $ref || -L $ref ]] || { echo "no $ref to restore" >&2; exit 1; }
   rm -f "$venv/bin/avf-spline-generator"
   mv "$ref" "$venv/bin/avf-spline-generator"
-  # pip installs bin/fibrs with the wheel, which lists it in its RECORD; remove only a copy this script installed
-  if ! grep -qs -E '^(\.\./)+bin/fibrs,' "$venv"/lib/python*/site-packages/fibrs-*.dist-info/RECORD; then
+  # put back the wheel's binary if a different one replaced it, and remove only a copy this script installed
+  if [[ -e $venv/bin/fibrs.wheel ]]; then
+    mv -f "$venv/bin/fibrs.wheel" "$venv/bin/fibrs"
+  elif ! wheel_owns_fibrs; then
     rm -f "$venv/bin/fibrs"
   fi
   rm -rf "$venv/share/fibrs"
@@ -56,8 +63,12 @@ elif [[ -L $entry && $(readlink "$entry") == fibrs ]]; then
 elif [[ -e $entry || -L $entry ]]; then
   mv "$entry" "$entry.reference"
 fi
-# the wheel already installs the binary there; copying a file onto itself would fail
+# the wheel may already install the binary there; copying a file onto itself would fail, and a different binary
+# must not lose the wheel's, which a second install finds already kept
 if ! [[ -e $venv/bin/fibrs && $bin -ef $venv/bin/fibrs ]]; then
+  if [[ -e $venv/bin/fibrs && ! -e $venv/bin/fibrs.wheel ]] && wheel_owns_fibrs; then
+    mv "$venv/bin/fibrs" "$venv/bin/fibrs.wheel"
+  fi
   install -m 0755 "$bin" "$venv/bin/fibrs"
 fi
 # the notices travel with the binary: the licences of the ported code and the statically linked libraries
