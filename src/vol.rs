@@ -1,4 +1,4 @@
-//! Sparse in-memory volumes stored as 32³ bricks
+//! Sparse in-memory volumes stored as 16³ bricks
 //!
 //! The band's fields are mostly air: a brick is allocated only once a value other than the volume's
 //! default is written to it, and reads from an unallocated brick return the default. This replaces the
@@ -9,7 +9,11 @@ use std::ops::Range;
 use rayon::prelude::*;
 
 /// Brick edge, as a shift
-pub const SHIFT: usize = 5;
+///
+/// A brick is allocated whole for its first non-default voxel, so smaller bricks hold less air where data ends:
+/// 16³ took 0.5 GiB (4%) less peak memory than 32³ on a 1024-plane PHerc0826 window, at the same speed, while
+/// the table of brick slots (16 bytes each) stays near 35 MB for that window
+pub const SHIFT: usize = 4;
 /// Brick edge in voxels
 pub const EDGE: usize = 1 << SHIFT;
 const MASK: usize = EDGE - 1;
