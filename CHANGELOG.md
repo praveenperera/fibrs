@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] - 2026-11-19
 
 - `fibrs predict` runs Qual's AFV fibre model V2 over a CT on an NVIDIA GPU and writes the probability zarr that
   villa's `lasagna.qualzz_inference` writes (`--mode villa`), or a resumable z band of it (band mode). It is native,
@@ -8,6 +8,9 @@
   `pip install "fibrs[predict]"` adds NVIDIA's cuDNN 9 and cuBLAS 12 pip packages, which the binary finds in its
   own environment; a system cuDNN and cuBLAS work too. On other platforms `fibrs predict` only plans a run
   (`--dry-run`).
+- `fibrs predict --precision fp32`, the default, keeps parity with that PyTorch reference: float32 tensors with
+  TF32 tensor-core convolutions. `--precision bf16` is an opt-in speed mode with small output differences,
+  measured in the README.
 
 ## [0.1.1] - 2026-11-18
 
@@ -28,5 +31,6 @@ The first release.
   Python module, and a CLI archive for each with `scripts/install-dropin.sh`
 - `--version` prints `0.2.0`, the original's version, as a drop-in has to
 
+[0.2.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.2.0
 [0.1.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.1.1
 [0.1.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.1.0
