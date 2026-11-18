@@ -56,34 +56,44 @@ TIMING = dict(
 )
 
 
-# bytes per voxel of one column on the device at its peak, in ColumnAccumulator.finish: the float32 sums (acc's two
-# channels and wsum, 12), then quantize's clamped float32 copy and finite mask beside acc (8 + 2 with acc's 8)
+# bytes per voxel of one column on the device at its peak, in ColumnAccumulator.finish: acc's two float32 channels
+# and wsum (12) with the coverage mask (1) and the divisor torch.where builds (4), then quantize's clamped float32
+# copy and finite mask beside acc (8 + 8 + 2); the uncovered count is taken a slab at a time to stay below that
 COLUMN_BYTES_PER_VOXEL = 18
 
 
-def check_column_memory(torch, device, nz: int, ny: int, nx: int, column: int, villa: bool) -> None:
-    """Refuse, before any column runs, a column the CUDA device can't hold. A column's accumulator spans the whole
-    band height, so a tall volume needs a narrower column. The estimate leaves out the network's activations"""
-    if device.type != "cuda":
+def column_bytes(nz: int, col: tuple[int, int, int, int]) -> int:
+    """Device bytes one column [y0, y1) x [x0, x1) of nz planes takes at its peak"""
+    y0, y1, x0, x1 = col
+    return COLUMN_BYTES_PER_VOXEL * nz * (y1 - y0) * (x1 - x0)
+
+
+def check_column_memory(torch, device, nz: int, ny: int, nx: int, pending: list, villa: bool) -> None:
+    """Refuse, before the output is created or any column runs, pending columns the CUDA device can't hold. A
+    column's accumulator spans the whole band height, so a tall volume needs a narrower column. The estimate leaves
+    out the network's activations"""
+    if device.type != "cuda" or not pending:
         return
     free, _ = torch.cuda.mem_get_info(device)
-    cy, cx = min(column, ny), min(column, nx)
-    need = COLUMN_BYTES_PER_VOXEL * nz * cy * cx
+    y0, y1, x0, x1 = max(pending, key=lambda col: column_bytes(nz, col))
+    need = column_bytes(nz, (y0, y1, x0, x1))
     if need <= free:
         return
 
-    # column sizes are multiples of the tile core (Columns)
-    fits = int((free / (COLUMN_BYTES_PER_VOXEL * nz)) ** 0.5) // CORE * CORE
+    # the largest column size whose widest column fits; sizes are multiples of the tile core (Columns), and a
+    # column is cut short where the volume ends
+    sizes = range(-(-max(ny, nx) // CORE) * CORE, 0, -CORE)
+    fits = next((n for n in sizes if COLUMN_BYTES_PER_VOXEL * nz * min(n, ny) * min(n, nx) <= free), None)
     if villa:
-        hint = (f"pass --column {fits} or less, which leaves villa mode's output unchanged" if fits >= CORE
+        hint = (f"pass --column {fits} or less, which leaves villa mode's output unchanged" if fits
                 else f"no column of {nz} planes fits")
     else:
         # in band mode the column size is part of the output, so a shorter band is the other way
-        hint = f"run a shorter band, or pass --column {fits} or less (band mode's output depends on it)"
-        if fits < CORE:
-            hint = "run a shorter band"
-    raise SystemExit(f"fibrs predict: a {cy} x {cx} column of {nz} planes needs about {need / 2**30:.1f} GiB on "
-                     f"{device}, which has {free / 2**30:.1f} GiB free; {hint}")
+        hint = "run a shorter band"
+        if fits:
+            hint += f", or pass --column {fits} or less (band mode's output depends on it)"
+    raise SystemExit(f"fibrs predict: a {y1 - y0} x {x1 - x0} column of {nz} planes needs about "
+                     f"{need / 2**30:.1f} GiB on {device}, which has {free / 2**30:.1f} GiB free; {hint}")
 
 
 def code_hashes() -> dict[str, str]:
@@ -167,7 +177,21 @@ def main(argv: list[str] | None = None) -> int:
     label, short, amp_dtype = PRECISION[a.precision]
 
     nz, ny, nx = a.z1 - a.z0, ct.shape[1], ct.shape[2]
-    check_column_memory(torch, device, nz, ny, nx, a.column, villa)
+    # the columns this run will compute, so a check refuses only what it would run
+    progress_f = a.out / "progress.jsonl"
+    done = set()
+    if progress_f.exists():
+        done = {tuple(json.loads(line)["col"]) for line in progress_f.read_text().splitlines() if line}
+    cols = Columns(ny, nx, a.column)
+    only = None
+    if a.only_columns:
+        only = {int(v) for v in a.only_columns.split(",") if v.strip()}
+        if not only <= set(range(len(cols.cols))):
+            raise ValueError(f"--only-columns outside 0..{len(cols.cols) - 1}")
+    pz_all = positions(nz)
+    todo = [(i, col, cols.tiles(col, pz_all)) for i, col in enumerate(cols.cols)
+            if col not in done and (only is None or i in only)]
+    check_column_memory(torch, device, nz, ny, nx, [col for _, col, _ in todo], villa)
     provenance = dict(model_sha256=hashes, code_sha256=code_hashes(), ct=str(a.ct.resolve()),
                       ct_identity=ct_identity(a.ct, a.z0, a.z1), z0=a.z0, z1=a.z1, tile=TILE, overlap=OVERLAP,
                       border=BORDER, column=a.column, batch=a.batch, precision=label,
@@ -196,19 +220,6 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("output exists with different provenance; use a new output")
     sem, tra = root["semantic"], root["tracing"]
 
-    progress_f = a.out / "progress.jsonl"
-    done = set()
-    if progress_f.exists():
-        done = {tuple(json.loads(line)["col"]) for line in progress_f.read_text().splitlines() if line}
-    cols = Columns(ny, nx, a.column)
-    only = None
-    if a.only_columns:
-        only = {int(v) for v in a.only_columns.split(",") if v.strip()}
-        if not only <= set(range(len(cols.cols))):
-            raise ValueError(f"--only-columns outside 0..{len(cols.cols) - 1}")
-    pz_all = positions(nz)
-    todo = [(i, col, cols.tiles(col, pz_all)) for i, col in enumerate(cols.cols)
-            if col not in done and (only is None or i in only)]
     cuda = device.type == "cuda"
     w3 = torch.from_numpy(blend_weights()).to(device)
     if cuda:

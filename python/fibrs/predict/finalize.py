@@ -74,7 +74,9 @@ class ColumnAccumulator:
         the two arrays None when ``quantized`` is false (a column whose tiles were all air writes nothing)"""
         torch = self.torch
         covered = self.wsum > 0
-        uncovered = int(covered.numel() - int(covered.sum()))
+        # a slab at a time: summing a bool tensor promotes it to int64, which for the whole column would be the
+        # largest allocation of the finish
+        uncovered = covered.numel() - sum(int(covered[z:z + TILE].sum()) for z in range(0, covered.shape[0], TILE))
         if not quantized:
             return None, None, uncovered
         self.acc.div_(torch.where(covered, self.wsum, torch.ones((), dtype=torch.float32, device=covered.device)))

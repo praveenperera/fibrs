@@ -184,7 +184,8 @@ python -m fibrs.predict ARGS   # the same, from Python (or python -m fibrs predi
 `FIBRS_PYTHON` names. `--ct` is a level-0 uint8 zarr v2 array (the `/0` directory of an OME-Zarr). `--device`
 defaults to `cuda`; `cpu` and, on Apple silicon, `mps` also run. In band mode, run the same command again on the
 same `--out` to resume a capped (`--max-minutes`) or interrupted run at the first unfinished column; the resume
-must use the same settings and device (CPU, CUDA or MPS, and the same GPU model) or it refuses the output.
+must use the same settings and device (CPU, CUDA or MPS, and on CUDA the same GPU model) or it refuses the
+output.
 `--expect-sha256` refuses a checkpoint with another hash.
 
 `--readers` (tile reader threads, default 4) changes the speed, not the output. `--column` (the size of the y–x
@@ -234,8 +235,8 @@ ran, and 4.2% (at most 8.5%) while villa main ran until it stopped.
   `fp32` (torch's defaults, which run convolutions in TF32 on CUDA) is the default and the checked mode.
 - Outputs from different devices (CPU, CUDA, MPS) differ from each other slightly, as the model's own outputs do.
 - A column's accumulator spans the whole band height on the device, about 18 bytes per voxel at its peak, so a
-  480 × 480 column of 12,500 planes needs about 48 GiB. On CUDA, a run whose column doesn't fit in the free memory
-  stops before it starts and names a `--column` that does; in villa mode the column size leaves the output
+  480 × 480 column of 12,500 planes needs about 48 GiB. On CUDA, a run whose pending columns don't fit in the free
+  memory stops before it starts and names a `--column` that does; in villa mode the column size leaves the output
   unchanged.
 - Villa mode reads which chunks are stored from the input's directory listing, so the input must be a zarr v2
   directory store (`.` or `/` chunk separator).
