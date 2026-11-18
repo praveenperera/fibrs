@@ -35,7 +35,7 @@ zstd = "0.13"
 # `fibrs predict` plans a run (--dry-run) but refuses to start one. Pinned by rev; build.rs records it in the
 # provenance from Cargo.lock
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
-volkit = { git = "https://github.com/praveenperera/volkit", rev = "0870b2f1bf061bbc32c5eebe93f19a7572d96ac5" }
+volkit = { git = "https://github.com/praveenperera/volkit", rev = "158a7c8ffb21bfc898852d7138ac8bf521b8ff0a" }
 # the free device memory for the column check, from the cudarc volkit already brings into the tree
 cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12040"] }
 

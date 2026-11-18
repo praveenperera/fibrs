@@ -983,22 +983,19 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "volkit"
 version = "0.1.0"
-source = "git+https://github.com/praveenperera/volkit?rev=0870b2f1bf061bbc32c5eebe93f19a7572d96ac5#0870b2f1bf061bbc32c5eebe93f19a7572d96ac5"
+source = "git+https://github.com/praveenperera/volkit?rev=158a7c8ffb21bfc898852d7138ac8bf521b8ff0a#158a7c8ffb21bfc898852d7138ac8bf521b8ff0a"
 dependencies = [
  "color-eyre",
  "cudakit",
  "cudarc",
  "half",
  "libloading",
- "lz4_flex",
  "memmap2",
- "rayon",
  "safetensors",
  "serde",
  "serde_json",
  "sha2",
  "windows-sys",
- "zstd",
 ]
 
 [[package]]
