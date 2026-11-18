@@ -189,9 +189,13 @@ tile batches a run would send to the GPU and how many tiles it would skip, witho
 
 The binary finds cuDNN and cuBLAS in the Python environment it is installed in (`site-packages/nvidia/*/lib`
 beside its `bin/fibrs`) before the system's, by loading those copies before the engine asks for the libraries by
-name. A system copy under a name the engine tries first (an unversioned `libcublas.so`, say) still wins, and
-`FIBRS_CUDA_LIBS=system` skips the pip copies. Each run's `summary-*.json` lists the cuDNN and cuBLAS files it
-loaded. cuDNN algorithm choices are timed on the first run and cached under `~/.cache` (see volkit's
+name; `FIBRS_CUDA_LIBS=system` skips the pip copies. The engine asks for the unversioned names (`libcublas.so`,
+`libcudnn.so`) first, so a system copy under one of those on the loader's path, such as a CUDA 13 toolkit's
+`libcublas.so`, is used instead, whatever its version. The run still works; it warns when the cuBLAS it loaded is
+not 12.x, and its provenance records the cuBLAS and cuDNN versions. To use cuBLAS 12 on such a machine, put a
+directory holding `libcublas.so -> libcublas.so.12` and `libcudnn.so -> libcudnn.so.9` symlinks first on
+`LD_LIBRARY_PATH`, or keep the CUDA 13 library directories off the loader's path. Each run's `summary-*.json`
+lists the cuDNN and cuBLAS files it loaded. cuDNN algorithm choices are timed on the first run and cached under `~/.cache` (see volkit's
 documentation for the cache variables).
 
 ### Modes

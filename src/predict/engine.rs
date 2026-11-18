@@ -153,11 +153,13 @@ mod native {
         let net =
             AfvV2::open(model_dir, &opts).wrap_err_with(|| format!("load AFV v2 from {}", model_dir.display()))?;
         let free = free_bytes(device)?;
+        warn_cublas_major(net.load.cublas);
         let load = &net.load;
         let mut provenance = Map::new();
         provenance.insert("network".into(), json!(LIBRARY));
         provenance.insert("weights".into(), json!("checkpoint_final.pth, read without torch"));
         provenance.insert("cudnn".into(), json!(load.cudnn));
+        provenance.insert("cublas".into(), json!(load.cublas));
         provenance.insert("ptx_tier".into(), json!(load.ptx_tier));
         provenance.insert("algo".into(), json!("find"));
         // acc (2 x float32), wsum (float32), semantic (2 x uint8) and tracing (2 x uint8 at 1/8)
@@ -170,6 +172,22 @@ mod native {
             provenance,
             libraries: super::libs::mapped(),
         })
+    }
+
+    /// Warns when the loaded cuBLAS is not 12.x: the engine binds cuBLAS 12 but asks for the unversioned
+    /// `libcublas.so` first, so a newer toolkit's copy on the loader's path wins over the 12.x ones. The run goes
+    /// on: the version is in the provenance, so the output says which cuBLAS made it and a resume under another
+    /// is refused
+    fn warn_cublas_major(version: i32) {
+        // cublasGetVersion: major * 10000 + minor * 100 + patch
+        let (major, minor, patch) = (version / 10000, version / 100 % 100, version % 100);
+        if major != 12 {
+            eprintln!(
+                "fibrs predict: warning: loaded cuBLAS {major}.{minor}.{patch}, not 12.x, because the loader found \
+                 an unversioned libcublas.so first; to use cuBLAS 12, put a directory holding libcublas.so -> \
+                 libcublas.so.12 and libcudnn.so -> libcudnn.so.9 symlinks first on LD_LIBRARY_PATH"
+            );
+        }
     }
 
     /// Free device memory, through the device's primary context (the one the engine runs in)

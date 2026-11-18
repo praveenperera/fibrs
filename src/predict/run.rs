@@ -432,6 +432,8 @@ fn run(c: Checked) -> Result<()> {
         "readers": c.readers,
         "timing": timing(),
         "cuda_libraries": e.libraries,
+        "cudnn": e.provenance.get("cudnn"),
+        "cublas": e.provenance.get("cublas"),
     });
     if villa {
         summary["mode"] = json!("villa");
