@@ -230,7 +230,9 @@ mod native {
 /// `FIBRS_CUDA_LIBS=system` skips the pip copies
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod libs {
+    use std::cmp::Reverse;
     use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
 
     /// (pip files, dependencies first; their directory under site-packages)
     const PIP: [(&[&str], &str); 2] =
@@ -258,8 +260,9 @@ mod libs {
                     .map(|p| p.join("site-packages"))
                     .filter(|p| p.is_dir())
                     .collect();
-                // the installing Python's site-packages first, then the rest in a fixed order
-                found.sort_by_key(|p| (!installed_fibrs(p), p.clone()));
+                // the installing Python's site-packages first: the newest fibrs install record, as the last
+                // install is the one that wrote bin/fibrs; then the rest in a fixed order
+                found.sort_by_key(|p| (Reverse(fibrs_record(p)), p.clone()));
                 for p in found {
                     if !out.contains(&p) {
                         out.push(p);
@@ -270,13 +273,17 @@ mod libs {
         out
     }
 
-    /// Whether `site` holds the `fibrs` wheel's install record
-    fn installed_fibrs(site: &Path) -> bool {
-        let Ok(entries) = std::fs::read_dir(site) else { return false };
-        entries.filter_map(Result::ok).any(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            name.starts_with("fibrs-") && name.ends_with(".dist-info")
-        })
+    /// When the `fibrs` wheel's install record in `site` was written, the newest when there are several
+    fn fibrs_record(site: &Path) -> Option<SystemTime> {
+        let entries = std::fs::read_dir(site).ok()?;
+        entries
+            .filter_map(Result::ok)
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.starts_with("fibrs-") && name.ends_with(".dist-info")
+            })
+            .filter_map(|e| e.metadata().and_then(|m| m.modified()).ok())
+            .max()
     }
 
     /// Whether `site` holds all of a pip package's files
@@ -296,7 +303,7 @@ mod libs {
         let any = |s: &&PathBuf| PIP.iter().any(|&p| holds(s, p));
         let site = sites
             .iter()
-            .find(|s| installed_fibrs(s) && any(s))
+            .find(|s| fibrs_record(s).is_some() && any(s))
             .or_else(|| sites.iter().find(|s| PIP.iter().all(|&p| holds(s, p))))
             .or_else(|| sites.iter().find(any));
         let Some(site) = site else { return };

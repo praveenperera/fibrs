@@ -86,7 +86,8 @@ RTX 5090:
 - **Resume:** a resume recognises the CT by its metadata and the names and sizes of its chunk files, not their
   contents. After changing the CT, use a fresh `--out`. Only one run at a time may use an output.
 - **Column memory:** a column's accumulators take about 14 bytes per voxel on the GPU, and at most 2^31 − 1 voxels
-  per column. A run that won't fit stops before it starts and suggests a `--column` that fits.
+  per column. A run that won't fit stops before it starts and says what would: a smaller `--column`, or a
+  shorter band.
 - **GPUs and cuDNN:** outputs from different GPU models or cuDNN versions can differ slightly, as the model's own
   outputs do under PyTorch.
 - **Precision modes:** PyTorch's `fp32-ieee` and `fp16` modes aren't offered.

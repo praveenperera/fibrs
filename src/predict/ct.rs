@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use color_eyre::eyre::{Result, bail, ensure, eyre};
 use serde_json::Value;
@@ -42,14 +42,16 @@ impl Cache {
     }
 }
 
-/// A decode's share of the cache bound, given back when the decode ends, whether it succeeded or not
-struct Decoding<'a>(&'a Mutex<Cache>, usize);
+/// A decode's share of the cache bound. A failed decode gives it back on drop; a finished one gives it back as
+/// its chunk lands (`Ct::land`), under the same lock, so no other decode can take the space in between
+struct Decoding<'a>(&'a Ct, usize);
 
 impl Drop for Decoding<'_> {
     fn drop(&mut self) {
-        if let Ok(mut cache) = self.0.lock() {
+        if let Ok(mut cache) = self.0.cache.lock() {
             cache.decoding -= self.1;
         }
+        self.0.room.notify_all();
     }
 }
 
@@ -63,6 +65,8 @@ pub struct Ct {
     fill: u8,
     fortran: bool,
     cache: Mutex<Cache>,
+    /// Signalled when a decode ends, for readers waiting for its share of the bound
+    room: Condvar,
 }
 
 /// What `.zarray` says when it isn't a 3D uint8 array: numpy's dtype name and the shape as Python prints it
@@ -118,6 +122,7 @@ impl Ct {
             fill,
             fortran,
             cache: Mutex::default(),
+            room: Condvar::new(),
         })
     }
 
@@ -130,16 +135,25 @@ impl Ct {
         let sep = if self.nested { "/" } else { "." };
         let name = format!("{}{sep}{}{sep}{}", key[0], key[1], key[2]);
         let n: usize = self.chunks.iter().product();
-        // room for this chunk, and for the others being decoded, before it decodes, so the cache and the
-        // decodes in flight together stay within the bound. When they cannot (chunks larger than the bound, or
-        // more decodes than fit) the cache empties, and each --readers thread holds only the chunk it decodes;
-        // a chunk larger than the bound is then kept alone, as decoding it for every tile costs more than
-        // holding it
+        // room for this chunk, and for the others being decoded, before it decodes, so the cache and the decodes
+        // in flight never pass the bound: a reader waits while the decodes already running leave no room. A
+        // chunk larger than the bound decodes alone and is then kept alone, as decoding it for every tile costs
+        // more than holding it
         let decoding = {
             let mut cache = self.cache.lock().map_err(|_| eyre!("CT cache poisoned"))?;
-            cache.make_room(n);
+            loop {
+                cache.make_room(n);
+                if cache.decoding == 0 || cache.bytes + cache.decoding + n <= CACHE_BYTES {
+                    break;
+                }
+                cache = self.room.wait(cache).map_err(|_| eyre!("CT cache poisoned"))?;
+            }
+            // another reader may have decoded it while this one waited
+            if let Some(c) = cache.chunks.get(&key) {
+                return Ok(c.clone());
+            }
             cache.decoding += n;
-            Decoding(&self.cache, n)
+            Decoding(self, n)
         };
         let data = match fs::read(self.dir.join(&name)) {
             Ok(bytes) => {
@@ -150,10 +164,15 @@ impl Ct {
             Err(e) if e.kind() == ErrorKind::NotFound => vec![self.fill; n],
             Err(e) => bail!("{}: {e}", self.dir.join(&name).display()),
         };
-        drop(decoding);
+        self.land(key, Arc::new(data), decoding)
+    }
 
-        let chunk = Arc::new(data);
+    /// Caches a decoded chunk and gives back its decode's share of the bound, under one lock
+    fn land(&self, key: [usize; 3], chunk: Chunk, decoding: Decoding<'_>) -> Result<Chunk> {
         let mut cache = self.cache.lock().map_err(|_| eyre!("CT cache poisoned"))?;
+        cache.decoding -= decoding.1;
+        // the share is given back here, so the guard must not give it back again
+        std::mem::forget(decoding);
         if cache.chunks.insert(key, chunk.clone()).is_none() {
             cache.order.push_back(key);
             cache.bytes += chunk.len();
@@ -165,6 +184,8 @@ impl Ct {
                 cache.bytes -= c.len();
             }
         }
+        drop(cache);
+        self.room.notify_all();
         Ok(chunk)
     }
 

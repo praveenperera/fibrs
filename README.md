@@ -246,7 +246,8 @@ PyTorch's `fp32-ieee` and `fp16` modes are not offered.
 - A column's accumulators span the whole band height on the GPU, about 14 bytes per voxel (a 480 × 480 column of
   8,000 planes needs about 24 GiB), and the engine takes at most 2^31 − 1 voxels in one column (a 480 × 480 column
   of up to 9,320 planes). A run whose pending columns don't fit, in the free GPU memory or in that limit, stops
-  before it starts and names a `--column` that does; in villa mode the column size leaves the output unchanged.
+  before it starts and says what would fit: a smaller `--column` when one does (in villa mode the column size
+  leaves the output unchanged), else a shorter band.
 - Villa mode reads which chunks are stored from the input's directory listing, so the input must be a zarr v2
   directory store (`.` or `/` chunk separator).
 - Outputs from different GPU models, or with different cuDNN versions, can differ slightly, as the model's own
