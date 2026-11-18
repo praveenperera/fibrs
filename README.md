@@ -185,6 +185,8 @@ python -m fibrs predict ARGS   # the same, from Python
 `--ct` is a level-0 uint8 zarr v2 array (the `/0` directory of an OME-Zarr). `--device` is `cuda` or `cuda:N`.
 Run the same command again on the same `--out` to resume a capped (`--max-minutes`) or interrupted run at the
 first unfinished column; the resume must use the same settings, binary and GPU model, or it refuses the output.
+One run at a time may use an output: a run locks it until it ends, and a second run on the same `--out` is
+refused.
 It recognises the CT by its metadata and the names and sizes of its chunk files, not their contents, so a chunk
 rewritten in place at the same size is not detected: after changing the CT, use a fresh `--out`.
 `--expect-sha256` refuses a checkpoint with another hash. `--dry-run` reads the CT and prints, per column, the
