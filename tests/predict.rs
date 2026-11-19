@@ -165,23 +165,20 @@ fn a_ct_that_is_not_3d_uint8_is_refused() {
 }
 
 #[test]
-fn every_attempt_is_recorded_before_the_checkpoint_is_checked() {
+fn a_checkpoint_mismatch_writes_nothing() {
     let model = scratch("model");
     for name in ["model.py", "plans.json", "dataset.json", "checkpoint_final.pth"] {
         fs::write(model.join(name), name).unwrap();
     }
-    let out = scratch("attempt");
+    let out = scratch("attempt").join("pred.zarr");
     let ct = fixtures().join("band.zarr");
     let args = ["--ct", ct.to_str().unwrap(), "--z0", "0", "--z1", "8", "--model-dir", model.to_str().unwrap()];
     let run = predict(&[&args[..], &["--out", out.to_str().unwrap(), "--expect-sha256", "00"]].concat());
     assert_eq!(run.status.code(), Some(1));
     let digest: String = Sha256::digest(b"checkpoint_final.pth").iter().map(|b| format!("{b:02x}")).collect();
     assert!(text(&run).contains(&format!("checkpoint sha256 {digest} != 00")), "{}", text(&run));
-    let attempts = fs::read_to_string(out.join("attempts.jsonl")).unwrap();
-    let rec: Value = serde_json::from_str(attempts.lines().next().unwrap()).unwrap();
-    assert_eq!(rec["attempt"], rec["start"]);
-    // nothing else is written before the checks pass
-    assert!(!out.join("semantic").exists() && !out.join(".zattrs").exists());
+    // the model is checked before the output is created
+    assert!(!out.exists());
 }
 
 #[test]
@@ -239,6 +236,31 @@ fn an_output_that_overlaps_the_ct_is_refused() {
     let after: Vec<_> = fs::read_dir(&ct).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(before, after);
     assert!(!dir.join("missing").exists());
+}
+
+#[test]
+fn an_output_given_through_the_ct_is_written_where_it_resolves() {
+    let model = scratch("through-model");
+    for name in ["model.py", "plans.json", "dataset.json", "checkpoint_final.pth"] {
+        fs::write(model.join(name), name).unwrap();
+    }
+    let dir = scratch("through-ct");
+    let ct = dir.join("band.zarr");
+    fs::create_dir_all(&ct).unwrap();
+    for entry in fs::read_dir(fixtures().join("band.zarr")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            fs::copy(entry.path(), ct.join(entry.file_name())).unwrap();
+        }
+    }
+    // `0.0.0` doesn't exist, so the path resolves to `dir/pred.zarr`, outside the CT; writing to it as given would
+    // create `0.0.0` inside the CT, where a chunk of a `.`-separated store would be
+    let out = ct.join("0.0.0/../../pred.zarr");
+    let args = ["--ct", ct.to_str().unwrap(), "--z0", "0", "--z1", "8", "--model-dir", model.to_str().unwrap()];
+    // without a GPU the run stops at the engine, after the attempt is recorded
+    let run = predict(&[&args[..], &["--out", out.to_str().unwrap()]].concat());
+    assert!(!ct.join("0.0.0").exists(), "{}", text(&run));
+    assert!(dir.join("pred.zarr/attempts.jsonl").exists(), "{}", text(&run));
 }
 
 #[test]
