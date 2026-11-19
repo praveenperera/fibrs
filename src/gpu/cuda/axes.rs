@@ -47,12 +47,13 @@ pub(super) const AXES_TILE_DEVICE_BYTES: usize = {
 /// float32 tensor values
 const RECORD: usize = 8;
 
-/// Most tiles per unit that let both slots' buffers fit in `budget` bytes of device memory
-pub(super) fn unit_tiles(budget: usize) -> usize {
-    (budget / (2 * AXES_TILE_DEVICE_BYTES)).clamp(1, AXES_UNIT_TILES)
-}
-
 impl Gpu {
+    /// Most direction field tiles per unit, so both slots' buffers fit in half the device memory free now
+    fn axes_unit_tiles(&self) -> Result<usize> {
+        let (free, _) = self.ctx.mem_get_info()?;
+        Ok((free / 2 / (2 * AXES_TILE_DEVICE_BYTES)).clamp(1, AXES_UNIT_TILES))
+    }
+
     /// The direction field (nx, ny), equal to `axes::direction_field`, and how many present voxels the host
     /// solved because the kernels could not certify them
     pub fn direction_field(&self, tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<(Vol<u8>, Vol<u8>, AxesCounts)> {
@@ -66,7 +67,7 @@ impl Gpu {
         // unit i stages and launches on slot i % 2 while unit i - 1 finishes on the other; a slot's previous
         // unit was collected (its stream synchronized) before the slot stages again
         let mut pending: Option<(usize, Meta)> = None;
-        for (i, unit) in units(tracing, shape, self.axes_unit_tiles).iter().enumerate() {
+        for (i, unit) in units(tracing, shape, self.axes_unit_tiles()?).iter().enumerate() {
             let s = i % 2;
             let meta = slots[s].stage(unit, tracing, shape)?;
             slots[s].launch(self, &meta)?;

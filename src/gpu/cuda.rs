@@ -127,11 +127,7 @@ pub struct Gpu {
     /// The device's index, model and compute capability, for the log
     name: String,
     k: Kernels,
-    /// Most tiles per unit, so both slots' buffers fit in half the device memory free when it opened
-    unit_tiles: usize,
-    /// Most direction field tiles per unit, sized the same way
-    axes_unit_tiles: usize,
-    /// Device memory free when it opened
+    /// Device memory free when it opened, which picks the device
     free: usize,
     /// `decode_dir` in the reference's CUDA rounding for every `nx << 8 | ny`, four float64 per entry
     dirs: CudaSlice<f64>,
@@ -230,18 +226,24 @@ impl Gpu {
         stream.synchronize()?;
         let unit = stream.clone_htod(&unit)?;
         stream.synchronize()?;
-        // the other half is left for the driver, other processes and later stages; a device too full for even one
-        // tile per unit fails in `centrality` or `direction_field` unless the volume's tiles are small, which
-        // `--device auto` answers by running on the CPU
         let (free, _) = ctx.mem_get_info()?;
-        let unit_tiles = (free / 2 / (2 * TILE_DEVICE_BYTES)).clamp(1, UNIT_TILES);
-        let axes_unit_tiles = axes::unit_tiles(free / 2);
         let name = format!("CUDA device {device}, {} (compute capability {major}.{minor})", ctx.name()?);
-        Ok(Self { ctx, name, k, unit_tiles, axes_unit_tiles, free, dirs, unit })
+        Ok(Self { ctx, name, k, free, dirs, unit })
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Most tiles per unit, so both slots' buffers fit in half the device memory free now, as other processes may
+    /// have taken some since the device opened
+    ///
+    /// The other half is left for the driver, other processes and later stages. A device too full for even one tile
+    /// per unit fails in `centrality` unless the volume's tiles are small, which `--device auto` answers by running
+    /// on the CPU; `direction_field` sizes its units the same way
+    fn unit_tiles(&self) -> Result<usize> {
+        let (free, _) = self.ctx.mem_get_info()?;
+        Ok((free / 2 / (2 * TILE_DEVICE_BYTES)).clamp(1, UNIT_TILES))
     }
 
     /// One family's centrality and seeds (1 = V, 2 = H), equal to `fields::centrality::<Fused>` of the family's
@@ -263,7 +265,7 @@ impl Gpu {
                 && shape.iter().all(|&n| u32::try_from(n).is_ok()),
             "volume of {shape:?} voxels is too large to index seeds"
         );
-        let units = units(&tracing[family - 1], shape, self.unit_tiles);
+        let units = units(&tracing[family - 1], shape, self.unit_tiles()?);
         let mut cent = Vol::new(shape, 0u16);
         let mut seeds = Vec::new();
         let mut slots = [Slot::new(&self.ctx)?, Slot::new(&self.ctx)?];

@@ -18,6 +18,13 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 crate="$root/fibrs-kernels"
 ptxdir="$root/ptx"
 toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$crate/rust-toolchain.toml")"
+# the compiler is picked from Cargo.lock, so a lockfile behind Cargo.toml would build with one cuda-rust revision
+# and compile with another
+if ! cargo "+$toolchain" metadata --locked --format-version 1 --manifest-path "$crate/Cargo.toml" > /dev/null; then
+  echo "$crate/Cargo.lock does not match Cargo.toml; update it (cargo update -p cuda-device) and rerun" >&2
+  exit 1
+fi
+lock_hash="$(sha256sum < "$crate/Cargo.lock")"
 source="$(sed -n 's|^source = "git+\(https://github.com/[^/]*/cuda-rust.git\)?rev=[^#]*#\([0-9a-f]*\)"$|\1 \2|p' "$crate/Cargo.lock" | sort -u)"
 repo="${source% *}"
 rev="${source#* }"
@@ -79,6 +86,12 @@ rm -f "$out/ptx/fibrs_kernels.ptx"
 cargo "+$toolchain" clean -q --target-dir "$out/cargo" -p fibrs-kernels
 CARGO_TARGET_DIR="$out/cargo" CUDA_OXIDE_PTX_DIR="$out/ptx" cargo "+$toolchain" oxide build --arch "sm_$arch"
 ptx="$out/ptx/fibrs_kernels.ptx"
+# cargo-oxide's own build takes no --locked (cargo flags after -- switch it to another build mode), so a build
+# that rewrote the lockfile is caught here
+if [[ "$(sha256sum < "$crate/Cargo.lock")" != "$lock_hash" ]]; then
+  echo "the build changed $crate/Cargo.lock; check it and rerun" >&2
+  exit 1
+fi
 if [[ ! -s "$ptx" ]]; then
   echo "sm_$arch: cargo-oxide wrote no PTX at $ptx" >&2
   exit 1
