@@ -11,8 +11,10 @@
 - The README's dense PHerc0358 box prediction rows are now from fibrs `42c4710`, which has the 0.2.0 release's
   prediction code: 85.3 s in band mode (1.94×) and 84.5 s with `--mode villa` (1.96×), with prediction values
   identical to those of the pre-release build timed before.
-- Correction to the 0.2.0 notes: the 50–52 s run on the 512 × 2048 × 2048 PHerc0358 crop was measured with a
-  pre-release build of 0.2.0, not the tagged release.
+- Correction to the 0.2.0 notes: two tracer results there were not measured with the tagged release. The 50–52 s
+  run on the 512 × 2048 × 2048 PHerc0358 crop used a pre-release build of 0.2.0, and the 332 s run on the PHerc0358
+  band, which is also the tracing part of the 739 s end-to-end row, used `42c4710`, which lacks 0.2.0's chunk-cache
+  change.
 
 ## [0.2.0] - 2026-11-19
 
