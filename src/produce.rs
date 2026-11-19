@@ -337,6 +337,9 @@ impl<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Producer<'_, P, C, D> {
                     let ahead = unsafe { &mut *self.slots[i % self.window].ahead.get() };
                     if self.retrace_all || writer.stale(&ahead.traced.reads, ahead.committed as u32) {
                         stats.retraced += 1;
+                        // the slot is traced into again only after its next claim; until then it would hold this
+                        // seed's curves and room for marks beyond what a kept result may
+                        ahead.traced.discard();
                         self.trace(i, &mut scratch, &mut own)?;
                         &mut own
                     } else {

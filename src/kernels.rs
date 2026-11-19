@@ -390,7 +390,7 @@ impl Coverage {
     #[inline(always)]
     fn read(&self, reads: &mut ReadSet, z: i64, y: i64, x: i64) -> u16 {
         let at = self.0.place(z as usize, y as usize, x as usize);
-        reads.push(at.slot);
+        reads.push(at.slot());
         self.0.get(at)
     }
 
@@ -574,7 +574,7 @@ impl CoverageWriter<'_> {
                 }
             };
             self.vol.set(m.at, value);
-            self.written[Self::entry(m.at.slot)] = stamp;
+            self.written[Self::entry(m.at.slot())] = stamp;
         }
     }
 }
@@ -648,6 +648,12 @@ impl Traced {
         self.marks.clear();
         self.tans.clear();
         self.reads.0.clear();
+    }
+
+    /// Drop a result that will not be committed, keeping no more room than [`Traced::trim`] does
+    pub fn discard(&mut self) {
+        self.clear();
+        self.trim();
     }
 }
 

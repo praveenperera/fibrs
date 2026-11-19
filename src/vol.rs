@@ -313,10 +313,21 @@ pub struct SharedVol {
 }
 
 /// Where a voxel of a [`SharedVol`] lives: its brick slot and its offset in the brick
+///
+/// Only [`SharedVol::place`] makes one, so the offset is always inside a brick: reads and writes through a place
+/// index the brick without a bounds check
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Place {
-    pub slot: usize,
-    pub offset: u16,
+    slot: usize,
+    offset: u16,
+}
+
+impl Place {
+    /// The brick slot, in C order over the brick grid
+    #[inline(always)]
+    pub fn slot(self) -> usize {
+        self.slot
+    }
 }
 
 impl SharedVol {
