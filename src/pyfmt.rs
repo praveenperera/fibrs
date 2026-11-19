@@ -245,58 +245,92 @@ pub fn py_float_repr(x: f64) -> String {
     format!("{sign}{body}")
 }
 
+/// How Python's `json.dumps` lays a value out: its `indent`, `separators` and `sort_keys`
+#[derive(Clone, Copy, Debug)]
+pub struct JsonStyle {
+    /// Spaces per nesting level; `None` writes everything on one line
+    pub indent: Option<usize>,
+    /// Between items, and between a key and its value
+    pub item: &'static str,
+    pub key: &'static str,
+    pub sort_keys: bool,
+}
+
+impl JsonStyle {
+    /// `json.dumps(value)`: one line, `", "` and `": "`
+    pub const DEFAULT: Self = Self { indent: None, item: ", ", key: ": ", sort_keys: false };
+    /// `separators=(",", ":")`
+    pub const COMPACT: Self = Self { indent: None, item: ",", key: ":", sort_keys: false };
+
+    /// `json.dumps(value, indent=n)`, whose item separator drops its trailing space
+    pub const fn indented(n: usize) -> Self {
+        Self { indent: Some(n), item: ",", key: ": ", sort_keys: false }
+    }
+
+    pub const fn sorted(self) -> Self {
+        Self { sort_keys: true, ..self }
+    }
+}
+
+/// `json.dumps(value, ...)` in `style`, with Python's default `ensure_ascii` and `allow_nan=False`
+pub fn py_dumps(value: &Value, style: JsonStyle) -> String {
+    let mut out = String::new();
+    write_value(value, style, 0, &mut out);
+    out
+}
+
 /// `json.dumps(value, separators=(",", ":"), allow_nan=False)` with Python's default `ensure_ascii`
 pub fn py_json(value: &Value) -> String {
-    let mut out = String::new();
-    write_json(value, &mut out);
-    out
+    py_dumps(value, JsonStyle::COMPACT)
 }
 
 /// `json.dump(value, handle, indent=2)`: one item per line, `": "` after keys, empty containers inline
 pub fn py_json_indent(value: &Value) -> String {
-    let mut out = String::new();
-    write_indented(value, 0, &mut out);
-    out
+    py_dumps(value, JsonStyle::indented(2))
 }
 
-fn write_indented(value: &Value, depth: usize, out: &mut String) {
+fn write_value(value: &Value, style: JsonStyle, depth: usize, out: &mut String) {
+    // a newline and the next level's indent before each item, or the item separator alone on one line
     let pad = |out: &mut String, d: usize| {
-        out.push('\n');
-        out.push_str(&"  ".repeat(d));
+        if let Some(n) = style.indent {
+            out.push('\n');
+            out.push_str(&" ".repeat(n * d));
+        }
     };
     match value {
         Value::Array(items) if !items.is_empty() => {
             out.push('[');
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    out.push_str(style.item);
                 }
                 pad(out, depth + 1);
-                write_indented(item, depth + 1, out);
+                write_value(item, style, depth + 1, out);
             }
             pad(out, depth);
             out.push(']');
         }
         Value::Object(map) if !map.is_empty() => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            if style.sort_keys {
+                // Python sorts str keys by code point, which is the UTF-8 byte order
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+            }
             out.push('{');
-            for (i, (k, v)) in map.iter().enumerate() {
+            for (i, (k, v)) in entries.into_iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    out.push_str(style.item);
                 }
                 pad(out, depth + 1);
                 write_str(k, out);
-                out.push_str(": ");
-                write_indented(v, depth + 1, out);
+                out.push_str(style.key);
+                write_value(v, style, depth + 1, out);
             }
             pad(out, depth);
             out.push('}');
         }
-        other => write_json(other, out),
-    }
-}
-
-fn write_json(value: &Value, out: &mut String) {
-    match value {
+        Value::Array(_) => out.push_str("[]"),
+        Value::Object(_) => out.push_str("{}"),
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Number(n) => {
@@ -309,28 +343,6 @@ fn write_json(value: &Value, out: &mut String) {
             }
         }
         Value::String(s) => write_str(s, out),
-        Value::Array(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_json(item, out);
-            }
-            out.push(']');
-        }
-        Value::Object(map) => {
-            out.push('{');
-            for (i, (k, v)) in map.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_str(k, out);
-                out.push(':');
-                write_json(v, out);
-            }
-            out.push('}');
-        }
     }
 }
 
@@ -399,6 +411,15 @@ mod tests {
         let v = json!({"a": [1, [], {}], "b": {"c": 9.362}, "d": null});
         let want = "{\n  \"a\": [\n    1,\n    [],\n    {}\n  ],\n  \"b\": {\n    \"c\": 9.362\n  },\n  \"d\": null\n}";
         assert_eq!(py_json_indent(&v), want);
+    }
+
+    #[test]
+    fn styles_match_python_dumps() {
+        let v = json!({"b": [1, 0.0, []], "a": {"é": null}});
+        assert_eq!(py_dumps(&v, JsonStyle::DEFAULT), r#"{"b": [1, 0.0, []], "a": {"\u00e9": null}}"#);
+        assert_eq!(py_dumps(&v, JsonStyle::DEFAULT.sorted()), r#"{"a": {"\u00e9": null}, "b": [1, 0.0, []]}"#);
+        let want = "{\n    \"a\": {\n        \"\\u00e9\": null\n    },\n    \"b\": [\n        1,\n        0.0,\n        []\n    ]\n}";
+        assert_eq!(py_dumps(&v, JsonStyle::indented(4).sorted()), want);
     }
 
     #[test]

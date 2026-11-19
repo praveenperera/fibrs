@@ -32,3 +32,20 @@ The Rust crates it links are MIT or Apache-2.0 licensed; Cargo.lock lists them.
 
 At run time the binary loads numpy's bundled OpenBLAS (libscipy_openblas64_*, BSD-3-Clause)
 from the Python environment it is installed into; that library is not distributed here.
+
+fibrs predict runs Qual's AFV fibre model V2
+(https://huggingface.co/Qualzz20/afv_fiber_9um_v2). The model and its weights are Qual's:
+fibrs ships neither and reads the snapshot you point it at. At run time it loads NVIDIA's
+cuDNN and cuBLAS from the system or from NVIDIA's pip packages; they are not distributed here.
+
+Its tiling, padding, blend, quantisation, tracing downsample and, in --mode villa, its choice
+of tiles and output chunks follow villa's lasagna.qualzz_inference and
+lasagna.tiled_predict3d (https://github.com/ScrollPrize/villa, commit 97fb9336c);
+src/predict/villa.rs reimplements villa's tile-selection rule. villa is MIT licensed,
+Copyright (c) 2024 Vesuvius Challenge; the full text is in licenses/villa-MIT.txt.
+
+On Linux x86-64 the binary includes fibrs predict's engine, volkit, whose embedded GPU kernels
+contain compiled code from NVIDIA libdevice (CUDA Toolkit 13.2), distributed under the NVIDIA
+CUDA Toolkit End User License Agreement and not under this crate's licence, and code compiled
+from NVIDIA's cuda-oxide device crate (Apache-2.0, Copyright (c) 2024-2026 NVIDIA CORPORATION
+& AFFILIATES). licenses/nvidia-gpu-kernels.txt gives the details and the terms that apply.

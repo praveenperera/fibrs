@@ -1,0 +1,19 @@
+NVIDIA code in fibrs predict's GPU kernels (Linux x86-64 builds)
+
+fibrs predict's engine, volkit (https://github.com/praveenperera/volkit),
+embeds GPU kernels as PTX and cubins. Those kernels contain:
+
+1. Compiled code from NVIDIA libdevice (libdevice.10.bc, CUDA Toolkit 13.2): the
+   __nv_expf, __nv_sqrtf, __nv_fmaxf, __nv_fminf and __nv_rintf functions. libdevice is
+   listed as distributable in Attachment A of the NVIDIA CUDA Toolkit End User License
+   Agreement, and this code is distributed under that Agreement's terms, not under fibrs's
+   or volkit's licences. The Agreement is at https://docs.nvidia.com/cuda/eula/ and in each
+   CUDA Toolkit as EULA.txt. It may be used only as part of fibrs, not on its own.
+
+2. Code compiled from NVIDIA's cuda-oxide device crate (https://github.com/NVIDIA/cuda-rust,
+   commit 8d825486993f806903d8968232214ddafa8ed7da):
+
+   Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+   Licensed under the Apache License, Version 2.0 (licenses/apache-2.0.txt).
+
+volkit's own THIRD_PARTY_NOTICES file lists these and its other upstream works.

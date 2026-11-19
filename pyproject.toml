@@ -12,10 +12,11 @@ requires-python = ">=3.9"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "licenses/*.txt"]
 authors = [{ name = "Praveen Perera", email = "me@praveenperera.com" }]
-keywords = ["vesuvius-challenge", "herculaneum", "papyrus", "fibre-tracing", "afv", "avf-spline-generator"]
+keywords = ["vesuvius-challenge", "herculaneum", "papyrus", "fibre-tracing", "afv", "avf-spline-generator", "inference", "cuda"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Science/Research",
+  "Environment :: GPU :: NVIDIA CUDA :: 12",
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
@@ -26,6 +27,15 @@ classifiers = [
 # the reference does. macOS numpy wheels link Accelerate and bundle no OpenBLAS, so there the same OpenBLAS build as
 # numpy 2.4.6's Linux wheel comes from scipy-openblas64
 dependencies = ["numpy>=2", "scipy-openblas64==0.3.31.188.0; sys_platform == 'darwin'"]
+
+[project.optional-dependencies]
+# cuDNN 9 and cuBLAS 12 for `fibrs predict`, for a machine without them installed; the binary loads them from this
+# environment's site-packages before the system's. NVIDIA ships both for Linux x86-64 only, where the binary has
+# its GPU engine, so elsewhere the extra installs nothing
+predict = [
+  "nvidia-cudnn-cu12>=9.1,<10; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "nvidia-cublas-cu12>=12.1,<13; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 
 [project.urls]
 Repository = "https://github.com/praveenperera/fibrs"

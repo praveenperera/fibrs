@@ -6,9 +6,13 @@ same flags and writes the same `.afv`: every metadata value except the per-run u
 point block and spatial-index row. The tracing algorithm, the AFV format and the fibre model whose
 predictions it reads are Qual's; this port changes how fast the tracer runs, not what it writes.
 
-On a 512 × 8169 × 8169 band of PHerc0826, with `--threads 4` for both tools, it took 191 s where the
-original took 11,840 s: 62 times faster, with about 23 times less CPU time, and the same `.afv`. Tracing
-runs on the CPU and needs no GPU.
+With `--threads 4` for both tools, it traces 22×–62× faster across three measured runs on 512-plane bands of
+PHerc0826 and PHerc1545 (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU and needs no
+GPU.
+
+`fibrs predict` runs the step before: Qual's AFV fibre model V2 over a CT volume on an NVIDIA GPU, without
+PyTorch, writing the probability zarr the tracer reads, as villa's inference writes it (see
+[Predictions](#predictions)).
 
 ## Install
 
@@ -17,7 +21,9 @@ pip install fibrs
 ```
 
 Install it into the environment that has numpy (normally the one that runs `avf-spline-generator`). It
-adds a `fibrs` command and a Python module, `fibrs`. Prebuilt CLI archives for Linux
+adds a `fibrs` command and a Python module, `fibrs`. `fibrs predict` is built into the same binary on Linux
+x86-64; `pip install "fibrs[predict]"` adds the cuDNN and cuBLAS it needs when the system has none (see
+[Predictions](#predictions)). Prebuilt CLI archives for Linux
 x86-64 (glibc 2.28+) and Apple silicon (macOS 11+) are named `fibrs-<version>-<target>.tar.gz`.
 
 ## Use
@@ -91,19 +97,33 @@ through the drop-in and through `python -m fibrs`. Both must write what the orig
 
 ## Speed
 
-The same band, on an Intel Core Ultra 7 270K Plus (24 cores), with `--threads 4` for both tools and other
-work running on the machine (one-minute load average 17.5–18.8):
+Three runs on an Intel Core Ultra 7 270K Plus (24 cores), with `--threads 4` for both tools and other work
+running on the machine each time. Runs 1 and 2 trace the same 512 × 8169 × 8169 band of PHerc0826, and run 3 a
+512-plane band of PHerc1545 (z 1280–1792):
 
-| Run | Wall | CPU time | Peak memory |
-|---|---|---|---|
-| `avf-spline-generator` 0.2.0 | 11,840 s (3.3 h) | about 11,940 s | 4.6 GiB |
-| `fibrs` 0.1.1 | 191 s | 516 s | 12.4 GiB |
-| Speedup | **62×** | **about 23×** | |
+| Run | Tool | Wall | CPU time | Peak memory |
+|---|---|---|---|---|
+| 1 | `avf-spline-generator` 0.2.0 | 11,840 s (3.3 h) | about 11,940 s | 4.6 GiB |
+| 1 | `fibrs` 0.1.1 | 191 s | 516 s | 12.4 GiB |
+| 2 | `avf-spline-generator` 0.2.0 | 4,686 s (1.3 h) | not measured | 4.6 GiB |
+| 2 | `fibrs` 0.1.0 | 172 s | not measured | 10.8 GiB |
+| 3 | `avf-spline-generator` 0.2.0 | 1,621 s (27 min) | 4,149 s | not measured |
+| 3 | `fibrs` 0.1.0 | 73.4 s | 191 s | not measured |
+| Speedup | | **22×–62×** | **about 22×–23× (runs 1 and 3)** | |
 
-The original uses about one core whatever `--threads` says, and the port keeps about 2.7 busy. The
-original's run was interrupted by a reboot and finished with `--resume`. Its wall time is the sum of the two
-parts, and the first part's CPU time is estimated from the second part's CPU-to-wall ratio (1.01). An
-earlier uninterrupted run of the original on the same band took 12,728 s.
+- Run 1: the one-minute load average was 17.5–18.8. The original's run was interrupted by a reboot and
+  finished with `--resume`. Its wall time is the sum of the two parts, and the first part's CPU time is
+  estimated from the second part's CPU-to-wall ratio (1.01). An earlier uninterrupted run of the original on
+  the same band took 12,728 s.
+- Run 2: the one-minute load average averaged 13.9 during the original's run and 8.8 during fibrs's. The two
+  `.afv` files held the same 149,680 fibres (compared logically, as each holds its own run uuid).
+- Run 3: the one-minute load average was 10.0 during the original's run and 7.4 during fibrs's. This band is
+  sparser, and the original kept about 2.6 cores busy on it. The two `.afv` files held the same 82,646 fibres
+  and 83,741 point blocks.
+
+The ratio varies with the run and with the machine's load: the range is the lowest and highest of the measured
+runs. The gap is largest on dense bands, where the original tracer uses about one core whatever `--threads`
+says; on run 1's band the port kept about 2.7 busy.
 
 ## Differences from the original
 
@@ -116,7 +136,8 @@ earlier uninterrupted run of the original on the same band took 12,728 s.
   Linux each allocation of 1 MiB or more (a decoded chunk, a tile's results) has its own mapping, so evicted
   chunks do not stay resident. `FIBRS_DEBUG_MEM=1` logs each stage's field sizes and resident memory.
 - The work directory holds `run.json` (with a `native` key, so neither tool resumes the other's
-  directory) and one finished curve file per family. An interrupted family is traced again from its first
+  directory, and only the fibrs version that started it resumes it) and one finished curve file per
+  family. An interrupted family is traced again from its first
   seed on `--resume`, instead of from the last 16-seed batch.
 - `--storage` and `--field-cache-mib` are validated, and `--storage` is recorded in `run.json` as the
   original records it, but neither selects anything. The chunk cache is bounded by `--native-cache-mib`
@@ -132,8 +153,167 @@ earlier uninterrupted run of the original on the same band took 12,728 s.
 - The original's batch-buffer capacity checks are not reproduced. Its smoothing-snapshot limit
   (`--field-cache-mib`) is not either, because no snapshot is taken.
 
+## Predictions
+
+`fibrs predict` runs Qual's [AFV fibre model V2](https://huggingface.co/Qualzz20/afv_fiber_9um_v2) over a CT
+volume and writes the probability zarr that villa's `python -m lasagna.qualzz_inference` writes: `semantic`
+(2 × Z × Y × X, uint8 V and H fibre probabilities) and `tracing` (the same at half resolution), the input that
+`fibrs` and [AVF_SPLINE_GENERATOR](https://github.com/Qualzz/AVF_SPLINE_GENERATOR) trace. Chunks that are all
+zero are not written (fill value 0), so a reader must treat a missing chunk as zero, as zarr does.
+
+The model, its weights and its output are Qual's, and the tiling, blending and quantisation are villa's lasagna
+inference. The network runs natively on the GPU through [volkit](https://github.com/praveenperera/volkit)'s
+`AfvV2`, with no PyTorch or Python: per tile, the model's own normalisation, the network in float32 with TF32
+convolutions (PyTorch's defaults), the softmax and the blend, then each column's finalise, in the reference's
+float32 order. Tiles are read on several threads ahead of the GPU, and one thread writes the output.
+
+### Requirements
+
+- Linux x86-64 and an NVIDIA GPU of compute capability 8.0 or later (RTX 30 series, A100 and newer; not the
+  T4 or the RTX 20 series), with a driver for CUDA 12 or later. The binary needs only the driver
+  (`libcuda.so.1`), not a CUDA toolkit.
+- cuDNN 9 (`libcudnn.so.9`) and cuBLAS 12 (`libcublas.so.12`). `pip install "fibrs[predict]"` installs them
+  from NVIDIA's pip packages (`nvidia-cudnn-cu12`, `nvidia-cublas-cu12`); a system install works too.
+- No PyTorch, and no Python at run time beyond what installs the wheel.
+
+On macOS and other platforms the binary has no GPU engine: `fibrs predict --dry-run` plans a run there, and a real
+run stops with an error naming what it needs. The tracer is unaffected.
+
+### Install and use
+
+```sh
+pip install "fibrs[predict]"   # or: pip install fibrs, with cuDNN 9 and cuBLAS 12 installed system-wide
+```
+
+Download the model snapshot (`model.py`, `plans.json`, `dataset.json`, `checkpoint_final.pth`) from
+[Qualzz20/afv_fiber_9um_v2](https://huggingface.co/Qualzz20/afv_fiber_9um_v2); `--model-dir` is that directory, which
+must not hold a `fold_0` checkpoint or be named `fold_*`, as the loader would then read other files.
+
+```sh
+# villa's output, for a whole CT array
+fibrs predict --mode villa --ct scroll.zarr/0 --model-dir afv_fiber_9um_v2 --out pred.zarr
+
+# one z band, resumable
+fibrs predict --ct scroll.zarr/0 --z0 12032 --z1 12544 --model-dir afv_fiber_9um_v2 --out band.zarr --max-minutes 60
+
+python -m fibrs predict ARGS   # the same, from Python
+```
+
+`--ct` is a level-0 uint8 zarr v2 array (the `/0` directory of an OME-Zarr). `--device` is `cuda` or `cuda:N`.
+Run the same command again on the same `--out` to resume a capped (`--max-minutes`) or interrupted run at the
+first unfinished column; the resume must use the same settings, binary and GPU model, or it refuses the output.
+One run at a time may use an output: a run locks it until it ends, and a second run on the same `--out` is
+refused.
+It recognises the CT by its metadata and the names and sizes of its chunk files, not their contents, so a chunk
+rewritten in place at the same size is not detected: after changing the CT, use a fresh `--out`.
+`--expect-sha256` refuses a checkpoint with another hash. `--dry-run` reads the CT and prints, per column, the
+tile batches a run would send to the GPU and how many tiles it would skip, without a GPU and without writing.
+
+The binary finds cuDNN and cuBLAS in the Python environment it is installed in (`site-packages/nvidia/*/lib`
+beside its `bin/fibrs`) before the system's, by loading those copies before the engine asks for the libraries by
+name; `FIBRS_CUDA_LIBS=system` skips the pip copies. The engine asks for the unversioned names (`libcublas.so`,
+`libcudnn.so`) first, so a system copy under one of those on the loader's path, such as a CUDA 13 toolkit's
+`libcublas.so`, is used instead, whatever its version. The run still works; it warns when the cuBLAS it loaded is
+not 12.x, and its provenance records the cuBLAS and cuDNN versions. To use cuBLAS 12 on such a machine, put a
+directory holding `libcublas.so -> libcublas.so.12` and `libcudnn.so -> libcudnn.so.9` symlinks first on
+`LD_LIBRARY_PATH`, or keep the CUDA 13 library directories off the loader's path. Each run's `summary-*.json`
+lists the cuDNN and cuBLAS files it loaded. cuDNN's convolution algorithms are timed on the first run and cached
+under `~/.cache` (see volkit's documentation for the cache variables). They set the rounding, so the provenance
+lists them and a resume that picks others is refused: keep the cache between a run and its resume.
+
+### Modes
+
+| Mode | What it computes |
+|---|---|
+| `--mode villa` | the whole array, as villa main's `lasagna.qualzz_inference` computes it, with villa's rule for which tiles run (from the input's stored chunks) |
+| band mode (the default) | a z band `[z0, z1)`, reflected at the band's own edges, tiles whose input is all zero skipped |
+
+Use `--mode villa` when you want villa's output. Band mode is for splitting a scroll into z bands that run
+separately and resume: it does not reproduce villa's output, because villa runs the whole volume, so its tiles near
+a band's edges see the planes beyond it, and it also runs tiles of stored zeros.
+
+The network runs on one tile at a time in both modes. `--batch` (band mode, default 4, at most 16) is how many
+tiles go to the GPU together, and `--readers` (tile reader threads, default 4) how many read ahead; both change
+the speed, not the output. `--column` (the size of the y–x columns a run is split into, default 480) leaves villa
+mode's output unchanged; in band mode it is part of the run's settings, as in the Python version.
+
+### Precision
+
+By default `fibrs predict` runs at the precision of villa's `lasagna.qualzz_inference` on PyTorch, to keep parity
+with it; `--mode villa` also computes the same tiles over the whole array, while band mode differs at the band's
+edges and in skipping all-zero tiles (see Modes). bf16 is opt-in, never the default and will never be used
+for published fibre sets.
+
+- `--precision fp32` (default): float32 tensors with TF32 tensor-core convolutions, the precision PyTorch uses for
+  the reference by default.
+- `--precision bf16` (opt-in): faster, small output differences. The network and its seg head run in bf16, with
+  the normalisation, softmax and blend still in float32. Against fp32, on 512-plane bands of PHerc0826 and
+  PHerc0813 traced with `fibrs`, the traced fibre length agreed to about 99% (99.2–99.4%, V and H fibres),
+  97.0–97.8% of fibres matched, and the fibre counts were within 0.3%; the 99.9th percentile of the probability
+  differences over the foreground was 11 (`semantic`) and 9 (`tracing`) of 255 on PHerc0826, and 8 and 7 on
+  PHerc0813.
+
+PyTorch's `fp32-ieee` and `fp16` modes are not offered.
+
+### Speed
+
+Against villa's `lasagna.qualzz_inference` on PyTorch, at its default precision (float32 with TF32 tensor-core
+convolutions). Both ran the same 726-tile crop of PHerc0826 (z 12032–12544, y 4096–5120, x 1536–2560) on one RTX
+5090 (driver 595.112.07). The runs alternated (ABBA), with 6 timed pairs per precision after 2 warm-up pairs, and
+each time is the whole command's wall time. The speedup is the mean of the per-pair ratios:
+
+| `fibrs predict --mode villa` precision | villa, PyTorch fp32 (median) | fibrs (median) | Speedup, mean (95% CI) |
+|---|---|---|---|
+| fp32 (default) | 45.37 s | 26.77 s | 1.72× (1.66–1.78×) |
+| bf16 (opt-in) | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) |
+
+fibrs, a pre-release build of 0.2.0 (`e9adcc9`), ran with cuDNN 9.27.0 and cuBLAS 13.4.1.3. villa ran PyTorch
+2.14.1 (CUDA 13.0) with cuDNN 9.24, at `0bddf2757`.
+
+### Parity
+
+- **fp32 (default)**, `fibrs predict --mode villa` against villa main's `lasagna.qualzz_inference` (`0bddf2757`)
+  on the same crop:
+  - the 99.9th percentile of the probability differences over the foreground is 1 of 255 in each channel;
+  - the largest difference is 3 of 255;
+  - the most likely class agrees at 99.97% of voxels in `semantic` and 99.973% in `tracing`;
+  - both cover all 256 output chunks, and leave nothing uncovered.
+
+  The outputs aren't identical, as expected from a different implementation. The differences are of the same
+  order as two runs of villa itself with `cudnn.benchmark` on (99.9th percentile 1).
+  Scoring the timed runs' outputs against the same bar is still in progress.
+- **Band mode** matches the reference engine value for value on a full PHerc0826 band, with 0 differences at
+  fp32 and at bf16. fibrs doesn't store chunks that are entirely zero, so its output is smaller on disk; zarr
+  reads a missing chunk as zero.
+- **Libraries:** running the release build with the cuDNN 9.28.1 and cuBLAS 12.9 that `fibrs[predict]` installs,
+  instead of a system cuDNN 9.27.0 and cuBLAS 13.4, left its outputs unchanged on three band columns at fp32 and
+  bf16. With the pip cuDNN alone, the villa-mode crop at fp32 was unchanged too.
+- **bf16 (opt-in)** against fp32: the figures under Precision.
+
+### Limits
+
+- The output's `voxel_size_um` attribute is always 9.362, the PHerc0826 CT's voxel size. If your CT has another
+  voxel size, pass the real one to the tracer (`--voxel-size-um`), which reads its own flag, not the attribute.
+- A column's accumulators span the whole band height on the GPU, about 14 bytes per voxel (a 480 × 480 column of
+  8,000 planes needs about 24 GiB), and the engine takes at most 2^31 − 1 voxels in one column (a 480 × 480 column
+  of up to 9,320 planes). A run whose pending columns don't fit, in the free GPU memory or in that limit, stops
+  before it starts and says what would fit: a smaller `--column` when one does (in villa mode the column size
+  leaves the output unchanged), else a shorter band.
+- Villa mode reads which chunks are stored from the input's directory listing, so the input must be a zarr v2
+  directory store (`.` or `/` chunk separator).
+- Outputs from different GPU models, or with different cuDNN versions, can differ slightly, as the model's own
+  outputs do under PyTorch.
+
+### Tests
+
+`cargo test` checks, without a GPU, that `fibrs predict --dry-run` feeds the network exactly the tiles, batches and
+bytes that fibrs's Python band reference (`fibrs.predict` at fibrs PR #3) feeds it, on small synthetic CTs in band
+and villa mode (`tests/predict.rs`, `tests/fixtures/predict`, written by `scripts/predict_fixtures.py`), and that
+bad arguments are refused with the reference's messages.
+
 ## Licence
 
 Apache-2.0, like the original; the licence text is `licenses/apache-2.0.txt`. `NOTICE` lists the ported code
-(AVF_SPLINE_GENERATOR, one NumPy sort routine) and the statically linked C libraries; their licence texts are in
-`licenses/`.
+(AVF_SPLINE_GENERATOR, one NumPy sort routine), the statically linked C libraries and what `fibrs predict` takes
+from villa (MIT: its tile rule in villa mode); their licence texts are in `licenses/`. The AFV model and its
+weights are Qual's, and cuDNN and cuBLAS are NVIDIA's; none of them is distributed here.

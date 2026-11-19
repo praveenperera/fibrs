@@ -529,6 +529,14 @@ pub fn run(args: Args) -> Result<Summary> {
         if saved.get("native").is_none() {
             bail!("Work directory holds a reference avf-spline-generator run; use a new work directory");
         }
+        // the checkpoints carry no format of their own beyond the release that wrote them
+        let started_by = &saved["native"]["version"];
+        if started_by != &config["native"]["version"] {
+            bail!(
+                "Work directory was started by fibrs {}; resume it with that version, or use a new work directory",
+                started_by.as_str().unwrap_or("of another version")
+            );
+        }
         if saved != config {
             bail!("Inputs or tracing settings changed; use a new work directory");
         }
