@@ -85,6 +85,12 @@ impl<T: Voxel> Vol<T> {
         unsafe { std::slice::from_raw_parts_mut(b.0.as_ptr(), BRICK) }
     }
 
+    /// The value every voxel outside an allocated brick reads as
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    pub fn default_value(&self) -> T {
+        self.default
+    }
+
     #[inline(always)]
     fn brick_index(&self, z: usize, y: usize, x: usize) -> usize {
         ((z >> SHIFT) * self.grid[1] + (y >> SHIFT)) * self.grid[2] + (x >> SHIFT)
@@ -133,6 +139,30 @@ impl<T: Voxel> Vol<T> {
             }
         };
         self.brick_mut(b)[Self::offset(z, y, x)] = value;
+    }
+
+    /// The voxels of brick `bi` (C order over the brick grid) in brick order, or None where every voxel reads as
+    /// the default
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    pub fn brick_at(&self, bi: usize) -> Option<&[T; BRICK]> {
+        let b = self.bricks[bi]?;
+        Some(self.brick(b).try_into().expect("a brick holds BRICK voxels"))
+    }
+
+    /// Replace brick `bi` with `data`, one brick's voxels in brick order; a brick that would hold only the default
+    /// is not allocated
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    pub fn set_brick(&mut self, bi: usize, data: &[T; BRICK]) {
+        let b = match self.bricks[bi] {
+            Some(b) => b,
+            None if data.iter().all(|&v| v == self.default) => return,
+            None => {
+                let b = Brick(self.store.alloc());
+                self.bricks[bi] = Some(b);
+                b
+            }
+        };
+        self.brick_mut(b).copy_from_slice(data);
     }
 
     /// Bytes held by allocated bricks
@@ -199,6 +229,9 @@ impl<T: Voxel> Vol<T> {
     /// Fill the bricks whose z index lies in `rows` in parallel, leaving the others as they are:
     /// `f(brick_lo, brick_dims, out)` writes one brick's voxels in C order (dims clipped at the volume edge) and
     /// returns whether any differs from the default
+    ///
+    /// Each row of bricks may be filled once: the store does not take bricks back, so a brick replaced by a second
+    /// fill would stay allocated, uncounted by [`Vol::resident_bytes`], until the volume is dropped
     pub fn fill_brick_rows<F>(&mut self, rows: Range<usize>, f: F)
     where
         F: Fn(Shape, Shape, &mut [T]) -> bool + Sync,
@@ -209,6 +242,7 @@ impl<T: Voxel> Vol<T> {
         let plane = grid[1] * grid[2];
         let store = &self.store;
         let slab = &mut self.bricks[rows.start * plane..rows.end * plane];
+        debug_assert!(slab.iter().all(Option::is_none), "brick rows {rows:?} are filled a second time");
         // each writer takes bricks from its own run of the store and reuses one dense buffer
         let init = || (store.run(), Vec::with_capacity(BRICK));
         slab.par_iter_mut().enumerate().for_each_init(init, |(run, dense), (i, slot)| {
@@ -224,7 +258,7 @@ impl<T: Voxel> Vol<T> {
                 *slot = None;
                 return;
             }
-            let ptr = store.alloc_in(run);
+            let ptr = run.alloc();
             // SAFETY: the store handed this brick to this writer alone, and it lives as long as the volume
             let b = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), BRICK) };
             for z in 0..dims[0] {

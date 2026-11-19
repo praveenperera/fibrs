@@ -20,9 +20,9 @@ use crate::arena::BufferPool;
 use crate::vol::{Shape, Vol};
 
 /// Halo the tensor needs: 4 + 1 + 6
-const HALO: usize = 11;
+pub(crate) const HALO: usize = 11;
 /// Tile edge for the parallel sweep; a multiple of the brick edge
-const CORE: usize = 64;
+pub(crate) const CORE: usize = 64;
 
 /// SciPy's Gaussian weights for σ 0.9 (radius 4) and σ 1.5 (radius 6), outermost first, centre last;
 /// computed by `scipy.ndimage._gaussian_kernel1d` and stored as their float64 bit patterns
@@ -135,6 +135,19 @@ impl Lapack {
         // vt.astype(float32)
         Ok([a[0] as f32, a[1] as f32, a[2] as f32])
     }
+
+    /// A voxel's stored direction from its structure tensor `m` (row-major, axes z, y, x): the eigenvector of the
+    /// smallest eigenvalue, flipped so z >= 0, its x and y quantized to bytes as `prepare.tensor_axes` stores them
+    pub(crate) fn direction(&self, m: [f32; 9], work: &mut Vec<f64>, iwork: &mut Vec<i64>) -> Result<(u8, u8)> {
+        let v = self.smallest(m, work, iwork)?;
+        // xyz = v[::-1], flipped so z >= 0
+        let mut xyz = [v[2], v[1], v[0]];
+        if xyz[2] < 0.0 {
+            xyz = xyz.map(|c| -c);
+        }
+        let q = |c: f32| (c * 127.0f32 + 128.0f32).round_ties_even().clamp(1.0, 255.0) as u8;
+        Ok((q(xyz[0]), q(xyz[1])))
+    }
 }
 
 /// Find numpy's OpenBLAS: `FIBRS_LAPACK`, else the venv this executable was started from
@@ -188,6 +201,11 @@ fn which(name: &Path) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
+/// The GPU kernels' certification of a voxel's direction, which the tests hold against dsyevd on the CPU
+#[cfg(test)]
+#[path = "../fibrs-kernels/src/eigen.rs"]
+mod eigen;
+
 fn weights<const N: usize>(bits: [u64; N]) -> [f64; N] {
     bits.map(f64::from_bits)
 }
@@ -210,33 +228,97 @@ impl<A: Allocator> Block<A> {
 
 /// One axis of `scipy.ndimage.correlate1d` with a symmetric kernel `w` (outermost first, centre last)
 /// and mode "reflect", in place
-fn correlate_axis<A: Allocator>(b: &mut Block<A>, axis: usize, w: &[f64], line: &mut Vec<f64>) {
+///
+/// Each output is `line[c] * centre`, then `(line[c - off] + line[c + off]) * w[j]` added for each outer weight
+/// in turn, in float64, as SciPy sums it; the loops run that sequence over a whole row of outputs at once so it
+/// vectorises, but each output's operations and their order are unchanged, so the result is bitwise the same
+fn correlate_axis<A: Allocator>(b: &mut Block<A>, axis: usize, w: &[f64], scratch: &mut Vec<f64>) {
+    if axis == 2 {
+        correlate_rows(b, w, scratch);
+    } else {
+        correlate_across_rows(b, axis, w, scratch);
+    }
+}
+
+/// `correlate_axis` along x, where each line is one contiguous row: the outputs of a row are summed together
+fn correlate_rows<A: Allocator>(b: &mut Block<A>, w: &[f64], scratch: &mut Vec<f64>) {
+    let r = w.len() - 1;
+    let n = b.dims[2];
+    let centre = w[r];
+    scratch.clear();
+    scratch.resize(n + 2 * r + n, 0.0);
+    let (line, acc) = scratch.split_at_mut(n + 2 * r);
+    for row in b.data.chunks_exact_mut(n) {
+        for (l, &v) in line[r..r + n].iter_mut().zip(row.iter()) {
+            *l = v as f64;
+        }
+        for k in 0..r {
+            line[r - 1 - k] = line[r + reflect(-1 - k as isize, n)];
+            line[r + n + k] = line[r + reflect((n + k) as isize, n)];
+        }
+
+        for (a, &l) in acc.iter_mut().zip(&line[r..r + n]) {
+            *a = l * centre;
+        }
+        for (j, &wj) in w[..r].iter().enumerate() {
+            let off = r - j;
+            let (lo, hi) = (&line[r - off..r - off + n], &line[r + off..r + off + n]);
+            for ((a, &l), &h) in acc.iter_mut().zip(lo).zip(hi) {
+                *a += (l + h) * wj;
+            }
+        }
+
+        for (v, &a) in row.iter_mut().zip(acc.iter()) {
+            *v = a as f32;
+        }
+    }
+}
+
+/// `correlate_axis` along z or y: the lines of one plane across the axis run side by side as contiguous x rows,
+/// so each step of the sum covers a whole x row
+fn correlate_across_rows<A: Allocator>(b: &mut Block<A>, axis: usize, w: &[f64], scratch: &mut Vec<f64>) {
     let r = w.len() - 1;
     let n = b.dims[axis];
+    let width = b.dims[2];
     let stride = b.stride(axis);
+    let other = 1 - axis;
+    let (planes, plane_stride) = (b.dims[other], b.stride(other));
     let centre = w[r];
-    line.resize(n + 2 * r, 0.0);
-    let others: Vec<usize> = (0..3).filter(|&a| a != axis).collect();
-    let (d0, d1) = (b.dims[others[0]], b.dims[others[1]]);
-    let (s0, s1) = (b.stride(others[0]), b.stride(others[1]));
-    for i0 in 0..d0 {
-        for i1 in 0..d1 {
-            let base = i0 * s0 + i1 * s1;
-            for k in 0..n {
-                line[r + k] = b.data[base + k * stride] as f64;
+    scratch.clear();
+    scratch.resize((n + 2 * r) * width + width, 0.0);
+    let (panel, acc) = scratch.split_at_mut((n + 2 * r) * width);
+    for p in 0..planes {
+        let base = p * plane_stride;
+        for k in 0..n {
+            let src = &b.data[base + k * stride..][..width];
+            for (l, &v) in panel[(r + k) * width..][..width].iter_mut().zip(src) {
+                *l = v as f64;
             }
-            for k in 0..r {
-                line[r - 1 - k] = line[r + reflect(-1 - k as isize, n)];
-                line[r + n + k] = line[r + reflect((n + k) as isize, n)];
+        }
+        for k in 0..r {
+            let below = r + reflect(-1 - k as isize, n);
+            panel.copy_within(below * width..(below + 1) * width, (r - 1 - k) * width);
+            let above = r + reflect((n + k) as isize, n);
+            panel.copy_within(above * width..(above + 1) * width, (r + n + k) * width);
+        }
+
+        for k in 0..n {
+            let c = r + k;
+            for (a, &l) in acc.iter_mut().zip(&panel[c * width..][..width]) {
+                *a = l * centre;
             }
-            for k in 0..n {
-                let c = r + k;
-                let mut acc = line[c] * centre;
-                for (j, &wj) in w[..r].iter().enumerate() {
-                    let off = r - j;
-                    acc += (line[c - off] + line[c + off]) * wj;
+            for (j, &wj) in w[..r].iter().enumerate() {
+                let off = r - j;
+                let lo = &panel[(c - off) * width..][..width];
+                let hi = &panel[(c + off) * width..][..width];
+                for ((a, &l), &h) in acc.iter_mut().zip(lo).zip(hi) {
+                    *a += (l + h) * wj;
                 }
-                b.data[base + k * stride] = acc as f32;
+            }
+
+            let out = &mut b.data[base + k * stride..][..width];
+            for (v, &a) in out.iter_mut().zip(acc.iter()) {
+                *v = a as f32;
             }
         }
     }
@@ -251,9 +333,9 @@ fn reflect(i: isize, n: usize) -> usize {
 }
 
 /// `gaussian_filter(block, sigma)` on float32: axes 0, 1, 2, each rounded to float32
-fn gaussian<A: Allocator>(b: &mut Block<A>, w: &[f64], line: &mut Vec<f64>) {
+fn gaussian<A: Allocator>(b: &mut Block<A>, w: &[f64], scratch: &mut Vec<f64>) {
     for axis in 0..3 {
-        correlate_axis(b, axis, w, line);
+        correlate_axis(b, axis, w, scratch);
     }
 }
 
@@ -290,9 +372,12 @@ pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<(Vol<u
     let mut nx = Vol::new(shape, 128u8);
     let mut ny = Vol::new(shape, 128u8);
     // every tile's smoothed block, gradients and products are a few MiB each and mostly of one size, so they come
-    // from a pool instead of a fresh mapping each; the pool keeps about one run of tiles' worth of freed buffers
-    let in_flight = 4 * rayon::current_num_threads();
-    let pool = BufferPool::new(in_flight * TILE_BUFFERS * tile_bytes(shape));
+    // from a pool instead of a fresh mapping each; a thread's next tile takes the buffers its last one freed, so
+    // the pool keeps one tile's buffers per thread, up to TILE_POOL_RETAIN
+    let threads = rayon::current_num_threads();
+    let in_flight = 4 * threads;
+    let per_tile = TILE_BUFFERS * BufferPool::footprint(tile_bytes(shape));
+    let pool = BufferPool::new((threads * per_tile).min(TILE_POOL_RETAIN));
     // tiles run a few per thread at a time and are written before the next run, so the dense tile results held
     // at once stay small; tile cores are disjoint, so the order they are written in does not matter
     for part in tiles.chunks(in_flight) {
@@ -306,6 +391,10 @@ pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<(Vol<u
     }
     Ok((nx, ny))
 }
+
+/// Most freed tile buffers the direction field keeps for reuse, the bound the README states: one tile's buffers
+/// per thread up to 12 threads
+const TILE_POOL_RETAIN: usize = 128 << 20;
 
 /// Pooled f32 buffers a tile holds at once: the smoothed block or a product, and three gradients
 const TILE_BUFFERS: usize = 4;
@@ -348,7 +437,7 @@ fn tile_axes(tracing: &[Vol<u8>; 2], t: Shape, lapack: &Lapack, pool: &BufferPoo
     let mut xx = vec![128u8; n];
     let mut yy = vec![128u8; n];
     let (w09, w15) = (weights(W09), weights(W15));
-    let mut line = Vec::new();
+    let mut scratch = Vec::new();
     let (mut work, mut iwork) = (Vec::new(), Vec::new());
     for (family, ids) in ids.iter().enumerate() {
         if ids.is_empty() {
@@ -358,7 +447,7 @@ fn tile_axes(tracing: &[Vol<u8>; 2], t: Shape, lapack: &Lapack, pool: &BufferPoo
         let mut data = Vec::with_capacity_in(raw.len(), pool);
         data.extend(raw.iter().map(|&v| v as f32 / 255.0f32));
         let mut smooth = Block { dims, data };
-        gaussian(&mut smooth, &w09, &mut line);
+        gaussian(&mut smooth, &w09, &mut scratch);
         let grad = [0, 1, 2].map(|a| gradient(&smooth, a));
         drop(smooth);
         let mut tensor = vec![[0.0f32; 9]; ids.len()];
@@ -367,7 +456,7 @@ fn tile_axes(tracing: &[Vol<u8>; 2], t: Shape, lapack: &Lapack, pool: &BufferPoo
                 let mut data = Vec::with_capacity_in(grad[u].data.len(), pool);
                 data.extend(grad[u].data.iter().zip(&grad[v].data).map(|(a, b)| a * b));
                 let mut prod = Block { dims, data };
-                gaussian(&mut prod, &w15, &mut line);
+                gaussian(&mut prod, &w15, &mut scratch);
                 for (m, &(_, at)) in tensor.iter_mut().zip(ids) {
                     m[3 * u + v] = prod.data[at];
                     m[3 * v + u] = prod.data[at];
@@ -375,15 +464,7 @@ fn tile_axes(tracing: &[Vol<u8>; 2], t: Shape, lapack: &Lapack, pool: &BufferPoo
             }
         }
         for (m, &(local, _)) in tensor.iter().zip(ids) {
-            let v = lapack.smallest(*m, &mut work, &mut iwork)?;
-            // xyz = v[::-1], flipped so z >= 0
-            let mut xyz = [v[2], v[1], v[0]];
-            if xyz[2] < 0.0 {
-                xyz = xyz.map(|c| -c);
-            }
-            let q = |c: f32| (c * 127.0f32 + 128.0f32).round_ties_even().clamp(1.0, 255.0) as u8;
-            xx[local] = q(xyz[0]);
-            yy[local] = q(xyz[1]);
+            (xx[local], yy[local]) = lapack.direction(*m, &mut work, &mut iwork)?;
         }
     }
     Ok(Some((start, core_dims, xx, yy)))
@@ -443,14 +524,298 @@ mod tests {
 
     #[test]
     fn correlate_matches_scipy_on_short_lines() {
-        let mut line = Vec::new();
+        let mut scratch = Vec::new();
         for (sigma, input, expected) in SCIPY_SHORT_LINES {
             let w = if sigma == 0.9 { weights(W09).to_vec() } else { weights(W15).to_vec() };
             let data = input.iter().map(|&b| f32::from_bits(b)).collect();
             let mut b = Block { dims: [1, 1, input.len()], data };
-            correlate_axis(&mut b, 2, &w, &mut line);
+            correlate_axis(&mut b, 2, &w, &mut scratch);
             let got: Vec<u32> = b.data.iter().map(|v| v.to_bits()).collect();
             assert_eq!(got, expected, "sigma {sigma}, n {}", input.len());
+        }
+    }
+
+    /// The per-line `correlate_axis` the row-at-a-time version replaced, kept as the bitwise reference
+    fn correlate_axis_per_line(b: &mut Block, axis: usize, w: &[f64]) {
+        let r = w.len() - 1;
+        let n = b.dims[axis];
+        let stride = b.stride(axis);
+        let centre = w[r];
+        let mut line = vec![0.0f64; n + 2 * r];
+        let others: Vec<usize> = (0..3).filter(|&a| a != axis).collect();
+        let (d0, d1) = (b.dims[others[0]], b.dims[others[1]]);
+        let (s0, s1) = (b.stride(others[0]), b.stride(others[1]));
+        for i0 in 0..d0 {
+            for i1 in 0..d1 {
+                let base = i0 * s0 + i1 * s1;
+                for k in 0..n {
+                    line[r + k] = b.data[base + k * stride] as f64;
+                }
+                for k in 0..r {
+                    line[r - 1 - k] = line[r + reflect(-1 - k as isize, n)];
+                    line[r + n + k] = line[r + reflect((n + k) as isize, n)];
+                }
+                for k in 0..n {
+                    let c = r + k;
+                    let mut acc = line[c] * centre;
+                    for (j, &wj) in w[..r].iter().enumerate() {
+                        let off = r - j;
+                        acc += (line[c - off] + line[c + off]) * wj;
+                    }
+                    b.data[base + k * stride] = acc as f32;
+                }
+            }
+        }
+    }
+
+    /// Plain Rust arithmetic for the certification: each operation rounds to nearest on its own, as the kernels'
+    /// explicit intrinsics do, since Rust never contracts float operations
+    struct Plain;
+
+    impl eigen::Ops for Plain {
+        fn mul(a: f64, b: f64) -> f64 {
+            a * b
+        }
+
+        fn add(a: f64, b: f64) -> f64 {
+            a + b
+        }
+
+        fn div(a: f64, b: f64) -> f64 {
+            a / b
+        }
+
+        fn sqrt(a: f64) -> f64 {
+            a.sqrt()
+        }
+
+        fn mul32(a: f32, b: f32) -> f32 {
+            a * b
+        }
+
+        fn add32(a: f32, b: f32) -> f32 {
+            a + b
+        }
+    }
+
+    /// A small xorshift, so the test tensors need no dependency
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// Uniform in [0, 1)
+        fn unit(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+
+        /// Uniform in [-1, 1)
+        fn signed(&mut self) -> f64 {
+            2.0 * self.unit() - 1.0
+        }
+
+        /// Uniform over the integers lo..=hi
+        fn int(&mut self, lo: i32, hi: i32) -> i32 {
+            lo + (self.next() % (hi - lo + 1) as u64) as i32
+        }
+
+        /// 10 to a uniform integer power in lo..=hi
+        fn scale(&mut self, lo: i32, hi: i32) -> f64 {
+            10f64.powi(self.int(lo, hi))
+        }
+
+        fn vector(&mut self) -> [f64; 3] {
+            [self.signed(), self.signed(), self.signed()]
+        }
+    }
+
+    fn normalized(v: [f64; 3]) -> [f64; 3] {
+        let n = v.iter().map(|c| c * c).sum::<f64>().sqrt();
+        v.map(|c| c / n)
+    }
+
+    /// An orthonormal basis whose first vector is `u` normalized
+    fn basis(u: [f64; 3], rng: &mut Rng) -> [[f64; 3]; 3] {
+        let c0 = normalized(u);
+        let r = rng.vector();
+        let d = r[0] * c0[0] + r[1] * c0[1] + r[2] * c0[2];
+        let c1 = normalized([0, 1, 2].map(|i| r[i] - d * c0[i]));
+        let c2 = [c0[1] * c1[2] - c0[2] * c1[1], c0[2] * c1[0] - c0[0] * c1[2], c0[0] * c1[1] - c0[1] * c1[0]];
+        [c0, c1, c2]
+    }
+
+    /// The upper triangle [a00, a01, a02, a11, a12, a22] of the matrix with eigenvectors `cols` and eigenvalues
+    /// `lambda`, computed in f64 and rounded to f32 as a smoothed tensor is
+    fn spectral(cols: [[f64; 3]; 3], lambda: [f64; 3]) -> [f32; 6] {
+        let at = |i: usize, j: usize| (0..3).map(|k| cols[k][i] * lambda[k] * cols[k][j]).sum::<f64>() as f32;
+        [at(0, 0), at(0, 1), at(0, 2), at(1, 1), at(1, 2), at(2, 2)]
+    }
+
+    /// Three increasing eigenvalues of one scale, well apart, so only the vector under test is hard
+    fn separated(rng: &mut Rng) -> [f64; 3] {
+        let s = rng.scale(-12, 6);
+        let l0 = rng.signed() * s;
+        let l1 = l0 + s * (0.1 + rng.unit());
+        [l0, l1, l1 + s * (0.1 + rng.unit())]
+    }
+
+    fn full(m: [f32; 6]) -> [f32; 9] {
+        [m[0], m[1], m[2], m[1], m[3], m[4], m[2], m[4], m[5]]
+    }
+
+    /// Test tensors by kind; the kinds after `random_*` are the adversarial ones
+    fn tensors() -> Vec<(&'static str, [f32; 6])> {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut out = Vec::new();
+        for _ in 0..1_500_000 {
+            let s = rng.scale(-20, 20);
+            out.push(("random_symmetric", [(); 6].map(|_| (rng.signed() * s) as f32)));
+        }
+        // structure tensors are smoothed sums of gradient outer products, so positive semidefinite
+        for _ in 0..1_500_000 {
+            let s = rng.scale(-20, 8);
+            let mut a = [0.0f64; 6];
+            for _ in 0..rng.int(1, 3) {
+                let (g, w) = (rng.vector(), rng.unit());
+                let outer = [g[0] * g[0], g[0] * g[1], g[0] * g[2], g[1] * g[1], g[1] * g[2], g[2] * g[2]];
+                a = [0, 1, 2, 3, 4, 5].map(|k| a[k] + w * outer[k]);
+            }
+            out.push(("random_structure", a.map(|v| (v * s) as f32)));
+        }
+        for _ in 0..1_000_000 {
+            let cols = basis(rng.vector(), &mut rng);
+            let s = rng.scale(-15, 15);
+            out.push(("random_spectral", spectral(cols, [(); 3].map(|_| rng.unit() * s))));
+        }
+
+        out.extend([[0.0f32; 6], [-0.0; 6], [0.0, -0.0, 0.0, -0.0, 0.0, -0.0]].map(|m| ("zero", m)));
+        // exact diagonals, with ties drawn from a few values, so repeated eigenvalues and an axis-aligned smallest
+        // vector (|z| exactly 0 or 1) both occur
+        let values = [0.0, 1.0, 2.0, -1.0, 0.5, 1e-30, 1e30, 3.0e-38];
+        for _ in 0..100_000 {
+            let d = [(); 3].map(|_| values[rng.int(0, values.len() as i32 - 1) as usize] as f32);
+            out.push(("diagonal", [d[0], 0.0, 0.0, d[1], 0.0, d[2]]));
+            let r = [(); 3].map(|_| (rng.signed() * rng.scale(-10, 10)) as f32);
+            out.push(("diagonal", [r[0], 0.0, 0.0, r[1], 0.0, r[2]]));
+        }
+        for _ in 0..100_000 {
+            let cols = basis(rng.vector(), &mut rng);
+            let (a, b) = (rng.signed() * rng.scale(-10, 10), rng.signed() * rng.scale(-10, 10));
+            for lambda in [[a, a, b], [a, b, b], [a, a, a]] {
+                out.push(("repeated", spectral(cols, lambda)));
+            }
+        }
+        for _ in 0..200_000 {
+            let cols = basis(rng.vector(), &mut rng);
+            let a = rng.unit() * rng.scale(-10, 10);
+            let rho = rng.scale(-16, -1) * rng.unit();
+            out.push(("near_degenerate", spectral(cols, [a, a * (1.0 + rho), a * (2.0 + rng.unit())])));
+        }
+        // the smallest vector nearly in the x-y plane, where its z sign decides the flip
+        for _ in 0..200_000 {
+            let zeta = rng.signed() * rng.scale(-17, -1);
+            let cols = basis([zeta, rng.signed(), rng.signed()], &mut rng);
+            out.push(("small_z", spectral(cols, separated(&mut rng))));
+        }
+        for _ in 0..100_000 {
+            let s = if rng.next() & 1 == 0 { rng.scale(-46, -36) } else { rng.scale(30, 38) };
+            out.push(("extreme_scale", [(); 6].map(|_| (rng.signed() * s) as f32)));
+        }
+        // the smallest vector's x and y within a hair of a quantization step's edge, (n + 0.5 - 128) / 127
+        for _ in 0..300_000 {
+            let mut edge = || {
+                let n = rng.int(60, 195) as f64;
+                let hair = if rng.next().is_multiple_of(4) { 0.0 } else { rng.signed() * rng.scale(-14, -5) };
+                (n + 0.5 - 128.0) / 127.0 + hair
+            };
+            let (x, y) = (edge(), edge());
+            let z = (1.0 - x * x - y * y).max(0.0).sqrt();
+            let cols = basis([z, y, x], &mut rng);
+            out.push(("quantization_edge", spectral(cols, separated(&mut rng))));
+        }
+        out
+    }
+
+    /// Every direction `eigen::certify` certifies equals dsyevd's, quantized as the CPU path stores it, over random
+    /// tensors at many scales and adversarial ones; the certification falls back on the hard ones instead
+    #[test]
+    #[ignore = "needs numpy's OpenBLAS: FIBRS_LAPACK=.../numpy.libs/libscipy_openblas64_*.so cargo test --release \
+                certify_matches_dsyevd -- --ignored"]
+    fn certify_matches_dsyevd() {
+        let lapack = Lapack::init(&find_lapack().unwrap()).unwrap();
+        let cases = tensors();
+        // per case: whether it was certified, and how it differs from dsyevd when it does
+        let results: Vec<(bool, Option<String>)> = cases
+            .par_iter()
+            .map_init(
+                || (Vec::new(), Vec::new()),
+                |(work, iwork), &(kind, m)| {
+                    let Some(got) = eigen::certify::<Plain>(m) else { return (false, None) };
+                    let want = lapack.direction(full(m), work, iwork).unwrap();
+                    let bits = m.map(f32::to_bits);
+                    (true, (got != want).then(|| format!("{kind} {bits:08x?}: certified {got:?}, dsyevd {want:?}")))
+                },
+            )
+            .collect();
+
+        let mut kinds: Vec<(&str, usize, usize)> = Vec::new();
+        for (&(kind, _), &(certified, _)) in cases.iter().zip(&results) {
+            if kinds.last().is_none_or(|k| k.0 != kind) {
+                kinds.push((kind, 0, 0));
+            }
+            let k = kinds.last_mut().expect("pushed above");
+            k.1 += 1;
+            k.2 += certified as usize;
+        }
+        for (kind, n, certified) in &kinds {
+            eprintln!("{kind}: {certified} of {n} certified");
+        }
+        let mismatches: Vec<&String> = results.iter().filter_map(|r| r.1.as_ref()).collect();
+        assert!(
+            mismatches.is_empty(),
+            "{} certified mismatches, first: {:#?}",
+            mismatches.len(),
+            &mismatches[..5.min(mismatches.len())]
+        );
+
+        let count = |pred: &dyn Fn(&str) -> bool| -> (usize, usize) {
+            kinds.iter().filter(|k| pred(k.0)).fold((0, 0), |(n, c), k| (n + k.1, c + k.2))
+        };
+        let (n, certified) = count(&|k| k.starts_with("random_"));
+        assert!(certified as f64 > 0.95 * n as f64, "only {certified} of {n} random tensors certified");
+        assert_eq!(count(&|k| k == "zero").1, 0, "a zero tensor was certified");
+        let (n, certified) = count(&|k| !k.starts_with("random_"));
+        assert!(certified < n, "no adversarial tensor fell back");
+    }
+
+    #[test]
+    fn correlate_matches_the_per_line_sum_bitwise() {
+        // tile-like blocks, including axes shorter than the kernel radius, of pseudo-random tensor-like values
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / (1u64 << 24) as f32 * 255.0 - 64.0
+        };
+        let mut scratch = Vec::new();
+        for dims in [[86, 86, 86], [3, 40, 17], [29, 2, 5], [7, 11, 1]] {
+            for w in [weights(W09).to_vec(), weights(W15).to_vec()] {
+                let data: Vec<f32> = (0..dims.iter().product::<usize>()).map(|_| next()).collect();
+                let mut got = Block { dims, data: data.clone() };
+                let mut want = Block { dims, data };
+                for axis in 0..3 {
+                    correlate_axis(&mut got, axis, &w, &mut scratch);
+                    correlate_axis_per_line(&mut want, axis, &w);
+                    let bits = |b: &Block| b.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&got), bits(&want), "dims {dims:?} axis {axis} radius {}", w.len() - 1);
+                }
+            }
         }
     }
 }

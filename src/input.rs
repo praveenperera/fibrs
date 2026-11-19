@@ -154,18 +154,25 @@ impl Predictions {
 
     /// Read `(2, hi - lo)` as uint8 in V, H order (`Predictions.read(lo, hi)`)
     pub fn read_u8(&self, lo: [usize; 3], hi: [usize; 3]) -> Result<Vec<u8>> {
-        let raw = self.read_raw(lo, hi)?;
+        self.read_u8_in(lo, hi, Global)
+    }
+
+    /// [`Predictions::read_u8`] into a buffer from `alloc`; uint8 arrays are read straight into it
+    fn read_u8_in<A: Allocator + Clone>(&self, lo: [usize; 3], hi: [usize; 3], alloc: A) -> Result<Vec<u8, A>> {
+        let raw = self.read_raw_in(lo, hi, alloc.clone())?;
         if self.dtype.kind == Kind::U8 {
             return Ok(raw);
         }
         let floats = self.to_f32(&raw)?;
         // np.rint(block * 255).astype("u1") in float32; values are already checked to lie in [0, 1]
-        Ok(floats.iter().map(|&v| (v * 255.0f32).round_ties_even() as u8).collect())
+        let mut out = Vec::with_capacity_in(floats.len(), alloc);
+        out.extend(floats.iter().map(|&v| (v * 255.0f32).round_ties_even() as u8));
+        Ok(out)
     }
 
     /// Read `(2, hi - lo)` as float32 without quantization (`read(..., quantized=False)`)
     pub fn read_f32(&self, lo: [usize; 3], hi: [usize; 3]) -> Result<Vec<f32>> {
-        let raw = self.read_raw(lo, hi)?;
+        let raw = self.read_raw_in(lo, hi, Global)?;
         if self.dtype.kind == Kind::U8 {
             return Ok(raw.iter().map(|&v| v as f32).collect());
         }
@@ -185,11 +192,12 @@ impl Predictions {
     }
 
     /// Raw element bytes of `(2, hi - lo)`, C order, channels already in V, H order
-    fn read_raw(&self, lo: [usize; 3], hi: [usize; 3]) -> Result<Vec<u8>> {
+    fn read_raw_in<A: Allocator>(&self, lo: [usize; 3], hi: [usize; 3], alloc: A) -> Result<Vec<u8, A>> {
         let dims = [0, 1, 2].map(|a| hi[a] - lo[a]);
         let es = self.dtype.size();
         let plane = dims.iter().product::<usize>() * es;
-        let mut out = vec![0u8; 2 * plane];
+        let mut out = Vec::with_capacity_in(2 * plane, alloc);
+        out.resize(2 * plane, 0u8);
         match &self.store {
             Store::Npy { map, offset, fortran } => {
                 let s = self.shape;
@@ -289,23 +297,20 @@ impl Predictions {
     ///
     /// A whole uint8 Blosc chunk holding both channels, which is what prediction writers store, is decoded
     /// straight into the returned buffer, its compressed bytes read into another buffer from `alloc`; anything
-    /// else goes through [`Predictions::read_u8`] and is copied
+    /// else is read through [`Predictions::read_u8`]'s path into a buffer from `alloc`
     pub fn read_chunk_in<A: Allocator + Copy>(
         &self,
         key: [usize; 3],
         edge: [usize; 3],
         alloc: A,
-    ) -> Result<([usize; 3], [usize; 3], Vec<u8, A>)> {
+    ) -> Result<NativeChunk<A>> {
         let lo = [0, 1, 2].map(|a| key[a] * edge[a]);
         let hi = [0, 1, 2].map(|a| (lo[a] + edge[a]).min(self.shape[a]));
         let dims = [0, 1, 2].map(|a| hi[a] - lo[a]);
         if let Some(data) = self.whole_chunk_in(key, edge, dims, alloc)? {
-            return Ok((lo, dims, data));
+            return Ok(NativeChunk { lo, dims, data });
         }
-        let read = self.read_u8(lo, hi)?;
-        let mut data = Vec::with_capacity_in(read.len(), alloc);
-        data.extend_from_slice(&read);
-        Ok((lo, dims, data))
+        Ok(NativeChunk { lo, dims, data: self.read_u8_in(lo, hi, alloc)? })
     }
 
     /// The fast path of [`Predictions::read_chunk_in`]: the chunk's decoded bytes are already `(2, dims)` in C order
@@ -318,36 +323,158 @@ impl Predictions {
         dims: [usize; 3],
         alloc: A,
     ) -> Result<Option<Vec<u8, A>>> {
-        let Store::Zarr { dir, chunks, sep, fill, compressor, fortran } = &self.store else { return Ok(None) };
-        let whole = chunks[0] == 2 && [chunks[1], chunks[2], chunks[3]] == edge && dims == edge;
-        if !whole || *fortran || *compressor != Compressor::Blosc || self.dtype.kind != Kind::U8 {
+        if self.slab_layout() != Some(edge) || dims != edge {
             return Ok(None);
         }
         let n = 2 * dims.iter().product::<usize>();
-        let name = format!("0{sep}{}{sep}{}{sep}{}", key[0], key[1], key[2]);
-        let path = dir.join(&name);
-        let mut file = match fs::File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // a uint8 fill value is one byte, the same in both channels, so channel order does not matter
+        let mut out = match self.packed_chunk_in(key, alloc)? {
+            PackedChunk::Fill(fill) => {
                 let mut out = Vec::with_capacity_in(n, alloc);
-                out.resize(n, fill[0]);
+                out.resize(n, fill);
                 return Ok(Some(out));
             }
-            Err(e) => return Err(eyre!("{}: {e}", path.display())),
+            PackedChunk::Blosc(bytes) => blosc_decompress_in(&bytes, alloc).map_err(|e| eyre!("chunk {key:?}: {e}"))?,
         };
-        let size = file.metadata().map_err(|e| eyre!("{}: {e}", path.display()))?.len() as usize;
-        let mut bytes = Vec::with_capacity_in(size, alloc);
-        bytes.resize(size, 0);
-        file.read_exact(&mut bytes).map_err(|e| eyre!("{}: {e}", path.display()))?;
-        let mut out = blosc_decompress_in(&bytes, alloc).map_err(|e| eyre!("chunk {name}: {e}"))?;
-        ensure!(out.len() == n, "chunk {name} decoded to {} bytes, expected {n}", out.len());
+        ensure!(out.len() == n, "chunk {key:?} decoded to {} bytes, expected {n}", out.len());
         if self.reverse {
             let (a, b) = out.split_at_mut(n / 2);
             a.swap_with_slice(b);
         }
         Ok(Some(out))
     }
+
+    /// The stored z, y, x extent of each channel of a chunk when the array's chunks can be decoded a few planes at
+    /// a time: uint8 Blosc chunks in C order holding both channels. `None` for any other layout
+    ///
+    /// Zarr stores the chunks at the volume's edge at this full extent too, so the same strides address every chunk
+    pub fn slab_layout(&self) -> Option<[usize; 3]> {
+        let Store::Zarr { chunks, compressor, fortran, .. } = &self.store else { return None };
+        let sliced = chunks[0] == 2 && !*fortran && *compressor == Compressor::Blosc && self.dtype.kind == Kind::U8;
+        sliced.then_some([chunks[1], chunks[2], chunks[3]])
+    }
+
+    /// The still-compressed bytes of chunk `key`, read into a buffer from `alloc`, for an array with a
+    /// [`Predictions::slab_layout`]
+    pub fn packed_chunk_in<A: Allocator>(&self, key: [usize; 3], alloc: A) -> Result<PackedChunk<A>> {
+        let Store::Zarr { dir, sep, fill, .. } = &self.store else { bail!("only Zarr chunks are packed") };
+        let name = format!("0{sep}{}{sep}{}{sep}{}", key[0], key[1], key[2]);
+        let path = dir.join(&name);
+        let mut file = match fs::File::open(&path) {
+            Ok(f) => f,
+            // a uint8 fill value is one byte, the same in both channels, so channel order does not matter
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(PackedChunk::Fill(fill[0])),
+            Err(e) => return Err(eyre!("{}: {e}", path.display())),
+        };
+        let size = file.metadata().map_err(|e| eyre!("{}: {e}", path.display()))?.len() as usize;
+        let mut bytes = Vec::with_capacity_in(size, alloc);
+        bytes.resize(size, 0);
+        file.read_exact(&mut bytes).map_err(|e| eyre!("{}: {e}", path.display()))?;
+        Ok(PackedChunk::Blosc(bytes))
+    }
+
+    /// Decode z planes `planes` of both channels of a packed chunk into `out`, V then H, each `(planes, cy, cx)`
+    /// at the stored extent of [`Predictions::slab_layout`]
+    ///
+    /// Blosc compresses a chunk in independent blocks (128 KiB, 8 planes of 128 × 128, in prediction zarrs), and
+    /// only the blocks the planes fall in are decoded
+    pub fn decode_planes<A: Allocator>(
+        &self,
+        packed: &PackedChunk<A>,
+        planes: std::ops::Range<usize>,
+        out: &mut [u8],
+    ) -> Result<()> {
+        let edge = self.slab_layout().ok_or_else(|| eyre!("the array's chunks cannot be decoded by planes"))?;
+        let plane = edge[1] * edge[2];
+        let channel = edge[0] * plane;
+        let len = planes.len() * plane;
+        ensure!(planes.end <= edge[0] && out.len() == 2 * len, "planes {planes:?} do not fit a {edge:?} chunk");
+        let bytes = match packed {
+            PackedChunk::Fill(fill) => {
+                out.fill(*fill);
+                return Ok(());
+            }
+            PackedChunk::Blosc(bytes) => bytes,
+        };
+        let (v, h) = out.split_at_mut(len);
+        // stored channel order is V, H, or H, V when `reverse`
+        let parts = if self.reverse { [h, v] } else { [v, h] };
+        frame_channel_ranges(bytes, channel, planes.start * plane, parts)
+    }
+
+    /// Whether the array's Blosc blocks each fall within runs of `planes` planes, so decoding those planes decodes
+    /// no more than they hold
+    ///
+    /// Judged by one stored chunk, since a writer compresses every chunk of an array alike; it only decides whether
+    /// reading by planes is worth its cache of compressed chunks. Each chunk is checked again as it is read
+    /// ([`Predictions::planes_fit`]), so a store that mixes block sizes is still decoded once per chunk
+    pub fn blocks_fit_planes(&self, planes: usize) -> bool {
+        let Some(edge) = self.slab_layout() else { return false };
+        let run = planes * edge[1] * edge[2];
+        match self.stored_chunk().map(|key| self.packed_chunk_in(key, Global)) {
+            Some(Ok(PackedChunk::Blosc(bytes))) => blocks_fit(&bytes, run),
+            // an array with no chunk stored holds only its fill value, which no decode reads
+            None => true,
+            Some(Ok(PackedChunk::Fill(_)) | Err(_)) => false,
+        }
+    }
+
+    /// Whether decoding `planes` planes of `packed` at a time decodes no more than they hold; a chunk the writer
+    /// never stored decodes nothing
+    pub fn planes_fit<A: Allocator>(&self, packed: &PackedChunk<A>, planes: usize) -> bool {
+        let Some(edge) = self.slab_layout() else { return false };
+        match packed {
+            PackedChunk::Fill(_) => true,
+            PackedChunk::Blosc(bytes) => blocks_fit(bytes, planes * edge[1] * edge[2]),
+        }
+    }
+
+    /// The key of a chunk the array stores, found by listing its directory, or `None` when it stores none
+    ///
+    /// Listing instead of opening keys in grid order finds a chunk however sparse the array is
+    fn stored_chunk(&self) -> Option<[usize; 3]> {
+        let Store::Zarr { dir, sep, chunks, .. } = &self.store else { return None };
+        let grid = [0, 1, 2].map(|a| self.shape[a].div_ceil(chunks[a + 1]));
+        let key = |parts: &[&str]| -> Option<[usize; 3]> {
+            let [c, z, y, x] = parts else { return None };
+            let k = [z.parse().ok()?, y.parse().ok()?, x.parse().ok()?];
+            (*c == "0" && (0..3).all(|a| k[a] < grid[a])).then_some(k)
+        };
+        // listed lazily: a whole-scroll array can store a million chunks, and the first will do
+        let names =
+            |d: &Path| fs::read_dir(d).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok());
+        if *sep != '/' {
+            return names(dir).find_map(|n| key(&n.split(*sep).collect::<Vec<_>>()));
+        }
+
+        // nested keys: 0/z/y/x
+        for z in names(&dir.join("0")) {
+            for y in names(&dir.join("0").join(&z)) {
+                for x in names(&dir.join("0").join(&z).join(&y)) {
+                    if let Some(k) = key(&["0", &z, &y, &x]) {
+                        return Some(k);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// A chunk of a [`Predictions::slab_layout`] array as stored, for [`Predictions::decode_planes`]
+pub enum PackedChunk<A: Allocator> {
+    /// The chunk's Blosc frame
+    Blosc(Vec<u8, A>),
+    /// A chunk the writer never stored: every voxel holds the fill value
+    Fill(u8),
+}
+
+/// One spatial chunk of predictions read by [`Predictions::read_chunk_in`]: uint8 `(2, dims)` in V, H order, C order
+pub struct NativeChunk<A: Allocator> {
+    /// Origin in voxels, z, y, x
+    pub lo: [usize; 3],
+    /// Extent in voxels, clipped to the array
+    pub dims: [usize; 3],
+    pub data: Vec<u8, A>,
 }
 
 /// Copy `count` elements of `es` bytes, `stride` elements apart from element `first`, contiguously into `out`
@@ -445,6 +572,90 @@ pub(crate) fn blosc_decompress_in<A: Allocator>(src: &[u8], alloc: A) -> Result<
     Ok(out)
 }
 
+/// The header fields of a Blosc 1 frame that decoding part of it depends on
+struct FrameInfo {
+    /// Decoded size
+    nbytes: usize,
+    typesize: usize,
+    /// Bytes per independently compressed block
+    blocksize: usize,
+}
+
+/// Validate a Blosc 1 frame and read its header: version, version, flags, typesize, then nbytes, blocksize and
+/// cbytes as little-endian u32
+fn blosc_frame_info(src: &[u8]) -> Result<FrameInfo> {
+    let mut nbytes = 0usize;
+    // SAFETY: c-blosc reads at most `src.len()` bytes of the header to validate it
+    let valid = unsafe { blosc_src::blosc_cbuffer_validate(src.as_ptr().cast(), src.len(), &mut nbytes) };
+    ensure!(valid == 0 && src.len() >= 16, "not a valid Blosc frame");
+    let blocksize = u32::from_le_bytes(src[8..12].try_into().expect("4 bytes")) as usize;
+    Ok(FrameInfo { nbytes, typesize: src[3] as usize, blocksize })
+}
+
+/// Decode the same byte range of both channels of a frame holding two channels of `channel` bytes each: bytes
+/// `start..` of each channel into the matching part, decoding only the blocks they fall in where it can
+fn frame_channel_ranges(bytes: &[u8], channel: usize, start: usize, parts: [&mut [u8]; 2]) -> Result<()> {
+    // a frame of another size would put one channel's bytes where the other's are read
+    let frame = blosc_frame_info(bytes)?;
+    ensure!(frame.nbytes == 2 * channel, "chunk frame holds {} bytes, expected {}", frame.nbytes, 2 * channel);
+    let len = parts[0].len();
+    ensure!(parts[1].len() == len && start + len <= channel, "bytes {start}.. lie outside a channel");
+    let starts = [start, channel + start];
+    let ts = frame.typesize;
+    let ranged = item_ranges_decode_whole_blocks(&frame) && frame.blocksize <= len;
+    if ranged && len.is_multiple_of(ts) && starts.iter().all(|s| s.is_multiple_of(ts)) {
+        for (at, part) in starts.into_iter().zip(parts) {
+            blosc_getitem(bytes, at, part)?;
+        }
+        return Ok(());
+    }
+
+    // c-blosc reads a range in whole items of the frame's typesize, so a frame whose items straddle the range's
+    // bounds is decoded whole, as is one whose blocks a range read could take short, and one whose blocks are larger
+    // than the range: reading each channel's range would decode a block holding both twice
+    let all = blosc_decompress(bytes)?;
+    for (at, part) in starts.into_iter().zip(parts) {
+        part.copy_from_slice(&all[at..at + len]);
+    }
+    Ok(())
+}
+
+/// Whether decoding `run` aligned bytes of a frame decodes no more than they hold: its blocks are no larger, and
+/// its items divide the run
+fn blocks_fit(bytes: &[u8], run: usize) -> bool {
+    blosc_frame_info(bytes)
+        .is_ok_and(|f| f.blocksize <= run && item_ranges_decode_whole_blocks(&f) && run.is_multiple_of(f.typesize))
+}
+
+/// Whether c-blosc's `blosc_getitem` decodes every block of the frame in full
+///
+/// A block is compressed as `typesize` streams of `blocksize / typesize` bytes each. When the type size does not
+/// divide the block size, which c-blosc never writes but a damaged header can claim, the streams cover less than
+/// the block; `blosc_getitem` does not check how much it decoded and copies the rest from its scratch buffer,
+/// where decoding the whole frame fails
+fn item_ranges_decode_whole_blocks(frame: &FrameInfo) -> bool {
+    frame.typesize > 0 && frame.blocksize > 0 && frame.blocksize.is_multiple_of(frame.typesize)
+}
+
+/// Decode bytes `start..start + out.len()` of one Blosc 1 frame into `out`, decoding only the blocks they fall in
+fn blosc_getitem(src: &[u8], start: usize, out: &mut [u8]) -> Result<()> {
+    let frame = blosc_frame_info(src)?;
+    let FrameInfo { nbytes, typesize, blocksize } = frame;
+    ensure!(
+        item_ranges_decode_whole_blocks(&frame),
+        "Blosc frame has {blocksize}-byte blocks of {typesize}-byte items"
+    );
+    // c-blosc counts `start` and the length in items of the frame's typesize
+    ensure!(start.is_multiple_of(typesize) && out.len().is_multiple_of(typesize), "bytes {start}.. split a Blosc item");
+    ensure!(start + out.len() <= nbytes && nbytes <= i32::MAX as usize, "bytes {start}.. lie outside the frame");
+    let (first, items) = ((start / typesize) as i32, (out.len() / typesize) as i32);
+    // SAFETY: the frame was validated against `src.len()` and the range lies inside it, so c-blosc writes exactly
+    // `out.len()` bytes; it decodes with a context of its own, so rayon threads may call it at once
+    let n = unsafe { blosc_src::blosc_getitem(src.as_ptr().cast(), first, items, out.as_mut_ptr().cast()) };
+    ensure!(n >= 0 && n as usize == out.len(), "Blosc frame failed to decode bytes {start}.. ({n})");
+    Ok(())
+}
+
 fn open_npy(path: &Path) -> Result<(Store, Vec<usize>, Dtype)> {
     let file = fs::File::open(path)?;
     // SAFETY: the input is read-only for the whole run; the reference memory-maps it the same way
@@ -532,11 +743,12 @@ fn fill_value(v: &Value) -> Result<f64> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
 
     use serde_json::Value;
 
-    use super::Predictions;
+    use super::{NativeChunk, Predictions, blocks_fit, blosc_getitem, frame_channel_ranges};
     use crate::arena::BufferPool;
 
     /// Every case in `tests/fixtures/readers` (the expected values were written by the reference's own
@@ -604,7 +816,7 @@ mod tests {
             for z in 0..grid[0] {
                 for y in 0..grid[1] {
                     for x in 0..grid[2] {
-                        let (lo, dims, data) = p.read_chunk_in([z, y, x], edge, &pool).unwrap();
+                        let NativeChunk { lo, dims, data } = p.read_chunk_in([z, y, x], edge, &pool).unwrap();
                         let hi = [0, 1, 2].map(|a| lo[a] + dims[a]);
                         assert_eq!(&data[..], &p.read_u8(lo, hi).unwrap()[..], "{}", case["name"]);
                         checked += 1;
@@ -614,5 +826,161 @@ mod tests {
             }
         }
         assert!(checked > 30 && direct > 10, "too few chunks checked: {checked}, {direct} directly");
+    }
+
+    /// Every run of planes of every chunk of every fixture that can be decoded by planes holds, in both channels,
+    /// the same bytes as the reference reader's window over it; the planes past the array's edge are not compared
+    #[test]
+    fn plane_decodes_match_window_reads() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/readers");
+        let manifest: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(root.join("manifest.json")).expect("manifest"))
+                .expect("manifest json");
+        let pool = BufferPool::new(1 << 20);
+        let (mut checked, mut reversed) = (0, 0);
+        for case in manifest.iter().filter(|c| c["error"].is_null()) {
+            let order = case["order"].as_str().unwrap();
+            let p = Predictions::open(&root.join(case["path"].as_str().unwrap()), case["key"].as_str(), order).unwrap();
+            let Some(edge) = p.slab_layout() else { continue };
+            let grid = [0, 1, 2].map(|a| p.shape[a].div_ceil(edge[a]));
+            // runs of one plane and of half a chunk, so runs inside one Blosc block and across blocks both occur
+            for width in [1, edge[0].div_ceil(2)] {
+                for key in
+                    (0..grid[0]).flat_map(|z| (0..grid[1]).flat_map(move |y| (0..grid[2]).map(move |x| [z, y, x])))
+                {
+                    let packed = p.packed_chunk_in(key, &pool).unwrap();
+                    for first in (0..edge[0]).step_by(width) {
+                        let planes = first..(first + width).min(edge[0]);
+                        let lo = [key[0] * edge[0] + first, key[1] * edge[1], key[2] * edge[2]];
+                        if lo[0] >= p.shape[0] {
+                            continue;
+                        }
+                        let len = planes.len() * edge[1] * edge[2];
+                        let mut out = vec![0u8; 2 * len];
+                        p.decode_planes(&packed, planes.clone(), &mut out).unwrap();
+                        let hi = [0, 1, 2].map(|a| (lo[a] + [planes.len(), edge[1], edge[2]][a]).min(p.shape[a]));
+                        let dims = [0, 1, 2].map(|a| hi[a] - lo[a]);
+                        let window = p.read_u8(lo, hi).unwrap();
+                        let half = dims.iter().product::<usize>();
+                        for c in 0..2 {
+                            for z in 0..dims[0] {
+                                for y in 0..dims[1] {
+                                    for x in 0..dims[2] {
+                                        let got = out[c * len + (z * edge[1] + y) * edge[2] + x];
+                                        let want = window[c * half + (z * dims[1] + y) * dims[2] + x];
+                                        assert_eq!(got, want, "{} chunk {key:?} planes {planes:?}", case["name"]);
+                                    }
+                                }
+                            }
+                        }
+                        checked += 1;
+                        reversed += (order == "HV") as usize;
+                    }
+                }
+            }
+        }
+        assert!(checked > 30, "too few plane runs checked: {checked}");
+        println!("{checked} plane runs checked, {reversed} in H, V order");
+    }
+
+    /// Compress `data` as one Blosc 1 frame with zstd and shuffle, as zarr writes prediction chunks
+    fn blosc_frame(data: &[u8], typesize: usize, blocksize: usize) -> Vec<u8> {
+        blosc_frame_with(c"zstd", data, typesize, blocksize)
+    }
+
+    fn blosc_frame_with(name: &std::ffi::CStr, data: &[u8], typesize: usize, blocksize: usize) -> Vec<u8> {
+        let mut out = vec![0u8; data.len() + 64];
+        // SAFETY: `out` has room for the frame and its 16-byte header; the context call keeps no global state
+        let n = unsafe {
+            blosc_src::blosc_compress_ctx(
+                3,
+                1,
+                typesize,
+                data.len(),
+                data.as_ptr().cast(),
+                out.as_mut_ptr().cast(),
+                out.len(),
+                name.as_ptr(),
+                blocksize,
+                1,
+            )
+        };
+        assert!(n > 0, "blosc_compress_ctx failed ({n})");
+        out.truncate(n as usize);
+        out
+    }
+
+    /// Ranges of both channels decode to the stored bytes whatever the frame's item size and block size, and a
+    /// frame of the wrong size is refused rather than read across channels
+    #[test]
+    fn channel_ranges_decode_any_frame() {
+        let channel = 8 * 64 * 64;
+        let data: Vec<u8> = (0..2 * channel).map(|i| (i * 7 + i / 977) as u8).collect();
+        let run = 2 * 64 * 64;
+        for (typesize, blocksize, fits) in
+            [(1, run, true), (3, run, false), (1, 2 * channel, false), (4, run / 2, true)]
+        {
+            let frame = blosc_frame(&data, typesize, blocksize);
+            assert_eq!(blocks_fit(&frame, run), fits, "typesize {typesize} blocksize {blocksize}");
+            for start in [0, run, channel - run] {
+                let (mut a, mut b) = (vec![0u8; run], vec![0u8; run]);
+                frame_channel_ranges(&frame, channel, start, [&mut a, &mut b]).unwrap();
+                assert_eq!(a, data[start..start + run], "typesize {typesize} start {start}");
+                assert_eq!(b, data[channel + start..channel + start + run], "typesize {typesize} start {start}");
+            }
+        }
+        let frame = blosc_frame(&data[..channel], 1, run);
+        let (mut a, mut b) = (vec![0u8; run], vec![0u8; run]);
+        assert!(frame_channel_ranges(&frame, channel / 2 + 1, 0, [&mut a, &mut b]).is_err());
+    }
+
+    /// A header whose block size its type size does not divide, which c-blosc never writes, is refused as decoding
+    /// the whole frame refuses it, where reading item ranges would fill part of each block from scratch memory
+    ///
+    /// LZ4 splits each block into one stream per byte of the type. Claiming one byte more per block than the four
+    /// streams hold leaves every block but the last a byte short, and only the last fails to decode, so ranges
+    /// that stop before it would read back as decoded
+    #[test]
+    fn a_damaged_block_size_is_refused() {
+        let channel = 256 << 10;
+        let data: Vec<u8> = (0..2 * channel).map(|i| (i * 7 + i / 977) as u8).collect();
+        let mut frame = blosc_frame_with(c"lz4", &data, 4, 16 << 10);
+        let block = u32::from_le_bytes(frame[8..12].try_into().unwrap()) as usize;
+        assert_eq!((frame[2] & 0x10, block), (0, 64 << 10), "an LZ4 frame split into 64 KiB blocks");
+        frame[8..12].copy_from_slice(&(block as u32 + 1).to_le_bytes());
+        let len = 2 * block;
+        assert!(!blocks_fit(&frame, len));
+        assert!(blosc_getitem(&frame, 0, &mut vec![0u8; block]).is_err());
+        let (mut a, mut b) = (vec![0u8; len], vec![0u8; len]);
+        assert!(frame_channel_ranges(&frame, channel, 0, [&mut a, &mut b]).is_err());
+    }
+
+    /// The probe judges an array by a chunk it stores even when every chunk before it in grid order is missing,
+    /// with either key separator
+    #[test]
+    fn a_sparse_array_is_judged_by_a_stored_chunk() {
+        let edge = 16;
+        let data: Vec<u8> = (0..2 * edge * edge * edge).map(|i| (i * 7 + i / 977) as u8).collect();
+        // one Blosc block for the whole chunk: decoding 8 planes would decode all 16
+        let frame = blosc_frame(&data, 1, data.len());
+        let root = std::env::temp_dir().join(format!("fibrs-sparse-probe-{}", std::process::id()));
+        for sep in [".", "/"] {
+            let dir = root.join(if sep == "." { "flat" } else { "nested" });
+            let _ = fs::remove_dir_all(&dir);
+            // 64 × 65 chunk positions: the stored one is past the first 4,096 in grid order
+            let last = "0/0/63/64".replace('/', sep);
+            fs::create_dir_all(dir.join(&last).parent().unwrap()).unwrap();
+            fs::write(dir.join(&last), &frame).unwrap();
+            let meta = serde_json::json!({
+                "zarr_format": 2, "shape": [2, edge, 64 * edge, 65 * edge], "chunks": [2, edge, edge, edge],
+                "dtype": "|u1", "fill_value": 0, "order": "C", "filters": null, "dimension_separator": sep,
+                "compressor": {"id": "blosc", "cname": "zstd", "clevel": 5, "shuffle": 0, "blocksize": 0},
+            });
+            fs::write(dir.join(".zarray"), meta.to_string()).unwrap();
+            let p = Predictions::open(&dir, None, "VH").unwrap();
+            assert_eq!(p.stored_chunk(), Some([0, 63, 64]), "separator {sep}");
+            assert!(!p.blocks_fit_planes(8), "separator {sep}");
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 }

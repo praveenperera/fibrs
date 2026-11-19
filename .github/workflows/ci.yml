@@ -52,6 +52,12 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
+      # the committed kernel PTX (ptx/) was built from the kernel sources and toolchain it records; rebuilding it
+      # needs cuda-oxide and a CUDA toolkit, so CI checks the hashes only
+      - name: PTX matches its sources
+        if: runner.os == 'Linux'
+        run: scripts/check-ptx.sh
+
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 

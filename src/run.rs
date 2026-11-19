@@ -26,9 +26,11 @@ use crate::arena::BufferPool;
 use crate::axes::{Lapack, direction_field, find_lapack};
 use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
+use crate::gpu::{AxesCounts, Gpu, Stages};
 use crate::input::Predictions;
 use crate::kernels::{Coverage, Fields, RawCurve, Scratch, trace_seed};
 use crate::log;
+use crate::stage1::{Fused, Separate};
 use crate::vol::{EDGE, Shape, Vol};
 
 /// The reference release whose interface and output this reproduces
@@ -54,6 +56,9 @@ pub enum Family {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Device {
+    /// The GPU when a usable one is found, else the CPU
+    #[value(name = "auto")]
+    Auto,
     #[value(name = "cpu")]
     Cpu,
     #[value(name = "cuda")]
@@ -118,12 +123,15 @@ pub struct Args {
     /// Optional AFV scan identifier
     #[arg(long)]
     pub coordinate_space: Option<String>,
-    /// Centrality backend; tracing always runs on CPU
-    #[arg(long, value_enum, default_value = "cpu")]
+    /// Where the direction field and centrality run (tracing always runs on the CPU): auto uses an NVIDIA GPU when
+    /// one is usable and the CPU otherwise, cpu never uses the GPU, and cuda fails without one. A GPU run writes the
+    /// original's --device cuda output, whose centrality can differ from its cpu output by a rounding. A resumed
+    /// run keeps the rounding it started with, so one started on the CPU keeps centrality there
+    #[arg(long, value_enum, default_value = "auto")]
     pub device: Device,
-    /// Visible CUDA device index
-    #[arg(long, default_value_t = 0)]
-    pub cuda_device: i64,
+    /// Visible CUDA device index for the GPU; without it, the first usable visible GPU
+    #[arg(long)]
+    pub cuda_device: Option<i64>,
     #[arg(long)]
     pub threads: Option<i64>,
     #[arg(long, default_value_t = 128)]
@@ -421,10 +429,13 @@ pub fn run(args: Args) -> Result<Summary> {
     {
         bail!("Voxel size must be positive and minimum length nonnegative");
     }
-    if args.origin_xyz.iter().min().copied().unwrap_or(0) < 0 || args.native_cache_mib < 1 || args.cuda_device < 0 {
+    if args.origin_xyz.iter().min().copied().unwrap_or(0) < 0
+        || args.native_cache_mib < 1
+        || args.cuda_device.is_some_and(|d| d < 0)
+    {
         bail!("Invalid origin, cache size or CUDA device");
     }
-    fix_mmap_threshold();
+    fix_malloc_thresholds();
     let max_threads = numba_max_threads();
     let threads = args.threads.unwrap_or(8.min(max_threads));
     if threads < 1 || threads > max_threads {
@@ -491,19 +502,37 @@ pub fn run(args: Args) -> Result<Summary> {
             bail!("Output cannot be inside an input Zarr store");
         }
     }
-    if args.device == Device::Cuda {
-        // centrality is the only CUDA stage in the reference; this port computes it on the CPU only
-        bail!("fibrs computes centrality on the CPU; use --device cpu");
-    }
+    let families: Vec<usize> = match args.family {
+        Family::Both => vec![1, 2],
+        Family::V => vec![1],
+        Family::H => vec![2],
+    };
     fs::create_dir_all(&work)?;
     let _lock = WorkLock::acquire(&work.join(".lock"))?;
+    // the work directory and a resumed run's settings are checked under the lock, so the saved rounding and the
+    // finished families are the ones this run resumes, and before the GPU opens, so a run that cannot start says
+    // why rather than why the GPU is missing
+    let manifest = work.join("run.json");
+    let saved = match (manifest.exists(), args.resume) {
+        (true, false) => bail!("Work directory already contains a run; use --resume"),
+        (false, true) => bail!("No run to resume in this work directory"),
+        (true, true) => Some(saved_run(&manifest)?),
+        (false, false) => {
+            for entry in fs::read_dir(&work)? {
+                if entry?.file_name() != ".lock" {
+                    bail!("A new run requires an empty work directory");
+                }
+            }
+            None
+        }
+    };
     let family_name = match args.family {
         Family::Both => "both",
         Family::V => "V",
         Family::H => "H",
     };
     let signatures = paths.iter().map(|p| file_signature(p)).collect::<Result<Vec<_>>>()?;
-    let config = json!({
+    let mut config = json!({
         "version": REFERENCE_VERSION,
         "predictions": native.path.to_string_lossy(),
         "array": args.array,
@@ -511,7 +540,8 @@ pub fn run(args: Args) -> Result<Summary> {
         "tracing_array": args.tracing_array,
         "channel_order": order,
         "shape": native.shape,
-        "device": "cpu",
+        // filled in below: a resumed run's saved rounding, or the rounding a new run's device gives
+        "device": null,
         "storage": match args.storage { Storage::Dense => "dense", Storage::Compressed => "compressed" },
         "family": family_name,
         "voxel_size_um": args.voxel_size_um,
@@ -521,47 +551,36 @@ pub fn run(args: Args) -> Result<Summary> {
         "input_signatures": signatures,
         "native": {"tool": "fibrs", "version": env!("CARGO_PKG_VERSION"), "checkpoint": 1},
     });
-    let manifest = work.join("run.json");
-    if manifest.exists() {
-        if !args.resume {
-            bail!("Work directory already contains a run; use --resume");
-        }
-        let saved: Value = serde_json::from_str(&fs::read_to_string(&manifest)?)?;
-        if saved.get("native").is_none() {
-            bail!("Work directory holds a reference avf-spline-generator run; use a new work directory");
-        }
-        // the checkpoints carry no format of their own beyond the release that wrote them
-        let started_by = &saved["native"]["version"];
-        if started_by != &config["native"]["version"] {
-            bail!(
-                "Work directory was started by fibrs {}; resume it with that version, or use a new work directory",
-                started_by.as_str().unwrap_or("of another version")
-            );
-        }
-        if saved != config {
-            bail!("Inputs or tracing settings changed; use a new work directory");
-        }
-    } else {
-        if args.resume {
-            bail!("No run to resume in this work directory");
-        }
-        for entry in fs::read_dir(&work)? {
-            if entry?.file_name() != ".lock" {
-                bail!("A new run requires an empty work directory");
+    let changed = || eyre!("Inputs or tracing settings changed; use a new work directory");
+    let started_on = match &saved {
+        Some(saved) => {
+            let rounding = match saved["device"].as_str() {
+                Some("cpu") => Rounding::Cpu,
+                Some("cuda") => Rounding::Cuda,
+                _ => return Err(changed()),
+            };
+            config["device"] = json!(rounding.name());
+            if *saved != config {
+                return Err(changed());
             }
+            Some(rounding)
         }
+        None => None,
+    };
+
+    let tracing_needed = families.iter().any(|&f| !family_complete(&work, f));
+    let cent = CentralityDevice::choose(args.device, args.cuda_device.map(|d| d as usize), started_on, tracing_needed)?;
+    if saved.is_none() {
+        config["device"] = json!(cent.rounding.name());
         save_json(&manifest, &config)?;
     }
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads as usize).build()?;
-    let families: Vec<usize> = match args.family {
-        Family::Both => vec![1, 2],
-        Family::V => vec![1],
-        Family::H => vec![2],
-    };
     let pending: Vec<usize> = families.iter().copied().filter(|&f| !family_complete(&work, f)).collect();
     if !pending.is_empty() {
         let cache_bytes = (args.native_cache_mib + args.field_cache_mib) as usize * 1024 * 1024;
-        pool.install(|| trace_families(&native, supplied.as_ref(), &work, &pending, threads as usize, cache_bytes))?;
+        pool.install(|| {
+            trace_families(&native, supplied.as_ref(), &work, &pending, threads as usize, cache_bytes, &cent)
+        })?;
     }
     let started = Instant::now();
     let opt = ExportOptions {
@@ -691,12 +710,19 @@ fn pool_block(native: &Predictions, lo: Shape, hi: Shape) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Freed native chunk buffers kept for reuse: each eviction frees one and the decode that caused it takes one, so
-/// few wait at a time; this bounds a burst of evictions, at 32 chunks of the usual 2 × 128³
+/// Freed native prediction buffers kept for reuse: each eviction frees one and the decode or read that caused it
+/// takes one, so few wait at a time; this bounds a burst of evictions, at 512 slabs of the usual 2 × 8 × 128²
 const CHUNK_POOL_RETAIN: usize = 128 << 20;
 
 /// Raw curves handed from the tracing thread to the finishing threads at a time
-const FINISH_BATCH: usize = 2048;
+///
+/// Each batch is finished in native-chunk order, so a larger batch reads and decodes each chunk for more curves:
+/// on a dense PHerc0358 crop 8192 read 55% fewer chunks and decoded 40% fewer slabs than 2048, for 10% less CPU
+/// time
+const FINISH_BATCH: usize = 8192;
+/// Raw curve points at which a batch is handed over even with fewer than [`FINISH_BATCH`] curves, so the batches in
+/// flight stay in the tens of megabytes (12 bytes a point) however long the curves are
+const FINISH_POINTS: usize = 2 << 20;
 
 fn trace_families(
     native: &Predictions,
@@ -705,27 +731,57 @@ fn trace_families(
     families: &[usize],
     threads: usize,
     cache_bytes: usize,
+    cent: &CentralityDevice,
 ) -> Result<()> {
     let t = Instant::now();
     log!("Preparing tracing predictions");
     let tracing = load_tracing(native, supplied)?;
     let resident = tracing.iter().map(Vol::resident_bytes).sum::<usize>();
     log!("Tracing predictions: {:.1} s, {:.2} GiB resident", t.elapsed().as_secs_f64(), gib(resident));
-    let t = Instant::now();
     let lapack = Lapack::init(&find_lapack()?)?;
-    let (nx, ny) = direction_field(&tracing, lapack)?;
+    let (nx, ny) = direction_field_on(cent.gpu.as_ref(), cent.strict, &tracing, lapack)?;
     release_freed();
     debug_dump(work, "nx", || nx.read_block([0, 0, 0], nx.shape()))?;
     debug_dump(work, "ny", || ny.read_block([0, 0, 0], ny.shape()))?;
-    log!("Direction field: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem("direction field", &[("tracing", resident), ("nx", nx.resident_bytes()), ("ny", ny.resident_bytes())]);
     let pool = BufferPool::new(CHUNK_POOL_RETAIN);
     let cache = NativeCache::new(native, cache_bytes, &pool);
     for &family in families {
-        trace_family(&tracing, &nx, &ny, &cache, work, family, threads)?;
+        trace_family(&tracing, &nx, &ny, &cache, work, family, Compute { threads, cent })?;
         release_freed();
     }
     Ok(())
+}
+
+/// The direction field, on `gpu` when there is one
+///
+/// Both devices give the same bytes, so when the GPU fails, such as out of memory, the CPU computes it instead,
+/// unless `strict` (`--device cuda`) asked for the GPU only
+fn direction_field_on(
+    gpu: Option<&Gpu>,
+    strict: bool,
+    tracing: &[Vol<u8>; 2],
+    lapack: &Lapack,
+) -> Result<(Vol<u8>, Vol<u8>)> {
+    let t = Instant::now();
+    let on_cpu = || -> Result<(Vol<u8>, Vol<u8>)> {
+        let field = direction_field(tracing, lapack)?;
+        log!("Direction field: {:.1} s", t.elapsed().as_secs_f64());
+        Ok(field)
+    };
+    let Some(gpu) = gpu else { return on_cpu() };
+    match gpu.direction_field(tracing, lapack) {
+        Ok((nx, ny, AxesCounts { present, fallback })) => {
+            let secs = t.elapsed().as_secs_f64();
+            log!("Direction field: {secs:.1} s, {fallback} of {present} voxels solved on the CPU");
+            Ok((nx, ny))
+        }
+        Err(e) if !strict => {
+            log!("Direction field on the CPU: the GPU failed ({e:#})");
+            on_cpu()
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// With `FIBRS_DEBUG_FIELDS` set, write a field densely as raw little-endian `NAME.raw` for comparison
@@ -779,9 +835,11 @@ fn release_freed() {
 /// after the first few the chunk cache's 4 MiB chunks and the stages' tile buffers come from the per-thread
 /// arenas instead, where they fragment and stay resident as they are evicted and freed on other threads: on a
 /// 512-plane 0826 band the peak varied from 8.9 to 10.8 GiB between runs without this and was 8.8 GiB in each
-/// of three runs with it, at the same speed. Setting the threshold also stops glibc's adjustment.
-/// A threshold set in the environment, by `MALLOC_MMAP_THRESHOLD_` or `GLIBC_TUNABLES`, still takes precedence
-fn fix_mmap_threshold() {
+/// of three runs with it, at the same speed. Setting the threshold also stops glibc's adjustment, so the trim
+/// threshold is set too (see below).
+/// Either threshold set in the environment, by `MALLOC_MMAP_THRESHOLD_`, `MALLOC_TRIM_THRESHOLD_` or
+/// `GLIBC_TUNABLES`, still takes precedence
+fn fix_malloc_thresholds() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none()
         && !std::env::var("GLIBC_TUNABLES").is_ok_and(|t| t.contains("glibc.malloc.mmap_threshold"))
@@ -789,6 +847,19 @@ fn fix_mmap_threshold() {
         // SAFETY: mallopt only changes how later allocations are served; it touches no live allocation
         unsafe {
             libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
+        }
+    }
+    // fixing the mmap threshold also fixes the trim threshold at 128 KiB, so each finishing thread's heap gave
+    // back c-blosc's 384 KiB decode scratch on every slab and faulted it in again: on a dense crop that was 460,000
+    // page faults a second and 15% of the CPU time in the kernel. 8 MiB stops it; `release_freed` still trims the
+    // heaps between stages
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if std::env::var_os("MALLOC_TRIM_THRESHOLD_").is_none()
+        && !std::env::var("GLIBC_TUNABLES").is_ok_and(|t| t.contains("glibc.malloc.trim_threshold"))
+    {
+        // SAFETY: as above
+        unsafe {
+            libc::mallopt(libc::M_TRIM_THRESHOLD, 8 << 20);
         }
     }
 }
@@ -809,6 +880,150 @@ fn gib(bytes: usize) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
 }
 
+/// Where a family's stages run: tracing and finishing on `threads` CPU threads, centrality as `cent` says
+#[derive(Clone, Copy)]
+struct Compute<'a> {
+    threads: usize,
+    cent: &'a CentralityDevice,
+}
+
+/// Which of the original's devices a run's centrality reproduces: its CPU kernel rounds some multiply-adds twice
+/// where its CUDA kernels round them once (`stage1.rs`). `run.json` records it as `device`, so one run never mixes
+/// the two, while the hardware a resumed run computes it on may change
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rounding {
+    Cpu,
+    Cuda,
+}
+
+impl Rounding {
+    fn name(self) -> &'static str {
+        match self {
+            Rounding::Cpu => "cpu",
+            Rounding::Cuda => "cuda",
+        }
+    }
+}
+
+/// A resumable run's `run.json`: one this release of fibrs started
+fn saved_run(manifest: &Path) -> Result<Value> {
+    let saved: Value = serde_json::from_str(&fs::read_to_string(manifest)?)?;
+    if saved.get("native").is_none() {
+        bail!("Work directory holds a reference avf-spline-generator run; use a new work directory");
+    }
+    // the checkpoints carry no format of their own beyond the release that wrote them
+    let started_by = &saved["native"]["version"];
+    if started_by.as_str() != Some(env!("CARGO_PKG_VERSION")) {
+        bail!(
+            "Work directory was started by fibrs {}; resume it with that version, or use a new work directory",
+            started_by.as_str().unwrap_or("of another version")
+        );
+    }
+    Ok(saved)
+}
+
+/// How a run computes the direction field and centrality: the centrality rounding it reproduces, and the GPU when
+/// one runs the direction field and, in the CUDA rounding, centrality (without one, the CPU computes either rounding,
+/// the CUDA one more slowly)
+struct CentralityDevice {
+    rounding: Rounding,
+    gpu: Option<Gpu>,
+    /// Whether a GPU failure mid-run ends the run (`--device cuda`) instead of moving to the CPU
+    strict: bool,
+}
+
+impl CentralityDevice {
+    /// The rounding a new run takes from `device`, or a resumed run from its `run.json`, and the GPU to compute
+    /// it on, opened only when a family still needs centrality
+    ///
+    /// `auto` takes the GPU when one opens, and otherwise the CPU, saying why. A run started on the CPU keeps
+    /// centrality there, but its direction field, the same bytes on either device, still takes the GPU
+    fn choose(
+        device: Device,
+        index: Option<usize>,
+        started_on: Option<Rounding>,
+        tracing_needed: bool,
+    ) -> Result<Self> {
+        let strict = device == Device::Cuda;
+        let cpu = |rounding| Self { rounding, gpu: None, strict };
+        let on_gpu = |gpu: Gpu| {
+            log!("Direction field and centrality on {} (--device cpu to use the CPU)", gpu.name());
+            Self { rounding: Rounding::Cuda, gpu: Some(gpu), strict }
+        };
+        let open = || Gpu::open(index, Stages::DirectionFieldAndCentrality);
+        let chosen = match (started_on, device) {
+            (Some(Rounding::Cpu), Device::Cuda) => {
+                bail!("This run started with centrality on the CPU and resumes only there; use --device cpu or auto")
+            }
+            (Some(Rounding::Cpu), Device::Auto) if tracing_needed => match Gpu::open(index, Stages::DirectionField) {
+                Ok(gpu) => {
+                    log!(
+                        "Direction field on {}, centrality on the CPU this run started on (--device cpu to use the CPU)",
+                        gpu.name()
+                    );
+                    Self { rounding: Rounding::Cpu, gpu: Some(gpu), strict }
+                }
+                Err(e) => {
+                    log!("Direction field and centrality on the CPU: no usable GPU ({e:#})");
+                    cpu(Rounding::Cpu)
+                }
+            },
+            (Some(Rounding::Cpu), _) | (None, Device::Cpu) => cpu(Rounding::Cpu),
+            (Some(Rounding::Cuda), _) if !tracing_needed => cpu(Rounding::Cuda),
+            (Some(Rounding::Cuda), Device::Cpu) => {
+                log!("Direction field and centrality on the CPU, centrality rounded as on the GPU this run started on");
+                cpu(Rounding::Cuda)
+            }
+            (_, Device::Cuda) => on_gpu(open().map_err(|e| eyre!("--device cuda needs a usable NVIDIA GPU: {e:#}"))?),
+            (Some(Rounding::Cuda), Device::Auto) => match open() {
+                Ok(gpu) => on_gpu(gpu),
+                Err(e) => {
+                    log!(
+                        "Direction field and centrality on the CPU, centrality rounded as on the GPU this run started \
+                         on: no usable GPU ({e:#})"
+                    );
+                    cpu(Rounding::Cuda)
+                }
+            },
+            (None, Device::Auto) => match open() {
+                Ok(gpu) => on_gpu(gpu),
+                Err(e) => {
+                    log!("Direction field and centrality on the CPU: no usable GPU ({e:#})");
+                    cpu(Rounding::Cpu)
+                }
+            },
+        };
+        Ok(chosen)
+    }
+
+    /// One family's centrality and seeds in the run's rounding
+    ///
+    /// When the GPU fails, such as out of memory, the CPU computes the same CUDA rounding unless `--device cuda`
+    /// asked for the GPU only
+    fn compute(
+        &self,
+        tracing: &[Vol<u8>; 2],
+        family: usize,
+        pres: &Presence,
+        nx: &Vol<u8>,
+        ny: &Vol<u8>,
+    ) -> Result<FamilyFields> {
+        let gpu = match (self.rounding, &self.gpu) {
+            (Rounding::Cpu, _) => return Ok(centrality::<Separate>(pres, nx, ny)),
+            (Rounding::Cuda, None) => return Ok(centrality::<Fused>(pres, nx, ny)),
+            (Rounding::Cuda, Some(gpu)) => gpu,
+        };
+        match gpu.centrality(tracing, family, nx, ny) {
+            Ok(fields) => Ok(fields),
+            Err(e) if !self.strict => {
+                log!("Centrality on the CPU, rounded as on the GPU: the GPU failed ({e:#})");
+                Ok(centrality::<Fused>(pres, nx, ny))
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
 fn trace_family(
     tracing: &[Vol<u8>; 2],
     nx: &Vol<u8>,
@@ -816,14 +1031,14 @@ fn trace_family(
     cache: &NativeCache,
     work: &Path,
     family: usize,
-    threads: usize,
+    Compute { threads, cent }: Compute,
 ) -> Result<()> {
     let label = if family == 1 { "V" } else { "H" };
     let folder = family_dir(work, family);
     fs::create_dir_all(&folder)?;
     let t = Instant::now();
     let pres = Presence::new(tracing, family);
-    let FamilyFields { cent, seeds } = centrality(&pres, nx, ny);
+    let FamilyFields { cent, seeds } = cent.compute(tracing, family, &pres, nx, ny)?;
     log!("{label} centrality: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem(label, &[("cent", cent.resident_bytes()), ("seeds", seeds.len() * std::mem::size_of::<Seed>())]);
     let t = Instant::now();
@@ -863,16 +1078,20 @@ fn trace_family(
     let produce = |tx: &SyncSender<Vec<RawCurve>>| -> Result<usize> {
         let mut cov = Coverage::new(shape);
         let mut scratch = Scratch::default();
-        let mut batch = Vec::new();
+        let mut batch: Vec<RawCurve> = Vec::new();
+        let mut points = 0;
         let mut count = 0;
         let mut last_log = Instant::now();
         for r in 0..cat.starts.len() - 1 {
             let (start, end) = (cat.starts[r], cat.starts[r + 1]);
             let primary_end = start + cat.primary[r];
             for (i, &seed) in cat.coords.iter().enumerate().take(end).skip(start) {
+                let before = batch.len();
                 trace_seed(&fields, &mut cov, &mut scratch, seed, i < primary_end, &mut batch)?;
-                if batch.len() >= FINISH_BATCH {
+                points += batch[before..].iter().map(|c| c.pts.len()).sum::<usize>();
+                if batch.len() >= FINISH_BATCH || points >= FINISH_POINTS {
                     count += batch.len();
+                    points = 0;
                     // a closed channel means finishing failed; its error is the one reported
                     if tx.send(std::mem::take(&mut batch)).is_err() {
                         return Ok(count);
@@ -909,9 +1128,10 @@ fn trace_family(
         w.finish()?;
     }
     log!(
-        "{label} traced: {raw} raw curves, {pieces} finished pieces in {:.1} s ({} native chunks decoded)",
+        "{label} traced: {raw} raw curves, {pieces} finished pieces in {:.1} s ({} native slabs decoded from {} chunk reads)",
         t.elapsed().as_secs_f64(),
-        cache.decoded()
+        cache.decoded(),
+        cache.read()
     );
     save_json(&folder.join("progress.json"), &json!({"complete": true, "raw_curves": raw, "curves": pieces}))?;
     Ok(())
