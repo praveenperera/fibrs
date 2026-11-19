@@ -746,7 +746,7 @@ fn trace_families(
     let cache = NativeCache::new(native, cache_bytes, &pools);
     let families = Families { tracing: &tracing, resident, cache: &cache, work, families, threads, cent };
     match &dirs {
-        Directions::Packed(packed) => families.trace(packed),
+        Directions::Packed(packed) => families.trace(&**packed),
         Directions::Split { nx, ny } => families.trace(&SplitDirs { nx, ny }),
     }
 }
@@ -802,7 +802,7 @@ fn direction_field_on(cent: &CentralityDevice, tracing: &[Vol<u8>; 2], lapack: &
         Ok((nx, ny, AxesCounts { present, fallback })) => {
             let secs = t.elapsed().as_secs_f64();
             log!("Direction field: {secs:.1} s, {fallback} of {present} voxels solved on the CPU");
-            Ok(Directions::Split { nx, ny })
+            Ok(Directions::Split { nx: Box::new(nx), ny: Box::new(ny) })
         }
         Err(e) if !cent.strict => {
             log!("Direction field on the CPU: the GPU failed ({e:#})");

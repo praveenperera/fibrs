@@ -517,8 +517,7 @@ impl<'v> Plan<'v> {
     /// it reaches 64 only where `own` is at least 32: only the output bricks with such a voxel can hold a nonzero
     /// value and be packed, and a sparse or faint unit pins room for those alone
     fn room(&self, own: &Vol<u8>) -> Room {
-        let out =
-            self.meta.bricks.iter().filter(|&&b| own.brick_at(b).is_some_and(|v| v.iter().any(|&p| p >= 32))).count();
+        let out = self.meta.bricks.iter().filter(|&&b| own.any_allocated_in_brick(b, |p| p >= 32)).count();
         Room { pool: self.pool.payloads.len(), out }
     }
 }
@@ -625,10 +624,10 @@ struct Inputs {
 }
 
 /// A unit's brick pool on the host: a table per volume from each brick of the unit's box to its payload's place
-/// in the pool, or [`NO_BRICK`], and the payloads in pool order, still in their volumes
+/// in the pool, or [`NO_BRICK`], and the payloads in pool order, each named by its volume and brick
 struct BrickPool<'v> {
     table: Vec<u32>,
-    payloads: Vec<&'v [u8; BRICK]>,
+    payloads: Vec<(&'v Vol<u8>, usize)>,
 }
 
 impl<'v> BrickPool<'v> {
@@ -637,7 +636,7 @@ impl<'v> BrickPool<'v> {
         let grid = vols[0].grid();
         let n_box = nb.iter().product::<usize>();
         let mut table = vec![NO_BRICK; vols.len() * n_box];
-        let mut payloads: Vec<&[u8; BRICK]> = Vec::new();
+        let mut payloads: Vec<(&'v Vol<u8>, usize)> = Vec::new();
         let mut entry = table.iter_mut();
         for vol in vols {
             for bz in b0[0]..b0[0] + nb[0] {
@@ -645,9 +644,9 @@ impl<'v> BrickPool<'v> {
                     let row = (bz * grid[1] + by) * grid[2];
                     for bx in b0[2]..b0[2] + nb[2] {
                         let slot = entry.next().expect("the table has an entry per volume and brick of the box");
-                        if let Some(b) = vol.brick_at(row + bx) {
+                        if vol.has_brick(row + bx) {
                             *slot = payloads.len() as u32;
-                            payloads.push(b);
+                            payloads.push((*vol, row + bx));
                         }
                     }
                 }
@@ -698,9 +697,16 @@ impl Inputs {
         let BrickPool { table, payloads } = pool;
         let n_pool = payloads.len() * BRICK;
         ensure!(n_pool <= self.staging.len(), "{n_pool} bytes of bricks overflow {} of staging", self.staging.len());
-        // the pool gathers the scattered bricks into pinned memory, so its upload is one asynchronous copy
+        // the pool gathers the scattered bricks into pinned memory, so its upload is one asynchronous copy; each
+        // brick is gathered from its sub-bricks off to the side, so the write-combined staging is written in order
         let host = &mut self.staging.as_mut_slice()?[..n_pool];
-        host.par_chunks_mut(BRICK).zip(payloads.par_iter()).for_each(|(d, s)| d.copy_from_slice(&s[..]));
+        host.par_chunks_exact_mut(BRICK).zip(payloads.par_iter()).for_each_init(
+            || Box::new([0u8; BRICK]),
+            |brick, (d, &(vol, bi))| {
+                vol.read_brick(bi, brick);
+                d.copy_from_slice(&brick[..]);
+            },
+        );
         fit(stream, &mut self.pool, n_pool)?;
         fit(stream, &mut self.table, table.len())?;
         fit(stream, &mut self.desc, desc.len())?;

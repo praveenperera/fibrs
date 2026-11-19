@@ -159,16 +159,19 @@ pub enum DirForm {
 
 /// An owned direction field in one of its two forms ([`DirField`])
 pub enum Directions {
-    Packed(Vol<u16>),
-    Split { nx: Vol<u8>, ny: Vol<u8> },
+    // both forms are boxed: a volume's handle is a few hundred bytes, and the split form holds two
+    Packed(Box<Vol<u16>>),
+    Split { nx: Box<Vol<u8>>, ny: Box<Vol<u8>> },
 }
 
 impl Directions {
     /// A field of `shape` in `form` where every voxel reads as straight up, `nx = ny = 128`
     pub fn new(shape: Shape, form: DirForm) -> Self {
         match form {
-            DirForm::Packed => Directions::Packed(Vol::new(shape, pack_dir(128, 128))),
-            DirForm::Split => Directions::Split { nx: Vol::new(shape, 128), ny: Vol::new(shape, 128) },
+            DirForm::Packed => Directions::Packed(Box::new(Vol::new(shape, pack_dir(128, 128)))),
+            DirForm::Split => {
+                Directions::Split { nx: Box::new(Vol::new(shape, 128)), ny: Box::new(Vol::new(shape, 128)) }
+            }
         }
     }
 

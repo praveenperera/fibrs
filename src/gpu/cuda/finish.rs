@@ -581,11 +581,11 @@ impl Tracing {
     ) -> Result<(CudaSlice<u32>, CudaSlice<u8>)> {
         let n_grid = vol.grid().iter().product::<usize>();
         let mut table = vec![NO_BRICK; n_grid];
-        let mut payloads: Vec<&[u8; BRICK]> = Vec::new();
+        let mut payloads: Vec<usize> = Vec::new();
         for (bi, slot) in table.iter_mut().enumerate() {
-            if let Some(b) = vol.brick_at(bi) {
+            if vol.has_brick(bi) {
                 *slot = payloads.len() as u32;
-                payloads.push(b);
+                payloads.push(bi);
             }
         }
         ensure!(payloads.len() < NO_BRICK as usize, "a pooled prediction holds too many bricks");
@@ -595,7 +595,15 @@ impl Tracing {
         for (k, part) in payloads.chunks(per_half).enumerate() {
             let len = part.len() * BRICK;
             let host = &mut staging.take()?[..len];
-            host.par_chunks_mut(BRICK).zip(part.par_iter()).for_each(|(d, s)| d.copy_from_slice(&s[..]));
+            // the brick is gathered from its sub-bricks off to the side, so the write-combined staging is written
+            // in order
+            host.par_chunks_mut(BRICK).zip(part.par_iter()).for_each_init(
+                || Box::new([0u8; BRICK]),
+                |brick, (d, &bi)| {
+                    vol.read_brick(bi, brick);
+                    d.copy_from_slice(&brick[..]);
+                },
+            );
             let at = k * per_half * BRICK;
             stream.memcpy_htod(&*host, &mut pool.slice_mut(at..at + len))?;
             staging.queued(stream)?;
