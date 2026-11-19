@@ -135,12 +135,12 @@ build that decoded whole chunks took 69–72 s, and one that also gave each deco
 ## Differences from the original
 
 - Fields live in memory as sparse 16³ bricks instead of a Zarr work store, so peak memory is higher and grows
-  with how much of the band holds fibres: 8.8 GiB against the original's 4.6 GiB on a 512 × 8169 × 8169 band
-  of PHerc0826, and 13.3 GiB on 1024 × 8169 × 8169 of the same scroll. With `--field-cache-mib 4096`, 4.1 GiB
-  of that is the chunk cache; a smaller cache lowers the peak by the difference but decodes again more often
-  (measured while chunks were decoded whole: at a 1 GiB cache the 1024-plane window peaked at 9.8 GiB and
-  traced about 19% slower; at 16 MiB tracing took about 60% longer). Memory each stage frees goes back to the
-  system before the next stage allocates.
+  with how much of the band holds fibres: 9.0 GiB against the original's 4.6 GiB on a 512 × 8169 × 8169 band of
+  PHerc0826, and 13.3 GiB on 1024 × 8169 × 8169 of the same scroll before predictions were decoded in slabs. With
+  `--field-cache-mib 4096`, 4.1 GiB of that is the chunk cache; a smaller cache lowers the peak by the
+  difference but decodes again more often (measured while chunks were decoded whole: at a 1 GiB cache the
+  1024-plane window peaked at 9.8 GiB and traced about 19% slower; at 16 MiB tracing took about 60% longer).
+  Memory each stage frees goes back to the system before the next stage allocates.
 - A point's value needs 8 voxels of the native predictions, so they are decoded 8 planes at a time (one 128 KiB
   Blosc block of each channel in a prediction zarr) instead of a whole chunk at a time. The cache holds these
   slabs, with the chunks' compressed bytes in a quarter of its budget. Decoded slabs, compressed chunks and the

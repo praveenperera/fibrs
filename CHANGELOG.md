@@ -24,10 +24,11 @@ over a CT volume on an NVIDIA GPU, natively in the `fibrs` binary, with no PyTor
   the cuDNN and cuBLAS versions. A resume with different settings is refused and names what changed.
 - **Tracing holds less in memory**, with the same `.afv`. Presence is computed from the two prediction fields as
   it is read instead of being stored, centrality is written tile batch by tile batch, coverage takes two bytes a
-  voxel instead of three, seeds are kept as a packed list, and fields are stored in 16³ bricks instead of 32³.
-  On Linux, allocations of 1 MiB or more get their own mapping, so the chunk cache's evicted chunks go back to
-  the system. On a 1024 × 8169 × 8169 window of PHerc0826 the peak fell from 17.4 GiB to 13.3 GiB, and on a
-  512-plane band from 8.9–10.8 GiB to 8.8 GiB.
+  voxel instead of three, seeds are kept as a packed list, and fields are stored in 16³ bricks instead of 32³. On
+  Linux, allocations of 1 MiB or more get their own mapping, so the chunk cache's evicted chunks go back to the
+  system. On a 1024 × 8169 × 8169 window of PHerc0826 the peak fell from 17.4 GiB to 13.3 GiB, measured before
+  predictions were decoded 8 planes at a time. On a 512-plane band it is 9.0 GiB, where 0.1.0 peaked at
+  8.9–10.8 GiB.
 - **Tracing is faster on dense bands**, with the same `.afv`:
   - The native predictions are decoded 8 planes at a time instead of a whole chunk at a time.
   - Decoded predictions and the direction field's tile buffers are reused from a pool.
