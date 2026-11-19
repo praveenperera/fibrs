@@ -115,6 +115,8 @@ fn bad_arguments_are_refused_with_the_reference_messages() {
         (&["--mode", "villa", "--batch", "4"], 2, "villa mode runs batches of 1; leave --batch out or pass 1"),
         (&["--z0", "0", "--z1", "8", "--precision", "fp16"], 2, "fp32 (the reference contract, the default) or bf16"),
         (&["--z0", "0", "--z1", "8", "--device", "cpu"], 2, "runs on a CUDA device (cuda, cuda:N), not \"cpu\""),
+        (&["--z0", "0", "--z1", "8", "--voxel-size-um", "0"], 2, "--voxel-size-um must be a positive number"),
+        (&["--z0", "0", "--z1", "8", "--voxel-size-um", "nan"], 2, "--voxel-size-um must be a positive number"),
         (&["--z0", "0", "--z1", "8", "--batch", "0"], 1, "--batch and --readers must be at least 1"),
         (&["--z0", "0", "--z1", "8", "--batch", "17"], 1, "--batch is at most 16"),
         (&["--z0", "0", "--z1", "7", "--dry-run"], 1, "band height must be even"),

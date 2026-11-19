@@ -89,6 +89,10 @@ pub struct Args {
     /// GPU
     #[arg(long)]
     dry_run: bool,
+    /// The CT's voxel size in micrometres, written as the output's `voxel_size_um` attribute. The default is the
+    /// PHerc0826 CT's, which the reference writes for every CT
+    #[arg(long, default_value_t = 9.362, allow_negative_numbers = true)]
+    voxel_size_um: f64,
 }
 
 /// The arguments after the checks argparse makes in the reference
@@ -144,6 +148,9 @@ fn parse(argv: &[OsString]) -> Checked {
     };
     let precision = Precision::parse(&a.precision).unwrap_or_else(|e| usage_error(ErrorKind::InvalidValue, e));
     let device = engine::device_index(&a.device).unwrap_or_else(|e| usage_error(ErrorKind::InvalidValue, e));
+    if !(a.voxel_size_um.is_finite() && a.voxel_size_um > 0.0) {
+        usage_error(ErrorKind::InvalidValue, "--voxel-size-um must be a positive number of micrometres");
+    }
     if batch < 1 || a.readers < 1 {
         fail("--batch and --readers must be at least 1");
     }
@@ -507,7 +514,7 @@ fn run(c: Checked) -> Result<()> {
     let mut attrs = Map::new();
     attrs.insert("channel_order".into(), json!("VH"));
     attrs.insert("axes".into(), json!(["c", "z", "y", "x"]));
-    attrs.insert("voxel_size_um".into(), json!(9.362));
+    attrs.insert("voxel_size_um".into(), json!(a.voxel_size_um));
     attrs.insert("origin_zyx".into(), json!([p.z0, 0, 0]));
     attrs.insert("inference".into(), Value::Object(prov));
     let output = Output::open_or_create(out, p.nz, p.ny, p.nx, &attrs)?;
