@@ -134,15 +134,29 @@ impl<T: Voxel> Vol<T> {
     /// The 2 × 2 × 2 values from an in-bounds voxel to the one past it on every axis, which must be in bounds too,
     /// in z, y, x order: corner `dz * 4 + dy * 2 + dx`
     ///
-    /// The tracer's trilinear samples read cells like this; when the cell lies in one sub-brick, it is found once
+    /// The tracer's trilinear samples read cells like this, so each sub-brick the cell touches is found once: one
+    /// for 42% of cells, two for another 42%, and at most eight
     #[inline(always)]
     pub fn cell(&self, z: usize, y: usize, x: usize) -> [T; 8] {
-        if (z & SUB_MASK) != SUB_MASK && (y & SUB_MASK) != SUB_MASK && (x & SUB_MASK) != SUB_MASK {
+        // the axes on which the cell crosses into the next sub-brick
+        let cross = [z, y, x].map(|v| (v & SUB_MASK) == SUB_MASK);
+        if cross == [false; 3] {
             let (sub, at) = self.locate(z, y, x);
             let (dy, dz) = (SUB_EDGE, SUB_EDGE * SUB_EDGE);
             return [0, 1, dy, dy + 1, dz, dz + 1, dz + dy, dz + dy + 1].map(|d| sub[at + d]);
         }
-        std::array::from_fn(|c| self.get(z + (c >> 2), y + (c >> 1 & 1), x + (c & 1)))
+        // the sub-brick of corner c is the one its offsets reach on the crossing axes only
+        let reach = |c: usize| {
+            let d = [c >> 2, c >> 1 & 1, c & 1];
+            (d[0] & cross[0] as usize) << 2 | (d[1] & cross[1] as usize) << 1 | (d[2] & cross[2] as usize)
+        };
+        let mut subs = [self.sub(0); 8];
+        for (k, sub) in subs.iter_mut().enumerate() {
+            if reach(k) == k {
+                *sub = self.locate(z + (k >> 2), y + (k >> 1 & 1), x + (k & 1)).0;
+            }
+        }
+        std::array::from_fn(|c| subs[reach(c)][Self::offset(z + (c >> 2), y + (c >> 1 & 1), x + (c & 1))])
     }
 
     /// The value at a voxel given as signed coordinates, which must be in bounds
