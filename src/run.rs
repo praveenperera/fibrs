@@ -27,8 +27,9 @@ use crate::axes::{Lapack, direction_field, find_lapack};
 use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
 use crate::input::Predictions;
-use crate::kernels::{Coverage, Fields, RawCurve, Scratch, trace_seed};
+use crate::kernels::{Coverage, Fields, RawCurve};
 use crate::log;
+use crate::produce::{Flow, Producer, Speculation, Stats};
 use crate::vol::{EDGE, Shape, Vol};
 
 /// The reference release whose interface and output this reproduces
@@ -695,7 +696,7 @@ fn pool_block(native: &Predictions, lo: Shape, hi: Shape) -> Result<Vec<u8>> {
 /// takes one, so few wait at a time; this bounds a burst of evictions, at 512 slabs of the usual 2 × 8 × 128²
 const CHUNK_POOL_RETAIN: usize = 128 << 20;
 
-/// Raw curves handed from the tracing thread to the finishing threads at a time
+/// Raw curves handed from the committing thread to the finishing threads at a time
 ///
 /// Each batch is finished in native-chunk order, so a larger batch reads and decodes each chunk for more curves:
 /// on a dense PHerc0358 crop 8192 read 55% fewer chunks and decoded 40% fewer slabs than 2048, for 10% less CPU
@@ -769,7 +770,7 @@ impl ToLe for u16 {
 /// Each stage frees what the next does not read (the direction field's and centrality's tile results, the seed
 /// field, a finished family's centrality and coverage), but glibc keeps freed memory in the arena of
 /// the thread that freed it and only trims the top of each heap. The next stage allocates from other threads'
-/// arenas (coverage grows on the tracing thread, the next family's fields on the pool's), so without this the
+/// arenas (coverage grows on the committing thread, the next family's fields on the pool's), so without this the
 /// freed bytes stay resident beside the new ones: on a 0826 band the H family peaked 1.7 GiB above V with the
 /// same fields
 fn release_freed() {
@@ -869,7 +870,10 @@ fn trace_family(
     let shape = pres.shape();
     let fields = Fields { pres: &pres, cent: &cent, dirs };
     let ctx = FinishCtx { tracing, pres: &pres, family };
-    let finish_pool = rayon::ThreadPoolBuilder::new().num_threads(threads.saturating_sub(1).max(1)).build()?;
+    // the pool's idle threads trace seeds ahead of the commit point, and it gets every thread: with one fewer, as
+    // when one thread traced every seed, a dense crop at --threads 4 traced no faster than that thread did, since
+    // finishing kept the pool busy. The committing thread traces the seeds no pool thread has started
+    let finish_pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
     let path = folder.join("curves.bin");
     let mut writer = CurveWriter::create(&path)?;
     // FIBRS_DEBUG_RAW=1 also keeps the raw curves (family-N/raw.bin, same format) to compare with the
@@ -881,38 +885,40 @@ fn trace_family(
     let t = Instant::now();
     let total = cat.coords.len();
     let mut pieces = 0;
+    let spec = Speculation::from_env()?;
+    let cov = Coverage::new(shape);
+    let producer = Producer::new(&fields, &cov, &cat, spec)?;
     let produce = |tx: &SyncSender<Vec<RawCurve>>| -> Result<usize> {
-        let mut cov = Coverage::new(shape);
-        let mut scratch = Scratch::default();
         let mut batch: Vec<RawCurve> = Vec::new();
         let mut points = 0;
         let mut count = 0;
         let mut last_log = Instant::now();
-        for r in 0..cat.starts.len() - 1 {
-            let (start, end) = (cat.starts[r], cat.starts[r + 1]);
-            let primary_end = start + cat.primary[r];
-            for (i, &seed) in cat.coords.iter().enumerate().take(end).skip(start) {
-                let before = batch.len();
-                trace_seed(&fields, &mut cov, &mut scratch, seed, i < primary_end, &mut batch)?;
-                points += batch[before..].iter().map(|c| c.pts.len()).sum::<usize>();
-                if batch.len() >= FINISH_BATCH || points >= FINISH_POINTS {
-                    count += batch.len();
-                    points = 0;
-                    // a closed channel means finishing failed; its error is the one reported
-                    if tx.send(std::mem::take(&mut batch)).is_err() {
-                        return Ok(count);
-                    }
-                }
-                if last_log.elapsed().as_secs_f64() >= 10.0 {
-                    log!("{label} seeds: {}/{total}; {} raw curves", i + 1, count + batch.len());
-                    last_log = Instant::now();
-                }
+        let deliver = |i: usize, curves: &mut Vec<RawCurve>| -> Result<Flow> {
+            points += curves.iter().map(|c| c.pts.len()).sum::<usize>();
+            batch.append(curves);
+            if last_log.elapsed().as_secs_f64() >= 10.0 {
+                log!("{label} seeds: {}/{total}; {} raw curves", i + 1, count + batch.len());
+                last_log = Instant::now();
             }
-        }
+            if batch.len() < FINISH_BATCH && points < FINISH_POINTS {
+                return Ok(Flow::Continue);
+            }
+            count += batch.len();
+            points = 0;
+            // a closed channel means finishing failed; its error is the one reported
+            match tx.send(std::mem::take(&mut batch)) {
+                Ok(()) => Ok(Flow::Continue),
+                Err(_) => Ok(Flow::Stop),
+            }
+        };
+        let stats = producer.run(&finish_pool, deliver)?;
         count += batch.len();
         if !batch.is_empty() {
             let _ = tx.send(batch);
         }
+        let (Stats { seeds, retraced, committer }, window) = (stats, spec.window);
+        let share = 100.0 * retraced as f64 / seeds.max(1) as f64;
+        log!("{label} window {window}: {retraced} seeds traced again ({share:.3}%), {committer} on the committer");
         debug_mem(label, &[("coverage", cov.resident_bytes()), ("cache", cache.bytes()), ("catalogue", 12 * total)]);
         Ok(count)
     };

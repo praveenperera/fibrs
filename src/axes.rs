@@ -349,7 +349,7 @@ type TileAxes = (Shape, Shape, Vec<u16>);
 /// Compute the packed direction of every voxel of the tracing volume from the two pooled channels
 ///
 /// Each voxel holds `nx << 8 | ny` ([`pack_dir`]). One volume instead of separate nx and ny volumes halves the
-/// brick lookups and cache lines of every direction read, which the tracer's producer thread is bound by
+/// brick lookups and cache lines of every direction read, which tracing is bound by
 pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<Vol<u16>> {
     let shape = tracing[0].shape();
     let grid = shape.map(|n| n.div_ceil(CORE));

@@ -12,7 +12,7 @@ use color_eyre::eyre::{Result, bail};
 
 use crate::arena::Voxel;
 use crate::pyfmt::{py_max, py_min};
-use crate::vol::Vol;
+use crate::vol::{Place, SharedVol, SharedVolWriter, Vol};
 
 /// cos(55°): the turn limit used throughout the tracer
 pub const COS55: f64 = 0.5735764363510462;
@@ -73,7 +73,7 @@ impl<T: Copy + Sync> Grid<T> for Dense<T> {
 /// `(b as f32 as f64 - 128.0) / 127.0` for every byte, the per-axis part of `decode_dir`
 ///
 /// A table over byte pairs gives the same values but takes 1.5 MiB, and its lookups missed the cache often
-/// enough to cost the producer a fifth of its time; the rest of `decode_dir` is a few float operations
+/// enough to cost the single-threaded tracer a fifth of its time; the rest of `decode_dir` is a few float operations
 const AXIS: [f64; 256] = {
     let mut t = [0.0f64; 256];
     let mut b = 0;
@@ -329,26 +329,37 @@ pub fn ortho_basis(ux: f64, uy: f64, uz: f64) -> [f64; 6] {
     [e1x, e1y, e1z, e2x, e2y, e2z]
 }
 
-/// Mutable coverage of one family: the reference's count (0, 1, 2) and first marking direction, packed in one
-/// `u16` per voxel
+/// Coverage of one family: the reference's count (0, 1, 2) and first marking direction, packed in one `u16` per
+/// voxel
 ///
 /// 0 is a count of 0 and 1 a count of 2, whose direction the reference never reads; a count of 1 stores the
 /// direction as `nx << 8 | ny`, which is at least 256 because `encode_dir` never returns a 0 byte. One volume
-/// instead of three saves a byte per covered voxel
-pub struct Coverage(Vol<u16>);
+/// instead of three saves a byte per covered voxel.
+///
+/// Seeds are traced on several threads against this shared volume while one [`CoverageWriter`] marks the curves
+/// of committed seeds, in seed order. Every read records the brick it touched in a [`ReadSet`], so the writer can
+/// tell whether anything a seed read has changed since it was traced
+pub struct Coverage(SharedVol);
 
 const UNCOVERED: u16 = 0;
 const COVERED_TWICE: u16 = 1;
 
 impl Coverage {
     pub fn new(shape: [usize; 3]) -> Self {
-        Self(Vol::new(shape, UNCOVERED))
+        Self(SharedVol::new(shape))
     }
 
     /// Whether a voxel has been marked at all
     #[inline]
-    pub fn is_covered(&self, z: i64, y: i64, x: i64) -> bool {
-        self.0.at(z, y, x) != UNCOVERED
+    pub fn is_covered(&self, reads: &mut ReadSet, z: i64, y: i64, x: i64) -> bool {
+        self.read(reads, z, y, x) != UNCOVERED
+    }
+
+    #[inline(always)]
+    fn read(&self, reads: &mut ReadSet, z: i64, y: i64, x: i64) -> u16 {
+        let at = self.0.place(z as usize, y as usize, x as usize);
+        reads.push(at.slot);
+        self.0.get(at)
     }
 
     /// Bytes held by allocated bricks
@@ -358,15 +369,16 @@ impl Coverage {
 
     /// `is_covered_same_dir` (core.py:237)
     #[inline]
-    pub fn covered_same_dir(&self, x: f64, y: f64, z: f64, tx: f64, ty: f64, tz: f64) -> bool {
-        let [d, h, w] = self.0.dims();
+    #[allow(clippy::too_many_arguments)]
+    pub fn covered_same_dir(&self, reads: &mut ReadSet, x: f64, y: f64, z: f64, tx: f64, ty: f64, tz: f64) -> bool {
+        let [d, h, w] = self.0.shape().map(|n| n as i64);
         let ix = (x + 0.5) as i64;
         let iy = (y + 0.5) as i64;
         let iz = (z + 0.5) as i64;
         if ix < 0 || ix >= w || iy < 0 || iy >= h || iz < 0 || iz >= d {
             return false;
         }
-        let c = self.0.at(iz, iy, ix);
+        let c = self.read(reads, iz, iy, ix);
         if c == UNCOVERED {
             return false;
         }
@@ -377,19 +389,28 @@ impl Coverage {
         (ux * tx + uy * ty + uz * tz).abs() > 0.86
     }
 
-    /// `mark_curve_coverage` (core.py:527) with `core_r = 2.05`
-    pub fn mark<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
-        &mut self,
+    /// The voxels `mark_curve_coverage` (core.py:527, `core_r = 2.05`) would update for one curve, in its order
+    ///
+    /// Everything that decides whether a voxel near a point is marked reads only the fields, so it is done here,
+    /// on the tracing thread; only the update itself, which reads the voxel's coverage, is left to
+    /// [`CoverageWriter::apply`]. `first` is the index of `tans[0]` in the seed's [`Traced::tans`]
+    pub fn mark_list<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
+        &self,
         f: &Fields<P, C, D>,
         pts: &[[f32; 3]],
         tans: &[[f32; 3]],
+        first: usize,
+        out: &mut Vec<Mark>,
     ) {
-        let [d, h, w] = self.0.dims();
+        let [d, h, w] = self.0.shape().map(|n| n as i64);
         let core_r2 = (2.05f64 * 2.05) as f32 as f64;
-        for (p, t) in pts.iter().zip(tans) {
+        for (k, (p, t)) in pts.iter().zip(tans).enumerate() {
             let [px, py, pz] = p.map(|v| v as f64);
             let [tx, ty, tz] = t.map(|v| v as f64);
             let (bnx, bny) = encode_dir(t[0], t[1], t[2]);
+            debug_assert!(bnx != 0);
+            let dir = pack_dir(bnx, bny);
+            let tan = u32::try_from(first + k).expect("a seed's curves hold fewer than 2³² points");
             let c0 = trilin_u16(f.cent, px, py, pz);
             let ix0 = (px + 0.5) as i64;
             let iy0 = (py + 0.5) as i64;
@@ -427,27 +448,101 @@ impl Coverage {
                                 trilin_u16(f.cent, 0.35 * px + 0.65 * xf, 0.35 * py + 0.65 * yf, 0.35 * pz + 0.65 * zf);
                             c0 + 2.0 >= cm1 && cm1 + 3.0 >= cm2 && cm2 + 3.0 >= cq
                         };
-                        if !suppress {
-                            continue;
-                        }
-                        let (zu, yu, xu) = (zz as usize, yy as usize, xx as usize);
-                        let c = self.0.get(zu, yu, xu);
-                        if c == UNCOVERED {
-                            debug_assert!(bnx != 0);
-                            self.0.set(zu, yu, xu, pack_dir(bnx, bny));
-                            continue;
-                        }
-                        // a count of 2 stays 2 whichever way the new direction points
-                        if c == COVERED_TWICE {
-                            continue;
-                        }
-                        let [ux0, uy0, uz0] = decode_packed(c);
-                        if (ux0 * tx + uy0 * ty + uz0 * tz).abs() <= 0.85 {
-                            self.0.set(zu, yu, xu, COVERED_TWICE);
+                        if suppress {
+                            out.push(Mark { at: self.0.place(zz as usize, yy as usize, xx as usize), dir, tan });
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// The coverage's one writer, which commits seeds in order
+    ///
+    /// # Panics
+    ///
+    /// When called a second time on the same coverage
+    pub fn writer(&self) -> CoverageWriter<'_> {
+        CoverageWriter { vol: self.0.writer(), written: vec![0; WRITTEN_SLOTS].into_boxed_slice() }
+    }
+}
+
+/// The brick slots a seed's tracing read from the coverage, in read order
+///
+/// A slot read again right after itself is kept once; steps mostly stay in one brick, so the set stays short
+#[derive(Default)]
+pub struct ReadSet(Vec<usize>);
+
+impl ReadSet {
+    #[inline(always)]
+    fn push(&mut self, slot: usize) {
+        if self.0.last() != Some(&slot) {
+            self.0.push(slot);
+        }
+    }
+
+    pub fn slots(&self) -> &[usize] {
+        &self.0
+    }
+}
+
+/// One voxel update of [`Coverage::mark_list`]: the encoded direction of the marking point and its tangent's
+/// index in [`Traced::tans`]
+#[derive(Clone, Copy)]
+pub struct Mark {
+    at: Place,
+    dir: u16,
+    tan: u32,
+}
+
+/// The `written` table's size, as a power of two
+const WRITTEN_BITS: u32 = 16;
+const WRITTEN_SLOTS: usize = 1 << WRITTEN_BITS;
+
+/// Applies committed seeds' marks to a [`Coverage`] and checks traced seeds' reads against them
+///
+/// `written` maps each brick slot, by a hash, to one more than the newest seed that changed a voxel in it. Only
+/// the last few dozen seeds matter for a check, so a small table that stays in cache replaces one counter per
+/// slot: slots that share an entry can only make a seed look stale, never current, and a stale seed is traced
+/// again
+pub struct CoverageWriter<'c> {
+    vol: SharedVolWriter<'c>,
+    written: Box<[u32]>,
+}
+
+impl CoverageWriter<'_> {
+    #[inline(always)]
+    fn entry(slot: usize) -> usize {
+        // Fibonacci hashing spreads neighbouring slots over the table
+        ((slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - WRITTEN_BITS)) as usize
+    }
+
+    /// Whether a seed that read `reads` while the first `committed` seeds were committed may have read a value a
+    /// later commit changed
+    pub fn stale(&self, reads: &ReadSet, committed: u32) -> bool {
+        reads.slots().iter().any(|&slot| self.written[Self::entry(slot)] > committed)
+    }
+
+    /// Mark seed `seed`'s curves, as `mark_curve_coverage` does curve by curve and point by point
+    pub fn apply(&mut self, seed: u32, traced: &Traced) {
+        let stamp = seed + 1;
+        for m in &traced.marks {
+            let c = self.vol.get(m.at);
+            let value = match c {
+                UNCOVERED => m.dir,
+                // a count of 2 stays 2 whichever way the new direction points
+                COVERED_TWICE => continue,
+                _ => {
+                    let [tx, ty, tz] = traced.tans[m.tan as usize].map(|v| v as f64);
+                    let [ux0, uy0, uz0] = decode_packed(c);
+                    if (ux0 * tx + uy0 * ty + uz0 * tz).abs() > 0.85 {
+                        continue;
+                    }
+                    COVERED_TWICE
+                }
+            };
+            self.vol.set(m.at, value);
+            self.written[Self::entry(m.at.slot)] = stamp;
         }
     }
 }
@@ -567,9 +662,43 @@ impl Default for Scratch {
     }
 }
 
-/// One accepted raw curve; its tangents only matter for coverage, which is marked as it is accepted
+/// One accepted raw curve; its tangents only matter for coverage, which [`Traced::marks`] holds
 pub struct RawCurve {
     pub pts: Vec<[f32; 3]>,
+}
+
+/// What tracing one seed found, before it is committed: the curves it accepted, the coverage updates they make,
+/// and the coverage bricks it read to decide
+///
+/// Kept and cleared between seeds, so a thread's buffers are reused
+#[derive(Default)]
+pub struct Traced {
+    pub curves: Vec<RawCurve>,
+    pub marks: Vec<Mark>,
+    /// The accepted curves' tangents, which [`Mark::tan`] indexes
+    pub tans: Vec<[f32; 3]>,
+    pub reads: ReadSet,
+}
+
+/// Marks a [`Traced`] keeps room for between seeds, 128 KiB: a seed whose curves are accepted makes thousands, but
+/// a window of seeds traced ahead each keeping room for the largest it has held would add hundreds of MiB
+const MARKS_KEPT: usize = 1 << 13;
+
+impl Traced {
+    /// Give back the room for marks beyond [`MARKS_KEPT`]
+    pub fn trim(&mut self) {
+        if self.marks.capacity() > MARKS_KEPT {
+            self.marks.clear();
+            self.marks.shrink_to(MARKS_KEPT);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.curves.clear();
+        self.marks.clear();
+        self.tans.clear();
+        self.reads.0.clear();
+    }
 }
 
 /// `trace_half_buf` (core.py:322) with `step_size = 0.75`, `max_low_steps = 3`
@@ -577,6 +706,7 @@ pub struct RawCurve {
 fn trace_half<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
     f: &Fields<P, C, D>,
     cov: &Coverage,
+    reads: &mut ReadSet,
     x0: f64,
     y0: f64,
     z0: f64,
@@ -720,7 +850,7 @@ fn trace_half<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
         } else {
             low_pres_run = 0;
         }
-        if cov.covered_same_dir(nx_p, ny_p, nz_p, ntx, nty, ntz) {
+        if cov.covered_same_dir(reads, nx_p, ny_p, nz_p, ntx, nty, ntz) {
             cov_run += 1;
             if cov_run >= 2 {
                 break;
@@ -760,35 +890,39 @@ fn trace_half<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
     n_pts
 }
 
-/// One iteration of `trace_seed_range` (core.py:882-1016) for seed `i`, with `min_raw_len = 7.5`;
-/// accepted curves are marked into `cov` and appended to `out`
+/// One iteration of `trace_seed_range` (core.py:882-1016) for seed `i`, with `min_raw_len = 7.5`, into `out`
+///
+/// The seed reads `cov` but does not mark it: its accepted curves and the marks they make are left in `out` for
+/// [`CoverageWriter::apply`]. Given the same coverage values at the bricks in `out.reads`, the result is the same
 #[allow(clippy::too_many_arguments)]
 pub fn trace_seed<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
     f: &Fields<P, C, D>,
-    cov: &mut Coverage,
+    cov: &Coverage,
     s: &mut Scratch,
     seed: [i32; 3],
     primary: bool,
-    out: &mut Vec<RawCurve>,
+    out: &mut Traced,
 ) -> Result<()> {
+    out.clear();
+    let reads = &mut out.reads;
     let [sz, sy, sx] = seed.map(|v| v as i64);
-    if !primary && cov.is_covered(sz, sy, sx) {
+    if !primary && cov.is_covered(reads, sz, sy, sx) {
         return Ok(());
     }
     let [ux, uy, uz] = f.dir_at(sz, sy, sx);
     let (sxf, syf, szf) = (sx as f64, sy as f64, sz as f64);
-    if cov.covered_same_dir(sxf, syf, szf, ux, uy, uz) {
+    if cov.covered_same_dir(reads, sxf, syf, szf, ux, uy, uz) {
         return Ok(());
     }
     let [cx, cy, cz] = f.recenter(sx as f32 as f64, sy as f32 as f64, sz as f32 as f64, ux, uy, uz, 1.5, 4);
-    if cov.covered_same_dir(cx, cy, cz, ux, uy, uz) {
+    if cov.covered_same_dir(reads, cx, cy, cz, ux, uy, uz) {
         return Ok(());
     }
     if trilin_u8(f.pres, cx, cy, cz) < 76.5 {
         return Ok(());
     }
     let [ux, uy, uz] = f.dir_aligned(cx, cy, cz, ux, uy, uz);
-    let nf = trace_half(f, cov, cx, cy, cz, ux, uy, uz, &mut s.pts_f, &mut s.tans_f);
+    let nf = trace_half(f, cov, reads, cx, cy, cz, ux, uy, uz, &mut s.pts_f, &mut s.tans_f);
     if nf == HALF {
         bail!("Full-scroll half-path buffer reached; refusing an artificial endpoint");
     }
@@ -811,7 +945,7 @@ pub fn trace_seed<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
             buz /= bn;
         }
     }
-    let nb = trace_half(f, cov, cx, cy, cz, bux, buy, buz, &mut s.pts_b, &mut s.tans_b);
+    let nb = trace_half(f, cov, reads, cx, cy, cz, bux, buy, buz, &mut s.pts_b, &mut s.tans_b);
     if nb == HALF {
         bail!("Full-scroll half-path buffer reached; refusing an artificial endpoint");
     }
@@ -845,8 +979,10 @@ pub fn trace_seed<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
         if (arc_len as f64) < req_len {
             continue;
         }
-        cov.mark(f, &s.pts_c[a..b], &s.tans_c[a..b]);
-        out.push(RawCurve { pts: s.pts_c[a..b].to_vec() });
+        // a later span's marks follow an earlier one's, as `mark_curve_coverage` marks them curve by curve
+        cov.mark_list(f, &s.pts_c[a..b], &s.tans_c[a..b], out.tans.len(), &mut out.marks);
+        out.tans.extend_from_slice(&s.tans_c[a..b]);
+        out.curves.push(RawCurve { pts: s.pts_c[a..b].to_vec() });
     }
     Ok(())
 }
@@ -1075,6 +1211,36 @@ mod tests {
         assert!(((x * x + y * y).sqrt() - 1.0).abs() < 1e-12);
         assert_eq!(encode_dir(0.0, 0.0, 1.0), (128, 128));
         assert_eq!(encode_dir(1.0, -1.0, -0.5), (1, 255));
+    }
+
+    #[test]
+    fn a_seed_is_stale_once_a_later_commit_changes_a_brick_it_read() {
+        let cov = Coverage::new([40, 70, 70]);
+        let mut reads = ReadSet::default();
+        assert!(!cov.is_covered(&mut reads, 20, 20, 20));
+        assert!(!cov.covered_same_dir(&mut reads, 60.0, 60.0, 30.0, 0.0, 0.0, 1.0));
+        assert_eq!(reads.slots().len(), 2);
+
+        // seed 3 marks a voxel in the first brick read: a seed traced once 4 seeds were committed saw the mark, one
+        // traced when only 3 were did not
+        let mut writer = cov.writer();
+        let mut traced = Traced::default();
+        traced.tans.push([0.0, 0.0, 1.0]);
+        traced.marks.push(Mark { at: cov.0.place(21, 22, 23), dir: pack_dir(128, 128), tan: 0 });
+        assert!(!writer.stale(&reads, 3));
+        writer.apply(3, &traced);
+        assert!(writer.stale(&reads, 3));
+        assert!(!writer.stale(&reads, 4));
+        assert!(cov.is_covered(&mut ReadSet::default(), 21, 22, 23));
+
+        // a count of 1 becomes 2 for a crossing direction and stays 1 for the same one
+        traced.marks[0].dir = pack_dir(255, 128);
+        traced.tans[0] = [0.0, 0.0, 1.0];
+        writer.apply(4, &traced);
+        assert_eq!(cov.0.get(cov.0.place(21, 22, 23)), pack_dir(128, 128));
+        traced.tans[0] = [1.0, 0.0, 0.0];
+        writer.apply(5, &traced);
+        assert_eq!(cov.0.get(cov.0.place(21, 22, 23)), COVERED_TWICE);
     }
 
     #[test]
