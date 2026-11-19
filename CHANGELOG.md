@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- The tracer stores its fields in 4³ sub-bricks within each 16³ brick, allocating only the sub-bricks that hold
+  data, so dense windows need less memory and write the same `.afv`. On PHerc0358's densest 1,024-plane window
+  with `--threads 8`, the peak fell from 21.6 GiB to 15.4 GiB with `--field-cache-mib 4096`, and from 17.7 GiB to
+  11.1 GiB with the default of 1024. No option or default changed.
 - **Centrality on the GPU.** `--device` now defaults to `auto`: centrality and the ridge seeds run on an NVIDIA GPU
   of compute capability 8.0 or later when one is usable (Linux x86-64; a driver for CUDA 12.0 or newer is enough, no
   CUDA toolkit), and on the CPU otherwise, with the reason in the log. `--device cpu` keeps them on the CPU,

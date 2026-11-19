@@ -198,20 +198,23 @@ took 52.6 s and 65.9 s with `--device cuda`, against 35.3 s and 59.3 s with `--d
 
 ## Differences from the original
 
-- Fields live in memory as sparse 16³ bricks instead of a Zarr work store, so peak memory is higher and grows
-  with how much of the band holds fibres: 9.0 GiB against the original's 4.6 GiB on a 512 × 8169 × 8169 band of
-  PHerc0826, and 13.3 GiB on 1024 × 8169 × 8169 of the same scroll before predictions were decoded in slabs. With
-  `--field-cache-mib 4096`, 4.1 GiB of that is the chunk cache; a smaller cache lowers the peak by the
-  difference but decodes again more often (measured while chunks were decoded whole: at a 1 GiB cache the
-  1024-plane window peaked at 9.8 GiB and traced about 19% slower; at 16 MiB tracing took about 60% longer).
-  Memory each stage frees goes back to the system before the next stage allocates.
+- Fields live in memory instead of a Zarr work store, so peak memory is higher than the original's and grows with
+  how much of the band holds fibres. Each field is cut into 16³ bricks of 4³ sub-bricks, and a sub-brick is stored
+  only once it holds a value other than the field's default: centrality and coverage are thin shells around the
+  fibres, and on PHerc0358's densest windows their values fill a tenth to a sixth of the 16³ bricks they touch. On
+  the 1,024-plane window z 1536–2560 of PHerc0358 (the 512-plane band z 1792–2304 with 256 planes on each side),
+  with `--threads 8` and `--field-cache-mib 4096`, the peak is 15.4 GiB, against 21.6 GiB for 0.2.0, which stored
+  whole 16³ bricks; both wrote the same `.afv`. 4.1 GiB of that peak is the chunk cache. A smaller cache lowers the
+  peak by the difference but decodes again more often: at `--field-cache-mib 1024` the same window peaked at 11.1
+  GiB and used 8% more CPU time. Memory each stage frees goes back to the system before the next stage allocates.
 - A point's value needs 8 voxels of the native predictions, so they are decoded 8 planes at a time (one 128 KiB
   Blosc block of each channel in a prediction zarr) instead of a whole chunk at a time. The cache holds these
   slabs, with the chunks' compressed bytes in a quarter of its budget, and a chunk whose Blosc blocks are larger
   than 8 planes is decoded once and cut into slabs. Arrays read a whole chunk at a time (chunks of 8 planes or
   fewer, or other layouts and compressors) give the whole budget to decoded chunks. Decoded slabs, compressed chunks and the
   direction field's tile buffers come from pools that each keep at most 128 MiB of freed buffers for reuse,
-  beside the cache, and each field's bricks are cut from 64 MiB mappings the field owns. Dense bands evict and decode
+  beside the cache, and each field reserves one range of addresses for its sub-bricks and commits it 64 MiB at a
+  time. Dense bands evict and decode
   hundreds of times a second, and on Linux mapping and unmapping memory takes a lock that every page fault in
   the process waits for, so a mapping per decode and per brick stalled the tracing threads. Other allocations
   of 1 MiB or more have their own mapping on Linux, so freed memory does not stay resident. `FIBRS_DEBUG_MEM=1`

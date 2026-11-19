@@ -72,15 +72,14 @@ impl<'a> Presence<'a> {
     /// The value at an in-bounds voxel
     #[inline(always)]
     pub fn get(&self, z: usize, y: usize, x: usize) -> u8 {
-        // the pooled predictions read 0 outside their bricks, and an own value of 0 gives presence 0 whatever
+        // the pooled predictions read 0 outside their sub-bricks, and an own value of 0 gives presence 0 whatever
         // the other is, so most air reads stop at the first lookup
         let (own, at) = self.own.locate(z, y, x);
-        let a = match own {
-            Some(b) if b[at] != 0 => b[at],
-            _ => return 0,
-        };
-        let b = self.other.locate(z, y, x).0.map_or(0, |b| b[at]);
-        Self::combine(a, b)
+        let a = own[at];
+        if a == 0 {
+            return 0;
+        }
+        Self::combine(a, self.other.locate(z, y, x).0[at])
     }
 
     /// Presence from an own and an other value
@@ -103,11 +102,14 @@ impl<'a> Presence<'a> {
     /// A dense C-order block with origin `lo` and extent `dims`
     pub fn read_block(&self, lo: Shape, dims: Shape) -> Vec<u8> {
         let mut out = vec![0u8; dims.iter().product()];
+        let mut other = vec![0u8; dims[2]];
         for z in 0..dims[0] {
             for y in 0..dims[1] {
                 let row = &mut out[(z * dims[1] + y) * dims[2]..][..dims[2]];
-                for (x, v) in row.iter_mut().enumerate() {
-                    *v = self.get(lo[0] + z, lo[1] + y, lo[2] + x);
+                self.own.read_row(lo[0] + z, lo[1] + y, lo[2], row);
+                self.other.read_row(lo[0] + z, lo[1] + y, lo[2], &mut other);
+                for (v, &b) in row.iter_mut().zip(&other) {
+                    *v = Self::combine(*v, b);
                 }
             }
         }
@@ -115,7 +117,7 @@ impl<'a> Presence<'a> {
     }
 
     /// Whether any voxel of the block `[lo, lo + dims)` satisfies `pred`; presence is 0 wherever the family's
-    /// own pooled prediction is, so only its allocated bricks are visited
+    /// own pooled prediction is, so only its allocated sub-bricks are visited
     pub fn any_in(&self, lo: Shape, dims: Shape, pred: impl Fn(u8) -> bool) -> bool {
         self.own.any_allocated_in(lo, dims, |z, y, x| pred(self.get(z, y, x)))
     }
