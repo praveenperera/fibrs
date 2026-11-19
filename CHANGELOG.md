@@ -31,9 +31,9 @@ over a CT volume on an NVIDIA GPU, natively in the `fibrs` binary, with no PyTor
   predictions were decoded 8 planes at a time. On a 512-plane band it is 9.0 GiB, where 0.1.0 peaked at
   8.9–10.8 GiB.
 - **Tracing is faster on dense bands**, with the same `.afv`:
-  - The native predictions are decoded 8 planes at a time instead of a whole chunk at a time. A chunk whose Blosc
-    blocks hold more than 8 planes is decoded whole, and each slab is cached as it is copied, so no thread holds a
-    second copy of the chunk.
+  - The native predictions are decoded 8 planes at a time instead of a whole chunk at a time when the array's
+    chunks allow it. If one chunk of such an array still has to be decoded whole, its 8-plane slabs are cached one
+    at a time as they are copied, so no thread holds a second copy of the chunk.
   - Decoded predictions and the direction field's tile buffers are reused from a pool.
   - Each field's bricks are cut from large mappings it owns.
   - The direction field's Gaussian filters sum a whole row of voxels at a time, in the same order as before.
@@ -91,7 +91,8 @@ overlaps. The speedup is the mean of the per-pair ratios:
 
 On a 512 × 2048 × 2048 box of PHerc0358 (z 2304–2816, y 2176–4224, x 2944–4992) with no all-zero tile, one run
 of each at fp32 on the same GPU took 165.6 s for villa, 85.4 s for fibrs in band mode (1.94×) and 84.8 s with
-`--mode villa` (1.95×). At fp32 the measured speedup is 1.72×–1.95×.
+`--mode villa` (1.95×). At fp32 the measured speedup is 1.68×–1.95×; the lowest is the single PHerc0826 run in
+band mode behind the end-to-end row under "Why the speed-up varies" (45.4 s and 27.0 s).
 
 fibrs, a pre-release build of 0.2.0 (`e9adcc9`), ran with cuDNN 9.27.0 and cuBLAS 13.4.1.3. villa ran PyTorch
 2.14.1 (CUDA 13.0) with cuDNN 9.24, at `0bddf2757`.

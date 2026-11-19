@@ -290,7 +290,8 @@ overlaps. The speedup is the mean of the per-pair ratios:
 
 On a 512 × 2048 × 2048 box of PHerc0358 (z 2304–2816, y 2176–4224, x 2944–4992) with no all-zero tile, one run
 of each at fp32 on the same GPU took 165.6 s for villa, 85.4 s for fibrs in band mode (1.94×) and 84.8 s with
-`--mode villa` (1.95×). At fp32 the measured speedup is 1.72×–1.95×.
+`--mode villa` (1.95×). At fp32 the measured speedup is 1.68×–1.95×; the lowest is the single PHerc0826 run in
+band mode behind the end-to-end row under [Why the speed-up varies](#why-the-speed-up-varies) (45.4 s and 27.0 s).
 
 fibrs, a pre-release build of 0.2.0 (`e9adcc9`), ran with cuDNN 9.27.0 and cuBLAS 13.4.1.3. villa ran PyTorch
 2.14.1 (CUDA 13.0) with cuDNN 9.24, at `0bddf2757`.
