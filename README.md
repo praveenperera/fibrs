@@ -75,8 +75,9 @@ manylinux_2_28`, and the macOS wheel `MACOSX_DEPLOYMENT_TARGET=11.0`).
 
 ## Numerics
 
-The direction field's eigenvectors come from `dsyevd` in numpy's own OpenBLAS, on float64 copies as
-`numpy.linalg.eigh` computes them, so they match `eigh` bit for bit. The binary finds that library from its
+On the CPU, the direction field's eigenvectors come from `dsyevd` in numpy's own OpenBLAS, on float64 copies as
+`numpy.linalg.eigh` computes them, so they match `eigh` bit for bit. On the GPU, each voxel's eigenvector is
+certified against an error bound to equal that result, and voxels that can't be certified go to the same `dsyevd`. The binary finds that library from its
 own path (`bin/../lib/python*/site-packages/numpy.libs/libscipy_openblas64_*.so`), then from
 `$VIRTUAL_ENV`, looking in each environment in numpy's copy first and then in the `scipy-openblas64`
 package (`site-packages/scipy_openblas64/lib`). `FIBRS_LAPACK` overrides both.
@@ -167,8 +168,8 @@ each decoded chunk its own mapping spent 40% of its CPU time in the kernel.
 
 ### Centrality on the GPU
 
-With `--threads 8` on an RTX 5090 host, each band ran four times back to back, CPU, GPU, GPU, CPU, with other work
-running on the machine:
+Measured before the direction field moved to the GPU, with `--threads 8` on an RTX 5090 host, each band ran four
+times back to back, CPU, GPU, GPU, CPU, with other work running on the machine:
 
 | Band | Centrality and seeds, CPU | Same, GPU | Whole run, CPU | Whole run, GPU |
 |---|---|---|---|---|
@@ -176,7 +177,7 @@ running on the machine:
 | PHerc0826, z 12032–12544 | 20.4 s | 5.0 s | 120 s | 105 s |
 
 Each figure is the mean of its two runs, and all eight `.afv` files were identical. The direction field (20–51 s
-here) and tracing still run on the CPU, so the whole run gains less, and its time moves with the machine's load
+here) and tracing ran on the CPU in these runs, so the whole run gains less, and its time moves with the machine's load
 (a mean one-minute load of 8–13 across these runs).
 
 The original's `--device cuda` doesn't make centrality faster. On the same bands with `--threads 8` its centrality
