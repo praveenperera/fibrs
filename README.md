@@ -141,11 +141,11 @@ ranges are the lowest and highest of the uninterrupted runs, 2 to 4. The CPU ran
 same build on the run 4 band, which used 853 s of CPU time (38×).
 
 On dense bands, fibrs's speed also depends on how it reads the predictions and allocates memory. Take a
-512 × 2048 × 2048 crop of PHerc0358's densest area (z 1792–2304, y 2176–4224, x 2944–4992) with `--threads 8`
-and `--field-cache-mib 224`, each pair of builds run back to back on the same busy machine. fibrs 0.2.0 takes
-50–52 s with a 2.6 GiB peak and writes the same `.afv` as 0.1.0, which took 104 s with a 3.5 GiB peak. A 0.2.0
-build that decoded whole chunks took 69–72 s, and one that also gave each decoded chunk its own mapping spent
-40% of its CPU time in the kernel.
+512 × 2048 × 2048 crop of PHerc0358's densest area (z 1792–2304, y 2176–4224, x 2944–4992) with `--threads 8` and
+`--field-cache-mib 224`, each pair of builds run back to back on the same busy machine. A pre-release build of
+0.2.0 that decodes the predictions 8 planes at a time took 50–52 s with a 2.6 GiB peak and wrote the same `.afv` as
+0.1.0, which took 104 s with a 3.5 GiB peak. One that decoded whole chunks took 69–72 s, and one that also gave
+each decoded chunk its own mapping spent 40% of its CPU time in the kernel.
 
 ## Differences from the original
 
@@ -377,8 +377,8 @@ more than one:
   estimated totals and set neither end. The original's time per fibre also differs between bands and between runs:
   about 0.035 s on the dense PHerc0358 band (run 4) and about 0.027 s on PHerc0813 (run 5, estimated), and its two
   uninterrupted runs on the same PHerc0826 band took 4,686 s and 12,728 s. fibrs took about 0.6–0.75 ms per fibre
-  on runs 4 and 5. Pre-release builds of 0.2.0 traced dense data slower than 0.1.0; 0.2.0 is faster than 0.1.0
-  there (the last row).
+  on runs 4 and 5. Pre-release builds of 0.2.0 traced dense data slower than 0.1.0; a later pre-release build is
+  faster than 0.1.0 there (the last row).
 
 | Stage | Scroll | Region (z / y / x) | Tiles run | Original | fibrs | Ratio | Precision | Measured as |
 |---|---|---|---|---|---|---|---|---|
@@ -393,7 +393,7 @@ more than one:
 | Prediction, `--mode villa` | PHerc0358 | same box | 100% | 165.6 s | 84.5 s | 1.96× | fp32 | one run each, not at the same time, against the same villa run; fibrs `42c4710` |
 | End to end, prediction in band mode | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 387.5 s | 41.7 s | 9.3× | fp32 | one run of each stage |
 | End to end, prediction in band mode | PHerc0358 | z 2304–2816, whole plane | 33.2% | 17,863 s, prediction estimated | 739 s | 24×, estimated | fp32 | villa's prediction time extrapolated from the box above; the rest one run of each stage, fibrs `e9adcc9` predicting; both tracers read fibrs's prediction |
-| Tracing, fibrs 0.1.0 → 0.2.0 | PHerc0358 | z 1792–2304 / y 2176–4224 / x 2944–4992 | 100% | 104 s (0.1.0) | 50–52 s (0.2.0) | 2.0–2.1× | CPU | back to back on one machine, `--threads 8`; not in the tracing range |
+| Tracing, fibrs 0.1.0 → a pre-release build of 0.2.0 | PHerc0358 | z 1792–2304 / y 2176–4224 / x 2944–4992 | 100% | 104 s (0.1.0) | 50–52 s (pre-release 0.2.0) | 2.0–2.1× | CPU | back to back on one machine, `--threads 8`; not in the tracing range |
 
 "Original" is `avf-spline-generator` 0.2.0 for tracing and villa's `lasagna.qualzz_inference` (main `0bddf2757`,
 PyTorch fp32) for prediction; end to end is the two stages added, on the PHerc0826 crop from a single run of each
