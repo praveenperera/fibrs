@@ -15,8 +15,8 @@ over a CT volume on an NVIDIA GPU, natively in the `fibrs` binary, with no PyTor
   The network, softmax, blend and finalise run on the GPU through [volkit](https://github.com/praveenperera/volkit).
   The weights are read from the model's `checkpoint_final.pth` directly.
 - **Two modes:**
-  - `--mode villa` computes villa's tiles over the whole array. Where input chunks are absent it skips their
-    tiles, as villa `97fb9336c` did; villa main runs them on zeros.
+  - `--mode villa` computes villa's tiles over the whole array. A 128³ output chunk with no stored input chunk
+    inside it is not computed or written, as in villa `97fb9336c`; villa main computes every chunk.
   - Band mode, the default, computes a resumable z band (`--z0`, `--z1`) column by column.
 
   Band mode can be capped with `--max-minutes` and resumed by running the same command again.
@@ -77,7 +77,9 @@ By default `fibrs predict` keeps parity with villa's `lasagna.qualzz_inference` 
 Against villa's `lasagna.qualzz_inference` on PyTorch, at its default precision (float32 with TF32 tensor-core
 convolutions). Both ran the same 726-tile crop of PHerc0826 (z 12032–12544, y 4096–5120, x 1536–2560) on one RTX
 5090 (driver 595.112.07). The runs alternated (ABBA), with 6 timed pairs per precision after one warm-up run of
-each, and each time is the whole command's wall time. The speedup is the mean of the per-pair ratios:
+each. Each time is the whole command's wall time on the same input and output, reading the CT and writing the zarr
+included, so it measures more than the network. On this crop villa ran 726 tiles and fibrs 864, as `--mode villa`
+runs a tile that straddles two of its columns once for each. The speedup is the mean of the per-pair ratios:
 
 | `fibrs predict --mode villa` precision | villa, PyTorch fp32 (median) | fibrs (median) | Speedup, mean (95% CI) |
 |---|---|---|---|
@@ -120,25 +122,28 @@ more than one:
   each scroll. The table gives it as the share of 128³ tiles that `fibrs predict --dry-run` would run (band mode,
   tiles whose input isn't all zero), measured the same way for every row.
 - **Prediction skips air.** villa main runs every tile; band mode skips tiles whose input is all zero, so on a
-  sparse band it runs a fraction of villa's tiles and on a dense one about as many. `--mode villa` runs the same
-  tiles as villa main on an input with every chunk stored, so its speed-up comes from the engine alone.
+  sparse band it runs a fraction of villa's tiles and on a dense one about as many. `--mode villa` doesn't skip
+  all-zero tiles, and on the PHerc0826 crop it ran 864 tiles where villa ran 726, since it runs a tile that
+  straddles two of its columns once for each. Every prediction time is the whole command's wall time on the same
+  input and output.
 - **Tracing varies with the run.** The tracer ratio varies with the run and with the machine's load, so it is
   given as the lowest to highest measured. Pre-release builds of 0.2.0 traced dense data slower than 0.1.0;
   0.2.0 is faster than 0.1.0 there (the last row).
 
 | Stage | Scroll | Region (z / y / x) | Tiles run | Original | fibrs | Ratio | Precision | Measured as |
 |---|---|---|---|---|---|---|---|---|
-| Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 11,840 s | 191 s | 62× | CPU | one run each (run 1) |
-| Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 4,686 s | 172 s | 27× | CPU | one run each (run 2) |
-| Tracing | PHerc1545 | z 1280–1792, whole plane | 8.4% | 1,621 s | 73.4 s | 22× | CPU | one run each (run 3) |
+| Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 11,840 s | 191 s | 62× | CPU | one run each (run 1; fibrs built before 0.1.0) |
+| Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 4,686 s | 172 s | 27× | CPU | one run each (run 2; fibrs 0.1.0) |
+| Tracing | PHerc1545 | z 1280–1792, whole plane | 8.4% | 1,621 s | 73.4 s | 22× | CPU | one run each (run 3; fibrs 0.1.0) |
 | Prediction, `--mode villa` | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 45.37 s | 26.77 s | 1.72× (1.66–1.78×) | fp32 | ABBA, 6 pairs: medians, mean ratio with 95% CI |
 | Prediction, `--mode villa` | PHerc0826 | same crop | 100% | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) | bf16 (opt-in) | ABBA, 6 pairs: medians, mean ratio with 95% CI |
-| End to end | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 387.5 s | 41.7 s | 9.3× | fp32 | one run of each stage |
+| End to end, prediction in band mode | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 387.5 s | 41.7 s | 9.3× | fp32 | one run of each stage |
 | Tracing, fibrs 0.1.0 → 0.2.0 | PHerc0358 | z 1792–2304 / y 2176–4224 / x 2944–4992 | 100% | 104 s (0.1.0) | 50–52 s (0.2.0) | 2.0–2.1× | CPU | back to back on one machine, `--threads 8`; not in the tracing range |
 
 "Original" is `avf-spline-generator` 0.2.0 for tracing and villa's `lasagna.qualzz_inference` (main `0bddf2757`,
-PyTorch fp32) for prediction; end to end is the two stages added, from a single run of each (prediction 45.4 s
-and 27.0 s, not the ABBA medians). Tracing ran with `--threads 4` for both tools unless the row says otherwise.
+PyTorch fp32) for prediction; end to end is the two stages added, from a single run of each (prediction 45.4 s and
+27.0 s, `fibrs predict` in band mode, not the ABBA medians). Tracing ran with `--threads 4` for both tools unless
+the row says otherwise.
 
 ### Known limitations
 
@@ -173,7 +178,7 @@ The first release.
 - `fibrs`, a native, multi-threaded drop-in for Qual's `avf-spline-generator` 0.2.0
   ([AVF_SPLINE_GENERATOR](https://github.com/Qualzz/AVF_SPLINE_GENERATOR) @ `bee798f`): the same flags and the
   same `.afv`, 22×–62× faster across three measured runs on 512-plane bands of PHerc0826 and PHerc1545 at
-  `--threads 4`
+  `--threads 4` (one with a build from before 0.1.0, two with 0.1.0)
 - wheels for Linux x86-64 (glibc 2.28+) and Apple silicon (macOS 11+), with the `fibrs` command and the `fibrs`
   Python module, and a CLI archive for each with `scripts/install-dropin.sh`
 - `--version` prints `0.2.0`, the original's version, as a drop-in has to

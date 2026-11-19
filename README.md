@@ -104,7 +104,7 @@ running on the machine each time. Runs 1 and 2 trace the same 512 × 8169 × 816
 | Run | Tool | Wall | CPU time | Peak memory |
 |---|---|---|---|---|
 | 1 | `avf-spline-generator` 0.2.0 | 11,840 s (3.3 h) | about 11,940 s | 4.6 GiB |
-| 1 | `fibrs` 0.1.1 | 191 s | 516 s | 12.4 GiB |
+| 1 | `fibrs`, built before 0.1.0 | 191 s | 516 s | 12.4 GiB |
 | 2 | `avf-spline-generator` 0.2.0 | 4,686 s (1.3 h) | 12,296 s | 4.6 GiB |
 | 2 | `fibrs` 0.1.0 | 172 s | 472 s | 10.8 GiB |
 | 3 | `avf-spline-generator` 0.2.0 | 1,621 s (27 min) | 4,149 s | 4.6 GiB |
@@ -239,7 +239,7 @@ lists them and a resume that picks others is refused: keep the cache between a r
 
 | Mode | What it computes |
 |---|---|
-| `--mode villa` | the whole array, as villa's `lasagna.qualzz_inference` computes it. It runs the tiles whose input holds a stored chunk, as villa `97fb9336c` did: on an input with every chunk stored that is every tile, as villa main runs (`0bddf2757`). Where input chunks are absent, villa main runs the model on zeros and writes those chunks, and `--mode villa` skips them, so its output differs there |
+| `--mode villa` | the whole array, as villa's `lasagna.qualzz_inference` computes it, with villa `97fb9336c`'s rule for absent input chunks: a 128³ output chunk is computed and written only when an input chunk inside it is stored, and the others read as zero. On an input with every chunk stored that is every output chunk, as villa main (`0bddf2757`) computes it. Where no input chunk inside an output chunk is stored, villa main runs the model on zeros there and writes the chunk, so the outputs differ there |
 | band mode (the default) | a z band `[z0, z1)`, reflected at the band's own edges, tiles whose input is all zero skipped |
 
 Use `--mode villa` when you want villa's output; on an input with absent chunks, see the table. Band mode is for
@@ -275,7 +275,9 @@ PyTorch's `fp32-ieee` and `fp16` modes are not offered.
 Against villa's `lasagna.qualzz_inference` on PyTorch, at its default precision (float32 with TF32 tensor-core
 convolutions). Both ran the same 726-tile crop of PHerc0826 (z 12032–12544, y 4096–5120, x 1536–2560) on one RTX
 5090 (driver 595.112.07). The runs alternated (ABBA), with 6 timed pairs per precision after one warm-up run of
-each, and each time is the whole command's wall time. The speedup is the mean of the per-pair ratios:
+each. Each time is the whole command's wall time on the same input and output, reading the CT and writing the zarr
+included, so it measures more than the network. On this crop villa ran 726 tiles and fibrs 864, as `--mode villa`
+runs a tile that straddles two of its columns once for each. The speedup is the mean of the per-pair ratios:
 
 | `fibrs predict --mode villa` precision | villa, PyTorch fp32 (median) | fibrs (median) | Speedup, mean (95% CI) |
 |---|---|---|---|
@@ -339,25 +341,28 @@ more than one:
   each scroll. The table gives it as the share of 128³ tiles that `fibrs predict --dry-run` would run (band mode,
   tiles whose input isn't all zero), measured the same way for every row.
 - **Prediction skips air.** villa main runs every tile; band mode skips tiles whose input is all zero, so on a
-  sparse band it runs a fraction of villa's tiles and on a dense one about as many. `--mode villa` runs the same
-  tiles as villa main on an input with every chunk stored, so its speed-up comes from the engine alone.
+  sparse band it runs a fraction of villa's tiles and on a dense one about as many. `--mode villa` doesn't skip
+  all-zero tiles, and on the PHerc0826 crop it ran 864 tiles where villa ran 726, since it runs a tile that
+  straddles two of its columns once for each. Every prediction time is the whole command's wall time on the same
+  input and output.
 - **Tracing varies with the run.** The tracer ratio varies with the run and with the machine's load, so it is
   given as the lowest to highest measured. Pre-release builds of 0.2.0 traced dense data slower than 0.1.0;
   0.2.0 is faster than 0.1.0 there (the last row).
 
 | Stage | Scroll | Region (z / y / x) | Tiles run | Original | fibrs | Ratio | Precision | Measured as |
 |---|---|---|---|---|---|---|---|---|
-| Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 11,840 s | 191 s | 62× | CPU | one run each (run 1) |
-| Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 4,686 s | 172 s | 27× | CPU | one run each (run 2) |
-| Tracing | PHerc1545 | z 1280–1792, whole plane | 8.4% | 1,621 s | 73.4 s | 22× | CPU | one run each (run 3) |
+| Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 11,840 s | 191 s | 62× | CPU | one run each (run 1; fibrs built before 0.1.0) |
+| Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 4,686 s | 172 s | 27× | CPU | one run each (run 2; fibrs 0.1.0) |
+| Tracing | PHerc1545 | z 1280–1792, whole plane | 8.4% | 1,621 s | 73.4 s | 22× | CPU | one run each (run 3; fibrs 0.1.0) |
 | Prediction, `--mode villa` | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 45.37 s | 26.77 s | 1.72× (1.66–1.78×) | fp32 | ABBA, 6 pairs: medians, mean ratio with 95% CI |
 | Prediction, `--mode villa` | PHerc0826 | same crop | 100% | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) | bf16 (opt-in) | ABBA, 6 pairs: medians, mean ratio with 95% CI |
-| End to end | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 387.5 s | 41.7 s | 9.3× | fp32 | one run of each stage |
+| End to end, prediction in band mode | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 387.5 s | 41.7 s | 9.3× | fp32 | one run of each stage |
 | Tracing, fibrs 0.1.0 → 0.2.0 | PHerc0358 | z 1792–2304 / y 2176–4224 / x 2944–4992 | 100% | 104 s (0.1.0) | 50–52 s (0.2.0) | 2.0–2.1× | CPU | back to back on one machine, `--threads 8`; not in the tracing range |
 
 "Original" is `avf-spline-generator` 0.2.0 for tracing and villa's `lasagna.qualzz_inference` (main `0bddf2757`,
-PyTorch fp32) for prediction; end to end is the two stages added, from a single run of each (prediction 45.4 s
-and 27.0 s, not the ABBA medians). Tracing ran with `--threads 4` for both tools unless the row says otherwise.
+PyTorch fp32) for prediction; end to end is the two stages added, from a single run of each (prediction 45.4 s and
+27.0 s, `fibrs predict` in band mode, not the ABBA medians). Tracing ran with `--threads 4` for both tools unless
+the row says otherwise.
 
 ## Licence
 
