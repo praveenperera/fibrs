@@ -699,8 +699,11 @@ const CHUNK_POOL_RETAIN: usize = 128 << 20;
 ///
 /// Each batch is finished in native-chunk order, so a larger batch reads and decodes each chunk for more curves:
 /// on a dense PHerc0358 crop 8192 read 55% fewer chunks and decoded 40% fewer slabs than 2048, for 10% less CPU
-/// time. The curves in flight stay in the tens of megabytes
+/// time
 const FINISH_BATCH: usize = 8192;
+/// Raw curve points at which a batch is handed over even with fewer than [`FINISH_BATCH`] curves, so the batches in
+/// flight stay in the tens of megabytes (12 bytes a point) however long the curves are
+const FINISH_POINTS: usize = 2 << 20;
 
 fn trace_families(
     native: &Predictions,
@@ -882,16 +885,20 @@ fn trace_family(
     let produce = |tx: &SyncSender<Vec<RawCurve>>| -> Result<usize> {
         let mut cov = Coverage::new(shape);
         let mut scratch = Scratch::default();
-        let mut batch = Vec::new();
+        let mut batch: Vec<RawCurve> = Vec::new();
+        let mut points = 0;
         let mut count = 0;
         let mut last_log = Instant::now();
         for r in 0..cat.starts.len() - 1 {
             let (start, end) = (cat.starts[r], cat.starts[r + 1]);
             let primary_end = start + cat.primary[r];
             for (i, &seed) in cat.coords.iter().enumerate().take(end).skip(start) {
+                let before = batch.len();
                 trace_seed(&fields, &mut cov, &mut scratch, seed, i < primary_end, &mut batch)?;
-                if batch.len() >= FINISH_BATCH {
+                points += batch[before..].iter().map(|c| c.pts.len()).sum::<usize>();
+                if batch.len() >= FINISH_BATCH || points >= FINISH_POINTS {
                     count += batch.len();
+                    points = 0;
                     // a closed channel means finishing failed; its error is the one reported
                     if tx.send(std::mem::take(&mut batch)).is_err() {
                         return Ok(count);
