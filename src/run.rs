@@ -720,16 +720,16 @@ fn trace_families(
     log!("Tracing predictions: {:.1} s, {:.2} GiB resident", t.elapsed().as_secs_f64(), gib(resident));
     let t = Instant::now();
     let lapack = Lapack::init(&find_lapack()?)?;
-    let (nx, ny) = direction_field(&tracing, lapack)?;
+    let dirs = direction_field(&tracing, lapack)?;
     release_freed();
-    debug_dump(work, "nx", || nx.read_block([0, 0, 0], nx.shape()))?;
-    debug_dump(work, "ny", || ny.read_block([0, 0, 0], ny.shape()))?;
+    debug_dump(work, "nx", || dirs.read_block([0, 0, 0], dirs.shape()).iter().map(|d| (d >> 8) as u8).collect())?;
+    debug_dump(work, "ny", || dirs.read_block([0, 0, 0], dirs.shape()).iter().map(|&d| d as u8).collect())?;
     log!("Direction field: {:.1} s", t.elapsed().as_secs_f64());
-    debug_mem("direction field", &[("tracing", resident), ("nx", nx.resident_bytes()), ("ny", ny.resident_bytes())]);
+    debug_mem("direction field", &[("tracing", resident), ("dirs", dirs.resident_bytes())]);
     let pool = BufferPool::new(CHUNK_POOL_RETAIN);
     let cache = NativeCache::new(native, cache_bytes, &pool);
     for &family in families {
-        trace_family(&tracing, &nx, &ny, &cache, work, family, threads)?;
+        trace_family(&tracing, &dirs, &cache, work, family, threads)?;
         release_freed();
     }
     Ok(())
@@ -833,8 +833,7 @@ fn gib(bytes: usize) -> f64 {
 
 fn trace_family(
     tracing: &[Vol<u8>; 2],
-    nx: &Vol<u8>,
-    ny: &Vol<u8>,
+    dirs: &Vol<u16>,
     cache: &NativeCache,
     work: &Path,
     family: usize,
@@ -845,7 +844,7 @@ fn trace_family(
     fs::create_dir_all(&folder)?;
     let t = Instant::now();
     let pres = Presence::new(tracing, family);
-    let FamilyFields { cent, seeds } = centrality(&pres, nx, ny);
+    let FamilyFields { cent, seeds } = centrality(&pres, dirs);
     log!("{label} centrality: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem(label, &[("cent", cent.resident_bytes()), ("seeds", seeds.len() * std::mem::size_of::<Seed>())]);
     let t = Instant::now();
@@ -868,7 +867,7 @@ fn trace_family(
     release_freed();
     log!("{label} seeds: {} in {:.1} s", cat.coords.len(), t.elapsed().as_secs_f64());
     let shape = pres.shape();
-    let fields = Fields { pres: &pres, cent: &cent, nx, ny };
+    let fields = Fields { pres: &pres, cent: &cent, dirs };
     let ctx = FinishCtx { tracing, pres: &pres, family };
     let finish_pool = rayon::ThreadPoolBuilder::new().num_threads(threads.saturating_sub(1).max(1)).build()?;
     let path = folder.join("curves.bin");

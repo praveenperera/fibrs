@@ -113,6 +113,25 @@ impl<T: Voxel> Vol<T> {
         (self.bricks[self.brick_index(z, y, x)].map(|b| self.brick(b)), Self::offset(z, y, x))
     }
 
+    /// The values at the eight corners of the cell whose lowest corner is `z, y, x`, in z, y, x order
+    ///
+    /// The cell must be in bounds. Most cells lie inside one brick, which is then looked up once instead of
+    /// eight times
+    #[inline(always)]
+    pub fn corners(&self, z: usize, y: usize, x: usize) -> [T; 8] {
+        if (z & MASK) == MASK || (y & MASK) == MASK || (x & MASK) == MASK {
+            return std::array::from_fn(|k| self.get(z + (k >> 2), y + (k >> 1 & 1), x + (k & 1)));
+        }
+        debug_assert!(z + 1 < self.shape[0] && y + 1 < self.shape[1] && x + 1 < self.shape[2]);
+        let Some(b) = self.bricks[self.brick_index(z, y, x)] else {
+            return [self.default; 8];
+        };
+        let (brick, at) = (self.brick(b), Self::offset(z, y, x));
+        const ROW: usize = EDGE;
+        const PLANE: usize = EDGE * EDGE;
+        [0, 1, ROW, ROW + 1, PLANE, PLANE + 1, PLANE + ROW, PLANE + ROW + 1].map(|d| brick[at + d])
+    }
+
     /// The value at a voxel given as signed coordinates, which must be in bounds
     #[inline(always)]
     pub fn at(&self, z: i64, y: i64, x: i64) -> T {

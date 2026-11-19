@@ -23,6 +23,16 @@ pub trait Grid<T: Copy>: Sync {
     fn dims(&self) -> [i64; 3];
     /// The value at an in-bounds voxel
     fn at(&self, z: i64, y: i64, x: i64) -> T;
+
+    /// The values at the eight corners of the cell whose lowest corner is `z, y, x`, which must be in bounds
+    /// with the cell, in z, y, x order: `[z][y][x]` flattened, so index `4 * dz + 2 * dy + dx`
+    #[inline(always)]
+    fn corners(&self, z: i64, y: i64, x: i64) -> [T; 8] {
+        std::array::from_fn(|k| {
+            let k = k as i64;
+            self.at(z + (k >> 2), y + (k >> 1 & 1), x + (k & 1))
+        })
+    }
 }
 
 impl<T: Voxel> Grid<T> for Vol<T> {
@@ -34,6 +44,11 @@ impl<T: Voxel> Grid<T> for Vol<T> {
     #[inline(always)]
     fn at(&self, z: i64, y: i64, x: i64) -> T {
         self.get(z as usize, y as usize, x as usize)
+    }
+
+    #[inline(always)]
+    fn corners(&self, z: i64, y: i64, x: i64) -> [T; 8] {
+        Vol::corners(self, z as usize, y as usize, x as usize)
     }
 }
 
@@ -55,24 +70,25 @@ impl<T: Copy + Sync> Grid<T> for Dense<T> {
     }
 }
 
-/// `decode_dir` for every byte pair; the function is pure, so a table gives the same values
-fn dir_table() -> &'static [[f64; 3]] {
-    static TABLE: OnceLock<Vec<[f64; 3]>> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut t = Vec::with_capacity(65536);
-        for nx in 0..=255u8 {
-            for ny in 0..=255u8 {
-                t.push(decode_dir_calc(nx, ny));
-            }
-        }
-        t
-    })
-}
+/// `(b as f32 as f64 - 128.0) / 127.0` for every byte, the per-axis part of `decode_dir`
+///
+/// A table over byte pairs gives the same values but takes 1.5 MiB, and its lookups missed the cache often
+/// enough to cost the producer a fifth of its time; the rest of `decode_dir` is a few float operations
+const AXIS: [f64; 256] = {
+    let mut t = [0.0f64; 256];
+    let mut b = 0;
+    while b < 256 {
+        t[b] = (b as u8 as f32 as f64 - 128.0) / 127.0;
+        b += 1;
+    }
+    t
+};
 
 /// `decode_dir` (core.py:8): all float64 after the float32 conversion of each byte
-fn decode_dir_calc(nx: u8, ny: u8) -> [f64; 3] {
-    let mut dx = (nx as f32 as f64 - 128.0) / 127.0;
-    let mut dy = (ny as f32 as f64 - 128.0) / 127.0;
+#[inline(always)]
+pub fn decode_dir(nx: u8, ny: u8) -> [f64; 3] {
+    let mut dx = AXIS[nx as usize];
+    let mut dy = AXIS[ny as usize];
     let r2 = dx * dx + dy * dy;
     if r2 <= 1.0 {
         return [dx, dy, (1.0f32 as f64 - r2).sqrt()];
@@ -83,9 +99,16 @@ fn decode_dir_calc(nx: u8, ny: u8) -> [f64; 3] {
     [dx, dy, 0.0f32 as f64]
 }
 
+/// The direction bytes `nx`, `ny` of a voxel as one value, `nx << 8 | ny`
 #[inline(always)]
-pub fn decode_dir(nx: u8, ny: u8) -> [f64; 3] {
-    dir_table()[(nx as usize) << 8 | ny as usize]
+pub const fn pack_dir(nx: u8, ny: u8) -> u16 {
+    (nx as u16) << 8 | ny as u16
+}
+
+/// `decode_dir` of packed direction bytes
+#[inline(always)]
+pub fn decode_packed(d: u16) -> [f64; 3] {
+    decode_dir((d >> 8) as u8, d as u8)
 }
 
 /// `encode_dir` (core.py:23), with float32 tangents
@@ -132,12 +155,12 @@ fn cell(d: [i64; 3], mut x: f64, mut y: f64, mut z: f64) -> ([i64; 3], [f32; 3])
 #[inline]
 pub fn trilin_u8<G: Grid<u8>>(arr: &G, x: f64, y: f64, z: f64) -> f64 {
     let ([iz, iy, ix], [fz, fy, fx]) = cell(arr.dims(), x, y, z);
-    let a = |z: i64, y: i64, x: i64| arr.at(z, y, x);
-    let lerp = |z: i64, y: i64| (1.0 - fx as f64) * a(z, y, ix) as f64 + (fx * a(z, y, ix + 1) as f32) as f64;
-    let p00 = lerp(iz, iy);
-    let p01 = lerp(iz, iy + 1);
-    let p10 = lerp(iz + 1, iy);
-    let p11 = lerp(iz + 1, iy + 1);
+    let c = arr.corners(iz, iy, ix);
+    let lerp = |k: usize| (1.0 - fx as f64) * c[k] as f64 + (fx * c[k + 1] as f32) as f64;
+    let p00 = lerp(0);
+    let p01 = lerp(2);
+    let p10 = lerp(4);
+    let p11 = lerp(6);
     let (fy, fz) = (fy as f64, fz as f64);
     (1.0 - fz) * ((1.0 - fy) * p00 + fy * p01) + fz * ((1.0 - fy) * p10 + fy * p11)
 }
@@ -147,28 +170,28 @@ pub fn trilin_u8<G: Grid<u8>>(arr: &G, x: f64, y: f64, z: f64) -> f64 {
 pub fn trilin_u16<G: Grid<u16>>(arr: &G, x: f64, y: f64, z: f64) -> f64 {
     let ([iz, iy, ix], [fz, fy, fx]) = cell(arr.dims(), x, y, z);
     let fx = fx as f64;
-    let a = |z: i64, y: i64, x: i64| arr.at(z, y, x) as f64;
-    let lerp = |z: i64, y: i64| (1.0 - fx) * a(z, y, ix) + fx * a(z, y, ix + 1);
-    let p00 = lerp(iz, iy);
-    let p01 = lerp(iz, iy + 1);
-    let p10 = lerp(iz + 1, iy);
-    let p11 = lerp(iz + 1, iy + 1);
+    let c = arr.corners(iz, iy, ix).map(f64::from);
+    let lerp = |k: usize| (1.0 - fx) * c[k] + fx * c[k + 1];
+    let p00 = lerp(0);
+    let p01 = lerp(2);
+    let p10 = lerp(4);
+    let p11 = lerp(6);
     let (fy, fz) = (fy as f64, fz as f64);
     0.01f32 as f64 * ((1.0 - fz) * ((1.0 - fy) * p00 + fy * p01) + fz * ((1.0 - fy) * p10 + fy * p11))
 }
 
 /// The read-only fields one family traces over
-pub struct Fields<'a, P, C, N> {
+pub struct Fields<'a, P, C, D> {
     pub pres: &'a P,
     pub cent: &'a C,
-    pub nx: &'a N,
-    pub ny: &'a N,
+    /// Packed direction bytes, [`pack_dir`]
+    pub dirs: &'a D,
 }
 
-impl<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>> Fields<'_, P, C, N> {
+impl<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Fields<'_, P, C, D> {
     #[inline(always)]
     fn dir_at(&self, z: i64, y: i64, x: i64) -> [f64; 3] {
-        decode_dir(self.nx.at(z, y, x), self.ny.at(z, y, x))
+        decode_packed(self.dirs.at(z, y, x))
     }
 
     /// `trilin_dir_aligned` (core.py:92)
@@ -176,17 +199,17 @@ impl<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>> Fields<'_, P, C, N> {
         let ([iz, iy, ix], [fz, fy, fx]) = cell(self.pres.dims(), x, y, z);
         let (fx, fy, fz) = (fx as f64, fy as f64, fz as f64);
         let (mut vx, mut vy, mut vz) = (0.0f64, 0.0f64, 0.0f64);
+        let pres = self.pres.corners(iz, iy, ix);
+        let dirs = self.dirs.corners(iz, iy, ix);
         for dz_i in 0..2 {
             let wz = if dz_i == 0 { 1.0 - fz } else { fz };
-            let zz = iz + dz_i;
             for dy_i in 0..2 {
                 let wy = wz * (if dy_i == 0 { 1.0 - fy } else { fy });
-                let yy = iy + dy_i;
                 for dx_i in 0..2 {
                     let w = wy * (if dx_i == 0 { 1.0 - fx } else { fx });
-                    let xx = ix + dx_i;
-                    let pw = w * (self.pres.at(zz, yy, xx) as f32 as f64 + 10.0);
-                    let [mut ux, mut uy, mut uz] = self.dir_at(zz, yy, xx);
+                    let k = 4 * dz_i + 2 * dy_i + dx_i;
+                    let pw = w * (pres[k] as f32 as f64 + 10.0);
+                    let [mut ux, mut uy, mut uz] = decode_packed(dirs[k]);
                     if ux * rx + uy * ry + uz * rz < 0.0 {
                         ux = -ux;
                         uy = -uy;
@@ -350,14 +373,14 @@ impl Coverage {
         if c == COVERED_TWICE {
             return true;
         }
-        let [ux, uy, uz] = decode_dir((c >> 8) as u8, c as u8);
+        let [ux, uy, uz] = decode_packed(c);
         (ux * tx + uy * ty + uz * tz).abs() > 0.86
     }
 
     /// `mark_curve_coverage` (core.py:527) with `core_r = 2.05`
-    pub fn mark<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>>(
+    pub fn mark<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
         &mut self,
-        f: &Fields<P, C, N>,
+        f: &Fields<P, C, D>,
         pts: &[[f32; 3]],
         tans: &[[f32; 3]],
     ) {
@@ -411,14 +434,14 @@ impl Coverage {
                         let c = self.0.get(zu, yu, xu);
                         if c == UNCOVERED {
                             debug_assert!(bnx != 0);
-                            self.0.set(zu, yu, xu, (bnx as u16) << 8 | bny as u16);
+                            self.0.set(zu, yu, xu, pack_dir(bnx, bny));
                             continue;
                         }
                         // a count of 2 stays 2 whichever way the new direction points
                         if c == COVERED_TWICE {
                             continue;
                         }
-                        let [ux0, uy0, uz0] = decode_dir((c >> 8) as u8, c as u8);
+                        let [ux0, uy0, uz0] = decode_packed(c);
                         if (ux0 * tx + uy0 * ty + uz0 * tz).abs() <= 0.85 {
                             self.0.set(zu, yu, xu, COVERED_TWICE);
                         }
@@ -431,7 +454,7 @@ impl Coverage {
 
 /// Centrality and ridge seeds of one tile (`stage1_centrality_and_ridge`, core.py:254, seed stride 2);
 /// every coordinate and clamp is local to the tile, as in the reference
-pub fn stage1(pres: &Dense<u8>, nx: &Dense<u8>, ny: &Dense<u8>) -> (Vec<u16>, Vec<u8>) {
+pub fn stage1(pres: &Dense<u8>, dirs: &Dense<u16>) -> (Vec<u16>, Vec<u8>) {
     let [d, h, w] = pres.dims();
     let (df, hf, wf) = (d as f64, h as f64, w as f64);
     let n = pres.data.len();
@@ -442,7 +465,7 @@ pub fn stage1(pres: &Dense<u8>, nx: &Dense<u8>, ny: &Dense<u8>) -> (Vec<u16>, Ve
     #[allow(clippy::approx_constant)]
     const SIN_A: [f32; 8] = [0.0, 0.70710678, 1.0, 0.70710678, 0.0, -0.70710678, -1.0, -0.70710678];
     const RADII: [(f64, f64); 4] = [(1.0, 0.5), (1.8, 0.28), (2.7, 0.14), (3.6, 0.06)];
-    let dir = |z: i64, y: i64, x: i64| decode_dir(nx.at(z, y, x), ny.at(z, y, x));
+    let dir = |z: i64, y: i64, x: i64| decode_packed(dirs.at(z, y, x));
     for z in 0..d {
         for y in 0..h {
             for x in 0..w {
@@ -551,8 +574,8 @@ pub struct RawCurve {
 
 /// `trace_half_buf` (core.py:322) with `step_size = 0.75`, `max_low_steps = 3`
 #[allow(clippy::too_many_arguments)]
-fn trace_half<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>>(
-    f: &Fields<P, C, N>,
+fn trace_half<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
+    f: &Fields<P, C, D>,
     cov: &Coverage,
     x0: f64,
     y0: f64,
@@ -740,8 +763,8 @@ fn trace_half<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>>(
 /// One iteration of `trace_seed_range` (core.py:882-1016) for seed `i`, with `min_raw_len = 7.5`;
 /// accepted curves are marked into `cov` and appended to `out`
 #[allow(clippy::too_many_arguments)]
-pub fn trace_seed<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>>(
-    f: &Fields<P, C, N>,
+pub fn trace_seed<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
+    f: &Fields<P, C, D>,
     cov: &mut Coverage,
     s: &mut Scratch,
     seed: [i32; 3],

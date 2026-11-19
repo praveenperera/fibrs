@@ -17,6 +17,7 @@ use libloading::Library;
 use rayon::prelude::*;
 
 use crate::arena::BufferPool;
+use crate::kernels::pack_dir;
 use crate::vol::{Shape, Vol};
 
 /// Halo the tensor needs: 4 + 1 + 6
@@ -342,17 +343,19 @@ fn gradient<A: Allocator + Copy>(b: &Block<A>, axis: usize) -> Block<A> {
     Block { dims: b.dims, data: out }
 }
 
-/// One tile's core: origin, extent, nx and ny
-type TileAxes = (Shape, Shape, Vec<u8>, Vec<u8>);
+/// One tile's core: origin, extent and packed directions
+type TileAxes = (Shape, Shape, Vec<u16>);
 
-/// Compute nx, ny for the whole tracing volume from the two pooled channels
-pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<(Vol<u8>, Vol<u8>)> {
+/// Compute the packed direction of every voxel of the tracing volume from the two pooled channels
+///
+/// Each voxel holds `nx << 8 | ny` ([`pack_dir`]). One volume instead of separate nx and ny volumes halves the
+/// brick lookups and cache lines of every direction read, which the tracer's producer thread is bound by
+pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<Vol<u16>> {
     let shape = tracing[0].shape();
     let grid = shape.map(|n| n.div_ceil(CORE));
     let tiles: Vec<Shape> =
         (0..grid[0]).flat_map(|z| (0..grid[1]).flat_map(move |y| (0..grid[2]).map(move |x| [z, y, x]))).collect();
-    let mut nx = Vol::new(shape, 128u8);
-    let mut ny = Vol::new(shape, 128u8);
+    let mut dirs = Vol::new(shape, pack_dir(128, 128));
     // every tile's smoothed block, gradients and products are a few MiB each and mostly of one size, so they come
     // from a pool instead of a fresh mapping each; a thread's next tile takes the buffers its last one freed, so
     // the pool keeps one tile's buffers per thread, up to TILE_POOL_RETAIN
@@ -366,12 +369,11 @@ pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<(Vol<u
         let results: Vec<Result<Option<TileAxes>>> =
             part.par_iter().map(|&t| tile_axes(tracing, t, lapack, &pool)).collect();
         for r in results {
-            let Some((lo, dims, xx, yy)) = r? else { continue };
-            nx.write_block(lo, dims, &xx);
-            ny.write_block(lo, dims, &yy);
+            let Some((lo, dims, d)) = r? else { continue };
+            dirs.write_block(lo, dims, &d);
         }
     }
-    Ok((nx, ny))
+    Ok(dirs)
 }
 
 /// Most freed tile buffers the direction field keeps for reuse, the bound the README states: one tile's buffers
@@ -416,8 +418,7 @@ fn tile_axes(tracing: &[Vol<u8>; 2], t: Shape, lapack: &Lapack, pool: &BufferPoo
         return Ok(None);
     }
     let n = core_dims.iter().product();
-    let mut xx = vec![128u8; n];
-    let mut yy = vec![128u8; n];
+    let mut dirs = vec![pack_dir(128, 128); n];
     let (w09, w15) = (weights(W09), weights(W15));
     let mut scratch = Vec::new();
     let (mut work, mut iwork) = (Vec::new(), Vec::new());
@@ -453,11 +454,10 @@ fn tile_axes(tracing: &[Vol<u8>; 2], t: Shape, lapack: &Lapack, pool: &BufferPoo
                 xyz = xyz.map(|c| -c);
             }
             let q = |c: f32| (c * 127.0f32 + 128.0f32).round_ties_even().clamp(1.0, 255.0) as u8;
-            xx[local] = q(xyz[0]);
-            yy[local] = q(xyz[1]);
+            dirs[local] = pack_dir(q(xyz[0]), q(xyz[1]));
         }
     }
-    Ok(Some((start, core_dims, xx, yy)))
+    Ok(Some((start, core_dims, dirs)))
 }
 
 #[cfg(test)]
