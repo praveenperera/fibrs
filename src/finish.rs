@@ -127,7 +127,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
     pub fn new(pred: &'a Predictions, budget_bytes: usize, pool: &'p BufferPool) -> Self {
         // whole Zarr chunks are the unit of reading; NPY input uses the reference's 64³ blocks
         let edge = pred.chunk_shape().unwrap_or([64, 64, 64]);
-        let sliced = pred.slab_layout().is_some_and(|e| e[0] % SLAB_PLANES == 0);
+        let sliced = pred.slab_layout().is_some_and(|e| e[0] % SLAB_PLANES == 0) && pred.blocks_fit_planes(SLAB_PLANES);
         let planes = if sliced { SLAB_PLANES } else { edge[0] };
         // compressed chunks are about a fifth of their decoded size, so a quarter of the budget keeps the chunks
         // of several times as many slabs as the rest holds
