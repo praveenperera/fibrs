@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, TryLockError};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -341,22 +341,30 @@ fn check_column_memory(c: &Checked, p: &Plan, e: &Opened) -> Result<()> {
     )
 }
 
-/// `path` made absolute with its links resolved, as far as it exists: the part that does not exist yet is kept as
-/// given, so an output that is not created yet compares with the CT too
+/// `path` made absolute with its links and `..` resolved, component by component: each prefix that exists is
+/// replaced by its canonical form, and the rest is joined as given, so an output that is not created yet compares
+/// with the CT too
 fn resolved(path: &Path) -> Result<PathBuf> {
-    let path = std::path::absolute(path)?;
-    let mut missing = Vec::new();
-    let mut existing = path.as_path();
-    loop {
-        if let Ok(real) = existing.canonicalize() {
-            return Ok(missing.iter().rev().fold(real, |p: PathBuf, part| p.join(part)));
+    let mut out = PathBuf::new();
+    for part in std::path::absolute(path)?.components() {
+        match part {
+            Component::CurDir => {}
+            // `out` is canonical up to its first missing component, and a missing component is not a link, so its
+            // parent is the lexical one
+            Component::ParentDir => {
+                out.pop();
+            }
+            part => {
+                out.push(part);
+                // a prefix that exists again after a `..` out of a missing directory may be a link
+                if let Ok(real) = out.canonicalize() {
+                    out = real;
+                }
+            }
         }
-        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
-            return Ok(path);
-        };
-        missing.push(name.to_os_string());
-        existing = parent;
     }
+
+    Ok(out)
 }
 
 /// Locks the output for this process; the lock goes with the process, so a killed run leaves none behind
@@ -381,22 +389,12 @@ fn run(c: Checked) -> Result<()> {
     let a = &c.a;
     let t_start = now_unix();
     let started = Instant::now();
-    // before the first write: an output in, at or around the CT would write into the input store
+    // nothing is written before the arguments and the model folder are checked: an output in, at or around the CT
+    // would write into the input store
     let (ct, out) = (resolved(&a.ct)?, resolved(&a.out)?);
     if out.starts_with(&ct) || ct.starts_with(&out) {
         bail!("--out {} overlaps --ct {}; write the output outside the input", a.out.display(), a.ct.display());
     }
-    // every attempt is recorded at its start, before the model loads, so a capped or killed run still shows it
-    fs::create_dir_all(&a.out)?;
-    let mut attempts = fs::OpenOptions::new().create(true).append(true).open(a.out.join("attempts.jsonl"))?;
-    // held until the run ends: two runs on one output, on different --only-columns say, would each rewrite the
-    // chunks their columns share from what they read, losing the other's columns while both record progress
-    lock_output(&attempts, &a.out)?;
-    let attempt = py_dumps(&json!({"attempt": t_start, "start": t_start}), JsonStyle::DEFAULT);
-    attempts.write_all(format!("{attempt}\n").as_bytes())?;
-
-    let progress = a.out.join("progress.jsonl");
-    let p = plan(&c, &progress)?;
     // the loader takes a fold_* folder's plans.json and dataset.json from its parent, so those hashed here
     // would not be the ones it runs with
     if a.model_dir.file_name().is_some_and(|n| n.to_string_lossy().starts_with("fold_")) {
@@ -427,6 +425,18 @@ fn run(c: Checked) -> Result<()> {
             );
         }
     }
+
+    // every attempt is recorded at its start, before the model loads, so a capped or killed run still shows it
+    fs::create_dir_all(&a.out)?;
+    let mut attempts = fs::OpenOptions::new().create(true).append(true).open(a.out.join("attempts.jsonl"))?;
+    // held until the run ends: two runs on one output, on different --only-columns say, would each rewrite the
+    // chunks their columns share from what they read, losing the other's columns while both record progress
+    lock_output(&attempts, &a.out)?;
+    let attempt = py_dumps(&json!({"attempt": t_start, "start": t_start}), JsonStyle::DEFAULT);
+    attempts.write_all(format!("{attempt}\n").as_bytes())?;
+
+    let progress = a.out.join("progress.jsonl");
+    let p = plan(&c, &progress)?;
     let mut e = engine::open(&a.model_dir, c.device, c.precision)?;
     check_column_memory(&c, &p, &e)?;
 

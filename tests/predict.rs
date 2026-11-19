@@ -217,7 +217,20 @@ fn an_output_that_overlaps_the_ct_is_refused() {
         }
     }
     let before: Vec<_> = fs::read_dir(&ct).unwrap().map(|e| e.unwrap().file_name()).collect();
-    for out in [ct.clone(), ct.join("pred.zarr"), ct.parent().unwrap().to_path_buf()] {
+    let dir = ct.parent().unwrap();
+    std::os::unix::fs::symlink(&ct, dir.join("link.zarr")).unwrap();
+    // `missing` doesn't exist, so `missing/..` only resolves lexically, and a prefix that exists again after it may
+    // be a link to the CT
+    let outs = [
+        ct.clone(),
+        ct.join("pred.zarr"),
+        dir.to_path_buf(),
+        dir.join("missing/../band.zarr"),
+        dir.join("missing/../band.zarr/pred.zarr"),
+        dir.join("missing/../link.zarr"),
+        dir.join("missing/deeper/../../link.zarr/pred.zarr"),
+    ];
+    for out in outs {
         let args = ["--ct", ct.to_str().unwrap(), "--z0", "0", "--z1", "8", "--model-dir", model.to_str().unwrap()];
         let run = predict(&[&args[..], &["--out", out.to_str().unwrap()]].concat());
         assert_eq!(run.status.code(), Some(1));
@@ -225,6 +238,7 @@ fn an_output_that_overlaps_the_ct_is_refused() {
     }
     let after: Vec<_> = fs::read_dir(&ct).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(before, after);
+    assert!(!dir.join("missing").exists());
 }
 
 #[test]
@@ -239,7 +253,8 @@ fn a_fold_folder_as_the_model_folder_is_refused() {
     let run = predict(&[&args[..], &["--out", out.to_str().unwrap()]].concat());
     assert_eq!(run.status.code(), Some(1));
     assert!(text(&run).contains("is named like a fold folder"), "{}", text(&run));
-    assert!(!out.join("semantic").exists());
+    // the model folder is checked before anything is written
+    assert!(!out.join("attempts.jsonl").exists());
 }
 
 #[test]
