@@ -208,9 +208,11 @@ impl<'a, 'p> NativeCache<'a, 'p> {
     /// Decode a chunk whose Blosc blocks are larger than a slab once, and return its slab `s`; decoding it slab by
     /// slab would decode each block once for every slab it holds
     ///
-    /// The chunk's other slabs nearest `s` are cached too, as many as the cache holds beside slab `s`, the nearest
-    /// last so they are dropped last; `slab` caches slab `s` after them. Caching every slab of a chunk larger than
-    /// the cache would drop the first ones cached before they are read, and decode the chunk again for each
+    /// The chunk's other slabs are cached too, as many as the cache holds beside slab `s`: the ones after `s` first,
+    /// since curves are mostly read forward, then the ones before it, nearest first in each direction. They are
+    /// inserted in reverse so the most wanted is dropped last, and `slab` caches slab `s` after them. Caching every
+    /// slab of a chunk larger than the cache would drop the first ones cached before they are read, and decode the
+    /// chunk again for each
     fn decode_whole(&self, chunk: Shape, s: usize, packed: &PackedChunk<&'p BufferPool>) -> Result<Slab<'p>> {
         let [ez, ey, ex] = self.edge;
         let channel = ez * ey * ex;
@@ -227,11 +229,19 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         let n = ez / self.planes;
         let bytes = BufferPool::footprint(2 * half);
         let others = self.slabs.lock().expect("cache lock").capacity(bytes).saturating_sub(1);
-        let nearest: Vec<usize> =
-            (1..n).flat_map(|d| [s.checked_sub(d), Some(s + d).filter(|&i| i < n)]).flatten().take(others).collect();
-        for &i in nearest.iter().rev() {
-            self.slabs.lock().expect("cache lock").insert([chunk[0], chunk[1], chunk[2], i], Arc::new(slab(i)), bytes);
+        let wanted: Vec<(SlabKey, Arc<Slab<'p>>)> = (s + 1..n)
+            .chain((0..s).rev())
+            .take(others)
+            .map(|i| ([chunk[0], chunk[1], chunk[2], i], Arc::new(slab(i))))
+            .collect();
+
+        // the copies above run outside the lock, so threads reading cached slabs do not wait on them
+        let mut slabs = self.slabs.lock().expect("cache lock");
+        for (key, cached) in wanted.into_iter().rev() {
+            slabs.insert(key, cached, bytes);
         }
+
+        drop(slabs);
         Ok(slab(s))
     }
 
@@ -515,19 +525,29 @@ mod tests {
     }
 
     /// A one-block chunk of 8 slabs read slab by slab through a cache of 3 slabs is decoded again only once the
-    /// slabs cached with the last decode are used up: at slabs 0, 3, 5 and 7, where caching every slab of each
-    /// decode dropped the next ones before they were read and decoded the chunk 6 times
+    /// slabs cached with the last decode are used up. Read forward it is decoded at slabs 0, 3 and 6, where caching
+    /// every slab of each decode dropped the next ones before they were read and decoded it 6 times, and caching
+    /// the nearest on both sides decoded it 4 times
     #[test]
     fn a_one_block_chunk_in_a_small_cache_is_decoded_once_per_cached_run() {
         let edge = 8 * SLAB_PLANES;
         let (dir, pred) = store("small-cache", edge, &[2 * edge * edge * edge]);
         let pool = BufferPool::new(1 << 20);
         let slab = BufferPool::footprint(2 * SLAB_PLANES * edge * edge) + ENTRY_BYTES;
-        let cache = slab_cache(&pred, &pool, 3 * slab);
-        for s in 0..edge / SLAB_PLANES {
-            cache.slab([0, 0, 0, s]).unwrap();
-        }
-        assert_eq!(cache.decoded(), 4);
+        let decodes = |reads: &[usize]| {
+            let cache = slab_cache(&pred, &pool, 3 * slab);
+            for &s in reads {
+                cache.slab([0, 0, 0, s]).unwrap();
+            }
+
+            cache.decoded()
+        };
+
+        // each decode caches the two slabs after the one read
+        assert_eq!(decodes(&[0, 1, 2, 3, 4, 5, 6, 7]), 3);
+        // the last slabs have none after them, so the one before is kept instead
+        assert_eq!(decodes(&[5, 6, 7]), 1);
+        assert_eq!(decodes(&[7, 6, 5]), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 }
