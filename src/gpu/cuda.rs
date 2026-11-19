@@ -110,8 +110,8 @@ pub struct Gpu {
     k: Kernels,
     /// Most tiles per unit, so both slots' buffers fit in half the device memory free when it opened
     unit_tiles: usize,
-    /// Whether the device had room for a full tile in each slot when it opened
-    roomy: bool,
+    /// Device memory free when it opened
+    free: usize,
     /// `decode_dir` in the reference's CUDA rounding for every `nx << 8 | ny`, four float64 per entry
     dirs: CudaSlice<f64>,
 }
@@ -143,16 +143,16 @@ impl Gpu {
         }
 
         // a host can list an older or busier GPU first, so each visible device gets its turn: the first with room
-        // for a full tile in each slot wins, and failing that the first that opened, which a small volume may fit
+        // for a full tile in each slot wins, and failing that the one with the most free memory, which a small
+        // volume may fit
         let count = CudaContext::device_count().map_err(|e| eyre!("count the CUDA devices: {e:?}"))?;
         let mut reasons = Vec::new();
         let mut cramped = None;
         for device in 0..count as usize {
             match Self::open_device(device) {
-                Ok(gpu) if gpu.roomy => return Ok(gpu),
-                Ok(gpu) => {
-                    cramped.get_or_insert(gpu);
-                }
+                Ok(gpu) if gpu.free >= 2 * TILE_DEVICE_BYTES => return Ok(gpu),
+                Ok(gpu) if cramped.as_ref().is_none_or(|c: &Gpu| gpu.free > c.free) => cramped = Some(gpu),
+                Ok(_) => {}
                 Err(e) => reasons.push(format!("{e:#}")),
             }
         }
@@ -196,10 +196,9 @@ impl Gpu {
         // tile per unit fails in `centrality` unless the volume's tiles are small, which `--device auto` answers by
         // running on the CPU
         let (free, _) = ctx.mem_get_info()?;
-        let roomy = free >= 2 * TILE_DEVICE_BYTES;
         let unit_tiles = (free / 2 / (2 * TILE_DEVICE_BYTES)).clamp(1, UNIT_TILES);
         let name = format!("CUDA device {device}, {} (compute capability {major}.{minor})", ctx.name()?);
-        Ok(Self { ctx, name, k, unit_tiles, roomy, dirs })
+        Ok(Self { ctx, name, k, unit_tiles, free, dirs })
     }
 
     pub fn name(&self) -> &str {
@@ -653,6 +652,9 @@ mod tests {
 
     /// Pooled predictions and a direction field with ridges in both families, noise, and an empty slab, over a
     /// shape whose tiles end mid-brick on every axis
+    ///
+    /// Tiles z 0, y 1 have empty cores, and tiles z 0, x 0, y 1 and 2 are empty to the edge of every brick their
+    /// regions touch, so the GPU path leaves them out and places the tiles after each gap
     fn volumes() -> ([Vol<u8>; 2], Vol<u8>, Vol<u8>) {
         let shape = [150, 260, 270];
         let mut tracing = [Vol::new(shape, 0u8), Vol::new(shape, 0u8)];
@@ -662,8 +664,9 @@ mod tests {
             for y in 0..shape[1] {
                 for x in 0..shape[2] {
                     let noise = (rng.next() % 41) as f64 - 20.0;
-                    // tiles z 0, y 1 hold no prediction, so the GPU path leaves them out
-                    if z < 128 && (128..256).contains(&y) {
+                    let empty_cores = z < 128 && (128..256).contains(&y);
+                    let empty_tile = z < 144 && y >= 112 && x < 144;
+                    if empty_cores || empty_tile {
                         continue;
                     }
                     let (zf, yf, xf) = (z as f64, y as f64, x as f64);
@@ -679,6 +682,18 @@ mod tests {
             }
         }
         (tracing, nx, ny)
+    }
+
+    /// The fixture leaves exactly tiles z 0, x 0, y 1 and 2 out of the GPU path, in both families
+    #[test]
+    fn fixture_leaves_out_two_tiles() {
+        let (tracing, nx, _) = volumes();
+        let shape = nx.shape();
+        let gaps = [[0, TILE, 0], [0, 2 * TILE, 0]];
+        let want: Vec<TileSpan> = tiles(shape, TILE).into_iter().filter(|t| !gaps.contains(&t.0)).collect();
+        for own in &tracing {
+            assert_eq!(units(own, shape, UNIT_TILES).concat(), want);
+        }
     }
 
     /// The kernels against `stage1::<Fused>`, the same computation on the CPU: every centrality voxel and every
