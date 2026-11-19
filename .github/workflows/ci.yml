@@ -55,8 +55,22 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      # the unit tests, every reader fixture in tests/fixtures/readers, and fibrs predict's plans, resume and
-      # argument checks against the Python reference's (tests/predict.rs)
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      # the tracer tests (tests/tile.rs) call dsyevd from numpy's OpenBLAS; scipy-openblas64 is the same build as a
+      # wheel of its own, for Linux and macOS alike (pyproject.toml)
+      - name: Install numpy's OpenBLAS
+        shell: bash
+        run: |
+          uv venv -q "$RUNNER_TEMP/lapack"
+          uv pip install -q --python "$RUNNER_TEMP/lapack/bin/python" scipy-openblas64==0.3.31.188.0
+          lib="$(find "$RUNNER_TEMP/lapack" -name 'libscipy_openblas64_*' \( -name '*.so' -o -name '*.dylib' \) | head -1)"
+          test -n "$lib"
+          echo "FIBRS_LAPACK=$lib" >> "$GITHUB_ENV"
+
+      # the unit tests, every reader fixture in tests/fixtures/readers, fibrs predict's plans, resume and argument
+      # checks against the Python reference's (tests/predict.rs), and tiled tracing end to end (tests/tile.rs)
       - name: Tests
         run: cargo test --release --locked
 

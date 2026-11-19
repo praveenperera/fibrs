@@ -129,10 +129,23 @@ impl Drop for TempGuard {
     }
 }
 
-/// Write `curves` (family 1 = V or 2 = H, tracing-space float32 x, y, z points) to `destination`
+/// One fibre for the export: its family (1 = V, 2 = H) and native float64 x, y, z points
+pub type Curve = (usize, Vec<[f64; 3]>);
+
+/// A finished curve's tracing-space float32 x, y, z points as native float64 coordinates,
+/// `points.astype("<f8") * 2 + 0.5 + origin`
+///
+/// `origin` is the native coordinate of the traced volume's first voxel: the crop origin, plus a tile's offset in
+/// the crop when a crop is traced in tiles
+pub fn tracing_to_native(points: &[[f32; 3]], origin: [f64; 3]) -> Vec<[f64; 3]> {
+    points.iter().map(|p| [0, 1, 2].map(|a| p[a] as f64 * 2.0 + 0.5 + origin[a])).collect()
+}
+
+/// Write `curves` (family 1 = V or 2 = H, native float64 x, y, z points from [`tracing_to_native`]) to
+/// `destination`
 pub fn export_afv<I>(curves: I, destination: &Path, opt: &ExportOptions) -> Result<Summary>
 where
-    I: IntoIterator<Item = Result<(usize, Vec<[f32; 3]>)>>,
+    I: IntoIterator<Item = Result<Curve>>,
 {
     if destination.exists() {
         bail!("Output already exists: {}", destination.display());
@@ -188,7 +201,7 @@ fn metadata(opt: &ExportOptions) -> Result<Vec<(&'static str, Value)>> {
 
 fn write_db<I>(curves: I, path: &Path, opt: &ExportOptions) -> Result<Summary>
 where
-    I: IntoIterator<Item = Result<(usize, Vec<[f32; 3]>)>>,
+    I: IntoIterator<Item = Result<Curve>>,
 {
     let mut db = Connection::open(path)?;
     db.execute_batch("PRAGMA foreign_keys=ON")?;
@@ -201,20 +214,15 @@ where
             meta.execute(params![k, py_json(&v)])?;
         }
     }
-    let origin = opt.origin_xyz.map(|v| v as f64);
     let limit = [opt.volume_shape[2], opt.volume_shape[1], opt.volume_shape[0]].map(|v| v as f64);
     let mut s = Summary::default();
     {
         let mut fiber = tx.prepare("INSERT INTO fibers VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")?;
         let mut block = tx.prepare("INSERT INTO blocks VALUES(?,?,?,?)")?;
         let mut bound = tx.prepare("INSERT INTO block_bounds VALUES(?,?,?,?,?,?,?)")?;
-        let mut q: Vec<[f64; 3]> = Vec::new();
         let mut seg: Vec<f64> = Vec::new();
         for item in curves {
-            let (family, points) = item?;
-            // points.astype("<f8") * 2 + 0.5 + origin
-            q.clear();
-            q.extend(points.iter().map(|p| [0, 1, 2].map(|a| p[a] as f64 * 2.0 + 0.5 + origin[a])));
+            let (family, q) = item?;
             let bad = q.iter().any(|p| (0..3).any(|a| !p[a].is_finite() || p[a] < 0.0 || p[a] >= limit[a]));
             if q.len() < 2 || bad {
                 bail!("Spline contains invalid native coordinates");

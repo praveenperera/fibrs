@@ -7,8 +7,9 @@ use crate::pyfmt::argsort_u16;
 use crate::vol::{Shape, Vol};
 
 /// Tile edge and halo of the reference's centrality pass (prepare.py:148-150); the kernel clamps samples
-/// to its tile, so these are part of the output, not a tuning choice
-const TILE: usize = 128;
+/// to its tile, so these are part of the output, not a tuning choice. A traced crop keeps the window's centrality
+/// only where its offset is a whole number of these tiles
+pub const TILE: usize = 128;
 const TILE_HALO: usize = 8;
 
 /// One family's centrality and its seeds
@@ -192,6 +193,24 @@ fn centrality_tile(pres: &Presence, nx: &Vol<u8>, ny: &Vol<u8>, start: Shape, en
     Some((start, inner, c, s))
 }
 
+/// Where a traced volume lies in the window whose seed order it keeps: its first voxel in the window and the
+/// window's shape, in tracing voxels
+///
+/// The catalogue groups seeds by 1024³ regions of the window, so a tile traced from a crop of the window orders the
+/// seeds it shares with the window by the same regions. A whole window is its own frame at offset zero
+#[derive(Clone, Copy, Debug)]
+pub struct RegionFrame {
+    pub offset: Shape,
+    pub window: Shape,
+}
+
+impl RegionFrame {
+    /// The frame of a volume traced whole
+    pub fn whole(shape: Shape) -> Self {
+        Self { offset: [0; 3], window: shape }
+    }
+}
+
 /// The seed catalogue: coordinates in tracing order, grouped by 1024³ region
 pub struct Catalogue {
     pub coords: Vec<[i32; 3]>,
@@ -202,9 +221,10 @@ pub struct Catalogue {
 }
 
 /// `prepare_seeds` (prepare.py:162): priority 2 then 1, each in descending centrality (reversed
-/// unstable argsort), then a stable sort by region
-pub fn catalogue(seeds: &[Seed], cent: &Vol<u16>) -> Catalogue {
+/// unstable argsort), then a stable sort by region of `frame`'s window
+pub fn catalogue(seeds: &[Seed], cent: &Vol<u16>, frame: RegionFrame) -> Catalogue {
     let shape = cent.shape();
+    debug_assert!((0..3).all(|a| frame.offset[a] + shape[a] <= frame.window[a]), "{frame:?} does not hold {shape:?}");
     let mut by_priority: [Vec<[i32; 3]>; 2] = [Vec::new(), Vec::new()];
     for &seed in seeds {
         let v = seed.priority();
@@ -220,9 +240,9 @@ pub fn catalogue(seeds: &[Seed], cent: &Vol<u16>) -> Catalogue {
         ordered.extend(order.iter().rev().map(|&i| raw[i]));
     }
     const REGION: usize = 1024;
-    let grid = shape.map(|n| n.div_ceil(REGION));
+    let grid = frame.window.map(|n| n.div_ceil(REGION));
     let key = |c: &[i32; 3]| {
-        let r = c.map(|v| v as usize / REGION);
+        let r = [0, 1, 2].map(|a| (c[a] as usize + frame.offset[a]) / REGION);
         (r[0] * grid[1] + r[1]) * grid[2] + r[2]
     };
     let keys: Vec<usize> = ordered.iter().map(key).collect();

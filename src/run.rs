@@ -21,14 +21,15 @@ use rayon::prelude::*;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::afv::{ExportOptions, MinLength, Summary, export_afv};
+use crate::afv::{Curve, ExportOptions, MinLength, Summary, export_afv, tracing_to_native};
 use crate::arena::BufferPool;
 use crate::axes::{Lapack, direction_field, find_lapack};
-use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
+use crate::fields::{FamilyFields, Presence, RegionFrame, Seed, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
 use crate::input::Predictions;
 use crate::kernels::{Coverage, Fields, RawCurve, Scratch, trace_seed};
 use crate::log;
+use crate::tiles::{Tile, Tiling, alignment, seam_curves};
 use crate::vol::{EDGE, Shape, Vol};
 
 /// The reference release whose interface and output this reproduces
@@ -134,6 +135,13 @@ pub struct Args {
     /// Compressed-mode tracing cache; minimum 16 MiB (default: 1024)
     #[arg(long, default_value_t = 1024)]
     pub field_cache_mib: i64,
+    /// Trace as NY x NX tiles in Y and X, one at a time, and join fibres across the seams (default: untiled)
+    // Set, as --origin-xyz: a repeated option replaces the earlier one
+    #[arg(long, num_args = 2, action = ArgAction::Set, value_names = ["NY", "NX"])]
+    pub tiles_yx: Option<Vec<i64>>,
+    /// Native voxels each tile is traced beyond its core, rounded up to the tile alignment (default: 256)
+    #[arg(long, value_name = "VOXELS")]
+    pub tile_halo: Option<i64>,
     /// Print the version and exit
     #[arg(long)]
     version: bool,
@@ -270,8 +278,8 @@ pub fn prescan(args: &[OsString]) -> Prescan {
     Prescan::Args(out)
 }
 
-/// The options argparse converts with `int` or `float`
-const NUMERIC_OPTIONS: [&str; 8] = [
+/// The options argparse converts with `int` or `float`, and fibrs' own integer options, read the same way
+const NUMERIC_OPTIONS: [&str; 10] = [
     "voxel-size-um",
     "min-length-mm",
     "origin-xyz",
@@ -280,7 +288,12 @@ const NUMERIC_OPTIONS: [&str; 8] = [
     "threads",
     "native-cache-mib",
     "field-cache-mib",
+    "tiles-yx",
+    "tile-halo",
 ];
+
+/// `--tile-halo`'s default: the Z halo v2-run windows carry, which met the crop bar in its tests
+const TILE_HALO: i64 = 256;
 
 /// A numeric argument in the form Rust parses, when Python's `int` or `float` would read it differently:
 /// whitespace stripped and underscores between digits removed. `None` leaves the text as it is, for the
@@ -476,6 +489,7 @@ pub fn run(args: Args) -> Result<Summary> {
     if (0..3).any(|a| native.shape[a] as i64 + origin_zyx[a] > domain[a]) {
         bail!("Prediction crop lies outside the declared native volume");
     }
+    let tiling = plan_tiles(&args, &native, supplied.as_ref())?;
     let mut paths = vec![native.path.clone()];
     if let Some(s) = &supplied {
         paths.push(s.path.clone());
@@ -503,7 +517,7 @@ pub fn run(args: Args) -> Result<Summary> {
         Family::H => "H",
     };
     let signatures = paths.iter().map(|p| file_signature(p)).collect::<Result<Vec<_>>>()?;
-    let config = json!({
+    let mut config = json!({
         "version": REFERENCE_VERSION,
         "predictions": native.path.to_string_lossy(),
         "array": args.array,
@@ -521,6 +535,10 @@ pub fn run(args: Args) -> Result<Summary> {
         "input_signatures": signatures,
         "native": {"tool": "fibrs", "version": env!("CARGO_PKG_VERSION"), "checkpoint": 1},
     });
+    // only a tiled run records its tiling, so an untiled run's manifest is the one earlier releases wrote
+    if let Some(t) = &tiling {
+        config["tiling"] = t.record();
+    }
     let manifest = work.join("run.json");
     if manifest.exists() {
         if !args.resume {
@@ -558,27 +576,104 @@ pub fn run(args: Args) -> Result<Summary> {
         Family::V => vec![1],
         Family::H => vec![2],
     };
-    let pending: Vec<usize> = families.iter().copied().filter(|&f| !family_complete(&work, f)).collect();
-    if !pending.is_empty() {
-        let cache_bytes = (args.native_cache_mib + args.field_cache_mib) as usize * 1024 * 1024;
-        pool.install(|| trace_families(&native, supplied.as_ref(), &work, &pending, threads as usize, cache_bytes))?;
-    }
-    let started = Instant::now();
+    let cache_bytes = (args.native_cache_mib + args.field_cache_mib) as usize * 1024 * 1024;
+    let origin_xyz = [args.origin_xyz[0], args.origin_xyz[1], args.origin_xyz[2]];
     let opt = ExportOptions {
         voxel_um: args.voxel_size_um,
-        origin_xyz: [args.origin_xyz[0], args.origin_xyz[1], args.origin_xyz[2]],
+        origin_xyz,
         volume_shape: [domain[0], domain[1], domain[2]],
         minimum_mm: min_mm,
         coordinate_space: args.coordinate_space.as_deref(),
     };
-    let curves = families.iter().flat_map(|&f| CurveReader::open(&work, f).unwrap_or_else(CurveReader::failed));
+    let curves: Box<dyn Iterator<Item = Result<Curve>> + '_> = match &tiling {
+        None => {
+            let pending: Vec<usize> = families.iter().copied().filter(|&f| !family_complete(&work, f)).collect();
+            if !pending.is_empty() {
+                let frame = RegionFrame::whole(native.shape.map(|n| n / 2));
+                let trace = || {
+                    trace_families(&native, supplied.as_ref(), &work, &pending, threads as usize, cache_bytes, frame)
+                };
+                pool.install(trace)?;
+            }
+            let origin = origin_xyz.map(|v| v as f64);
+            let curves = families.iter().flat_map(|&f| CurveReader::open(&work, f).unwrap_or_else(CurveReader::failed));
+            Box::new(curves.map(move |c| c.map(|(family, points)| (family, tracing_to_native(&points, origin)))))
+        }
+        Some(tiling) => {
+            for tile in &tiling.tiles() {
+                let dir = work.join(tile.name());
+                let pending: Vec<usize> = families.iter().copied().filter(|&f| !family_complete(&dir, f)).collect();
+                if pending.is_empty() {
+                    log!("Tile {}: already traced", describe(tile, tiling.grid()));
+                    continue;
+                }
+                log!("Tile {}", describe(tile, tiling.grid()));
+                fs::create_dir_all(&dir)?;
+                let lo = [0, tile.traced[0].lo, tile.traced[1].lo];
+                let hi = [native.shape[0], tile.traced[0].hi, tile.traced[1].hi];
+                let crop = native.crop(lo, hi)?;
+                // the tracing array is half the native one, and the alignment keeps the tile's half offset on its
+                // chunks
+                let tracing_crop =
+                    supplied.as_ref().map(|s| s.crop(lo.map(|v| v / 2), [s.shape[0], hi[1] / 2, hi[2] / 2]));
+                let tracing_crop = tracing_crop.transpose()?;
+                let frame = RegionFrame { offset: lo.map(|v| v / 2), window: native.shape.map(|n| n / 2) };
+                let trace = || {
+                    trace_families(&crop, tracing_crop.as_ref(), &dir, &pending, threads as usize, cache_bytes, frame)
+                };
+                pool.install(trace)?;
+                drop((crop, tracing_crop));
+                release_freed();
+            }
+            Box::new(seam_curves(&work, tiling, &families, origin_xyz))
+        }
+    };
+    let started = Instant::now();
     let summary = export_afv(curves, &args.output, &opt)?;
     log!("Export: {:.1} s", started.elapsed().as_secs_f64());
     log!("Wrote {} fibres ({} points) to {}", summary.fiber_count, summary.point_count, output.display());
     Ok(summary)
 }
 
-fn gcd(a: usize, b: usize) -> usize {
+/// The tiling `--tiles-yx` and `--tile-halo` ask for, or `None` for an untiled run
+fn plan_tiles(args: &Args, native: &Predictions, supplied: Option<&Predictions>) -> Result<Option<Tiling>> {
+    let Some(grid) = &args.tiles_yx else {
+        if args.tile_halo.is_some() {
+            bail!("--tile-halo requires --tiles-yx");
+        }
+        return Ok(None);
+    };
+    if grid.iter().any(|&n| n < 1) {
+        bail!("--tiles-yx needs at least one tile along each axis");
+    }
+    let halo = args.tile_halo.unwrap_or(TILE_HALO);
+    if halo < 0 {
+        bail!("--tile-halo must be nonnegative");
+    }
+    let align = alignment(native, supplied);
+    let extent = [native.shape[1], native.shape[2]];
+    Ok(Some(Tiling::new([grid[0] as usize, grid[1] as usize], halo as usize, align, extent)?))
+}
+
+/// A tile's place and boxes for the log: `tile-00-01 of 2 x 2: core y 0..256, x 256..512; traced y ...`
+fn describe(tile: &Tile, grid: [usize; 2]) -> String {
+    format!(
+        "{} of {} x {}: core y {}..{}, x {}..{}; traced y {}..{}, x {}..{}",
+        tile.name(),
+        grid[0],
+        grid[1],
+        tile.core[0].lo,
+        tile.core[0].hi,
+        tile.core[1].lo,
+        tile.core[1].hi,
+        tile.traced[0].lo,
+        tile.traced[0].hi,
+        tile.traced[1].lo,
+        tile.traced[1].hi
+    )
+}
+
+pub(crate) fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
 }
 
@@ -712,6 +807,7 @@ fn trace_families(
     families: &[usize],
     threads: usize,
     cache_bytes: usize,
+    frame: RegionFrame,
 ) -> Result<()> {
     let t = Instant::now();
     log!("Preparing tracing predictions");
@@ -728,11 +824,23 @@ fn trace_families(
     debug_mem("direction field", &[("tracing", resident), ("nx", nx.resident_bytes()), ("ny", ny.resident_bytes())]);
     let pool = BufferPool::new(CHUNK_POOL_RETAIN);
     let cache = NativeCache::new(native, cache_bytes, &pool);
+    let volume = Volume { tracing: &tracing, nx: &nx, ny: &ny, cache: &cache, frame };
     for &family in families {
-        trace_family(&tracing, &nx, &ny, &cache, work, family, threads)?;
+        trace_family(volume, work, family, threads)?;
         release_freed();
     }
     Ok(())
+}
+
+/// What every family traced from one volume shares: its pooled predictions, direction field and native cache, and
+/// where it lies in the window
+#[derive(Clone, Copy)]
+struct Volume<'v, 'a, 'p> {
+    tracing: &'v [Vol<u8>; 2],
+    nx: &'v Vol<u8>,
+    ny: &'v Vol<u8>,
+    cache: &'v NativeCache<'a, 'p>,
+    frame: RegionFrame,
 }
 
 /// With `FIBRS_DEBUG_FIELDS` set, write a field densely as raw little-endian `NAME.raw` for comparison
@@ -831,15 +939,8 @@ fn gib(bytes: usize) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
 }
 
-fn trace_family(
-    tracing: &[Vol<u8>; 2],
-    nx: &Vol<u8>,
-    ny: &Vol<u8>,
-    cache: &NativeCache,
-    work: &Path,
-    family: usize,
-    threads: usize,
-) -> Result<()> {
+fn trace_family(volume: Volume, work: &Path, family: usize, threads: usize) -> Result<()> {
+    let Volume { tracing, nx, ny, cache, frame } = volume;
     let label = if family == 1 { "V" } else { "H" };
     let folder = family_dir(work, family);
     fs::create_dir_all(&folder)?;
@@ -849,7 +950,7 @@ fn trace_family(
     log!("{label} centrality: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem(label, &[("cent", cent.resident_bytes()), ("seeds", seeds.len() * std::mem::size_of::<Seed>())]);
     let t = Instant::now();
-    let cat = catalogue(&seeds, &cent);
+    let cat = catalogue(&seeds, &cent, frame);
     debug_dump(&folder, "presence", || pres.read_block([0, 0, 0], pres.shape()))?;
     debug_dump(&folder, "centrality", || cent.read_block([0, 0, 0], cent.shape()))?;
     debug_dump(&folder, "seeds", || {
@@ -1027,13 +1128,14 @@ impl CurveWriter {
 }
 
 /// Reads one family's finished curves back for the export
-enum CurveReader {
+pub(crate) enum CurveReader {
     Open { family: usize, input: BufReader<File> },
     Failed(Option<color_eyre::Report>),
 }
 
 impl CurveReader {
-    fn open(work: &Path, family: usize) -> Result<Self> {
+    /// The finished curves of `family` in the work directory `work` (a tile's, in a tiled run)
+    pub(crate) fn open(work: &Path, family: usize) -> Result<Self> {
         if !family_complete(work, family) {
             bail!("Cannot export an unfinished tracing run");
         }
@@ -1200,6 +1302,22 @@ mod tests {
         let args = Args::try_parse_from(std::iter::once(OsString::from("x")).chain(args)).expect("parses");
         assert_eq!((args.voxel_size_um, args.threads, args.family), (10.5, Some(12), Family::V));
         assert_eq!(args.predictions, PathBuf::from("p"));
+    }
+
+    /// The tile options read their values as the reference's integer options do, a repeated one replaces the
+    /// earlier, and their shared prefix is ambiguous as argparse finds it
+    #[test]
+    fn tile_options_parse_as_the_numeric_options() {
+        let args = parse(
+            "--pred p --voxel-size-um 1 --output o --work-dir w --tiles-yx 2 1_0 --tiles-yx 3 4 --tile-halo 1_28",
+        );
+        assert_eq!((args.tiles_yx, args.tile_halo), (Some(vec![3, 4]), Some(128)));
+        let args = parse("--pred p --voxel-size-um 1 --output o --work-dir w --tiles 1 1");
+        assert_eq!((args.tiles_yx, args.tile_halo), (Some(vec![1, 1]), None));
+        assert_eq!(action("--tiles-yx 2 --help"), "error");
+        assert_eq!(action("--tiles-yx 2 x --help"), "error");
+        assert_eq!(action("--ti 2 --version"), "error");
+        assert_eq!(action("--tile-h 64 --version"), "version");
     }
 
     #[test]

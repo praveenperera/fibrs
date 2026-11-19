@@ -11,6 +11,8 @@ mod kernels;
 mod predict;
 mod pyfmt;
 mod run;
+mod seams;
+mod tiles;
 mod vol;
 
 use std::ffi::OsString;

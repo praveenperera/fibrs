@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+These changes are for 0.4.0.
+
+- **Tiled tracing.** `--tiles-yx NY NX` traces a window as NY × NX tiles in Y and X, one at a time, so the run's
+  peak memory is about its densest tile's instead of the whole window's. Each tile is traced from its core plus
+  `--tile-halo` native voxels (default 256) of its neighbours. Core edges and the halo are whole units of 256 native
+  voxels for prediction zarrs. Each tile's fibres are cut to its core and joined across the seams by the rule the
+  v2-run pipeline uses for its Z bands: cut ends of the same family at most 1.5 voxels apart, shortest first, never
+  into a loop. A `--tiles-yx 1 1` run writes the untiled run's `.afv`. Without `--tiles-yx`, runs, their output and
+  their `run.json` are unchanged. See [Tiled tracing](README.md#tiled-tracing).
 - The README's tracer speed range is now 22×–47× on wall time and about 22×–38× on CPU time, from the three
   uninterrupted runs on bands of PHerc0826, PHerc1545 and PHerc0358. Two runs whose original was interrupted and
   resumed, one of them on a band of PHerc0813, are listed with estimated totals. The original's time per fibre
