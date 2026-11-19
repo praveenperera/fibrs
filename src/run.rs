@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::afv::{ExportOptions, MinLength, Summary, export_afv};
+use crate::arena::BufferPool;
 use crate::axes::{Lapack, direction_field, find_lapack};
 use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
@@ -690,6 +691,10 @@ fn pool_block(native: &Predictions, lo: Shape, hi: Shape) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Freed native chunk buffers kept for reuse: each eviction frees one and the decode that caused it takes one, so
+/// few wait at a time; this bounds a burst of evictions, at 32 chunks of the usual 2 × 128³
+const CHUNK_POOL_RETAIN: usize = 128 << 20;
+
 /// Raw curves handed from the tracing thread to the finishing threads at a time
 const FINISH_BATCH: usize = 2048;
 
@@ -714,7 +719,8 @@ fn trace_families(
     debug_dump(work, "ny", || ny.read_block([0, 0, 0], ny.shape()))?;
     log!("Direction field: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem("direction field", &[("tracing", resident), ("nx", nx.resident_bytes()), ("ny", ny.resident_bytes())]);
-    let cache = NativeCache::new(native, cache_bytes);
+    let pool = BufferPool::new(CHUNK_POOL_RETAIN);
+    let cache = NativeCache::new(native, cache_bytes, &pool);
     for &family in families {
         trace_family(&tracing, &nx, &ny, &cache, work, family, threads)?;
         release_freed();

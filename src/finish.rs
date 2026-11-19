@@ -10,41 +10,47 @@ use std::sync::{Arc, Mutex};
 
 use color_eyre::eyre::Result;
 
+use crate::arena::BufferPool;
 use crate::fields::Presence;
 use crate::input::Predictions;
 use crate::kernels::{evaluate_curve, fit_curve};
 use crate::vol::{Shape, Vol};
 
-/// One decoded native chunk, `(2, dims)` uint8 in V, H order
-struct Chunk {
+/// One decoded native chunk, `(2, dims)` uint8 in V, H order, in a buffer of the cache's pool
+struct Chunk<'p> {
     lo: Shape,
     dims: Shape,
-    data: Vec<u8>,
+    data: Vec<u8, &'p BufferPool>,
 }
 
 /// A bounded cache of decoded native chunks shared by the finishing threads, least recently used
 /// first out
-pub struct NativeCache<'a> {
+///
+/// Dense windows evict and decode chunks hundreds of times a second, so every chunk buffer, and the compressed
+/// bytes it is decoded from, comes from `pool`: an evicted chunk's buffer goes back to it once the last
+/// finishing thread lets go of the chunk, and the next decode takes it
+pub struct NativeCache<'a, 'p> {
     pred: &'a Predictions,
     edge: Shape,
     budget: usize,
-    lru: Mutex<Lru>,
+    pool: &'p BufferPool,
+    lru: Mutex<Lru<'p>>,
 }
 
 #[derive(Default)]
-struct Lru {
-    map: HashMap<Shape, (Arc<Chunk>, u64)>,
+struct Lru<'p> {
+    map: HashMap<Shape, (Arc<Chunk<'p>>, u64)>,
     bytes: usize,
     clock: u64,
     decoded: u64,
 }
 
-impl<'a> NativeCache<'a> {
+impl<'a, 'p> NativeCache<'a, 'p> {
     /// `budget_bytes` bounds the decoded chunks held at once; one chunk is always kept
-    pub fn new(pred: &'a Predictions, budget_bytes: usize) -> Self {
+    pub fn new(pred: &'a Predictions, budget_bytes: usize, pool: &'p BufferPool) -> Self {
         // whole Zarr chunks are the unit of decoding; NPY input uses the reference's 64³ blocks
         let edge = pred.chunk_shape().unwrap_or([64, 64, 64]);
-        Self { pred, edge, budget: budget_bytes, lru: Mutex::default() }
+        Self { pred, edge, budget: budget_bytes, pool, lru: Mutex::default() }
     }
 
     /// The chunk grid key of a native voxel
@@ -62,7 +68,7 @@ impl<'a> NativeCache<'a> {
         self.lru.lock().expect("cache lock").decoded
     }
 
-    fn chunk(&self, key: Shape) -> Result<Arc<Chunk>> {
+    fn chunk(&self, key: Shape) -> Result<Arc<Chunk<'p>>> {
         {
             let mut s = self.lru.lock().expect("cache lock");
             s.clock += 1;
@@ -73,7 +79,7 @@ impl<'a> NativeCache<'a> {
             }
         }
         // decode outside the lock; two threads may decode the same chunk once each, which only costs time
-        let (lo, dims, data) = self.pred.read_chunk_u8(key, self.edge)?;
+        let (lo, dims, data) = self.pred.read_chunk_in(key, self.edge, self.pool)?;
         let chunk = Arc::new(Chunk { lo, dims, data });
         let mut s = self.lru.lock().expect("cache lock");
         s.clock += 1;
@@ -97,13 +103,13 @@ impl<'a> NativeCache<'a> {
 const RECENT: usize = 8;
 
 /// Per-thread view of the native cache
-pub struct NativeSampler<'c, 'a> {
-    cache: &'c NativeCache<'a>,
-    recent: Vec<(Shape, Arc<Chunk>)>,
+pub struct NativeSampler<'c, 'a, 'p> {
+    cache: &'c NativeCache<'a, 'p>,
+    recent: Vec<(Shape, Arc<Chunk<'p>>)>,
 }
 
-impl<'c, 'a> NativeSampler<'c, 'a> {
-    pub fn new(cache: &'c NativeCache<'a>) -> Self {
+impl<'c, 'a, 'p> NativeSampler<'c, 'a, 'p> {
+    pub fn new(cache: &'c NativeCache<'a, 'p>) -> Self {
         Self { cache, recent: Vec::with_capacity(RECENT) }
     }
 
