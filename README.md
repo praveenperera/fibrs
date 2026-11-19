@@ -6,9 +6,9 @@ same flags and writes the same `.afv`: every metadata value except the per-run u
 point block and spatial-index row. The tracing algorithm, the AFV format and the fibre model whose
 predictions it reads are Qual's; this port changes how fast the tracer runs, not what it writes.
 
-With `--threads 4` for both tools, it traces 22×–62× faster across three measured runs on 512-plane bands of
-PHerc0826 and PHerc1545 (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU and needs no
-GPU.
+With `--threads 4` for both tools, it traces 22×–47× faster across three uninterrupted runs on 512-plane bands of
+PHerc0826, PHerc1545 and PHerc0358 (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU and
+needs no GPU.
 
 `fibrs predict` runs the step before: Qual's AFV fibre model V2 over a CT volume on an NVIDIA GPU, without
 PyTorch, writing the probability zarr the tracer reads, as villa's inference writes it (see
@@ -98,9 +98,10 @@ through the drop-in and through `python -m fibrs`. Both must write what the orig
 
 ## Speed
 
-Three runs on an Intel Core Ultra 7 270K Plus (24 cores), with `--threads 4` for both tools and other work
-running on the machine each time. Runs 1 and 2 trace the same 512 × 8169 × 8169 band of PHerc0826, and run 3 a
-512-plane band of PHerc1545 (z 1280–1792):
+Five runs on an Intel Core Ultra 7 270K Plus (24 cores), with `--threads 4` for both tools and other work
+running on the machine each time. Runs 1 and 2 trace the same 512 × 8169 × 8169 band of PHerc0826, run 3 a
+512-plane band of PHerc1545 (z 1280–1792), run 4 a 512 × 7783 × 7783 band of PHerc0358 (z 2304–2816) and run 5
+a 512-plane band of PHerc0813 (z 2304–2816):
 
 | Run | Tool | Wall | CPU time | Peak memory |
 |---|---|---|---|---|
@@ -110,20 +111,34 @@ running on the machine each time. Runs 1 and 2 trace the same 512 × 8169 × 816
 | 2 | `fibrs` 0.1.0 | 172 s | 472 s | 10.8 GiB |
 | 3 | `avf-spline-generator` 0.2.0 | 1,621 s (27 min) | 4,149 s | 4.6 GiB |
 | 3 | `fibrs` 0.1.0 | 73.4 s | 191 s | 7.0 GiB |
-| Speedup | | **22×–62×** | **about 22×–26×** | |
+| 4 | `avf-spline-generator` 0.2.0 | 15,632 s (4.3 h) | 32,739 s | 4.6 GiB |
+| 4 | `fibrs` 0.2.0 | 332 s | 902 s | 14.0 GiB |
+| 5 | `avf-spline-generator` 0.2.0 | about 9,176 s (2.5 h) | about 27,460 s | 4.7 GiB |
+| 5 | `fibrs` 0.2.0 | 202 s | 564 s | 11.8 GiB |
+| Speedup, runs 2 to 4 | | **22×–47×** | **about 22×–38×** (38× with the 853 s repeat of run 4) | |
 
 - Run 1: the one-minute load average was 17.5–18.8. The original's run was interrupted by a reboot and
   finished with `--resume`. Its wall time is the sum of the two parts, and the first part's CPU time is
   estimated from the second part's CPU-to-wall ratio (1.01). An earlier uninterrupted run of the original on
-  the same band took 12,728 s.
+  the same band took 12,728 s. Run 1's total is estimated, so it sets neither end of the range.
 - Run 2: the one-minute load average averaged 13.9 during the original's run and 8.8 during fibrs's. The two
   `.afv` files held the same 149,680 fibres (compared logically, as each holds its own run uuid).
 - Run 3: the one-minute load average was 10.0 during the original's run and 7.4 during fibrs's. This band is
   sparser. The two `.afv` files held the same 82,646 fibres and 83,741 point blocks.
+- Run 4: the two runs were not at the same time. This is the densest band measured. The two `.afv` files
+  held the same 448,286 fibres and 460,560 point blocks.
+- Run 5: the two runs were not at the same time. The original's first attempt logged progress for 5,074 s before it
+  was stopped and finished with `--resume` in 4,102 s. Its wall time is the sum of the two parts, and the first
+  part's CPU time is estimated from the second part's CPU-to-wall ratio (2.99). The resumed part loaded the
+  direction field and the V centrality instead of recomputing them; it restored 103,340 batches 105 s after it
+  started and was tracing again after 126 s. The ratios are about 45× on wall time and about 49× on CPU time; as
+  the total is estimated, the run sets neither end of the range. The two `.afv` files held the same 337,735 fibres
+  and 344,279 point blocks. Run 5's memory is the peak RSS of both tools.
 
-The original kept about 2.6 cores busy in runs 2 and 3, and about one in run 1 (whose CPU time is partly
-estimated); the port kept about 2.7. The ratio varies with the run and with the machine's load: the range is the
-lowest and highest of the measured runs.
+The original kept about 2.1–3.0 cores busy in runs 2 to 5 and about one in run 1; the CPU times of runs 1 and 5 are
+partly estimated. The port kept about 2.6–2.8. The ratio varies with the run and with the machine's load: the
+ranges are the lowest and highest of the uninterrupted runs, 2 to 4. The CPU range also covers a second fibrs 0.2.0
+run on the run 4 band, which used 853 s of CPU time (38×).
 
 On dense bands, fibrs's speed also depends on how it reads the predictions and allocates memory. Take a
 512 × 2048 × 2048 crop of PHerc0358's densest area (z 1792–2304, y 2176–4224, x 2944–4992) with `--threads 8`
@@ -355,16 +370,21 @@ more than one:
   each of its columns that the tile's core overlaps. Every measured prediction time is the whole command's wall
   time, reading the same CT crop and writing arrays of the same shapes and chunk sizes. villa's prediction was not
   run on the whole PHerc0358 band; its time there is estimated, so that end-to-end ratio is an estimate too.
-- **Tracing varies with the run.** The tracer ratio varies with the run and with the machine's load, so it is
-  given as the lowest to highest measured. Pre-release builds of 0.2.0 traced dense data slower than 0.1.0;
-  0.2.0 is faster than 0.1.0 there (the last row).
+- **Tracing varies with the run.** The tracer ratio varies with the run and with the machine's load, so it is given
+  as the lowest to highest of the uninterrupted runs; the two runs whose original was interrupted and resumed have
+  estimated totals and set neither end. The original's time per fibre also differs between bands and between runs:
+  about 0.035 s on the dense PHerc0358 band (run 4) and about 0.027 s on PHerc0813 (run 5, estimated), and its two
+  uninterrupted runs on the same PHerc0826 band took 4,686 s and 12,728 s. fibrs took about 0.6–0.75 ms per fibre
+  on runs 4 and 5. Pre-release builds of 0.2.0 traced dense data slower than 0.1.0; 0.2.0 is faster than 0.1.0
+  there (the last row).
 
 | Stage | Scroll | Region (z / y / x) | Tiles run | Original | fibrs | Ratio | Precision | Measured as |
 |---|---|---|---|---|---|---|---|---|
-| Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 11,840 s | 191 s | 62× | CPU | one run each (run 1; fibrs built before 0.1.0) |
+| Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 11,840 s | 191 s | about 62× | CPU | one run each; the original was interrupted and resumed; total estimated (run 1; fibrs built before 0.1.0) |
 | Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 4,686 s | 172 s | 27× | CPU | one run each (run 2; fibrs 0.1.0) |
 | Tracing | PHerc1545 | z 1280–1792, whole plane | 8.4% | 1,621 s | 73.4 s | 22× | CPU | one run each (run 3; fibrs 0.1.0) |
-| Tracing | PHerc0358 | z 2304–2816, whole plane | 33.2% | 15,632 s | 332 s | 47× | CPU | one run each, not at the same time (fibrs 0.2.0) |
+| Tracing | PHerc0358 | z 2304–2816, whole plane | 33.2% | 15,632 s | 332 s | 47× | CPU | one run each, not at the same time (run 4; fibrs 0.2.0) |
+| Tracing | PHerc0813 | z 2304–2816, whole plane | 25.4% | 9,176 s | 202 s | about 45× | CPU | one run each, not at the same time; the original was interrupted and resumed; total estimated (run 5; fibrs 0.2.0) |
 | Prediction, `--mode villa` | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 45.37 s | 26.77 s | 1.72× (1.66–1.78×) | fp32 | ABBA, 6 pairs: medians, mean ratio with 95% CI |
 | Prediction, `--mode villa` | PHerc0826 | same crop | 100% | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) | bf16 (opt-in) | ABBA, 6 pairs: medians, mean ratio with 95% CI |
 | Prediction, band mode | PHerc0358 | z 2304–2816 / y 2176–4224 / x 2944–4992 | 100% | 165.6 s | 85.4 s | 1.94× | fp32 | one run each; fibrs `e9adcc9` |
