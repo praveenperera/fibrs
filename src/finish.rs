@@ -42,7 +42,8 @@ struct Lru<'p> {
 }
 
 impl<'a, 'p> NativeCache<'a, 'p> {
-    /// `budget_bytes` bounds the decoded chunks held at once; one chunk is always kept
+    /// `budget_bytes` bounds the decoded chunks held at once, counted as the pool buffers they occupy; one chunk is
+    /// always kept. Freed buffers the pool keeps for reuse are outside the budget
     pub fn new(pred: &'a Predictions, budget_bytes: usize, pool: &'p BufferPool) -> Self {
         // whole Zarr chunks are the unit of decoding; NPY input uses the reference's 64³ blocks
         let edge = pred.chunk_shape().unwrap_or([64, 64, 64]);
@@ -54,7 +55,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         [z / self.edge[0], y / self.edge[1], x / self.edge[2]]
     }
 
-    /// Bytes of decoded chunks held now
+    /// Bytes of the pool buffers held by decoded chunks now
     pub fn bytes(&self) -> usize {
         self.lru.lock().expect("cache lock").bytes
     }
@@ -81,13 +82,13 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         s.decoded += 1;
         let now = s.clock;
         if let Some((old, _)) = s.map.insert(key, (chunk.clone(), now)) {
-            s.bytes -= old.data.len();
+            s.bytes -= BufferPool::footprint(old.data.len());
         }
-        s.bytes += chunk.data.len();
+        s.bytes += BufferPool::footprint(chunk.data.len());
         while s.bytes > self.budget && s.map.len() > 1 {
             let oldest = s.map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| *k).expect("nonempty");
             let (gone, _) = s.map.remove(&oldest).expect("present");
-            s.bytes -= gone.data.len();
+            s.bytes -= BufferPool::footprint(gone.data.len());
         }
         Ok(chunk)
     }

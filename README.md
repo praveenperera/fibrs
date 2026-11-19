@@ -134,16 +134,16 @@ the kernel.
 ## Differences from the original
 
 - Fields live in memory as sparse 16³ bricks instead of a Zarr work store, so peak memory is higher and grows
-  with how much of the band holds fibres: 8.8 GiB against the original's 4.6 GiB on a 512 × 8169 × 8169 band
-  of PHerc0826, and 13.3 GiB on 1024 × 8169 × 8169 of the same scroll. With `--field-cache-mib 4096`, 4.1 GiB
-  of that is the chunk cache; a smaller cache lowers the peak by the difference but decodes chunks again (at a
-  1 GiB cache the 1024-plane window peaked at 9.8 GiB and traced about 19% slower; at 16 MiB tracing took
-  about 60% longer). Memory each stage frees goes back to the system before the next stage allocates.
-  Decoded chunks, the compressed bytes they are read from and the direction field's tile buffers come from a
-  pool that keeps a bounded amount of freed buffers for reuse, and each field's bricks are cut from 64 MiB
-  mappings the field owns. Dense bands evict and decode chunks hundreds of times a second, and on Linux mapping
-  and unmapping memory takes a lock that every page fault in the process waits for, so a mapping per chunk and
-  per brick stalled the tracing threads. Other allocations of 1 MiB or more have their own mapping on Linux, so
+  with how much of the band holds fibres: 8.8 GiB against the original's 4.6 GiB on a 512 × 8169 × 8169 band of
+  PHerc0826, and 13.3 GiB on 1024 × 8169 × 8169 of the same scroll. With `--field-cache-mib 4096`, 4.1 GiB of
+  that is the chunk cache; a smaller cache lowers the peak by the difference but decodes chunks again (at a
+  1 GiB cache the 1024-plane window peaked at 9.8 GiB and traced about 19% slower; at 16 MiB tracing took about
+  60% longer). Memory each stage frees goes back to the system before the next stage allocates. Decoded chunks,
+  the compressed bytes they are read from and the direction field's tile buffers come from a pool that keeps up
+  to 128 MiB of freed buffers for reuse beside the cache, and each field's bricks are cut from 64 MiB mappings
+  the field owns. Dense bands evict and decode chunks hundreds of times a second, and on Linux mapping and
+  unmapping memory takes a lock that every page fault in the process waits for, so a mapping per chunk and per
+  brick stalled the tracing threads. Other allocations of 1 MiB or more have their own mapping on Linux, so
   freed memory does not stay resident. `FIBRS_DEBUG_MEM=1` logs each stage's field sizes and resident memory.
 - The work directory holds `run.json` (with a `native` key, so neither tool resumes the other's
   directory, and only the fibrs version that started it resumes it) and one finished curve file per
