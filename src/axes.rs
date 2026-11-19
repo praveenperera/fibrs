@@ -17,6 +17,7 @@ use libloading::Library;
 use rayon::prelude::*;
 
 use crate::arena::BufferPool;
+use crate::kernels::{DirForm, Directions};
 use crate::vol::{Shape, Vol};
 
 /// Halo the tensor needs: 4 + 1 + 6
@@ -363,14 +364,14 @@ fn gradient<A: Allocator + Copy>(b: &Block<A>, axis: usize) -> Block<A> {
 /// One tile's core: origin, extent, nx and ny
 type TileAxes = (Shape, Shape, Vec<u8>, Vec<u8>);
 
-/// Compute nx, ny for the whole tracing volume from the two pooled channels
-pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<(Vol<u8>, Vol<u8>)> {
+/// Compute nx, ny for the whole tracing volume from the two pooled channels, written in `form`
+/// ([`crate::kernels::DirField`])
+pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack, form: DirForm) -> Result<Directions> {
     let shape = tracing[0].shape();
     let grid = shape.map(|n| n.div_ceil(CORE));
     let tiles: Vec<Shape> =
         (0..grid[0]).flat_map(|z| (0..grid[1]).flat_map(move |y| (0..grid[2]).map(move |x| [z, y, x]))).collect();
-    let mut nx = Vol::new(shape, 128u8);
-    let mut ny = Vol::new(shape, 128u8);
+    let mut dirs = Directions::new(shape, form);
     // every tile's smoothed block, gradients and products are a few MiB each and mostly of one size, so they come
     // from a pool instead of a fresh mapping each; a thread's next tile takes the buffers its last one freed, so
     // the pool keeps one tile's buffers per thread, up to TILE_POOL_RETAIN
@@ -385,11 +386,10 @@ pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<(Vol<u
             part.par_iter().map(|&t| tile_axes(tracing, t, lapack, &pool)).collect();
         for r in results {
             let Some((lo, dims, xx, yy)) = r? else { continue };
-            nx.write_block(lo, dims, &xx);
-            ny.write_block(lo, dims, &yy);
+            dirs.write_block(lo, dims, &xx, &yy);
         }
     }
-    Ok((nx, ny))
+    Ok(dirs)
 }
 
 /// Most freed tile buffers the direction field keeps for reuse, the bound the README states: one tile's buffers

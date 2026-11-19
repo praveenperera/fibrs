@@ -7,10 +7,11 @@
 
 use std::ops::Range;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, Ordering};
 
 use rayon::prelude::*;
 
-use crate::arena::{BrickStore, Voxel};
+use crate::arena::{BrickRun, BrickStore, Voxel};
 
 /// Brick edge, as a shift
 ///
@@ -26,6 +27,18 @@ pub const BRICK: usize = EDGE * EDGE * EDGE;
 
 /// A z, y, x shape
 pub type Shape = [usize; 3];
+
+/// The slot of the brick holding voxel `z, y, x` in a brick grid of `grid`
+#[inline(always)]
+fn brick_index(grid: Shape, z: usize, y: usize, x: usize) -> usize {
+    ((z >> SHIFT) * grid[1] + (y >> SHIFT)) * grid[2] + (x >> SHIFT)
+}
+
+/// A voxel's offset in its brick
+#[inline(always)]
+fn offset(z: usize, y: usize, x: usize) -> usize {
+    ((z & MASK) << (2 * SHIFT)) | ((y & MASK) << SHIFT) | (x & MASK)
+}
 
 /// A sparse 3D volume of `T` in z, y, x order
 pub struct Vol<T: Voxel> {
@@ -93,12 +106,12 @@ impl<T: Voxel> Vol<T> {
 
     #[inline(always)]
     fn brick_index(&self, z: usize, y: usize, x: usize) -> usize {
-        ((z >> SHIFT) * self.grid[1] + (y >> SHIFT)) * self.grid[2] + (x >> SHIFT)
+        brick_index(self.grid, z, y, x)
     }
 
     #[inline(always)]
     fn offset(z: usize, y: usize, x: usize) -> usize {
-        ((z & MASK) << (2 * SHIFT)) | ((y & MASK) << SHIFT) | (x & MASK)
+        offset(z, y, x)
     }
 
     /// The value at an in-bounds voxel
@@ -119,10 +132,23 @@ impl<T: Voxel> Vol<T> {
         (self.bricks[self.brick_index(z, y, x)].map(|b| self.brick(b)), Self::offset(z, y, x))
     }
 
-    /// The value at a voxel given as signed coordinates, which must be in bounds
+    /// The values at the eight corners of the cell whose lowest corner is `z, y, x`, in z, y, x order
+    ///
+    /// The cell must be in bounds. Most cells lie inside one brick, which is then looked up once instead of
+    /// eight times
     #[inline(always)]
-    pub fn at(&self, z: i64, y: i64, x: i64) -> T {
-        self.get(z as usize, y as usize, x as usize)
+    pub fn corners(&self, z: usize, y: usize, x: usize) -> [T; 8] {
+        if (z & MASK) == MASK || (y & MASK) == MASK || (x & MASK) == MASK {
+            return std::array::from_fn(|k| self.get(z + (k >> 2), y + (k >> 1 & 1), x + (k & 1)));
+        }
+        debug_assert!(z + 1 < self.shape[0] && y + 1 < self.shape[1] && x + 1 < self.shape[2]);
+        let Some(b) = self.bricks[self.brick_index(z, y, x)] else {
+            return [self.default; 8];
+        };
+        let (brick, at) = (self.brick(b), Self::offset(z, y, x));
+        const ROW: usize = EDGE;
+        const PLANE: usize = EDGE * EDGE;
+        [0, 1, ROW, ROW + 1, PLANE, PLANE + 1, PLANE + ROW, PLANE + ROW + 1].map(|d| brick[at + d])
     }
 
     /// Set one voxel, allocating its brick on first non-default write
@@ -273,6 +299,118 @@ impl<T: Voxel> Vol<T> {
     }
 }
 
+/// A sparse `u16` volume, zero by default, that one writer changes while other threads read it
+///
+/// Every voxel is an atomic `u16` and every brick slot an atomic pointer: the writer publishes a brick it
+/// allocates with a release store, so a reader that sees the pointer sees the brick's zeros, and a reader racing
+/// the writer reads either the old or the new value of a voxel, never a torn one. Readers learn nothing about
+/// ordering from a voxel's value; the tracer orders them through its own commit counter
+pub struct SharedVol {
+    shape: Shape,
+    grid: Shape,
+    /// Each brick slot's first voxel, null while the whole brick reads as zero
+    bricks: Box<[AtomicPtr<u16>]>,
+    store: BrickStore<u16>,
+    /// Whether [`SharedVol::writer`] has been called: a second writer would race the first on allocation
+    has_writer: AtomicBool,
+}
+
+/// Where a voxel of a [`SharedVol`] lives: its brick slot and its offset in the brick
+///
+/// Only [`SharedVol::place`] makes one, so the offset is always inside a brick: reads and writes through a place
+/// index the brick without a bounds check
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Place {
+    slot: usize,
+    offset: u16,
+}
+
+impl Place {
+    /// The brick slot, in C order over the brick grid
+    #[inline(always)]
+    pub fn slot(self) -> usize {
+        self.slot
+    }
+}
+
+impl SharedVol {
+    /// An empty volume where every voxel reads as zero
+    pub fn new(shape: Shape) -> Self {
+        let grid = shape.map(|n| n.div_ceil(EDGE));
+        let slots: usize = grid.iter().product();
+        let bricks = (0..slots).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect();
+        // the store's bricks start zeroed (fresh mappings), so it never writes them before they are published
+        let store = BrickStore::new(BRICK, 0, slots);
+        Self { shape, grid, bricks, store, has_writer: AtomicBool::new(false) }
+    }
+
+    pub fn shape(&self) -> Shape {
+        self.shape
+    }
+
+    /// The brick slot and offset of an in-bounds voxel
+    #[inline(always)]
+    pub fn place(&self, z: usize, y: usize, x: usize) -> Place {
+        debug_assert!(z < self.shape[0] && y < self.shape[1] && x < self.shape[2]);
+        Place { slot: brick_index(self.grid, z, y, x), offset: offset(z, y, x) as u16 }
+    }
+
+    /// The value at a place
+    #[inline(always)]
+    pub fn get(&self, at: Place) -> u16 {
+        let brick = self.bricks[at.slot].load(Ordering::Acquire);
+        if brick.is_null() {
+            return 0;
+        }
+        // SAFETY: a published brick holds BRICK voxels of `store`, which lives as long as `self`, and is only
+        // ever accessed atomically once published
+        unsafe { AtomicU16::from_ptr(brick.add(at.offset as usize)) }.load(Ordering::Relaxed)
+    }
+
+    /// Bytes held by allocated bricks
+    pub fn resident_bytes(&self) -> usize {
+        let allocated = self.bricks.iter().filter(|b| !b.load(Ordering::Relaxed).is_null()).count();
+        allocated * BRICK * std::mem::size_of::<u16>()
+    }
+
+    /// The volume's one writer
+    ///
+    /// # Panics
+    ///
+    /// When called a second time on the same volume
+    pub fn writer(&self) -> SharedVolWriter<'_> {
+        assert!(!self.has_writer.swap(true, Ordering::Relaxed), "a shared volume has one writer");
+        SharedVolWriter { vol: self, run: self.store.run() }
+    }
+}
+
+/// The only handle that changes a [`SharedVol`]
+pub struct SharedVolWriter<'v> {
+    vol: &'v SharedVol,
+    run: BrickRun<'v, u16>,
+}
+
+impl SharedVolWriter<'_> {
+    /// The value at a place; the writer always sees its own writes
+    #[inline(always)]
+    pub fn get(&self, at: Place) -> u16 {
+        self.vol.get(at)
+    }
+
+    /// Set one voxel, allocating and publishing its brick on the first write to it
+    #[inline]
+    pub fn set(&mut self, at: Place, value: u16) {
+        let slot = &self.vol.bricks[at.slot];
+        let mut brick = slot.load(Ordering::Relaxed);
+        if brick.is_null() {
+            brick = self.run.alloc().as_ptr();
+            slot.store(brick, Ordering::Release);
+        }
+        // SAFETY: as in `SharedVol::get`; only this writer stores voxels
+        unsafe { AtomicU16::from_ptr(brick.add(at.offset as usize)) }.store(value, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +426,17 @@ mod tests {
         let block: Vec<u8> = (0..3 * 4 * 5).map(|i| i as u8).collect();
         v.write_block([30, 31, 28], [3, 4, 5], &block);
         assert_eq!(v.read_block([30, 31, 28], [3, 4, 5]), block);
+    }
+
+    #[test]
+    fn shared_volume_reads_its_writers_values() {
+        let v = SharedVol::new([20, 33, 40]);
+        let at = v.place(19, 32, 39);
+        assert_eq!(v.get(at), 0);
+        let mut w = v.writer();
+        w.set(at, 0x8080);
+        w.set(v.place(19, 32, 38), 1);
+        assert_eq!((v.get(at), w.get(v.place(19, 32, 38)), v.get(v.place(0, 0, 0))), (0x8080, 1, 0));
+        assert_eq!(v.resident_bytes(), BRICK * 2);
     }
 }

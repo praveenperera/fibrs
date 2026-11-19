@@ -2,7 +2,7 @@
 
 use rayon::prelude::*;
 
-use crate::kernels::{Dense, Grid};
+use crate::kernels::{Dense, DirField, Grid};
 use crate::pyfmt::argsort_u16;
 use crate::stage1::{Arith, stage1};
 use crate::vol::{Shape, Vol};
@@ -80,7 +80,24 @@ impl<'a> Presence<'a> {
             _ => return 0,
         };
         let b = self.other.locate(z, y, x).0.map_or(0, |b| b[at]);
-        if a < b { 0 } else { (a as u16 + b as u16).min(255) as u8 }
+        Self::combine(a, b)
+    }
+
+    /// Presence from an own and an other value
+    #[inline(always)]
+    fn combine(own: u8, other: u8) -> u8 {
+        if own < other { 0 } else { (own as u16 + other as u16).min(255) as u8 }
+    }
+
+    /// The values at the eight corners of an in-bounds cell, as [`Vol::corners`]
+    #[inline(always)]
+    pub fn corners(&self, z: usize, y: usize, x: usize) -> [u8; 8] {
+        let own = self.own.corners(z, y, x);
+        if own == [0; 8] {
+            return own;
+        }
+        let other = self.other.corners(z, y, x);
+        std::array::from_fn(|k| Self::combine(own[k], other[k]))
     }
 
     /// A dense C-order block with origin `lo` and extent `dims`
@@ -114,6 +131,11 @@ impl Grid<u8> for Presence<'_> {
     fn at(&self, z: i64, y: i64, x: i64) -> u8 {
         self.get(z as usize, y as usize, x as usize)
     }
+
+    #[inline(always)]
+    fn corners(&self, z: i64, y: i64, x: i64) -> [u8; 8] {
+        Presence::corners(self, z as usize, y as usize, x as usize)
+    }
 }
 
 /// The reference's `tiles(shape, size)` order: C order over tile origins
@@ -137,7 +159,7 @@ type TileFields = (Shape, Shape, Vec<u16>, Vec<u8>);
 
 /// Centrality and seeds over the reference's 128³ tiles with an 8-voxel halo, tiles in parallel, in the rounding
 /// of the reference's CPU kernel ([`crate::stage1::Separate`]) or its CUDA kernels ([`crate::stage1::Fused`])
-pub fn centrality<A: Arith>(pres: &Presence, nx: &Vol<u8>, ny: &Vol<u8>) -> FamilyFields {
+pub fn centrality<A: Arith, D: DirField>(pres: &Presence, dirs: &D) -> FamilyFields {
     let shape = pres.shape();
     assert!(
         shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d)).is_some_and(|n| n <= Seed::MAX_VOXELS),
@@ -150,7 +172,7 @@ pub fn centrality<A: Arith>(pres: &Presence, nx: &Vol<u8>, ny: &Vol<u8>) -> Fami
     // at once stay small; tile cores are disjoint, so the order they are written in does not matter
     for part in jobs.chunks(4 * rayon::current_num_threads()) {
         let results: Vec<Option<TileFields>> =
-            part.par_iter().map(|&(start, end)| centrality_tile::<A>(pres, nx, ny, start, end)).collect();
+            part.par_iter().map(|&(start, end)| centrality_tile::<A, D>(pres, dirs, start, end)).collect();
         for (start, inner, c, s) in results.into_iter().flatten() {
             cent.write_block(start, inner, &c);
             let mut i = 0;
@@ -174,13 +196,7 @@ pub fn centrality<A: Arith>(pres: &Presence, nx: &Vol<u8>, ny: &Vol<u8>) -> Fami
 }
 
 /// One tile's core centrality and seeds, or None when no voxel of the tile and its halo reaches presence 64
-fn centrality_tile<A: Arith>(
-    pres: &Presence,
-    nx: &Vol<u8>,
-    ny: &Vol<u8>,
-    start: Shape,
-    end: Shape,
-) -> Option<TileFields> {
+fn centrality_tile<A: Arith, D: DirField>(pres: &Presence, dirs: &D, start: Shape, end: Shape) -> Option<TileFields> {
     let shape = pres.shape();
     let lo = start.map(|v| v.saturating_sub(TILE_HALO));
     let hi = [0, 1, 2].map(|a| (end[a] + TILE_HALO).min(shape[a]));
@@ -189,9 +205,8 @@ fn centrality_tile<A: Arith>(
     if !pres.any_in(lo, dims, |p| p >= 64) {
         return None;
     }
-    let block = |v: &Vol<u8>| Dense { dims, data: v.read_block(lo, dims) };
     let pres = Dense { dims, data: pres.read_block(lo, dims) };
-    let (cent, seeds) = stage1::<A>(&pres, &block(nx), &block(ny));
+    let (cent, seeds) = stage1::<A>(&pres, &Dense { dims, data: dirs.packed_block(lo, dims) });
     let inner = [0, 1, 2].map(|a| end[a] - start[a]);
     let off = [0, 1, 2].map(|a| start[a] - lo[a]);
     let mut c = Vec::with_capacity(inner.iter().product());

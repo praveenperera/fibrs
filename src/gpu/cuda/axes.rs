@@ -445,6 +445,7 @@ mod tests {
     use super::*;
     use crate::axes::{direction_field, find_lapack};
     use crate::gpu::Stages;
+    use crate::kernels::{DirForm, Directions};
 
     /// A small xorshift, so the test volume needs no dependency
     struct Rng(u64);
@@ -498,7 +499,10 @@ mod tests {
         let tracing = volumes();
         let shape = tracing[0].shape();
         let (nx, ny, counts) = gpu.direction_field(&tracing, lapack).unwrap();
-        let (want_nx, want_ny) = direction_field(&tracing, lapack).unwrap();
+        let Directions::Split { nx: want_nx, ny: want_ny } = direction_field(&tracing, lapack, DirForm::Split).unwrap()
+        else {
+            unreachable!("asked for the split form")
+        };
         for (name, got, want) in [("nx", &nx, &want_nx), ("ny", &ny, &want_ny)] {
             let (a, b) = (got.read_block([0; 3], shape), want.read_block([0; 3], shape));
             let differ = a.iter().zip(&b).filter(|(a, b)| a != b).count();
