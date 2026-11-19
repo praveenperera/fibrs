@@ -442,7 +442,8 @@ mod tests {
             .run(&pool, |i, curves| {
                 let first = 1..producer.window.min(cat.coords.len());
                 let traced_ahead = |j: usize| producer.slots[j % producer.window].done.load(Ordering::Acquire) == j + 1;
-                while i == 0 && !first.clone().all(traced_ahead) {
+                // a helper that panicked never publishes its seed; stop waiting so the run reports the panic
+                while i == 0 && !first.clone().all(traced_ahead) && !producer.panicked.load(Ordering::SeqCst) {
                     std::thread::yield_now();
                 }
                 out.extend(curves.drain(..).map(|c| c.pts));
