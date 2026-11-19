@@ -165,23 +165,20 @@ fn a_ct_that_is_not_3d_uint8_is_refused() {
 }
 
 #[test]
-fn every_attempt_is_recorded_before_the_checkpoint_is_checked() {
+fn a_checkpoint_mismatch_writes_nothing() {
     let model = scratch("model");
     for name in ["model.py", "plans.json", "dataset.json", "checkpoint_final.pth"] {
         fs::write(model.join(name), name).unwrap();
     }
-    let out = scratch("attempt");
+    let out = scratch("attempt").join("pred.zarr");
     let ct = fixtures().join("band.zarr");
     let args = ["--ct", ct.to_str().unwrap(), "--z0", "0", "--z1", "8", "--model-dir", model.to_str().unwrap()];
     let run = predict(&[&args[..], &["--out", out.to_str().unwrap(), "--expect-sha256", "00"]].concat());
     assert_eq!(run.status.code(), Some(1));
     let digest: String = Sha256::digest(b"checkpoint_final.pth").iter().map(|b| format!("{b:02x}")).collect();
     assert!(text(&run).contains(&format!("checkpoint sha256 {digest} != 00")), "{}", text(&run));
-    let attempts = fs::read_to_string(out.join("attempts.jsonl")).unwrap();
-    let rec: Value = serde_json::from_str(attempts.lines().next().unwrap()).unwrap();
-    assert_eq!(rec["attempt"], rec["start"]);
-    // nothing else is written before the checks pass
-    assert!(!out.join("semantic").exists() && !out.join(".zattrs").exists());
+    // the model is checked before the output is created
+    assert!(!out.exists());
 }
 
 #[test]
@@ -217,14 +214,33 @@ fn an_output_that_overlaps_the_ct_is_refused() {
         }
     }
     let before: Vec<_> = fs::read_dir(&ct).unwrap().map(|e| e.unwrap().file_name()).collect();
-    for out in [ct.clone(), ct.join("pred.zarr"), ct.parent().unwrap().to_path_buf()] {
-        let args = ["--ct", ct.to_str().unwrap(), "--z0", "0", "--z1", "8", "--model-dir", model.to_str().unwrap()];
+    let dir = ct.parent().unwrap();
+    std::os::unix::fs::symlink(&ct, dir.join("link.zarr")).unwrap();
+    std::os::unix::fs::symlink(dir.join("gone"), dir.join("broken")).unwrap();
+    fs::write(dir.join("done.txt"), "").unwrap();
+    let args = ["--ct", ct.to_str().unwrap(), "--z0", "0", "--z1", "8", "--model-dir", model.to_str().unwrap()];
+    let refused = |out: PathBuf, why: &str| {
         let run = predict(&[&args[..], &["--out", out.to_str().unwrap()]].concat());
         assert_eq!(run.status.code(), Some(1));
-        assert!(text(&run).contains("overlaps --ct"), "{}", text(&run));
+        assert!(text(&run).contains(why), "{}", text(&run));
+    };
+
+    // the part of a path that exists resolves as the system resolves it, links and `..` included
+    for out in [ct.clone(), ct.join("pred.zarr"), dir.to_path_buf(), ct.join("../band.zarr")] {
+        refused(out, "overlaps --ct");
     }
+    for out in [dir.join("link.zarr"), dir.join("link.zarr/pred.zarr")] {
+        refused(out, "overlaps --ct");
+    }
+    // a path the system would not open is refused, whatever it would name lexically
+    refused(dir.join("broken/../pred.zarr"), "which does not resolve");
+    refused(dir.join("done.txt/../pred.zarr"), "steps through");
+    refused(dir.join("missing/../pred.zarr"), "uses .. after");
+    refused(ct.join("0.0.0/../../pred.zarr"), "uses .. after");
+
     let after: Vec<_> = fs::read_dir(&ct).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(before, after);
+    assert!(!dir.join("missing").exists() && !dir.join("pred.zarr").exists());
 }
 
 #[test]
@@ -239,7 +255,8 @@ fn a_fold_folder_as_the_model_folder_is_refused() {
     let run = predict(&[&args[..], &["--out", out.to_str().unwrap()]].concat());
     assert_eq!(run.status.code(), Some(1));
     assert!(text(&run).contains("is named like a fold folder"), "{}", text(&run));
-    assert!(!out.join("semantic").exists());
+    // the model folder is checked before anything is written
+    assert!(!out.join("attempts.jsonl").exists());
 }
 
 #[test]
