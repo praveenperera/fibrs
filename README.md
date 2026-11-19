@@ -232,6 +232,7 @@ python -m fibrs predict ARGS   # the same, from Python
 ```
 
 `--ct` is a level-0 uint8 zarr v2 array (the `/0` directory of an OME-Zarr). `--device` is `cuda` or `cuda:N`.
+`--voxel-size-um` is the CT's voxel size, written as the output's `voxel_size_um` attribute (default 9.362).
 Run the same command again on the same `--out` to resume a capped (`--max-minutes`) or interrupted run at the
 first unfinished column; the resume must use the same settings, binary and GPU model, or it refuses the output.
 One run at a time may use an output: a run locks it until it ends, and a second run on the same `--out` is
@@ -339,8 +340,9 @@ and cuBLAS 13.4.1.3. villa ran PyTorch 2.14.1 (CUDA 13.0) with cuDNN 9.24, at `0
 
 ### Limits
 
-- The output's `voxel_size_um` attribute is always 9.362, the PHerc0826 CT's voxel size. If your CT has another
-  voxel size, pass the real one to the tracer (`--voxel-size-um`), which reads its own flag, not the attribute.
+- The output's `voxel_size_um` attribute is 9.362, the PHerc0826 CT's voxel size, unless `--voxel-size-um` gives
+  another; the reference writes 9.362 for every CT. fibrs does not read it from the CT's OME-Zarr metadata. The
+  tracer doesn't read the attribute either: pass the CT's voxel size to it as `--voxel-size-um` too.
 - A column's accumulators span the whole band height on the GPU, about 14 bytes per voxel (a 480 × 480 column of
   8,000 planes needs about 24 GiB), and the engine takes at most 2^31 − 1 voxels in one column (a 480 × 480 column
   of up to 9,320 planes). A run whose pending columns don't fit, in the free GPU memory or in that limit, stops

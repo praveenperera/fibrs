@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- `fibrs predict --voxel-size-um` sets the output's `voxel_size_um` attribute, which was always 9.362, the PHerc0826
+  CT's voxel size, as in the reference. The default is still 9.362, so pass it for a CT with another voxel size
+  (8.64 for example). Predictions are unchanged. A resume with a different value is refused.
 - The README's tracer speed range is now 22×–47× on wall time and about 22×–38× on CPU time, from the three
   uninterrupted runs on bands of PHerc0826, PHerc1545 and PHerc0358. Two runs whose original was interrupted and
   resumed, one of them on a band of PHerc0813, are listed with estimated totals. The original's time per fibre
