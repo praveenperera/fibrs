@@ -466,6 +466,12 @@ fn run(c: Checked) -> Result<()> {
     prov.insert("model_sha256".into(), Value::Object(hashes));
     let exe = std::env::current_exe()?;
     prov.insert("code_sha256".into(), json!({format!("fibrs {}", env!("CARGO_PKG_VERSION")): sha256(&exe)?}));
+    // the CT was opened through `c.ct`; if a directory on it was replaced by a link since it was resolved, the store
+    // read is not the one recorded, and a resume could mix two stores whose metadata match
+    let now = fs::canonicalize(&c.ct)?;
+    if now != c.ct {
+        bail!("--ct {} now resolves to {}; it changed while the run started", c.ct.display(), now.display());
+    }
     prov.insert("ct".into(), json!(c.ct.to_string_lossy()));
     prov.insert("ct_identity".into(), json!(ct_identity(&c.ct, p.z0, p.z1)?));
     for (k, v) in [
