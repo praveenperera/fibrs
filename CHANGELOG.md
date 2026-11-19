@@ -28,10 +28,14 @@ over a CT volume on an NVIDIA GPU, natively in the `fibrs` binary, with no PyTor
   On Linux, allocations of 1 MiB or more get their own mapping, so the chunk cache's evicted chunks go back to
   the system. On a 1024 × 8169 × 8169 window of PHerc0826 the peak fell from 17.4 GiB to 13.3 GiB, and on a
   512-plane band from 8.9–10.8 GiB to 8.8 GiB.
-- **Tracing is faster on dense bands**, with the same `.afv`. Decoded chunks and the direction field's tile buffers
-  are reused from a pool, and each field's bricks are cut from large mappings it owns. Dense bands no longer stall
-  on the kernel's memory-map lock. On a 512 × 2048 × 2048 crop of PHerc0358's densest area at `--threads 8`, a run
-  takes 62–65 s with a 2.5 GiB peak, where 0.1.0 took 82 s with a 3.4 GiB peak.
+- **Tracing is faster on dense bands**, with the same `.afv`:
+  - The native predictions are decoded 8 planes at a time instead of a whole chunk at a time.
+  - Decoded predictions and the direction field's tile buffers are reused from a pool.
+  - Each field's bricks are cut from large mappings it owns.
+
+  Dense bands no longer stall on the kernel's memory-map lock. On a 512 × 2048 × 2048 crop of PHerc0358's densest
+  area at `--threads 8`, a run takes 50–52 s with a 2.6 GiB peak, where 0.1.0 took 104 s with a 3.5 GiB peak on
+  the same machine.
 
 ### Install
 

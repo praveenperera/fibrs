@@ -125,25 +125,29 @@ The ratio varies with the run and with the machine's load: the range is the lowe
 runs. The gap is largest on dense bands, where the original tracer uses about one core whatever `--threads`
 says; on run 1's band the port kept about 2.7 busy.
 
-On dense bands, fibrs's speed also depends on how it allocates memory. Take a 512 × 2048 × 2048 crop of
-PHerc0358's densest area (z 1792–2304, y 2176–4224, x 2944–4992) with `--threads 8` and `--field-cache-mib 224`.
-fibrs 0.1.0 took 82 s with a 3.4 GiB peak. fibrs 0.2.0 takes 62–65 s with a 2.5 GiB peak and writes the same
-`.afv`. A 0.2.0 build that gave each decoded chunk its own mapping took 122 s and spent 40% of its CPU time in
-the kernel.
+On dense bands, fibrs's speed also depends on how it reads the predictions and allocates memory. Take a
+512 × 2048 × 2048 crop of PHerc0358's densest area (z 1792–2304, y 2176–4224, x 2944–4992) with `--threads 8`
+and `--field-cache-mib 224`, each pair of builds run back to back on the same busy machine. fibrs 0.2.0 takes
+50–52 s with a 2.6 GiB peak and writes the same `.afv` as 0.1.0, which took 104 s with a 3.5 GiB peak. A 0.2.0
+build that decoded whole chunks took 69–72 s, and one that also gave each decoded chunk its own mapping spent
+40% of its CPU time in the kernel.
 
 ## Differences from the original
 
 - Fields live in memory as sparse 16³ bricks instead of a Zarr work store, so peak memory is higher and grows
   with how much of the band holds fibres: 8.8 GiB against the original's 4.6 GiB on a 512 × 8169 × 8169 band
   of PHerc0826, and 13.3 GiB on 1024 × 8169 × 8169 of the same scroll. With `--field-cache-mib 4096`, 4.1 GiB
-  of that is the chunk cache; a smaller cache lowers the peak by the difference but decodes chunks again (at a
-  1 GiB cache the 1024-plane window peaked at 9.8 GiB and traced about 19% slower; at 16 MiB tracing took
-  about 60% longer). Memory each stage frees goes back to the system before the next stage allocates.
-  Decoded chunks, the compressed bytes they are read from and the direction field's tile buffers come from a
-  pool that keeps a bounded amount of freed buffers for reuse, and each field's bricks are cut from 64 MiB
-  mappings the field owns. Dense bands evict and decode chunks hundreds of times a second, and on Linux mapping
-  and unmapping memory takes a lock that every page fault in the process waits for, so a mapping per chunk and
-  per brick stalled the tracing threads. Other allocations of 1 MiB or more have their own mapping on Linux, so
+  of that is the chunk cache; a smaller cache lowers the peak by the difference but decodes again more often
+  (measured while chunks were decoded whole: at a 1 GiB cache the 1024-plane window peaked at 9.8 GiB and
+  traced about 19% slower; at 16 MiB tracing took about 60% longer). Memory each stage frees goes back to the
+  system before the next stage allocates.
+- A point's value needs 8 voxels of the native predictions, so they are decoded 8 planes at a time (one
+  128 KiB Blosc block of each channel in a prediction zarr) instead of a whole chunk at a time. The cache holds
+  these slabs, with the chunks' compressed bytes in a quarter of its budget. Decoded slabs, compressed chunks
+  and the direction field's tile buffers come from a pool that keeps a bounded amount of freed buffers for
+  reuse, and each field's bricks are cut from 64 MiB mappings the field owns. Dense bands evict and decode
+  hundreds of times a second, and on Linux mapping and unmapping memory takes a lock that every page fault in
+  the process waits for, so a mapping per decode and per brick stalled the tracing threads. Other allocations of 1 MiB or more have their own mapping on Linux, so
   freed memory does not stay resident. `FIBRS_DEBUG_MEM=1` logs each stage's field sizes and resident memory.
 - The work directory holds `run.json` (with a `native` key, so neither tool resumes the other's
   directory, and only the fibrs version that started it resumes it) and one finished curve file per

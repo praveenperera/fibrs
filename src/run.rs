@@ -424,7 +424,7 @@ pub fn run(args: Args) -> Result<Summary> {
     if args.origin_xyz.iter().min().copied().unwrap_or(0) < 0 || args.native_cache_mib < 1 || args.cuda_device < 0 {
         bail!("Invalid origin, cache size or CUDA device");
     }
-    fix_mmap_threshold();
+    fix_malloc_thresholds();
     let max_threads = numba_max_threads();
     let threads = args.threads.unwrap_or(8.min(max_threads));
     if threads < 1 || threads > max_threads {
@@ -691,12 +691,16 @@ fn pool_block(native: &Predictions, lo: Shape, hi: Shape) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Freed native chunk buffers kept for reuse: each eviction frees one and the decode that caused it takes one, so
-/// few wait at a time; this bounds a burst of evictions, at 32 chunks of the usual 2 × 128³
+/// Freed native prediction buffers kept for reuse: each eviction frees one and the decode or read that caused it
+/// takes one, so few wait at a time; this bounds a burst of evictions, at 512 slabs of the usual 2 × 8 × 128²
 const CHUNK_POOL_RETAIN: usize = 128 << 20;
 
 /// Raw curves handed from the tracing thread to the finishing threads at a time
-const FINISH_BATCH: usize = 2048;
+///
+/// Each batch is finished in native-chunk order, so a larger batch reads and decodes each chunk for more curves:
+/// on a dense PHerc0358 crop 8192 read 55% fewer chunks and decoded 40% fewer slabs than 2048, for 10% less CPU
+/// time. The curves in flight stay in the tens of megabytes
+const FINISH_BATCH: usize = 8192;
 
 fn trace_families(
     native: &Predictions,
@@ -779,9 +783,11 @@ fn release_freed() {
 /// after the first few the chunk cache's 4 MiB chunks and the stages' tile buffers come from the per-thread
 /// arenas instead, where they fragment and stay resident as they are evicted and freed on other threads: on a
 /// 512-plane 0826 band the peak varied from 8.9 to 10.8 GiB between runs without this and was 8.8 GiB in each
-/// of three runs with it, at the same speed. Setting the threshold also stops glibc's adjustment.
-/// A threshold set in the environment, by `MALLOC_MMAP_THRESHOLD_` or `GLIBC_TUNABLES`, still takes precedence
-fn fix_mmap_threshold() {
+/// of three runs with it, at the same speed. Setting the threshold also stops glibc's adjustment, so the trim
+/// threshold is set too (see below).
+/// Either threshold set in the environment, by `MALLOC_MMAP_THRESHOLD_`, `MALLOC_TRIM_THRESHOLD_` or
+/// `GLIBC_TUNABLES`, still takes precedence
+fn fix_malloc_thresholds() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none()
         && !std::env::var("GLIBC_TUNABLES").is_ok_and(|t| t.contains("glibc.malloc.mmap_threshold"))
@@ -789,6 +795,19 @@ fn fix_mmap_threshold() {
         // SAFETY: mallopt only changes how later allocations are served; it touches no live allocation
         unsafe {
             libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
+        }
+    }
+    // fixing the mmap threshold also fixes the trim threshold at 128 KiB, so each finishing thread's heap gave
+    // back c-blosc's 384 KiB decode scratch on every slab and faulted it in again: on a dense crop that was 460,000
+    // page faults a second and 15% of the CPU time in the kernel. 8 MiB stops it; `release_freed` still trims the
+    // heaps between stages
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if std::env::var_os("MALLOC_TRIM_THRESHOLD_").is_none()
+        && !std::env::var("GLIBC_TUNABLES").is_ok_and(|t| t.contains("glibc.malloc.trim_threshold"))
+    {
+        // SAFETY: as above
+        unsafe {
+            libc::mallopt(libc::M_TRIM_THRESHOLD, 8 << 20);
         }
     }
 }
@@ -909,9 +928,10 @@ fn trace_family(
         w.finish()?;
     }
     log!(
-        "{label} traced: {raw} raw curves, {pieces} finished pieces in {:.1} s ({} native chunks decoded)",
+        "{label} traced: {raw} raw curves, {pieces} finished pieces in {:.1} s ({} native slabs decoded from {} chunk reads)",
         t.elapsed().as_secs_f64(),
-        cache.decoded()
+        cache.decoded(),
+        cache.read()
     );
     save_json(&folder.join("progress.json"), &json!({"complete": true, "raw_curves": raw, "curves": pieces}))?;
     Ok(())

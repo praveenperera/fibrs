@@ -318,36 +318,90 @@ impl Predictions {
         dims: [usize; 3],
         alloc: A,
     ) -> Result<Option<Vec<u8, A>>> {
-        let Store::Zarr { dir, chunks, sep, fill, compressor, fortran } = &self.store else { return Ok(None) };
-        let whole = chunks[0] == 2 && [chunks[1], chunks[2], chunks[3]] == edge && dims == edge;
-        if !whole || *fortran || *compressor != Compressor::Blosc || self.dtype.kind != Kind::U8 {
+        if self.slab_layout() != Some(edge) || dims != edge {
             return Ok(None);
         }
         let n = 2 * dims.iter().product::<usize>();
-        let name = format!("0{sep}{}{sep}{}{sep}{}", key[0], key[1], key[2]);
-        let path = dir.join(&name);
-        let mut file = match fs::File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // a uint8 fill value is one byte, the same in both channels, so channel order does not matter
+        let mut out = match self.packed_chunk_in(key, alloc)? {
+            PackedChunk::Fill(fill) => {
                 let mut out = Vec::with_capacity_in(n, alloc);
-                out.resize(n, fill[0]);
+                out.resize(n, fill);
                 return Ok(Some(out));
             }
-            Err(e) => return Err(eyre!("{}: {e}", path.display())),
+            PackedChunk::Blosc(bytes) => blosc_decompress_in(&bytes, alloc).map_err(|e| eyre!("chunk {key:?}: {e}"))?,
         };
-        let size = file.metadata().map_err(|e| eyre!("{}: {e}", path.display()))?.len() as usize;
-        let mut bytes = Vec::with_capacity_in(size, alloc);
-        bytes.resize(size, 0);
-        file.read_exact(&mut bytes).map_err(|e| eyre!("{}: {e}", path.display()))?;
-        let mut out = blosc_decompress_in(&bytes, alloc).map_err(|e| eyre!("chunk {name}: {e}"))?;
-        ensure!(out.len() == n, "chunk {name} decoded to {} bytes, expected {n}", out.len());
+        ensure!(out.len() == n, "chunk {key:?} decoded to {} bytes, expected {n}", out.len());
         if self.reverse {
             let (a, b) = out.split_at_mut(n / 2);
             a.swap_with_slice(b);
         }
         Ok(Some(out))
     }
+
+    /// The stored z, y, x extent of each channel of a chunk when the array's chunks can be decoded a few planes at
+    /// a time: uint8 Blosc chunks in C order holding both channels. `None` for any other layout
+    ///
+    /// Zarr stores the chunks at the volume's edge at this full extent too, so the same strides address every chunk
+    pub fn slab_layout(&self) -> Option<[usize; 3]> {
+        let Store::Zarr { chunks, compressor, fortran, .. } = &self.store else { return None };
+        let sliced = chunks[0] == 2 && !*fortran && *compressor == Compressor::Blosc && self.dtype.kind == Kind::U8;
+        sliced.then_some([chunks[1], chunks[2], chunks[3]])
+    }
+
+    /// The still-compressed bytes of chunk `key`, read into a buffer from `alloc`, for an array with a
+    /// [`Predictions::slab_layout`]
+    pub fn packed_chunk_in<A: Allocator>(&self, key: [usize; 3], alloc: A) -> Result<PackedChunk<A>> {
+        let Store::Zarr { dir, sep, fill, .. } = &self.store else { bail!("only Zarr chunks are packed") };
+        let name = format!("0{sep}{}{sep}{}{sep}{}", key[0], key[1], key[2]);
+        let path = dir.join(&name);
+        let mut file = match fs::File::open(&path) {
+            Ok(f) => f,
+            // a uint8 fill value is one byte, the same in both channels, so channel order does not matter
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(PackedChunk::Fill(fill[0])),
+            Err(e) => return Err(eyre!("{}: {e}", path.display())),
+        };
+        let size = file.metadata().map_err(|e| eyre!("{}: {e}", path.display()))?.len() as usize;
+        let mut bytes = Vec::with_capacity_in(size, alloc);
+        bytes.resize(size, 0);
+        file.read_exact(&mut bytes).map_err(|e| eyre!("{}: {e}", path.display()))?;
+        Ok(PackedChunk::Blosc(bytes))
+    }
+
+    /// Decode z planes `planes` of both channels of a packed chunk into `out`, V then H, each `(planes, cy, cx)`
+    /// at the stored extent of [`Predictions::slab_layout`]
+    ///
+    /// Blosc compresses a chunk in independent blocks (128 KiB, 8 planes of 128 × 128, in prediction zarrs), and
+    /// only the blocks the planes fall in are decoded
+    pub fn decode_planes<A: Allocator>(
+        &self,
+        packed: &PackedChunk<A>,
+        planes: std::ops::Range<usize>,
+        out: &mut [u8],
+    ) -> Result<()> {
+        let edge = self.slab_layout().ok_or_else(|| eyre!("the array's chunks cannot be decoded by planes"))?;
+        let plane = edge[1] * edge[2];
+        let channel = edge[0] * plane;
+        let len = planes.len() * plane;
+        ensure!(planes.end <= edge[0] && out.len() == 2 * len, "planes {planes:?} do not fit a {edge:?} chunk");
+        let (v, h) = out.split_at_mut(len);
+        // stored channel order is V, H, or H, V when `reverse`
+        let (first, second) = if self.reverse { (h, v) } else { (v, h) };
+        for (c, part) in [first, second].into_iter().enumerate() {
+            match packed {
+                PackedChunk::Fill(fill) => part.fill(*fill),
+                PackedChunk::Blosc(bytes) => blosc_getitem(bytes, c * channel + planes.start * plane, part)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A chunk of a [`Predictions::slab_layout`] array as stored, for [`Predictions::decode_planes`]
+pub enum PackedChunk<A: Allocator> {
+    /// The chunk's Blosc frame
+    Blosc(Vec<u8, A>),
+    /// A chunk the writer never stored: every voxel holds the fill value
+    Fill(u8),
 }
 
 /// One spatial chunk of predictions read by [`Predictions::read_chunk_in`]: uint8 `(2, dims)` in V, H order, C order
@@ -452,6 +506,27 @@ pub(crate) fn blosc_decompress_in<A: Allocator>(src: &[u8], alloc: A) -> Result<
     // SAFETY: c-blosc reported writing all `nbytes` bytes
     unsafe { out.set_len(nbytes) };
     Ok(out)
+}
+
+/// Decode bytes `start..start + out.len()` of one Blosc 1 frame into `out`, decoding only the blocks they fall in
+fn blosc_getitem(src: &[u8], start: usize, out: &mut [u8]) -> Result<()> {
+    let mut nbytes = 0usize;
+    // SAFETY: c-blosc reads at most `src.len()` bytes of the header to validate it
+    let valid = unsafe { blosc_src::blosc_cbuffer_validate(src.as_ptr().cast(), src.len(), &mut nbytes) };
+    ensure!(valid == 0 && src.len() >= 16, "not a valid Blosc frame");
+    // c-blosc counts `start` and the length in items of the frame's typesize
+    let typesize = src[3] as usize;
+    ensure!(
+        typesize > 0 && start.is_multiple_of(typesize) && out.len().is_multiple_of(typesize),
+        "bytes {start}.. split a Blosc item"
+    );
+    ensure!(start + out.len() <= nbytes && nbytes <= i32::MAX as usize, "bytes {start}.. lie outside the frame");
+    let (first, items) = ((start / typesize) as i32, (out.len() / typesize) as i32);
+    // SAFETY: the frame was validated against `src.len()` and the range lies inside it, so c-blosc writes exactly
+    // `out.len()` bytes; it decodes with a context of its own, so rayon threads may call it at once
+    let n = unsafe { blosc_src::blosc_getitem(src.as_ptr().cast(), first, items, out.as_mut_ptr().cast()) };
+    ensure!(n >= 0 && n as usize == out.len(), "Blosc frame failed to decode bytes {start}.. ({n})");
+    Ok(())
 }
 
 fn open_npy(path: &Path) -> Result<(Store, Vec<usize>, Dtype)> {
@@ -623,5 +698,60 @@ mod tests {
             }
         }
         assert!(checked > 30 && direct > 10, "too few chunks checked: {checked}, {direct} directly");
+    }
+
+    /// Every run of planes of every chunk of every fixture that can be decoded by planes holds, in both channels,
+    /// the same bytes as the reference reader's window over it; the planes past the array's edge are not compared
+    #[test]
+    fn plane_decodes_match_window_reads() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/readers");
+        let manifest: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(root.join("manifest.json")).expect("manifest"))
+                .expect("manifest json");
+        let pool = BufferPool::new(1 << 20);
+        let (mut checked, mut reversed) = (0, 0);
+        for case in manifest.iter().filter(|c| c["error"].is_null()) {
+            let order = case["order"].as_str().unwrap();
+            let p = Predictions::open(&root.join(case["path"].as_str().unwrap()), case["key"].as_str(), order).unwrap();
+            let Some(edge) = p.slab_layout() else { continue };
+            let grid = [0, 1, 2].map(|a| p.shape[a].div_ceil(edge[a]));
+            // runs of one plane and of half a chunk, so runs inside one Blosc block and across blocks both occur
+            for width in [1, edge[0].div_ceil(2)] {
+                for key in
+                    (0..grid[0]).flat_map(|z| (0..grid[1]).flat_map(move |y| (0..grid[2]).map(move |x| [z, y, x])))
+                {
+                    let packed = p.packed_chunk_in(key, &pool).unwrap();
+                    for first in (0..edge[0]).step_by(width) {
+                        let planes = first..(first + width).min(edge[0]);
+                        let lo = [key[0] * edge[0] + first, key[1] * edge[1], key[2] * edge[2]];
+                        if lo[0] >= p.shape[0] {
+                            continue;
+                        }
+                        let len = planes.len() * edge[1] * edge[2];
+                        let mut out = vec![0u8; 2 * len];
+                        p.decode_planes(&packed, planes.clone(), &mut out).unwrap();
+                        let hi = [0, 1, 2].map(|a| (lo[a] + [planes.len(), edge[1], edge[2]][a]).min(p.shape[a]));
+                        let dims = [0, 1, 2].map(|a| hi[a] - lo[a]);
+                        let window = p.read_u8(lo, hi).unwrap();
+                        let half = dims.iter().product::<usize>();
+                        for c in 0..2 {
+                            for z in 0..dims[0] {
+                                for y in 0..dims[1] {
+                                    for x in 0..dims[2] {
+                                        let got = out[c * len + (z * edge[1] + y) * edge[2] + x];
+                                        let want = window[c * half + (z * dims[1] + y) * dims[2] + x];
+                                        assert_eq!(got, want, "{} chunk {key:?} planes {planes:?}", case["name"]);
+                                    }
+                                }
+                            }
+                        }
+                        checked += 1;
+                        reversed += (order == "HV") as usize;
+                    }
+                }
+            }
+        }
+        assert!(checked > 30, "too few plane runs checked: {checked}");
+        println!("{checked} plane runs checked, {reversed} in H, V order");
     }
 }
