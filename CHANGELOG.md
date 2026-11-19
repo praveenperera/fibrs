@@ -33,6 +33,7 @@ over a CT volume on an NVIDIA GPU, natively in the `fibrs` binary, with no PyTor
   - The native predictions are decoded 8 planes at a time instead of a whole chunk at a time.
   - Decoded predictions and the direction field's tile buffers are reused from a pool.
   - Each field's bricks are cut from large mappings it owns.
+  - The direction field's Gaussian filters sum a whole row of voxels at a time, in the same order as before.
 
   Dense bands no longer stall on the kernel's memory-map lock. On a 512 × 2048 × 2048 crop of PHerc0358's densest
   area at `--threads 8`, a run takes 50–52 s with a 2.6 GiB peak, where 0.1.0 took 104 s with a 3.5 GiB peak on
