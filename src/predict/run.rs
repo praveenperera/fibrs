@@ -94,8 +94,9 @@ pub struct Args {
 /// The arguments after the checks argparse makes in the reference
 struct Checked {
     a: Args,
-    /// `--ct` resolved once, as [`resolved`] does; every read of the CT goes through it, so the store the overlap
-    /// check passed is the one read even if a link on the given path changes during the run
+    /// `--ct` canonicalized once; every read of the CT goes through it, so the store the overlap check passed is the
+    /// one read even if a link on the given path changes during the run. The CT must exist by then, or a link made
+    /// later would be read through but recorded unresolved, and a resume would not match it
     ct: PathBuf,
     /// `--out` resolved once; every write goes through it, since the given path may step through the CT on its way
     /// (`<ct>/0.0.0/../../pred.zarr`)
@@ -105,6 +106,9 @@ struct Checked {
     column: usize,
     precision: Precision,
     device: usize,
+    /// When the command started, before the paths were resolved, so `--max-minutes` and `this_run_wall_s` count it
+    t_start: f64,
+    started: Instant,
 }
 
 /// What each summary timing field measures here
@@ -123,6 +127,7 @@ fn usage_error(kind: ErrorKind, msg: impl std::fmt::Display) -> ! {
 }
 
 fn parse(argv: &[OsString]) -> Checked {
+    let (t_start, started) = (now_unix(), Instant::now());
     let a = Args::parse_from(std::iter::once(OsString::from("fibrs predict")).chain(argv.iter().cloned()));
     let batch = match (a.mode, a.batch) {
         (Mode::Band, b) => {
@@ -147,11 +152,9 @@ fn parse(argv: &[OsString]) -> Checked {
     }
     let column = usize::try_from(a.column).unwrap_or(0);
     let readers = a.readers as usize;
-    let (ct, out) = match (resolved(&a.ct), resolved(&a.out)) {
-        (Ok(ct), Ok(out)) => (ct, out),
-        (Err(e), _) | (_, Err(e)) => fail(format!("{e:#}")),
-    };
-    Checked { a, ct, out, batch: batch as usize, readers, column, precision, device }
+    let ct = fs::canonicalize(&a.ct).unwrap_or_else(|e| fail(format!("--ct {}: {e}", a.ct.display())));
+    let out = resolved(&a.out).unwrap_or_else(|e| fail(format!("{e:#}")));
+    Checked { a, ct, out, batch: batch as usize, readers, column, precision, device, t_start, started }
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -405,8 +408,7 @@ fn run(c: Checked) -> Result<()> {
     }
 
     let a = &c.a;
-    let t_start = now_unix();
-    let started = Instant::now();
+    let (t_start, started) = (c.t_start, c.started);
     // nothing is written before the arguments and the model folder are checked: an output in, at or around the CT
     // would write into the input store
     let out = &c.out;
