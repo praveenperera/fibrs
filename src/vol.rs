@@ -224,7 +224,7 @@ impl<T: Voxel> Vol<T> {
                 *slot = None;
                 return;
             }
-            let ptr = store.alloc_in(run);
+            let ptr = run.alloc();
             // SAFETY: the store handed this brick to this writer alone, and it lives as long as the volume
             let b = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), BRICK) };
             for z in 0..dims[0] {

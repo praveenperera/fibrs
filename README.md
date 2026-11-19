@@ -141,14 +141,15 @@ build that decoded whole chunks took 69–72 s, and one that also gave each deco
   (measured while chunks were decoded whole: at a 1 GiB cache the 1024-plane window peaked at 9.8 GiB and
   traced about 19% slower; at 16 MiB tracing took about 60% longer). Memory each stage frees goes back to the
   system before the next stage allocates.
-- A point's value needs 8 voxels of the native predictions, so they are decoded 8 planes at a time (one
-  128 KiB Blosc block of each channel in a prediction zarr) instead of a whole chunk at a time. The cache holds
-  these slabs, with the chunks' compressed bytes in a quarter of its budget. Decoded slabs, compressed chunks
-  and the direction field's tile buffers come from a pool that keeps a bounded amount of freed buffers for
-  reuse, and each field's bricks are cut from 64 MiB mappings the field owns. Dense bands evict and decode
+- A point's value needs 8 voxels of the native predictions, so they are decoded 8 planes at a time (one 128 KiB
+  Blosc block of each channel in a prediction zarr) instead of a whole chunk at a time. The cache holds these
+  slabs, with the chunks' compressed bytes in a quarter of its budget. Decoded slabs, compressed chunks and the
+  direction field's tile buffers come from a pool that keeps up to 128 MiB of freed buffers for reuse beside
+  the cache, and each field's bricks are cut from 64 MiB mappings the field owns. Dense bands evict and decode
   hundreds of times a second, and on Linux mapping and unmapping memory takes a lock that every page fault in
-  the process waits for, so a mapping per decode and per brick stalled the tracing threads. Other allocations of 1 MiB or more have their own mapping on Linux, so
-  freed memory does not stay resident. `FIBRS_DEBUG_MEM=1` logs each stage's field sizes and resident memory.
+  the process waits for, so a mapping per decode and per brick stalled the tracing threads. Other allocations
+  of 1 MiB or more have their own mapping on Linux, so freed memory does not stay resident. `FIBRS_DEBUG_MEM=1`
+  logs each stage's field sizes and resident memory.
 - The work directory holds `run.json` (with a `native` key, so neither tool resumes the other's
   directory, and only the fibrs version that started it resumes it) and one finished curve file per
   family. An interrupted family is traced again from its first

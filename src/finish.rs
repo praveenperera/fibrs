@@ -117,7 +117,8 @@ struct Counts {
 }
 
 impl<'a, 'p> NativeCache<'a, 'p> {
-    /// `budget_bytes` bounds the decoded slabs and compressed chunks held at once; one of each is always kept
+    /// `budget_bytes` bounds the decoded slabs and compressed chunks held at once, counted as the pool buffers they
+    /// occupy; one of each is always kept. Freed buffers the pool keeps for reuse are outside the budget
     pub fn new(pred: &'a Predictions, budget_bytes: usize, pool: &'p BufferPool) -> Self {
         // whole Zarr chunks are the unit of reading; NPY input uses the reference's 64³ blocks
         let edge = pred.chunk_shape().unwrap_or([64, 64, 64]);
@@ -147,7 +148,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         [cz, cy, cx, (z % self.edge[0]) / self.planes]
     }
 
-    /// Bytes of decoded slabs and compressed chunks held now
+    /// Bytes of the pool buffers held by decoded slabs and compressed chunks now
     pub fn bytes(&self) -> usize {
         self.slabs.lock().expect("cache lock").bytes + self.packed.lock().expect("cache lock").bytes
     }
@@ -169,7 +170,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         // decode outside the lock; two threads may decode the same slab once each, which only costs time
         let slab = Arc::new(self.decode(key)?);
         self.counts.lock().expect("cache lock").decoded += 1;
-        self.slabs.lock().expect("cache lock").insert(key, slab.clone(), slab.data.len());
+        self.slabs.lock().expect("cache lock").insert(key, slab.clone(), BufferPool::footprint(slab.data.capacity()));
         Ok(slab)
     }
 
@@ -195,7 +196,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         }
         let packed = Arc::new(self.pred.packed_chunk_in(key, self.pool)?);
         let bytes = match &*packed {
-            PackedChunk::Blosc(b) => b.len(),
+            PackedChunk::Blosc(b) => BufferPool::footprint(b.capacity()),
             PackedChunk::Fill(_) => 0,
         };
         self.counts.lock().expect("cache lock").read += 1;
