@@ -2,6 +2,7 @@
 //! (Qualzz/AVF_SPLINE_GENERATOR @ bee798f7, Apache-2.0) that writes the same `.afv`
 
 mod afv;
+mod arena;
 mod axes;
 mod fields;
 mod finish;

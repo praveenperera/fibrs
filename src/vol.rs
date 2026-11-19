@@ -2,11 +2,15 @@
 //!
 //! The band's fields are mostly air: a brick is allocated only once a value other than the volume's
 //! default is written to it, and reads from an unallocated brick return the default. This replaces the
-//! reference's compressed Zarr work store and its paged tile cache with plain memory
+//! reference's compressed Zarr work store and its paged tile cache with plain memory. Bricks live in a
+//! [`BrickStore`] owned by the volume, not one heap allocation each
 
 use std::ops::Range;
+use std::ptr::NonNull;
 
 use rayon::prelude::*;
+
+use crate::arena::{BrickStore, Voxel};
 
 /// Brick edge, as a shift
 ///
@@ -24,19 +28,38 @@ pub const BRICK: usize = EDGE * EDGE * EDGE;
 pub type Shape = [usize; 3];
 
 /// A sparse 3D volume of `T` in z, y, x order
-pub struct Vol<T> {
+pub struct Vol<T: Voxel> {
     shape: Shape,
     grid: Shape,
     default: T,
-    bricks: Vec<Option<Box<[T; BRICK]>>>,
+    /// Each brick slot's storage in `store`, or `None` while every voxel of the brick reads as the default; a
+    /// slot is one pointer wide, as a boxed brick was
+    bricks: Vec<Option<Brick<T>>>,
+    store: BrickStore<T>,
 }
 
-impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
+/// An allocated brick's first voxel in the volume's store
+#[derive(Clone, Copy)]
+struct Brick<T>(NonNull<T>);
+
+// SAFETY: a brick pointer is only dereferenced through the volume that owns its store, under the volume's own
+// sharing rules below
+unsafe impl<T: Send> Send for Brick<T> {}
+unsafe impl<T: Sync> Sync for Brick<T> {}
+
+// SAFETY: the brick pointers address `store`, which the volume owns and frees only when it is dropped. Bricks are
+// written only through `&mut self` (each slot by one writer in `fill_brick_rows`) and read through `&self`, so
+// the volume follows the same sharing rules as the `Box`ed bricks it replaced
+unsafe impl<T: Voxel> Send for Vol<T> {}
+unsafe impl<T: Voxel> Sync for Vol<T> {}
+
+impl<T: Voxel> Vol<T> {
     /// An empty volume where every voxel reads as `default`
     pub fn new(shape: Shape, default: T) -> Self {
         let grid = shape.map(|n| n.div_ceil(EDGE));
-        let bricks = (0..grid.iter().product()).map(|_| None).collect();
-        Self { shape, grid, default, bricks }
+        let slots = grid.iter().product();
+        let bricks = vec![None; slots];
+        Self { shape, grid, default, bricks, store: BrickStore::new(BRICK, default, slots) }
     }
 
     pub fn shape(&self) -> Shape {
@@ -48,14 +71,18 @@ impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
         self.grid
     }
 
-    /// A brick with every voxel set to `default`; a fixed-size box is one pointer wide, so each slot of the
-    /// table is 8 bytes instead of 16
-    fn new_brick(default: T) -> Box<[T; BRICK]> {
-        // through a Vec, which allocates zeroed bricks with calloc so untouched pages are never resident
-        let Ok(b) = vec![default; BRICK].into_boxed_slice().try_into() else {
-            unreachable!("the Vec has BRICK voxels")
-        };
-        b
+    /// The voxels of an allocated brick
+    #[inline(always)]
+    fn brick(&self, b: Brick<T>) -> &[T] {
+        // SAFETY: an allocated slot points at BRICK voxels of `store`, which lives as long as `self`
+        unsafe { std::slice::from_raw_parts(b.0.as_ptr(), BRICK) }
+    }
+
+    /// The voxels of an allocated brick, for writing
+    #[inline(always)]
+    fn brick_mut(&mut self, b: Brick<T>) -> &mut [T] {
+        // SAFETY: as in `brick`, and `&mut self` makes this the only access to the brick
+        unsafe { std::slice::from_raw_parts_mut(b.0.as_ptr(), BRICK) }
     }
 
     #[inline(always)]
@@ -72,8 +99,8 @@ impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
     #[inline(always)]
     pub fn get(&self, z: usize, y: usize, x: usize) -> T {
         debug_assert!(z < self.shape[0] && y < self.shape[1] && x < self.shape[2]);
-        match &self.bricks[self.brick_index(z, y, x)] {
-            Some(b) => b[Self::offset(z, y, x)],
+        match self.bricks[self.brick_index(z, y, x)] {
+            Some(b) => self.brick(b)[Self::offset(z, y, x)],
             None => self.default,
         }
     }
@@ -83,7 +110,7 @@ impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
     #[inline(always)]
     pub fn locate(&self, z: usize, y: usize, x: usize) -> (Option<&[T]>, usize) {
         debug_assert!(z < self.shape[0] && y < self.shape[1] && x < self.shape[2]);
-        (self.bricks[self.brick_index(z, y, x)].as_deref().map(|b| b.as_slice()), Self::offset(z, y, x))
+        (self.bricks[self.brick_index(z, y, x)].map(|b| self.brick(b)), Self::offset(z, y, x))
     }
 
     /// The value at a voxel given as signed coordinates, which must be in bounds
@@ -96,17 +123,16 @@ impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
     #[inline]
     pub fn set(&mut self, z: usize, y: usize, x: usize, value: T) {
         let bi = self.brick_index(z, y, x);
-        let default = self.default;
-        match &mut self.bricks[bi] {
-            Some(b) => b[Self::offset(z, y, x)] = value,
-            slot @ None => {
-                if value != default {
-                    let mut b = Self::new_brick(default);
-                    b[Self::offset(z, y, x)] = value;
-                    *slot = Some(b);
-                }
+        let b = match self.bricks[bi] {
+            Some(b) => b,
+            None if value == self.default => return,
+            None => {
+                let b = Brick(self.store.alloc());
+                self.bricks[bi] = Some(b);
+                b
             }
-        }
+        };
+        self.brick_mut(b)[Self::offset(z, y, x)] = value;
     }
 
     /// Bytes held by allocated bricks
@@ -173,6 +199,9 @@ impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
     /// Fill the bricks whose z index lies in `rows` in parallel, leaving the others as they are:
     /// `f(brick_lo, brick_dims, out)` writes one brick's voxels in C order (dims clipped at the volume edge) and
     /// returns whether any differs from the default
+    ///
+    /// Each row of bricks may be filled once: the store does not take bricks back, so a brick replaced by a second
+    /// fill would stay allocated, uncounted by [`Vol::resident_bytes`], until the volume is dropped
     pub fn fill_brick_rows<F>(&mut self, rows: Range<usize>, f: F)
     where
         F: Fn(Shape, Shape, &mut [T]) -> bool + Sync,
@@ -181,20 +210,27 @@ impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
         let shape = self.shape;
         let default = self.default;
         let plane = grid[1] * grid[2];
+        let store = &self.store;
         let slab = &mut self.bricks[rows.start * plane..rows.end * plane];
-        slab.par_iter_mut().enumerate().for_each(|(i, slot)| {
+        debug_assert!(slab.iter().all(Option::is_none), "brick rows {rows:?} are filled a second time");
+        // each writer takes bricks from its own run of the store and reuses one dense buffer
+        let init = || (store.run(), Vec::with_capacity(BRICK));
+        slab.par_iter_mut().enumerate().for_each_init(init, |(run, dense), (i, slot)| {
             let bi = rows.start * plane + i;
             let bz = bi / plane;
             let by = (bi / grid[2]) % grid[1];
             let bx = bi % grid[2];
             let lo = [bz * EDGE, by * EDGE, bx * EDGE];
             let dims = [0, 1, 2].map(|a| EDGE.min(shape[a] - lo[a]));
-            let mut dense = vec![default; dims.iter().product()];
-            if !f(lo, dims, &mut dense) {
+            dense.clear();
+            dense.resize(dims.iter().product(), default);
+            if !f(lo, dims, dense) {
                 *slot = None;
                 return;
             }
-            let mut b = Self::new_brick(default);
+            let ptr = run.alloc();
+            // SAFETY: the store handed this brick to this writer alone, and it lives as long as the volume
+            let b = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), BRICK) };
             for z in 0..dims[0] {
                 for y in 0..dims[1] {
                     let src = &dense[(z * dims[1] + y) * dims[2]..][..dims[2]];
@@ -202,7 +238,7 @@ impl<T: Copy + PartialEq + Send + Sync> Vol<T> {
                     b[at..at + dims[2]].copy_from_slice(src);
                 }
             }
-            *slot = Some(b);
+            *slot = Some(Brick(ptr));
         });
     }
 }

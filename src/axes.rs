@@ -8,6 +8,7 @@
 //! eigenvectors come from the `dsyevd` of numpy's own OpenBLAS on a float64 copy, cast back to float32, which
 //! is what `np.linalg.eigh` does with float32 input (`_commonType` always computes in double)
 
+use std::alloc::{Allocator, Global};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -15,6 +16,7 @@ use color_eyre::eyre::{Result, bail, eyre};
 use libloading::Library;
 use rayon::prelude::*;
 
+use crate::arena::BufferPool;
 use crate::vol::{Shape, Vol};
 
 /// Halo the tensor needs: 4 + 1 + 6
@@ -191,12 +193,12 @@ fn weights<const N: usize>(bits: [u64; N]) -> [f64; N] {
 }
 
 /// A dense f32 block
-struct Block {
+struct Block<A: Allocator = Global> {
     dims: Shape,
-    data: Vec<f32>,
+    data: Vec<f32, A>,
 }
 
-impl Block {
+impl<A: Allocator> Block<A> {
     fn stride(&self, axis: usize) -> usize {
         match axis {
             0 => self.dims[1] * self.dims[2],
@@ -208,7 +210,7 @@ impl Block {
 
 /// One axis of `scipy.ndimage.correlate1d` with a symmetric kernel `w` (outermost first, centre last)
 /// and mode "reflect", in place
-fn correlate_axis(b: &mut Block, axis: usize, w: &[f64], line: &mut Vec<f64>) {
+fn correlate_axis<A: Allocator>(b: &mut Block<A>, axis: usize, w: &[f64], line: &mut Vec<f64>) {
     let r = w.len() - 1;
     let n = b.dims[axis];
     let stride = b.stride(axis);
@@ -249,17 +251,19 @@ fn reflect(i: isize, n: usize) -> usize {
 }
 
 /// `gaussian_filter(block, sigma)` on float32: axes 0, 1, 2, each rounded to float32
-fn gaussian(b: &mut Block, w: &[f64], line: &mut Vec<f64>) {
+fn gaussian<A: Allocator>(b: &mut Block<A>, w: &[f64], line: &mut Vec<f64>) {
     for axis in 0..3 {
         correlate_axis(b, axis, w, line);
     }
 }
 
-/// `np.gradient` of a float32 block along one axis (unit spacing, first-order edges)
-fn gradient(b: &Block, axis: usize) -> Block {
+/// `np.gradient` of a float32 block along one axis (unit spacing, first-order edges), in a buffer from the
+/// block's own allocator
+fn gradient<A: Allocator + Copy>(b: &Block<A>, axis: usize) -> Block<A> {
     let n = b.dims[axis];
     let s = b.stride(axis);
-    let mut out = vec![0.0f32; b.data.len()];
+    let mut out = Vec::with_capacity_in(b.data.len(), *b.data.allocator());
+    out.resize(b.data.len(), 0.0f32);
     for (i, o) in out.iter_mut().enumerate() {
         let k = (i / s) % n;
         let f = &b.data;
@@ -285,10 +289,18 @@ pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<(Vol<u
         (0..grid[0]).flat_map(|z| (0..grid[1]).flat_map(move |y| (0..grid[2]).map(move |x| [z, y, x]))).collect();
     let mut nx = Vol::new(shape, 128u8);
     let mut ny = Vol::new(shape, 128u8);
+    // every tile's smoothed block, gradients and products are a few MiB each and mostly of one size, so they come
+    // from a pool instead of a fresh mapping each; a thread's next tile takes the buffers its last one freed, so
+    // the pool keeps one tile's buffers per thread, up to TILE_POOL_RETAIN
+    let threads = rayon::current_num_threads();
+    let in_flight = 4 * threads;
+    let per_tile = TILE_BUFFERS * BufferPool::footprint(tile_bytes(shape));
+    let pool = BufferPool::new((threads * per_tile).min(TILE_POOL_RETAIN));
     // tiles run a few per thread at a time and are written before the next run, so the dense tile results held
     // at once stay small; tile cores are disjoint, so the order they are written in does not matter
-    for part in tiles.chunks(4 * rayon::current_num_threads()) {
-        let results: Vec<Result<Option<TileAxes>>> = part.par_iter().map(|&t| tile_axes(tracing, t, lapack)).collect();
+    for part in tiles.chunks(in_flight) {
+        let results: Vec<Result<Option<TileAxes>>> =
+            part.par_iter().map(|&t| tile_axes(tracing, t, lapack, &pool)).collect();
         for r in results {
             let Some((lo, dims, xx, yy)) = r? else { continue };
             nx.write_block(lo, dims, &xx);
@@ -298,7 +310,19 @@ pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<(Vol<u
     Ok((nx, ny))
 }
 
-fn tile_axes(tracing: &[Vol<u8>; 2], t: Shape, lapack: &Lapack) -> Result<Option<TileAxes>> {
+/// Most freed tile buffers the direction field keeps for reuse, the bound the README states: one tile's buffers
+/// per thread up to 12 threads
+const TILE_POOL_RETAIN: usize = 128 << 20;
+
+/// Pooled f32 buffers a tile holds at once: the smoothed block or a product, and three gradients
+const TILE_BUFFERS: usize = 4;
+
+/// Bytes of one f32 buffer of an interior tile: the core and its halo on each side, clipped to the volume
+fn tile_bytes(shape: Shape) -> usize {
+    shape.iter().map(|&n| n.min(CORE + 2 * HALO)).product::<usize>() * size_of::<f32>()
+}
+
+fn tile_axes(tracing: &[Vol<u8>; 2], t: Shape, lapack: &Lapack, pool: &BufferPool) -> Result<Option<TileAxes>> {
     let shape = tracing[0].shape();
     let start = t.map(|i| i * CORE);
     let end = [0, 1, 2].map(|a| (start[a] + CORE).min(shape[a]));
@@ -338,14 +362,17 @@ fn tile_axes(tracing: &[Vol<u8>; 2], t: Shape, lapack: &Lapack) -> Result<Option
             continue;
         }
         let raw = tracing[family].read_block(lo, dims);
-        let mut smooth = Block { dims, data: raw.iter().map(|&v| v as f32 / 255.0f32).collect() };
+        let mut data = Vec::with_capacity_in(raw.len(), pool);
+        data.extend(raw.iter().map(|&v| v as f32 / 255.0f32));
+        let mut smooth = Block { dims, data };
         gaussian(&mut smooth, &w09, &mut line);
         let grad = [0, 1, 2].map(|a| gradient(&smooth, a));
         drop(smooth);
         let mut tensor = vec![[0.0f32; 9]; ids.len()];
         for u in 0..3 {
             for v in u..3 {
-                let data = grad[u].data.iter().zip(&grad[v].data).map(|(a, b)| a * b).collect();
+                let mut data = Vec::with_capacity_in(grad[u].data.len(), pool);
+                data.extend(grad[u].data.iter().zip(&grad[v].data).map(|(a, b)| a * b));
                 let mut prod = Block { dims, data };
                 gaussian(&mut prod, &w15, &mut line);
                 for (m, &(_, at)) in tensor.iter_mut().zip(ids) {

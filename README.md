@@ -56,7 +56,8 @@ cargo build --release
 cargo test --release
 ```
 
-It builds on Linux and macOS. The wheel is built with maturin from
+It builds on Linux and macOS with Rust 1.100 or later, the first stable release with the allocator API it uses.
+The wheel is built with maturin from
 `pyproject.toml` (`maturin build --release`; the published Linux wheel uses `--zig --compatibility
 manylinux_2_28`, and the macOS wheel `MACOSX_DEPLOYMENT_TARGET=11.0`).
 
@@ -125,16 +126,26 @@ The ratio varies with the run and with the machine's load: the range is the lowe
 runs. The gap is largest on dense bands, where the original tracer uses about one core whatever `--threads`
 says; on run 1's band the port kept about 2.7 busy.
 
+On dense bands, fibrs's speed also depends on how it allocates memory. Take a 512 × 2048 × 2048 crop of
+PHerc0358's densest area (z 1792–2304, y 2176–4224, x 2944–4992) with `--threads 8` and `--field-cache-mib 224`.
+fibrs 0.1.0 took 82 s with a 3.4 GiB peak. fibrs 0.2.0 takes 62–65 s with a 2.5 GiB peak and writes the same
+`.afv`. A 0.2.0 build that gave each decoded chunk its own mapping took 122 s and spent 40% of its CPU time in
+the kernel.
+
 ## Differences from the original
 
 - Fields live in memory as sparse 16³ bricks instead of a Zarr work store, so peak memory is higher and grows
-  with how much of the band holds fibres: 8.8 GiB against the original's 4.6 GiB on a 512 × 8169 × 8169 band
-  of PHerc0826, and 13.3 GiB on 1024 × 8169 × 8169 of the same scroll. With `--field-cache-mib 4096`, 4.1 GiB
-  of that is the chunk cache; a smaller cache lowers the peak by the difference but decodes chunks again (at a
-  1 GiB cache the 1024-plane window peaked at 9.8 GiB and traced about 19% slower; at 16 MiB tracing took
-  about 60% longer). Memory each stage frees goes back to the system before the next stage allocates, and on
-  Linux each allocation of 1 MiB or more (a decoded chunk, a tile's results) has its own mapping, so evicted
-  chunks do not stay resident. `FIBRS_DEBUG_MEM=1` logs each stage's field sizes and resident memory.
+  with how much of the band holds fibres: 8.8 GiB against the original's 4.6 GiB on a 512 × 8169 × 8169 band of
+  PHerc0826, and 13.3 GiB on 1024 × 8169 × 8169 of the same scroll. With `--field-cache-mib 4096`, 4.1 GiB of
+  that is the chunk cache; a smaller cache lowers the peak by the difference but decodes chunks again (at a
+  1 GiB cache the 1024-plane window peaked at 9.8 GiB and traced about 19% slower; at 16 MiB tracing took about
+  60% longer). Memory each stage frees goes back to the system before the next stage allocates. Decoded chunks,
+  the compressed bytes they are read from and the direction field's tile buffers come from pools that each keep
+  at most 128 MiB of freed buffers for reuse, beside the cache, and each field's bricks are cut from 64 MiB mappings
+  the field owns. Dense bands evict and decode chunks hundreds of times a second, and on Linux mapping and
+  unmapping memory takes a lock that every page fault in the process waits for, so a mapping per chunk and per
+  brick stalled the tracing threads. Other allocations of 1 MiB or more have their own mapping on Linux, so
+  freed memory does not stay resident. `FIBRS_DEBUG_MEM=1` logs each stage's field sizes and resident memory.
 - The work directory holds `run.json` (with a `native` key, so neither tool resumes the other's
   directory, and only the fibrs version that started it resumes it) and one finished curve file per
   family. An interrupted family is traced again from its first

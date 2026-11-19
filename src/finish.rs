@@ -10,41 +10,44 @@ use std::sync::{Arc, Mutex};
 
 use color_eyre::eyre::Result;
 
+use crate::arena::BufferPool;
 use crate::fields::Presence;
-use crate::input::Predictions;
+use crate::input::{NativeChunk, Predictions};
 use crate::kernels::{evaluate_curve, fit_curve};
 use crate::vol::{Shape, Vol};
 
-/// One decoded native chunk, `(2, dims)` uint8 in V, H order
-struct Chunk {
-    lo: Shape,
-    dims: Shape,
-    data: Vec<u8>,
-}
+/// One decoded native chunk, in a buffer of the cache's pool
+type Chunk<'p> = NativeChunk<&'p BufferPool>;
 
 /// A bounded cache of decoded native chunks shared by the finishing threads, least recently used
 /// first out
-pub struct NativeCache<'a> {
+///
+/// Dense windows evict and decode chunks hundreds of times a second, so every chunk buffer, and the compressed
+/// bytes it is decoded from, comes from `pool`: an evicted chunk's buffer goes back to it once the last
+/// finishing thread lets go of the chunk, and the next decode takes it
+pub struct NativeCache<'a, 'p> {
     pred: &'a Predictions,
     edge: Shape,
     budget: usize,
-    lru: Mutex<Lru>,
+    pool: &'p BufferPool,
+    lru: Mutex<Lru<'p>>,
 }
 
 #[derive(Default)]
-struct Lru {
-    map: HashMap<Shape, (Arc<Chunk>, u64)>,
+struct Lru<'p> {
+    map: HashMap<Shape, (Arc<Chunk<'p>>, u64)>,
     bytes: usize,
     clock: u64,
     decoded: u64,
 }
 
-impl<'a> NativeCache<'a> {
-    /// `budget_bytes` bounds the decoded chunks held at once; one chunk is always kept
-    pub fn new(pred: &'a Predictions, budget_bytes: usize) -> Self {
+impl<'a, 'p> NativeCache<'a, 'p> {
+    /// `budget_bytes` bounds the decoded chunks held at once, counted as the pool buffers they occupy; one chunk is
+    /// always kept. Freed buffers the pool keeps for reuse are outside the budget
+    pub fn new(pred: &'a Predictions, budget_bytes: usize, pool: &'p BufferPool) -> Self {
         // whole Zarr chunks are the unit of decoding; NPY input uses the reference's 64³ blocks
         let edge = pred.chunk_shape().unwrap_or([64, 64, 64]);
-        Self { pred, edge, budget: budget_bytes, lru: Mutex::default() }
+        Self { pred, edge, budget: budget_bytes, pool, lru: Mutex::default() }
     }
 
     /// The chunk grid key of a native voxel
@@ -52,7 +55,7 @@ impl<'a> NativeCache<'a> {
         [z / self.edge[0], y / self.edge[1], x / self.edge[2]]
     }
 
-    /// Bytes of decoded chunks held now
+    /// Bytes of the pool buffers held by decoded chunks now
     pub fn bytes(&self) -> usize {
         self.lru.lock().expect("cache lock").bytes
     }
@@ -62,7 +65,7 @@ impl<'a> NativeCache<'a> {
         self.lru.lock().expect("cache lock").decoded
     }
 
-    fn chunk(&self, key: Shape) -> Result<Arc<Chunk>> {
+    fn chunk(&self, key: Shape) -> Result<Arc<Chunk<'p>>> {
         {
             let mut s = self.lru.lock().expect("cache lock");
             s.clock += 1;
@@ -73,20 +76,19 @@ impl<'a> NativeCache<'a> {
             }
         }
         // decode outside the lock; two threads may decode the same chunk once each, which only costs time
-        let (lo, dims, data) = self.pred.read_chunk_u8(key, self.edge)?;
-        let chunk = Arc::new(Chunk { lo, dims, data });
+        let chunk = Arc::new(self.pred.read_chunk_in(key, self.edge, self.pool)?);
         let mut s = self.lru.lock().expect("cache lock");
         s.clock += 1;
         s.decoded += 1;
         let now = s.clock;
         if let Some((old, _)) = s.map.insert(key, (chunk.clone(), now)) {
-            s.bytes -= old.data.len();
+            s.bytes -= BufferPool::footprint(old.data.len());
         }
-        s.bytes += chunk.data.len();
+        s.bytes += BufferPool::footprint(chunk.data.len());
         while s.bytes > self.budget && s.map.len() > 1 {
             let oldest = s.map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| *k).expect("nonempty");
             let (gone, _) = s.map.remove(&oldest).expect("present");
-            s.bytes -= gone.data.len();
+            s.bytes -= BufferPool::footprint(gone.data.len());
         }
         Ok(chunk)
     }
@@ -97,13 +99,13 @@ impl<'a> NativeCache<'a> {
 const RECENT: usize = 8;
 
 /// Per-thread view of the native cache
-pub struct NativeSampler<'c, 'a> {
-    cache: &'c NativeCache<'a>,
-    recent: Vec<(Shape, Arc<Chunk>)>,
+pub struct NativeSampler<'c, 'a, 'p> {
+    cache: &'c NativeCache<'a, 'p>,
+    recent: Vec<(Shape, Arc<Chunk<'p>>)>,
 }
 
-impl<'c, 'a> NativeSampler<'c, 'a> {
-    pub fn new(cache: &'c NativeCache<'a>) -> Self {
+impl<'c, 'a, 'p> NativeSampler<'c, 'a, 'p> {
+    pub fn new(cache: &'c NativeCache<'a, 'p>) -> Self {
         Self { cache, recent: Vec::with_capacity(RECENT) }
     }
 
