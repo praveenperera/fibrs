@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+- `fibrs predict` reads the CT through the path its overlap check resolved. It used to open the CT again by the path
+  as given, so a link on that path changed during a run could make it read a different store from the one checked.
+
 ## [0.2.0] - 2026-11-19
 
 fibrs 0.2.0 adds `fibrs predict`. It runs Qual's [AFV fibre model V2](https://huggingface.co/Qualzz20/afv_fiber_9um_v2)
