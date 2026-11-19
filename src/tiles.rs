@@ -87,8 +87,9 @@ impl Tiling {
         let mut edges = [Vec::new(), Vec::new()];
         for (a, axis) in ["Y", "X"].into_iter().enumerate() {
             let n = grid[a];
-            edges[a] = (0..n).map(|k| k * extent[a] / (n * align) * align).chain([extent[a]]).collect();
-            if edges[a].windows(2).any(|w| w[0] >= w[1]) {
+            // one tile is the whole extent; more need n whole units, and then consecutive edges differ by at least
+            // one unit. Checked before the edges are built, so an absurd grid is refused rather than allocated
+            if n > 1 && n > extent[a] / align {
                 bail!(
                     "--tiles-yx {} {}: the {axis} extent of {} voxels does not split into {n} tiles of whole \
                      {align}-voxel units",
@@ -97,6 +98,8 @@ impl Tiling {
                     extent[a]
                 );
             }
+
+            edges[a] = (0..n).map(|k| k * extent[a] / (n * align) * align).chain([extent[a]]).collect();
         }
 
         Ok(Self { grid, halo: halo.div_ceil(align) * align, align, extent, edges })
@@ -326,6 +329,7 @@ mod tests {
         // a 511-voxel extent holds one whole 256-voxel unit, too few for two cores
         assert!(Tiling::new([2, 1], 256, 256, [511, 600]).is_err());
         assert!(Tiling::new([0, 1], 256, 256, [600, 600]).is_err());
+        assert!(Tiling::new([1_000_000_000, 1], 256, 256, [640, 640]).is_err());
     }
 
     /// The core box is open where the core meets the window's edge, and the interior faces are the core edges
