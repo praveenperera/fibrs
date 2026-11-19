@@ -509,9 +509,9 @@ pub fn run(args: Args) -> Result<Summary> {
     };
     fs::create_dir_all(&work)?;
     let _lock = WorkLock::acquire(&work.join(".lock"))?;
-    // the work directory is checked under the lock, so the saved rounding and the finished families are the ones
-    // this run resumes, and before the GPU opens, so a run that cannot start says why rather than why the GPU is
-    // missing
+    // the work directory and a resumed run's settings are checked under the lock, so the saved rounding and the
+    // finished families are the ones this run resumes, and before the GPU opens, so a run that cannot start says
+    // why rather than why the GPU is missing
     let manifest = work.join("run.json");
     let saved = match (manifest.exists(), args.resume) {
         (true, false) => bail!("Work directory already contains a run; use --resume"),
@@ -526,16 +526,13 @@ pub fn run(args: Args) -> Result<Summary> {
             None
         }
     };
-    let started_on = saved.as_ref().and_then(|s| s["device"].as_str());
-    let tracing_needed = families.iter().any(|&f| !family_complete(&work, f));
-    let cent = CentralityDevice::choose(args.device, args.cuda_device.map(|d| d as usize), started_on, tracing_needed)?;
     let family_name = match args.family {
         Family::Both => "both",
         Family::V => "V",
         Family::H => "H",
     };
     let signatures = paths.iter().map(|p| file_signature(p)).collect::<Result<Vec<_>>>()?;
-    let config = json!({
+    let mut config = json!({
         "version": REFERENCE_VERSION,
         "predictions": native.path.to_string_lossy(),
         "array": args.array,
@@ -543,7 +540,8 @@ pub fn run(args: Args) -> Result<Summary> {
         "tracing_array": args.tracing_array,
         "channel_order": order,
         "shape": native.shape,
-        "device": cent.rounding.name(),
+        // filled in below: a resumed run's saved rounding, or the rounding a new run's device gives
+        "device": null,
         "storage": match args.storage { Storage::Dense => "dense", Storage::Compressed => "compressed" },
         "family": family_name,
         "voxel_size_um": args.voxel_size_um,
@@ -553,10 +551,28 @@ pub fn run(args: Args) -> Result<Summary> {
         "input_signatures": signatures,
         "native": {"tool": "fibrs", "version": env!("CARGO_PKG_VERSION"), "checkpoint": 1},
     });
-    match saved {
-        Some(saved) if saved != config => bail!("Inputs or tracing settings changed; use a new work directory"),
-        Some(_) => {}
-        None => save_json(&manifest, &config)?,
+    let changed = || eyre!("Inputs or tracing settings changed; use a new work directory");
+    let started_on = match &saved {
+        Some(saved) => {
+            let rounding = match saved["device"].as_str() {
+                Some("cpu") => Rounding::Cpu,
+                Some("cuda") => Rounding::Cuda,
+                _ => return Err(changed()),
+            };
+            config["device"] = json!(rounding.name());
+            if *saved != config {
+                return Err(changed());
+            }
+            Some(rounding)
+        }
+        None => None,
+    };
+
+    let tracing_needed = families.iter().any(|&f| !family_complete(&work, f));
+    let cent = CentralityDevice::choose(args.device, args.cuda_device.map(|d| d as usize), started_on, tracing_needed)?;
+    if saved.is_none() {
+        config["device"] = json!(cent.rounding.name());
+        save_json(&manifest, &config)?;
     }
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads as usize).build()?;
     let pending: Vec<usize> = families.iter().copied().filter(|&f| !family_complete(&work, f)).collect();
@@ -922,7 +938,12 @@ impl CentralityDevice {
     ///
     /// `auto` takes the GPU when one opens, and otherwise the CPU, saying why. A run started on the CPU keeps
     /// centrality there, but its direction field, the same bytes on either device, still takes the GPU
-    fn choose(device: Device, index: Option<usize>, started_on: Option<&str>, tracing_needed: bool) -> Result<Self> {
+    fn choose(
+        device: Device,
+        index: Option<usize>,
+        started_on: Option<Rounding>,
+        tracing_needed: bool,
+    ) -> Result<Self> {
         let strict = device == Device::Cuda;
         let cpu = |rounding| Self { rounding, gpu: None, strict };
         let on_gpu = |gpu: Gpu| {
@@ -931,10 +952,10 @@ impl CentralityDevice {
         };
         let open = || Gpu::open(index, Stages::DirectionFieldAndCentrality);
         let chosen = match (started_on, device) {
-            (Some("cpu"), Device::Cuda) => {
+            (Some(Rounding::Cpu), Device::Cuda) => {
                 bail!("This run started with centrality on the CPU and resumes only there; use --device cpu or auto")
             }
-            (Some("cpu"), Device::Auto) if tracing_needed => match Gpu::open(index, Stages::DirectionField) {
+            (Some(Rounding::Cpu), Device::Auto) if tracing_needed => match Gpu::open(index, Stages::DirectionField) {
                 Ok(gpu) => {
                     log!(
                         "Direction field on {}, centrality on the CPU this run started on (--device cpu to use the CPU)",
@@ -947,14 +968,14 @@ impl CentralityDevice {
                     cpu(Rounding::Cpu)
                 }
             },
-            (Some("cpu"), _) | (None, Device::Cpu) => cpu(Rounding::Cpu),
-            (Some(_), _) if !tracing_needed => cpu(Rounding::Cuda),
-            (Some(_), Device::Cpu) => {
+            (Some(Rounding::Cpu), _) | (None, Device::Cpu) => cpu(Rounding::Cpu),
+            (Some(Rounding::Cuda), _) if !tracing_needed => cpu(Rounding::Cuda),
+            (Some(Rounding::Cuda), Device::Cpu) => {
                 log!("Direction field and centrality on the CPU, centrality rounded as on the GPU this run started on");
                 cpu(Rounding::Cuda)
             }
             (_, Device::Cuda) => on_gpu(open().map_err(|e| eyre!("--device cuda needs a usable NVIDIA GPU: {e:#}"))?),
-            (Some(_), Device::Auto) => match open() {
+            (Some(Rounding::Cuda), Device::Auto) => match open() {
                 Ok(gpu) => on_gpu(gpu),
                 Err(e) => {
                     log!(
