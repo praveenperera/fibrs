@@ -6,7 +6,6 @@
 //! [`BrickStore`] owned by the volume, not one heap allocation each
 
 use std::ops::Range;
-use std::ptr::NonNull;
 
 use rayon::prelude::*;
 
@@ -44,27 +43,17 @@ pub struct Vol<T: Voxel> {
     shape: Shape,
     grid: Shape,
     default: T,
-    /// Each brick's table of sub-brick ids, or `None` while every voxel of the brick reads as the default; a
-    /// slot is one pointer wide
-    bricks: Vec<Option<Table>>,
-    /// The tables, [`SUBS`] ids each; id 0 is the table of an unallocated brick, all zeros
-    tables: BrickStore<u32>,
+    /// Each brick's table of sub-brick ids in `tables`; 0, the table of all zeros, while every voxel of the brick
+    /// reads as the default
+    bricks: Vec<u32>,
+    /// The tables, [`SUBS`] sub-brick ids each, 0 for an unallocated sub-brick; id 0 is the table of every
+    /// unallocated brick
+    tables: BrickStore<u32, SUBS>,
     /// The sub-bricks; id 0 holds the default and stands for every unallocated sub-brick
-    store: BrickStore<T>,
-    /// The table of an unallocated brick
-    empty: Table,
+    store: BrickStore<T, SUB>,
 }
 
-/// A brick's table: the id of each of its sub-bricks in the volume's store, 0 for an unallocated one
-#[derive(Clone, Copy)]
-struct Table(NonNull<u32>);
-
-// SAFETY: a table pointer is only dereferenced through the volume that owns its store, under the volume's own
-// sharing rules below
-unsafe impl Send for Table {}
-unsafe impl Sync for Table {}
-
-// SAFETY: the table pointers and sub-brick ids address `tables` and `store`, which the volume owns and frees only
+// SAFETY: the table and sub-brick ids address `tables` and `store`, which the volume owns and frees only
 // when it is dropped. Tables and sub-bricks are written only through `&mut self` (each brick by one writer in
 // `fill_brick_rows`) and read through `&self`, so the volume follows the same sharing rules as `Box`ed bricks
 unsafe impl<T: Voxel> Send for Vol<T> {}
@@ -75,13 +64,13 @@ impl<T: Voxel> Vol<T> {
     pub fn new(shape: Shape, default: T) -> Self {
         let grid = shape.map(|n| n.div_ceil(EDGE));
         let slots = grid.iter().product();
-        let bricks = vec![None; slots];
+        let bricks = vec![0; slots];
         // each store's id 0 is handed out first: the empty table and the default sub-brick
-        let mut tables = BrickStore::new(SUBS, 0u32, slots + 1);
-        let (_, empty) = tables.alloc();
-        let mut store = BrickStore::new(SUB, default, slots * SUBS + 1);
+        let mut tables = BrickStore::new(0, slots + 1);
+        tables.alloc();
+        let mut store = BrickStore::new(default, slots * SUBS + 1);
         store.alloc();
-        Self { shape, grid, default, bricks, tables, store, empty: Table(empty) }
+        Self { shape, grid, default, bricks, tables, store }
     }
 
     pub fn shape(&self) -> Shape {
@@ -115,9 +104,8 @@ impl<T: Voxel> Vol<T> {
     /// The sub-brick ids of a brick, all 0 for an unallocated one
     #[inline(always)]
     fn table(&self, bi: usize) -> &[u32; SUBS] {
-        let t = self.bricks[bi].unwrap_or(self.empty);
-        // SAFETY: a table is SUBS ids in `tables`, which lives as long as `self`
-        unsafe { &*t.0.as_ptr().cast::<[u32; SUBS]>() }
+        // SAFETY: every brick names a table `tables` handed out, which lives as long as `self`
+        unsafe { &*self.tables.get(self.bricks[bi]).as_ptr().cast::<[u32; SUBS]>() }
     }
 
     /// The voxels of a sub-brick, the default one for id 0
@@ -168,16 +156,16 @@ impl<T: Voxel> Vol<T> {
     pub fn set(&mut self, z: usize, y: usize, x: usize, value: T) {
         let bi = self.brick_index(z, y, x);
         let table = match self.bricks[bi] {
-            Some(t) => t,
-            None if value == self.default => return,
-            None => {
-                let t = Table(self.tables.alloc().1);
-                self.bricks[bi] = Some(t);
+            0 if value == self.default => return,
+            0 => {
+                let (id, t) = self.tables.alloc();
+                self.bricks[bi] = id;
                 t
             }
+            id => self.tables.get(id),
         };
         // SAFETY: the table is SUBS ids in `tables`, and `&mut self` makes this the only access to it
-        let slot = unsafe { &mut *table.0.as_ptr().add(Self::sub_index(z, y, x)) };
+        let slot = unsafe { &mut *table.as_ptr().add(Self::sub_index(z, y, x)) };
         let ptr = match *slot {
             0 if value == self.default => return,
             0 => {
@@ -193,9 +181,9 @@ impl<T: Voxel> Vol<T> {
 
     /// Bytes held by allocated sub-bricks and the tables that name them
     pub fn resident_bytes(&self) -> usize {
-        let tables = self.bricks.iter().filter(|b| b.is_some()).count();
+        let tables = self.bricks.iter().filter(|&&t| t != 0).count();
         let subs: usize = (0..self.bricks.len())
-            .filter(|&bi| self.bricks[bi].is_some())
+            .filter(|&bi| self.bricks[bi] != 0)
             .map(|bi| self.table(bi).iter().filter(|&&id| id != 0).count())
             .sum();
         tables * SUBS * size_of::<u32>() + subs * SUB * size_of::<T>()
@@ -286,7 +274,7 @@ impl<T: Voxel> Vol<T> {
         let plane = grid[1] * grid[2];
         let (tables, store) = (&self.tables, &self.store);
         let slab = &mut self.bricks[rows.start * plane..rows.end * plane];
-        debug_assert!(slab.iter().all(Option::is_none), "brick rows {rows:?} are filled a second time");
+        debug_assert!(slab.iter().all(|&t| t == 0), "brick rows {rows:?} are filled a second time");
         // each writer takes tables and sub-bricks from its own runs of the stores and reuses one dense buffer
         let init = || (tables.run(), store.run(), Vec::with_capacity(BRICK));
         slab.par_iter_mut().enumerate().for_each_init(init, |(table_run, run, dense), (i, slot)| {
@@ -298,7 +286,7 @@ impl<T: Voxel> Vol<T> {
             let dims = [0, 1, 2].map(|a| EDGE.min(shape[a] - lo[a]));
             dense.clear();
             dense.resize(dims.iter().product(), default);
-            *slot = None;
+            *slot = 0;
             if !f(lo, dims, dense) {
                 return;
             }
@@ -317,8 +305,8 @@ impl<T: Voxel> Vol<T> {
                     continue;
                 }
                 let ids = table.get_or_insert_with(|| {
-                    let t = table_run.alloc().1;
-                    *slot = Some(Table(t));
+                    let (id, t) = table_run.alloc();
+                    *slot = id;
                     // SAFETY: the store handed this table to this writer alone, and it lives as long as the volume
                     unsafe { std::slice::from_raw_parts_mut(t.as_ptr(), SUBS) }
                 });
