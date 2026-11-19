@@ -49,6 +49,10 @@ impl<'p> Slab<'p> {
     }
 }
 
+/// Bytes charged for an entry's own bookkeeping (its `Arc`, map and order slots), so entries that hold no data,
+/// such as chunks missing from a sparse array, still count against the budget
+const ENTRY_BYTES: usize = 128;
+
 /// A byte-bounded map that drops its least recently used entries first; one entry is always kept
 struct Lru<K, V> {
     map: HashMap<K, (V, u64, usize)>,
@@ -74,6 +78,7 @@ impl<K: Copy + Eq + Hash, V: Clone> Lru<K, V> {
     }
 
     fn insert(&mut self, key: K, value: V, bytes: usize) {
+        let bytes = bytes + ENTRY_BYTES;
         self.clock += 1;
         if let Some((_, used, old)) = self.map.insert(key, (value, self.clock, bytes)) {
             self.order.remove(&used);
