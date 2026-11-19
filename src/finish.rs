@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, eyre};
 
 use crate::arena::BufferPool;
 use crate::fields::Presence;
@@ -127,7 +127,9 @@ impl<'a, 'p> NativeCache<'a, 'p> {
     pub fn new(pred: &'a Predictions, budget_bytes: usize, pool: &'p BufferPool) -> Self {
         // whole Zarr chunks are the unit of reading; NPY input uses the reference's 64³ blocks
         let edge = pred.chunk_shape().unwrap_or([64, 64, 64]);
-        let sliced = pred.slab_layout().is_some_and(|e| e[0] % SLAB_PLANES == 0) && pred.blocks_fit_planes(SLAB_PLANES);
+        // a chunk of one slab is decoded whole either way, and needs no cache of compressed chunks
+        let sliced = pred.slab_layout().is_some_and(|e| e[0] > SLAB_PLANES && e[0].is_multiple_of(SLAB_PLANES))
+            && pred.blocks_fit_planes(SLAB_PLANES);
         let planes = if sliced { SLAB_PLANES } else { edge[0] };
         // compressed chunks are about a fifth of their decoded size, so a quarter of the budget keeps the chunks
         // of several times as many slabs as the rest holds
@@ -190,7 +192,8 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         let half = self.planes * ey * ex;
         let mut data = Vec::with_capacity_in(2 * half, self.pool);
         data.resize(2 * half, 0);
-        self.pred.decode_planes(&packed, s * self.planes..(s + 1) * self.planes, &mut data)?;
+        let planes = s * self.planes..(s + 1) * self.planes;
+        self.pred.decode_planes(&packed, planes, &mut data).map_err(|e| eyre!("chunk {:?}: {e}", [cz, cy, cx]))?;
         let lo = [cz * self.edge[0] + s * self.planes, cy * ey, cx * ex];
         Ok(Slab { lo, stride: [ey * ex, ex], half, data })
     }
