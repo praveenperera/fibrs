@@ -25,7 +25,8 @@ libc = "0.2"
 libloading = "0.9"
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode"] }
 memmap2 = "0.9"
-# an optional global allocator, measured against glibc malloc on dense windows (`--features mimalloc`)
+# the global allocator (the default `mimalloc` feature): glibc malloc maps and unmaps large blocks while holding
+# mmap_lock, which stalls every tracing thread's page faults on dense windows
 mimalloc = { version = "0.1.52", optional = true }
 rayon = "1.12"
 rusqlite = { version = "0.40", features = ["bundled"] }
@@ -41,6 +42,10 @@ zstd = "0.13"
 volkit = "0.1"
 # the free device memory for the column check, from the cudarc volkit already brings into the tree
 cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12040"] }
+
+[features]
+# `--no-default-features` builds with the system allocator
+default = ["mimalloc"]
 
 [profile.release]
 debug = 1

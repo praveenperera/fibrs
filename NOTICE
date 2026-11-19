@@ -22,6 +22,8 @@ vendor. Their full licence texts are in licenses/:
   2014 Kiyoshi Masui, licenses/c-blosc-bitshuffle.txt)
 - LZ4 1.10.0 (lz4-sys): BSD-2-Clause, Copyright (c) 2011-2020 Yann Collet
   (licenses/lz4.txt)
+- mimalloc 3.3.2 (libmimalloc-sys 0.1.49), the binary's allocator: MIT, Copyright (c) 2018-2025
+  Microsoft Corporation, Daan Leijen (licenses/mimalloc.txt)
 - Zstandard 1.5.7 (zstd-sys): BSD-3-Clause, Copyright (c) Meta Platforms, Inc. and
   affiliates (licenses/zstd.txt)
 - zlib (libz-sys, static): zlib licence, Copyright (C) Jean-loup Gailly and Mark Adler

@@ -19,7 +19,7 @@ use std::ffi::OsString;
 
 use clap::{CommandFactory, Parser};
 
-/// mimalloc in place of the system allocator, when built with `--features mimalloc`
+/// mimalloc in place of the system allocator, unless built with `--no-default-features`
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

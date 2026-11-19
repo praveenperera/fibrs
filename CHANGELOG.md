@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Changes
+
+- **mimalloc is the allocator.** The binary now allocates through mimalloc 3.3.2 instead of the system allocator.
+  On dense windows, glibc malloc maps and unmaps large blocks while holding the kernel's `mmap_lock`, which stalls
+  the page faults of every tracing thread. Output is unchanged. `cargo build --release --no-default-features` builds
+  with the system allocator.
+
 ## [0.3.0] - 2026-11-19
 
 fibrs 0.3.0 runs the tracer's direction field and centrality on an NVIDIA GPU when one is usable, and on the CPU
