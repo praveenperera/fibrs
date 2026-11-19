@@ -17,14 +17,28 @@
 //! multiply-add is an explicit round-to-nearest instruction (`mul.rn`, `add.rn`, `fma.rn`), which neither LLVM
 //! nor ptxas contracts, placed where Numba's PTX and the SASS ptxas builds from it put theirs. The host's
 //! `stage1::<Fused>` (src/stage1.rs) is the same computation on the CPU, and the GPU tests hold the two equal
+//!
+//! The `fb_ax_*` kernels compute the direction field (`axes::direction_field`, src/axes.rs) on the CPU's tiles:
+//! 64³ cores with an 11-voxel halo, each box clipped to the volume. [`fb_ax_gather`] writes both tracing channels
+//! of each box densely and lists each tile's present core voxels per family; per family, [`fb_ax_smooth0`] and
+//! [`fb_ax_smooth`] apply the σ 0.9 Gaussian, [`fb_ax_grad`] takes `np.gradient`, [`fb_ax_tensor_z`] and
+//! [`fb_ax_tensor_y`] smooth the six gradient products along z and y, and [`fb_ax_eigen`] smooths them along x at
+//! each listed voxel and certifies its quantized eigenvector ([`eigen::certify`]), handing the voxels it cannot
+//! certify back to the host's `dsyevd`. Each filter runs over the whole box with the CPU's edge rules, and every
+//! float32 and float64 operation is an explicit round-to-nearest instruction in the CPU's order, so the bytes
+//! equal the CPU's
 
 #![no_std]
 #![allow(clippy::missing_safety_doc)]
 
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
-use cuda_device::float::{add_rn_f64, div_rn_f64, fma_rn_f64, mul_rn_f32, mul_rn_f64, sqrt_rn_f64};
+use cuda_device::float::{add_rn_f32, add_rn_f64, div_rn_f64, fma_rn_f64, mul_rn_f32, mul_rn_f64, sqrt_rn_f64};
 use cuda_device::kernel;
-use cuda_device::thread::{blockDim_x, blockIdx_x, blockIdx_y, threadIdx_x};
+use cuda_device::thread::{__unroll_config, blockDim_x, blockIdx_x, blockIdx_y, threadIdx_x};
+
+pub mod eigen;
+
+use eigen::{Ops, certify};
 
 /// Brick edge as a shift; the host's `vol::SHIFT`
 const SHIFT: u32 = 4;
@@ -506,5 +520,470 @@ pub unsafe fn fb_pack(out: *const u16, n: u32, slots: *const u32, packed: *mut u
     let slot = unsafe { *slots.add((i / BRICK) as usize) };
     if slot != NO_BRICK {
         unsafe { *packed.add((slot * BRICK + i % BRICK) as usize) = *out.add(i as usize) };
+    }
+}
+
+/// SciPy's Gaussian weights for σ 0.9 (radius 4) and σ 1.5 (radius 6), outermost first, centre last: the float64
+/// bit patterns of `W09` and `W15` in src/axes.rs
+const W09: [f64; 5] = [
+    f64::from_bits(0x3ef7dff10d1ee066),
+    f64::from_bits(0x3f5c138a6b624c17),
+    f64::from_bits(0x3fa336a4e8e9e375),
+    f64::from_bits(0x3fce9aeb020a6f44),
+    f64::from_bits(0x3fdc5e85af5bea50),
+];
+const W15: [f64; 7] = [
+    f64::from_bits(0x3f17638649a0fcd1),
+    f64::from_bits(0x3f50d891ab53680a),
+    f64::from_bits(0x3f7f1e741f80c9b8),
+    f64::from_bits(0x3fa26dd9e7a284e1),
+    f64::from_bits(0x3fbbfdc88289323c),
+    f64::from_bits(0x3fcb42851d1c8a96),
+    f64::from_bits(0x3fd1058ef29a59d7),
+];
+
+/// The certification's arithmetic in explicit round-to-nearest instructions
+struct Rn;
+
+impl Ops for Rn {
+    #[inline(always)]
+    fn mul(a: f64, b: f64) -> f64 {
+        mul_rn_f64(a, b)
+    }
+
+    #[inline(always)]
+    fn add(a: f64, b: f64) -> f64 {
+        add_rn_f64(a, b)
+    }
+
+    #[inline(always)]
+    fn div(a: f64, b: f64) -> f64 {
+        div_rn_f64(a, b)
+    }
+
+    #[inline(always)]
+    fn sqrt(a: f64) -> f64 {
+        sqrt_rn_f64(a)
+    }
+
+    #[inline(always)]
+    fn mul32(a: f32, b: f32) -> f32 {
+        mul_rn_f32(a, b)
+    }
+
+    #[inline(always)]
+    fn add32(a: f32, b: f32) -> f32 {
+        add_rn_f32(a, b)
+    }
+}
+
+impl Tile {
+    /// Voxels in the box
+    #[inline(always)]
+    fn len(&self) -> u32 {
+        (self.dims[0] * self.dims[1] * self.dims[2]) as u32
+    }
+
+    /// Box coordinates of the box voxel `i`
+    #[inline(always)]
+    fn voxel(&self, i: u32) -> (i32, i32, i32) {
+        let (h, w) = (self.dims[1] as u32, self.dims[2] as u32);
+        let z = i / (h * w);
+        let y = i / w - z * h;
+        let x = i - (z * h + y) * w;
+        (z as i32, y as i32, x as i32)
+    }
+
+    /// Core coordinates of the core voxel with core-local index `i`, `(cz·ch + cy)·cw + cx`
+    #[inline(always)]
+    fn core_voxel(&self, i: u32) -> (u32, u32, u32) {
+        let (ch, cw) = (self.core[1] as u32, self.core[2] as u32);
+        let cz = i / (ch * cw);
+        let cy = i / cw - cz * ch;
+        let cx = i - (cz * ch + cy) * cw;
+        (cz, cy, cx)
+    }
+
+    /// The core voxel's element in the output bricks, as [`fb_seeds`] lays them out
+    #[inline(always)]
+    fn out_at(&self, cz: u32, cy: u32, cx: u32) -> usize {
+        let (ch, cw) = (self.core[1] as u32, self.core[2] as u32);
+        let (nby, nbx) = ((ch + MASK) >> SHIFT, (cw + MASK) >> SHIFT);
+        let brick = ((cz >> SHIFT) * nby + (cy >> SHIFT)) * nbx + (cx >> SHIFT);
+        let at = ((cz & MASK) << (2 * SHIFT)) | ((cy & MASK) << SHIFT) | (cx & MASK);
+        self.out as usize + (brick * BRICK + at) as usize
+    }
+}
+
+/// Whether tile `t` lists any present voxel of `family`; the per-family kernels skip a tile that lists none
+#[inline(always)]
+unsafe fn has_family(count: *const u32, t: u32, family: u32) -> bool {
+    unsafe { *count.add((2 * t + family) as usize) != 0 }
+}
+
+/// The sample SciPy's "reflect" mode reads for position `i` of a line of `n` samples: half-sample symmetric,
+/// repeated with period `2n` (`reflect` in src/axes.rs), so a line shorter than the kernel radius reflects more
+/// than once; each step mirrors about the nearer edge, which maps `i` to the same sample as `i mod 2n` does
+#[inline(always)]
+fn reflect(mut i: i32, n: i32) -> i32 {
+    while i < 0 || i >= n {
+        i = if i < 0 { -1 - i } else { 2 * n - 1 - i };
+    }
+    i
+}
+
+/// One output of SciPy's `correlate1d` with the symmetric kernel `w` (outermost first, centre last) at position
+/// `c` of a line of `n` samples, `read(k)` giving sample `k`: `line[c]·centre`, then `(line[c − off] +
+/// line[c + off])·w[j]` added for each outer weight in turn, in float64, rounded to float32 at the end
+/// (`correlate_rows` in src/axes.rs)
+///
+/// `w` is a reference to a constant, a read-only global: taken by value, the array stays in local memory when
+/// the tap loop is not unrolled
+#[inline(always)]
+fn correlate<const N: usize>(w: &'static [f64; N], c: i32, n: i32, read: impl Fn(i32) -> f32) -> f32 {
+    let r = N - 1;
+    let mut acc = mul_rn_f64(read(c) as f64, w[r]);
+    let mut j = 0;
+    while j < r {
+        __unroll_config::<0>();
+        let off = (r - j) as i32;
+        let pair = add_rn_f64(read(reflect(c - off, n)) as f64, read(reflect(c + off, n)) as f64);
+        acc = add_rn_f64(acc, mul_rn_f64(pair, w[j]));
+        j += 1;
+    }
+    acc as f32
+}
+
+/// Write both tracing channels of each tile's box densely (`raw[c·total + base + i]`, volumes 0 and 1 of the
+/// tables, default 0), and list each tile's present core voxels, those with `c0 + c1 ≥ 40`, per family (1 where
+/// `c1 > c0`, else 0): `list[(2t + f)·cap + k]` is the core-local index `(cz·ch + cy)·cw + cx` of the family's
+/// `k`th voxel, in no particular order, and `count[2t + f]` (zeroed by the host) ends as the number listed. `cap`
+/// is at least every tile's core size, so a list cannot overflow; were it smaller, voxels past `cap` would be
+/// counted, not written, and [`fb_ax_eigen`], whose grid covers `cap` entries, would read only written ones
+///
+/// Grid: x over box voxels in blocks, y over tiles
+#[kernel]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn fb_ax_gather(
+    desc: *const u32,
+    pool: *const u8,
+    table: *const u32,
+    nb: u32,
+    bz0: u32,
+    by0: u32,
+    bx0: u32,
+    nby: u32,
+    nbx: u32,
+    total: u32,
+    cap: u32,
+    raw: *mut u8,
+    count: *mut u32,
+    list: *mut u32,
+) {
+    let ti = blockIdx_y();
+    let t = unsafe { tile(desc, ti) };
+    let i = blockIdx_x() * blockDim_x() + threadIdx_x();
+    if i >= t.len() {
+        return;
+    }
+    let (z, y, x) = t.voxel(i);
+    let (gz, gy, gx) = (t.lo[0] + z as u32, t.lo[1] + y as u32, t.lo[2] + x as u32);
+    let b = Bricks { pool, table, nb, b0: [bz0, by0, bx0], nby, nbx };
+    let (c0, c1) = unsafe { (b.get(0, gz, gy, gx, 0), b.get(1, gz, gy, gx, 0)) };
+    let at = (t.base + i) as usize;
+    unsafe {
+        *raw.add(at) = c0;
+        *raw.add(total as usize + at) = c1;
+    }
+
+    let (cz, cy, cx) = (z - t.off[0], y - t.off[1], x - t.off[2]);
+    let core = cz >= 0 && cy >= 0 && cx >= 0 && cz < t.core[0] && cy < t.core[1] && cx < t.core[2];
+    if !core || (c0 as u32 + c1 as u32) < 40 {
+        return;
+    }
+    let slot = 2 * ti + (c1 > c0) as u32;
+    // SAFETY: `count` holds 2 u32 per tile the host zeroed; device-scope relaxed atomics only hand out distinct
+    // slots
+    let k = unsafe { DeviceAtomicU32::from_ptr(count.add(slot as usize)).fetch_add(1, AtomicOrdering::Relaxed) };
+    if k >= cap {
+        return;
+    }
+    let local = (cz * t.core[1] + cy) * t.core[2] + cx;
+    unsafe { *list.add((slot * cap + k) as usize) = local as u32 };
+}
+
+/// The σ 0.9 Gaussian along z of the family's channel as float32 (`unit[v] = v as f32 / 255.0`, the host's
+/// table): `raw` box → `dst` box
+///
+/// Grid: x over box voxels in blocks, y over tiles
+#[kernel]
+pub unsafe fn fb_ax_smooth0(
+    desc: *const u32,
+    count: *const u32,
+    family: u32,
+    total: u32,
+    raw: *const u8,
+    unit: *const f32,
+    dst: *mut f32,
+) {
+    let ti = blockIdx_y();
+    if unsafe { !has_family(count, ti, family) } {
+        return;
+    }
+    let t = unsafe { tile(desc, ti) };
+    let i = blockIdx_x() * blockDim_x() + threadIdx_x();
+    if i >= t.len() {
+        return;
+    }
+    let (z, y, x) = t.voxel(i);
+    let channel = unsafe { raw.add((family * total) as usize) };
+    let v = correlate(&W09, z, t.dims[0], |k| unsafe { *unit.add(*channel.add(t.idx(k, y, x)) as usize) });
+    unsafe { *dst.add((t.base + i) as usize) = v };
+}
+
+/// The σ 0.9 Gaussian along `axis` (1 or 2) of a float32 box: `src` → `dst`
+///
+/// Grid: x over box voxels in blocks, y over tiles
+#[kernel]
+pub unsafe fn fb_ax_smooth(
+    desc: *const u32,
+    count: *const u32,
+    family: u32,
+    axis: u32,
+    src: *const f32,
+    dst: *mut f32,
+) {
+    let ti = blockIdx_y();
+    if unsafe { !has_family(count, ti, family) } {
+        return;
+    }
+    let t = unsafe { tile(desc, ti) };
+    let i = blockIdx_x() * blockDim_x() + threadIdx_x();
+    if i >= t.len() {
+        return;
+    }
+    let (z, y, x) = t.voxel(i);
+    let v = if axis == 1 {
+        correlate(&W09, y, t.dims[1], |k| unsafe { *src.add(t.idx(z, k, x)) })
+    } else {
+        correlate(&W09, x, t.dims[2], |k| unsafe { *src.add(t.idx(z, y, k)) })
+    };
+    unsafe { *dst.add((t.base + i) as usize) = v };
+}
+
+/// `np.gradient` along one axis at index `k` of a line of `n` samples, `f(j)` giving sample `j`: one-sided at
+/// the ends, central inside, in float32 (`gradient` in src/axes.rs; its `/ 2.0` is the same correctly rounded
+/// value as `· 0.5`, and its `/ 1.0` is exact)
+///
+/// A box axis is 1 voxel only on a 1-voxel volume axis, which `np.gradient` refuses and the CPU's `gradient`
+/// indexes past; it gives 0 here rather than reading outside the box
+#[inline(always)]
+fn gradient(k: i32, n: i32, f: impl Fn(i32) -> f32) -> f32 {
+    if n < 2 {
+        0.0
+    } else if k == 0 {
+        add_rn_f32(f(1), -f(0))
+    } else if k == n - 1 {
+        add_rn_f32(f(k), -f(k - 1))
+    } else {
+        mul_rn_f32(add_rn_f32(f(k + 1), -f(k - 1)), 0.5)
+    }
+}
+
+/// The gradient of the smoothed box `s` along each axis `a`: `g[a·total + base + i]`
+///
+/// Grid: x over box voxels in blocks, y over tiles
+#[kernel]
+pub unsafe fn fb_ax_grad(desc: *const u32, count: *const u32, family: u32, total: u32, s: *const f32, g: *mut f32) {
+    let ti = blockIdx_y();
+    if unsafe { !has_family(count, ti, family) } {
+        return;
+    }
+    let t = unsafe { tile(desc, ti) };
+    let i = blockIdx_x() * blockDim_x() + threadIdx_x();
+    if i >= t.len() {
+        return;
+    }
+    let (z, y, x) = t.voxel(i);
+    let gz = gradient(z, t.dims[0], |k| unsafe { *s.add(t.idx(k, y, x)) });
+    let gy = gradient(y, t.dims[1], |k| unsafe { *s.add(t.idx(z, k, x)) });
+    let gx = gradient(x, t.dims[2], |k| unsafe { *s.add(t.idx(z, y, k)) });
+    let at = (t.base + i) as usize;
+    let total = total as usize;
+    unsafe {
+        *g.add(at) = gz;
+        *g.add(total + at) = gy;
+        *g.add(2 * total + at) = gx;
+    }
+}
+
+/// The six gradient products `g_u·g_v` in float32 at scratch index `at`, (u, v) in (0,0), (0,1), (0,2), (1,1),
+/// (1,2), (2,2) order, widened to float64 for the Gaussian's sums
+#[inline(always)]
+unsafe fn products(g: *const f32, total: usize, at: usize) -> [f64; 6] {
+    let (g0, g1, g2) = unsafe { (*g.add(at), *g.add(total + at), *g.add(2 * total + at)) };
+    [
+        mul_rn_f32(g0, g0) as f64,
+        mul_rn_f32(g0, g1) as f64,
+        mul_rn_f32(g0, g2) as f64,
+        mul_rn_f32(g1, g1) as f64,
+        mul_rn_f32(g1, g2) as f64,
+        mul_rn_f32(g2, g2) as f64,
+    ]
+}
+
+/// `acc[k] + (lo[k] + hi[k])·w` for each channel, one Gaussian step of [`correlate`] on six lines at once
+#[inline(always)]
+fn step6(acc: [f64; 6], lo: [f64; 6], hi: [f64; 6], w: f64) -> [f64; 6] {
+    let f = |a: f64, l: f64, h: f64| add_rn_f64(a, mul_rn_f64(add_rn_f64(l, h), w));
+    [
+        f(acc[0], lo[0], hi[0]),
+        f(acc[1], lo[1], hi[1]),
+        f(acc[2], lo[2], hi[2]),
+        f(acc[3], lo[3], hi[3]),
+        f(acc[4], lo[4], hi[4]),
+        f(acc[5], lo[5], hi[5]),
+    ]
+}
+
+/// The σ 1.5 Gaussian along z of the six gradient products of `g`: `p[k·total + base + i]` for product `k`; the
+/// products are formed at each of the 13 z positions as they are read, which gives the same values as smoothing
+/// a stored product box
+///
+/// Grid: x over box voxels in blocks, y over tiles
+#[kernel]
+pub unsafe fn fb_ax_tensor_z(desc: *const u32, count: *const u32, family: u32, total: u32, g: *const f32, p: *mut f32) {
+    let ti = blockIdx_y();
+    if unsafe { !has_family(count, ti, family) } {
+        return;
+    }
+    let t = unsafe { tile(desc, ti) };
+    let i = blockIdx_x() * blockDim_x() + threadIdx_x();
+    if i >= t.len() {
+        return;
+    }
+    let (z, y, x) = t.voxel(i);
+    let (n, total) = (t.dims[0], total as usize);
+    let r = W15.len() - 1;
+    let c = unsafe { products(g, total, t.idx(z, y, x)) };
+    let w = W15[r];
+    let mut acc = [
+        mul_rn_f64(c[0], w),
+        mul_rn_f64(c[1], w),
+        mul_rn_f64(c[2], w),
+        mul_rn_f64(c[3], w),
+        mul_rn_f64(c[4], w),
+        mul_rn_f64(c[5], w),
+    ];
+    // a counted range loop, which `#[unroll]` needs
+    #[allow(clippy::needless_range_loop)]
+    #[unroll]
+    for j in 0..6 {
+        let off = (r - j) as i32;
+        let lo = unsafe { products(g, total, t.idx(reflect(z - off, n), y, x)) };
+        let hi = unsafe { products(g, total, t.idx(reflect(z + off, n), y, x)) };
+        acc = step6(acc, lo, hi, W15[j]);
+    }
+
+    let at = (t.base + i) as usize;
+    unsafe {
+        *p.add(at) = acc[0] as f32;
+        *p.add(total + at) = acc[1] as f32;
+        *p.add(2 * total + at) = acc[2] as f32;
+        *p.add(3 * total + at) = acc[3] as f32;
+        *p.add(4 * total + at) = acc[4] as f32;
+        *p.add(5 * total + at) = acc[5] as f32;
+    }
+}
+
+/// The σ 1.5 Gaussian along y of each of the six product channels: `p` → `q`, both `[k·total + base + i]`
+///
+/// Grid: x over box voxels in blocks, y over tiles
+#[kernel]
+pub unsafe fn fb_ax_tensor_y(desc: *const u32, count: *const u32, family: u32, total: u32, p: *const f32, q: *mut f32) {
+    let ti = blockIdx_y();
+    if unsafe { !has_family(count, ti, family) } {
+        return;
+    }
+    let t = unsafe { tile(desc, ti) };
+    let i = blockIdx_x() * blockDim_x() + threadIdx_x();
+    if i >= t.len() {
+        return;
+    }
+    let (z, y, x) = t.voxel(i);
+    let at = (t.base + i) as usize;
+    let mut k = 0;
+    while k < 6 {
+        let channel = unsafe { p.add(k * total as usize) };
+        let v = correlate(&W15, y, t.dims[1], |j| unsafe { *channel.add(t.idx(z, j, x)) });
+        unsafe { *q.add(k * total as usize + at) = v };
+        k += 1;
+    }
+}
+
+/// Finish each listed voxel of the family: the σ 1.5 Gaussian along x of the six `q` channels at the voxel gives
+/// its tensor m = [a00, a01, a02, a11, a12, a22]; a certified (nx, ny) goes to the core voxel's element of
+/// `out_nx` and `out_ny` (brick order, as [`fb_seeds`] writes `out`), and an uncertified voxel to the next
+/// fallback record `fb[8j..8j + 8] = [tile, core-local index, m as float32 bits]` through `fb_count` (records
+/// past `fb_cap` are counted, not written, and the host fails the run)
+///
+/// Grid: x over list entries (`cap`) in blocks, y over tiles
+#[kernel]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn fb_ax_eigen(
+    desc: *const u32,
+    count: *const u32,
+    family: u32,
+    total: u32,
+    cap: u32,
+    list: *const u32,
+    q: *const f32,
+    out_nx: *mut u8,
+    out_ny: *mut u8,
+    fb: *mut u32,
+    fb_cap: u32,
+    fb_count: *mut u32,
+) {
+    let ti = blockIdx_y();
+    let slot = 2 * ti + family;
+    let k = blockIdx_x() * blockDim_x() + threadIdx_x();
+    if k >= unsafe { *count.add(slot as usize) } {
+        return;
+    }
+    let t = unsafe { tile(desc, ti) };
+    let local = unsafe { *list.add((slot * cap + k) as usize) };
+    let (cz, cy, cx) = t.core_voxel(local);
+    let (z, y, x) = (t.off[0] + cz as i32, t.off[1] + cy as i32, t.off[2] + cx as i32);
+    let n = t.dims[2];
+    let channel = |c: usize| {
+        let src = unsafe { q.add(c * total as usize) };
+        correlate(&W15, x, n, |j| unsafe { *src.add(t.idx(z, y, j)) })
+    };
+    let m = [channel(0), channel(1), channel(2), channel(3), channel(4), channel(5)];
+
+    if let Some((nx, ny)) = certify::<Rn>(m) {
+        let at = t.out_at(cz, cy, cx);
+        unsafe {
+            *out_nx.add(at) = nx;
+            *out_ny.add(at) = ny;
+        }
+        return;
+    }
+
+    // SAFETY: `fb_count` is one u32 the host zeroed; device-scope relaxed atomics only hand out distinct records
+    let j = unsafe { DeviceAtomicU32::from_ptr(fb_count).fetch_add(1, AtomicOrdering::Relaxed) };
+    if j >= fb_cap {
+        return;
+    }
+    let rec = unsafe { fb.add(8 * j as usize) };
+    unsafe {
+        *rec = ti;
+        *rec.add(1) = local;
+        *rec.add(2) = m[0].to_bits();
+        *rec.add(3) = m[1].to_bits();
+        *rec.add(4) = m[2].to_bits();
+        *rec.add(5) = m[3].to_bits();
+        *rec.add(6) = m[4].to_bits();
+        *rec.add(7) = m[5].to_bits();
     }
 }

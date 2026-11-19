@@ -8,7 +8,7 @@ predictions it reads are Qual's; this port changes how fast the tracer runs, not
 
 With `--threads 4` for both tools, it traces 22×–47× faster across three uninterrupted runs on 512-plane bands of
 PHerc0826, PHerc1545 and PHerc0358 (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU;
-centrality runs on an NVIDIA GPU when one is found, and on the CPU otherwise.
+the direction field and centrality run on an NVIDIA GPU when one is found, and on the CPU otherwise.
 
 `fibrs predict` runs the step before: Qual's AFV fibre model V2 over a CT volume on an NVIDIA GPU, without
 PyTorch, writing the probability zarr the tracer reads, as villa's inference writes it (see
@@ -35,13 +35,15 @@ fibrs --predictions P --array semantic --channel-order VH --tracing-predictions 
 python -m fibrs ARGS      # the same, from Python
 ```
 
-Centrality runs on the GPU when a usable one is found: Linux x86-64, an NVIDIA GPU of compute capability 8.0 or
-later, and its driver (no CUDA toolkit). Otherwise it runs on the CPU, and the log says why. `--device cpu` keeps it
-on the CPU, `--device cuda` fails instead of falling back, and `--cuda-device N` picks the GPU (by default the first
-usable one). The GPU rounds some steps differently from the CPU (see "Differences from the original"), and a resumed
-run keeps the rounding it started with. A run started on the GPU can resume without one: the CPU then computes
-centrality as the GPU does, more slowly. `--device auto` does the same if the GPU fails mid-run, for example when it
-runs out of memory.
+The direction field and centrality run on the GPU when a usable one is found: Linux x86-64, an NVIDIA GPU of compute
+capability 8.0 or later, and its driver (no CUDA toolkit). Otherwise they run on the CPU, and the log says why.
+`--device cpu` keeps them on the CPU, `--device cuda` fails instead of falling back, and `--cuda-device N` picks the
+GPU (by default the first usable one). The GPU direction field is the CPU's bit for bit: the GPU certifies each
+voxel's eigenvector against an error bound, and the few voxels it cannot certify are solved on the CPU with the same
+`dsyevd` (the log line counts them). Centrality rounds some steps differently on the GPU (see "Differences from the
+original"), and a resumed run keeps the rounding it started with. A run started on the GPU can resume without one:
+the CPU then computes centrality as the GPU does, more slowly. `--device auto` also moves the direction field or
+centrality to the CPU if the GPU fails mid-run, for example when it runs out of memory.
 
 `fibrs.run([...])` runs it from Python and returns the exit status.
 
@@ -207,9 +209,10 @@ took 52.6 s and 65.9 s with `--device cuda`, against 35.3 s and 59.3 s with `--d
   original records it, but neither selects anything. The chunk cache is bounded by `--native-cache-mib`
   plus `--field-cache-mib`.
 - `--device` defaults to `auto` (the GPU when one is usable) where the original defaults to `cpu`. On the GPU
-  the port writes what the original writes with `--device cuda`, whose kernels round some multiply-adds as one
-  fused operation, so its output can differ from the original's `--device cpu` output; pass `--device cpu` to
-  match that.
+  the port writes what the original writes with `--device cuda`, whose centrality kernels round some multiply-adds
+  as one fused operation, so its output can differ from the original's `--device cpu` output; pass `--device cpu`
+  to match that. The original always computes the direction field on the CPU; the port computes it on the GPU
+  too, with the same result.
 - The command line replays argparse's pass, so exit status and selected values match, but help text and
   usage-error wording differ. Some argparse readings are not reproduced: numbers written with non-ASCII
   digits; non-UTF-8 bytes in the text options (`--array`, `--tracing-array`, `--coordinate-space`);
