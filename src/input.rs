@@ -404,8 +404,9 @@ impl Predictions {
     /// Whether the array's Blosc blocks each fall within runs of `planes` planes, so decoding those planes decodes
     /// no more than they hold
     ///
-    /// Judged by one stored chunk, since a writer compresses every chunk of an array alike; a frame compressed as
-    /// one block, for example, would be decoded whole for every run of planes
+    /// Judged by one stored chunk, since a writer compresses every chunk of an array alike; it only decides whether
+    /// reading by planes is worth its cache of compressed chunks. Each chunk is checked again as it is read
+    /// ([`Predictions::planes_fit`]), so a store that mixes block sizes is still decoded once per chunk
     pub fn blocks_fit_planes(&self, planes: usize) -> bool {
         let Some(edge) = self.slab_layout() else { return false };
         let run = planes * edge[1] * edge[2];
@@ -414,6 +415,16 @@ impl Predictions {
             // an array with no chunk stored holds only its fill value, which no decode reads
             None => true,
             Some(Ok(PackedChunk::Fill(_)) | Err(_)) => false,
+        }
+    }
+
+    /// Whether decoding `planes` planes of `packed` at a time decodes no more than they hold; a chunk the writer
+    /// never stored decodes nothing
+    pub fn planes_fit<A: Allocator>(&self, packed: &PackedChunk<A>, planes: usize) -> bool {
+        let Some(edge) = self.slab_layout() else { return false };
+        match packed {
+            PackedChunk::Fill(_) => true,
+            PackedChunk::Blosc(bytes) => blocks_fit(bytes, planes * edge[1] * edge[2]),
         }
     }
 
@@ -428,11 +439,11 @@ impl Predictions {
             let k = [z.parse().ok()?, y.parse().ok()?, x.parse().ok()?];
             (*c == "0" && (0..3).all(|a| k[a] < grid[a])).then_some(k)
         };
-        let names = |d: &Path| -> Vec<String> {
-            fs::read_dir(d).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok()).collect()
-        };
+        // listed lazily: a whole-scroll array can store a million chunks, and the first will do
+        let names =
+            |d: &Path| fs::read_dir(d).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok());
         if *sep != '/' {
-            return names(dir).iter().find_map(|n| key(&n.split(*sep).collect::<Vec<_>>()));
+            return names(dir).find_map(|n| key(&n.split(*sep).collect::<Vec<_>>()));
         }
 
         // nested keys: 0/z/y/x
@@ -591,8 +602,8 @@ fn frame_channel_ranges(bytes: &[u8], channel: usize, start: usize, parts: [&mut
     ensure!(parts[1].len() == len && start + len <= channel, "bytes {start}.. lie outside a channel");
     let starts = [start, channel + start];
     let ts = frame.typesize;
-    if item_ranges_decode_whole_blocks(&frame) && len.is_multiple_of(ts) && starts.iter().all(|s| s.is_multiple_of(ts))
-    {
+    let ranged = item_ranges_decode_whole_blocks(&frame) && frame.blocksize <= len;
+    if ranged && len.is_multiple_of(ts) && starts.iter().all(|s| s.is_multiple_of(ts)) {
         for (at, part) in starts.into_iter().zip(parts) {
             blosc_getitem(bytes, at, part)?;
         }
@@ -600,7 +611,8 @@ fn frame_channel_ranges(bytes: &[u8], channel: usize, start: usize, parts: [&mut
     }
 
     // c-blosc reads a range in whole items of the frame's typesize, so a frame whose items straddle the range's
-    // bounds is decoded whole, as is one whose blocks a range read could take short
+    // bounds is decoded whole, as is one whose blocks a range read could take short, and one whose blocks are larger
+    // than the range: reading each channel's range would decode a block holding both twice
     let all = blosc_decompress(bytes)?;
     for (at, part) in starts.into_iter().zip(parts) {
         part.copy_from_slice(&all[at..at + len]);
@@ -873,8 +885,11 @@ mod tests {
 
     /// Compress `data` as one Blosc 1 frame with zstd and shuffle, as zarr writes prediction chunks
     fn blosc_frame(data: &[u8], typesize: usize, blocksize: usize) -> Vec<u8> {
+        blosc_frame_with(c"zstd", data, typesize, blocksize)
+    }
+
+    fn blosc_frame_with(name: &std::ffi::CStr, data: &[u8], typesize: usize, blocksize: usize) -> Vec<u8> {
         let mut out = vec![0u8; data.len() + 64];
-        let name = c"zstd";
         // SAFETY: `out` has room for the frame and its 16-byte header; the context call keeps no global state
         let n = unsafe {
             blosc_src::blosc_compress_ctx(
@@ -921,16 +936,22 @@ mod tests {
 
     /// A header whose block size its type size does not divide, which c-blosc never writes, is refused as decoding
     /// the whole frame refuses it, where reading item ranges would fill part of each block from scratch memory
+    ///
+    /// LZ4 splits each block into one stream per byte of the type. Claiming one byte more per block than the four
+    /// streams hold leaves every block but the last a byte short, and only the last fails to decode, so ranges
+    /// that stop before it would read back as decoded
     #[test]
     fn a_damaged_block_size_is_refused() {
-        let channel = 8 * 64 * 64;
+        let channel = 256 << 10;
         let data: Vec<u8> = (0..2 * channel).map(|i| (i * 7 + i / 977) as u8).collect();
-        let run = 2 * 64 * 64;
-        let mut frame = blosc_frame(&data, 4, run / 2);
-        frame[8..12].copy_from_slice(&(run as u32 / 2 - 2).to_le_bytes());
-        assert!(!blocks_fit(&frame, run));
-        assert!(blosc_getitem(&frame, 0, &mut vec![0u8; run]).is_err());
-        let (mut a, mut b) = (vec![0u8; run], vec![0u8; run]);
+        let mut frame = blosc_frame_with(c"lz4", &data, 4, 16 << 10);
+        let block = u32::from_le_bytes(frame[8..12].try_into().unwrap()) as usize;
+        assert_eq!((frame[2] & 0x10, block), (0, 64 << 10), "an LZ4 frame split into 64 KiB blocks");
+        frame[8..12].copy_from_slice(&(block as u32 + 1).to_le_bytes());
+        let len = 2 * block;
+        assert!(!blocks_fit(&frame, len));
+        assert!(blosc_getitem(&frame, 0, &mut vec![0u8; block]).is_err());
+        let (mut a, mut b) = (vec![0u8; len], vec![0u8; len]);
         assert!(frame_channel_ranges(&frame, channel, 0, [&mut a, &mut b]).is_err());
     }
 

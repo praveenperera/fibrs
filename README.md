@@ -144,7 +144,9 @@ build that decoded whole chunks took 69–72 s, and one that also gave each deco
   Memory each stage frees goes back to the system before the next stage allocates.
 - A point's value needs 8 voxels of the native predictions, so they are decoded 8 planes at a time (one 128 KiB
   Blosc block of each channel in a prediction zarr) instead of a whole chunk at a time. The cache holds these
-  slabs, with the chunks' compressed bytes in a quarter of its budget. Decoded slabs, compressed chunks and the
+  slabs, with the chunks' compressed bytes in a quarter of its budget, and a chunk whose Blosc blocks are larger
+  than 8 planes is decoded once and cut into slabs. Arrays read a whole chunk at a time (chunks of 8 planes or
+  fewer, or other layouts and compressors) give the whole budget to decoded chunks. Decoded slabs, compressed chunks and the
   direction field's tile buffers come from pools that each keep at most 128 MiB of freed buffers for reuse,
   beside the cache, and each field's bricks are cut from 64 MiB mappings the field owns. Dense bands evict and decode
   hundreds of times a second, and on Linux mapping and unmapping memory takes a lock that every page fault in
