@@ -28,7 +28,7 @@ use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
 use crate::gpu::{AxesCounts, Gpu, Stages};
 use crate::input::Predictions;
-use crate::kernels::{Coverage, DirField, Fields, RawCurve, SplitDirs};
+use crate::kernels::{Coverage, DirField, DirForm, Directions, Fields, RawCurve, SplitDirs};
 use crate::log;
 use crate::produce::{Flow, Producer, Speculation, Stats};
 use crate::stage1::{Fused, Separate};
@@ -740,7 +740,7 @@ fn trace_families(
     let resident = tracing.iter().map(Vol::resident_bytes).sum::<usize>();
     log!("Tracing predictions: {:.1} s, {:.2} GiB resident", t.elapsed().as_secs_f64(), gib(resident));
     let lapack = Lapack::init(&find_lapack()?)?;
-    let dirs = direction_field_on(cent.gpu.as_ref(), cent.strict, &tracing, lapack)?;
+    let dirs = direction_field_on(cent, &tracing, lapack)?;
     release_freed();
     let pool = BufferPool::new(CHUNK_POOL_RETAIN);
     let cache = NativeCache::new(native, cache_bytes, &pool);
@@ -749,12 +749,6 @@ fn trace_families(
         Directions::Packed(packed) => families.trace(packed),
         Directions::Split { nx, ny } => families.trace(&SplitDirs { nx, ny }),
     }
-}
-
-/// The direction field in the form the device that computed it gives ([`DirField`])
-enum Directions {
-    Packed(Vol<u16>),
-    Split { nx: Vol<u8>, ny: Vol<u8> },
 }
 
 /// What tracing each pending family needs besides the direction field
@@ -770,9 +764,8 @@ struct Families<'a, 'n, 'p> {
 
 impl Families<'_, '_, '_> {
     fn trace<D: DirField>(&self, dirs: &D) -> Result<()> {
-        let whole = || dirs.packed_block([0, 0, 0], dirs.shape());
-        debug_dump(self.work, "nx", || whole().iter().map(|d| (d >> 8) as u8).collect())?;
-        debug_dump(self.work, "ny", || whole().iter().map(|&d| d as u8).collect())?;
+        debug_dump(self.work, "nx", || dir_bytes(dirs, 8))?;
+        debug_dump(self.work, "ny", || dir_bytes(dirs, 0))?;
         debug_mem("direction field", &[("tracing", self.resident), ("directions", dirs.resident_bytes())]);
         for &family in self.families {
             let compute = Compute { threads: self.threads, cent: self.cent };
@@ -783,25 +776,33 @@ impl Families<'_, '_, '_> {
     }
 }
 
-/// The direction field, on `gpu` when there is one
+/// One direction byte of every voxel as a dense C-order array, `nx` for `shift` 8 and `ny` for 0, read a voxel at a
+/// time so a dump holds one byte a voxel in either form
+fn dir_bytes<D: DirField>(dirs: &D, shift: u32) -> Vec<u8> {
+    let [d, h, w] = dirs.shape().map(|n| n as i64);
+    let voxels = (0..d).flat_map(|z| (0..h).flat_map(move |y| (0..w).map(move |x| [z, y, x])));
+    voxels.map(|[z, y, x]| (dirs.at(z, y, x) >> shift) as u8).collect()
+}
+
+/// The direction field, on the GPU when there is one, in the form the run's centrality reads
 ///
 /// Both devices give the same bytes, so when the GPU fails, such as out of memory, the CPU computes it instead,
-/// unless `strict` (`--device cuda`) asked for the GPU only
-fn direction_field_on(gpu: Option<&Gpu>, strict: bool, tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<Directions> {
+/// unless `--device cuda` asked for the GPU only
+fn direction_field_on(cent: &CentralityDevice, tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<Directions> {
     let t = Instant::now();
     let on_cpu = || -> Result<Directions> {
-        let field = direction_field(tracing, lapack)?;
+        let field = direction_field(tracing, lapack, cent.dir_form())?;
         log!("Direction field: {:.1} s", t.elapsed().as_secs_f64());
-        Ok(Directions::Packed(field))
+        Ok(field)
     };
-    let Some(gpu) = gpu else { return on_cpu() };
+    let Some(gpu) = &cent.gpu else { return on_cpu() };
     match gpu.direction_field(tracing, lapack) {
         Ok((nx, ny, AxesCounts { present, fallback })) => {
             let secs = t.elapsed().as_secs_f64();
             log!("Direction field: {secs:.1} s, {fallback} of {present} voxels solved on the CPU");
             Ok(Directions::Split { nx, ny })
         }
-        Err(e) if !strict => {
+        Err(e) if !cent.strict => {
             log!("Direction field on the CPU: the GPU failed ({e:#})");
             on_cpu()
         }
@@ -1021,6 +1022,15 @@ impl CentralityDevice {
         Ok(chosen)
     }
 
+    /// The form the direction field is written in: split when the GPU computes centrality, which reads `nx` and
+    /// `ny` as two volumes, so a field the CPU computes after a GPU failure needs no copy
+    fn dir_form(&self) -> DirForm {
+        match (self.rounding, &self.gpu) {
+            (Rounding::Cuda, Some(_)) => DirForm::Split,
+            _ => DirForm::Packed,
+        }
+    }
+
     /// One family's centrality and seeds in the run's rounding
     ///
     /// When the GPU fails, such as out of memory, the CPU computes the same CUDA rounding unless `--device cuda`
@@ -1032,19 +1042,13 @@ impl CentralityDevice {
         pres: &Presence,
         dirs: &D,
     ) -> Result<FamilyFields> {
-        let gpu = match (self.rounding, &self.gpu) {
-            (Rounding::Cpu, _) => return Ok(centrality::<Separate, _>(pres, dirs)),
-            (Rounding::Cuda, None) => return Ok(centrality::<Fused, _>(pres, dirs)),
-            (Rounding::Cuda, Some(gpu)) => gpu,
+        let (gpu, (nx, ny)) = match (self.rounding, &self.gpu, dirs.split()) {
+            (Rounding::Cpu, _, _) => return Ok(centrality::<Separate, _>(pres, dirs)),
+            (Rounding::Cuda, Some(gpu), Some(split)) => (gpu, split),
+            // no GPU, or a packed field, which [`Self::dir_form`] asks for only when there is no GPU
+            (Rounding::Cuda, _, _) => return Ok(centrality::<Fused, _>(pres, dirs)),
         };
-        // the GPU reads nx and ny as two volumes: its own, or copies held only while it computes when the CPU
-        // computed the direction field
-        let on_gpu = {
-            let split = dirs.split();
-            let (nx, ny) = split.pair();
-            gpu.centrality(tracing, family, nx, ny)
-        };
-        match on_gpu {
+        match gpu.centrality(tracing, family, nx, ny) {
             Ok(fields) => Ok(fields),
             Err(e) if !self.strict => {
                 log!("Centrality on the CPU, rounded as on the GPU: the GPU failed ({e:#})");

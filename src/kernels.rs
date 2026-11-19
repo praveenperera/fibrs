@@ -114,10 +114,10 @@ pub fn decode_packed(d: u16) -> [f64; 3] {
 /// The direction field as centrality and the tracer read it: each voxel's `nx` and `ny` as one packed value
 /// ([`pack_dir`])
 ///
-/// The CPU computes it as one packed volume, `Vol<u16>`: the tracer is bound by direction reads, and one volume
-/// instead of two halves their brick lookups and cache lines. The GPU computes and reads `nx` and `ny` as two
-/// volumes, which [`SplitDirs`] reads as packed values. Each is kept in the form it was computed in, since converting
-/// one into the other would hold both at once
+/// It is held in the form the centrality device reads. On the CPU that is one packed volume, `Vol<u16>`: the tracer
+/// is bound by direction reads, and one volume instead of two halves their brick lookups and cache lines. The GPU
+/// reads `nx` and `ny` as two volumes, which [`SplitDirs`] reads as packed values. A field is written in its final
+/// form ([`Directions`]) and never converted, since converting one into the other would hold both at once
 pub trait DirField: Grid<u16> {
     fn shape(&self) -> Shape;
 
@@ -127,23 +127,8 @@ pub trait DirField: Grid<u16> {
     /// A dense C-order block of packed values with origin `lo` and extent `dims`
     fn packed_block(&self, lo: Shape, dims: Shape) -> Vec<u16>;
 
-    /// `nx` and `ny` as two volumes, for the GPU's centrality
-    fn split(&self) -> Split<'_>;
-}
-
-/// `nx` and `ny` as two volumes: the field's own, or copies made from a packed field
-pub enum Split<'a> {
-    Borrowed(&'a Vol<u8>, &'a Vol<u8>),
-    Owned(Box<(Vol<u8>, Vol<u8>)>),
-}
-
-impl Split<'_> {
-    pub fn pair(&self) -> (&Vol<u8>, &Vol<u8>) {
-        match self {
-            Split::Borrowed(nx, ny) => (nx, ny),
-            Split::Owned(pair) => (&pair.0, &pair.1),
-        }
-    }
+    /// `nx` and `ny` as two volumes for the GPU's centrality, when the field is held that way
+    fn split(&self) -> Option<(&Vol<u8>, &Vol<u8>)>;
 }
 
 impl DirField for Vol<u16> {
@@ -159,17 +144,46 @@ impl DirField for Vol<u16> {
         self.read_block(lo, dims)
     }
 
-    /// Copies, made only when the CPU computed the direction field and the GPU then computes centrality, as when
-    /// the GPU failed during the direction field
-    fn split(&self) -> Split<'_> {
-        let d = self.default_value();
-        let (mut nx, mut ny) = (Vol::new(self.shape(), (d >> 8) as u8), Vol::new(self.shape(), d as u8));
-        for bi in 0..self.grid().iter().product() {
-            let Some(b) = self.brick_at(bi) else { continue };
-            nx.set_brick(bi, &std::array::from_fn(|k| (b[k] >> 8) as u8));
-            ny.set_brick(bi, &std::array::from_fn(|k| b[k] as u8));
+    fn split(&self) -> Option<(&Vol<u8>, &Vol<u8>)> {
+        None
+    }
+}
+
+/// The form a direction field is written in: [`DirForm::Split`] when the GPU computes centrality, which reads `nx`
+/// and `ny` as two volumes, and [`DirForm::Packed`] otherwise
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirForm {
+    Packed,
+    Split,
+}
+
+/// An owned direction field in one of its two forms ([`DirField`])
+pub enum Directions {
+    Packed(Vol<u16>),
+    Split { nx: Vol<u8>, ny: Vol<u8> },
+}
+
+impl Directions {
+    /// A field of `shape` in `form` where every voxel reads as straight up, `nx = ny = 128`
+    pub fn new(shape: Shape, form: DirForm) -> Self {
+        match form {
+            DirForm::Packed => Directions::Packed(Vol::new(shape, pack_dir(128, 128))),
+            DirForm::Split => Directions::Split { nx: Vol::new(shape, 128), ny: Vol::new(shape, 128) },
         }
-        Split::Owned(Box::new((nx, ny)))
+    }
+
+    /// Copy dense C-order blocks of `nx` and `ny` bytes with origin `lo` and extent `dims` into the field
+    pub fn write_block(&mut self, lo: Shape, dims: Shape, nx: &[u8], ny: &[u8]) {
+        match self {
+            Directions::Packed(dirs) => {
+                let packed: Vec<u16> = nx.iter().zip(ny).map(|(&x, &y)| pack_dir(x, y)).collect();
+                dirs.write_block(lo, dims, &packed);
+            }
+            Directions::Split { nx: to_nx, ny: to_ny } => {
+                to_nx.write_block(lo, dims, nx);
+                to_ny.write_block(lo, dims, ny);
+            }
+        }
     }
 }
 
@@ -211,8 +225,8 @@ impl DirField for SplitDirs<'_> {
         nx.iter().zip(&ny).map(|(&x, &y)| pack_dir(x, y)).collect()
     }
 
-    fn split(&self) -> Split<'_> {
-        Split::Borrowed(self.nx, self.ny)
+    fn split(&self) -> Option<(&Vol<u8>, &Vol<u8>)> {
+        Some((self.nx, self.ny))
     }
 }
 
@@ -1238,12 +1252,17 @@ mod tests {
         let shape = [20, 33, 17];
         let (mut nx, mut ny) = (Vol::new(shape, 128u8), Vol::new(shape, 128u8));
         let mut packed = Vol::new(shape, pack_dir(128, 128));
+        let (mut written_packed, mut written_split) =
+            (Directions::new(shape, DirForm::Packed), Directions::new(shape, DirForm::Split));
         for ([z, y, x], bx, by) in
             [([1, 2, 3], 7, 250), ([1, 2, 4], 9, 128), ([18, 30, 16], 1, 128), ([5, 20, 9], 128, 129)]
         {
             nx.set(z, y, x, bx);
             ny.set(z, y, x, by);
             packed.set(z, y, x, pack_dir(bx, by));
+            for written in [&mut written_packed, &mut written_split] {
+                written.write_block([z, y, x], [1, 1, 1], &[bx], &[by]);
+            }
         }
 
         let split = SplitDirs { nx: &nx, ny: &ny };
@@ -1252,10 +1271,17 @@ mod tests {
         assert_eq!(split.corners(1, 2, 3)[1], pack_dir(9, 128));
         assert_eq!(split.packed_block([0; 3], shape), packed.packed_block([0; 3], shape));
 
-        let back = packed.split();
-        let (bx, by) = back.pair();
-        assert_eq!(bx.read_block([0; 3], shape), nx.read_block([0; 3], shape));
-        assert_eq!(by.read_block([0; 3], shape), ny.read_block([0; 3], shape));
+        assert!(packed.split().is_none());
+        assert_eq!(
+            split.split().map(|(x, y)| (x.read_block([0; 3], shape), y.read_block([0; 3], shape))),
+            Some((nx.read_block([0; 3], shape), ny.read_block([0; 3], shape)))
+        );
+
+        // the field the CPU writes in either form reads the same values
+        let Directions::Packed(written) = written_packed else { panic!("packed form") };
+        assert_eq!(written.packed_block([0; 3], shape), packed.packed_block([0; 3], shape));
+        let Directions::Split { nx: wx, ny: wy } = written_split else { panic!("split form") };
+        assert_eq!(SplitDirs { nx: &wx, ny: &wy }.packed_block([0; 3], shape), packed.packed_block([0; 3], shape));
     }
 
     #[test]
