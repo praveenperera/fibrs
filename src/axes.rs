@@ -210,33 +210,97 @@ impl<A: Allocator> Block<A> {
 
 /// One axis of `scipy.ndimage.correlate1d` with a symmetric kernel `w` (outermost first, centre last)
 /// and mode "reflect", in place
-fn correlate_axis<A: Allocator>(b: &mut Block<A>, axis: usize, w: &[f64], line: &mut Vec<f64>) {
+///
+/// Each output is `line[c] * centre`, then `(line[c - off] + line[c + off]) * w[j]` added for each outer weight
+/// in turn, in float64, as SciPy sums it; the loops run that sequence over a whole row of outputs at once so it
+/// vectorises, but each output's operations and their order are unchanged, so the result is bitwise the same
+fn correlate_axis<A: Allocator>(b: &mut Block<A>, axis: usize, w: &[f64], scratch: &mut Vec<f64>) {
+    if axis == 2 {
+        correlate_rows(b, w, scratch);
+    } else {
+        correlate_across_rows(b, axis, w, scratch);
+    }
+}
+
+/// `correlate_axis` along x, where each line is one contiguous row: the outputs of a row are summed together
+fn correlate_rows<A: Allocator>(b: &mut Block<A>, w: &[f64], scratch: &mut Vec<f64>) {
+    let r = w.len() - 1;
+    let n = b.dims[2];
+    let centre = w[r];
+    scratch.clear();
+    scratch.resize(n + 2 * r + n, 0.0);
+    let (line, acc) = scratch.split_at_mut(n + 2 * r);
+    for row in b.data.chunks_exact_mut(n) {
+        for (l, &v) in line[r..r + n].iter_mut().zip(row.iter()) {
+            *l = v as f64;
+        }
+        for k in 0..r {
+            line[r - 1 - k] = line[r + reflect(-1 - k as isize, n)];
+            line[r + n + k] = line[r + reflect((n + k) as isize, n)];
+        }
+
+        for (a, &l) in acc.iter_mut().zip(&line[r..r + n]) {
+            *a = l * centre;
+        }
+        for (j, &wj) in w[..r].iter().enumerate() {
+            let off = r - j;
+            let (lo, hi) = (&line[r - off..r - off + n], &line[r + off..r + off + n]);
+            for ((a, &l), &h) in acc.iter_mut().zip(lo).zip(hi) {
+                *a += (l + h) * wj;
+            }
+        }
+
+        for (v, &a) in row.iter_mut().zip(acc.iter()) {
+            *v = a as f32;
+        }
+    }
+}
+
+/// `correlate_axis` along z or y: the lines of one plane across the axis run side by side as contiguous x rows,
+/// so each step of the sum covers a whole x row
+fn correlate_across_rows<A: Allocator>(b: &mut Block<A>, axis: usize, w: &[f64], scratch: &mut Vec<f64>) {
     let r = w.len() - 1;
     let n = b.dims[axis];
+    let width = b.dims[2];
     let stride = b.stride(axis);
+    let other = 1 - axis;
+    let (planes, plane_stride) = (b.dims[other], b.stride(other));
     let centre = w[r];
-    line.resize(n + 2 * r, 0.0);
-    let others: Vec<usize> = (0..3).filter(|&a| a != axis).collect();
-    let (d0, d1) = (b.dims[others[0]], b.dims[others[1]]);
-    let (s0, s1) = (b.stride(others[0]), b.stride(others[1]));
-    for i0 in 0..d0 {
-        for i1 in 0..d1 {
-            let base = i0 * s0 + i1 * s1;
-            for k in 0..n {
-                line[r + k] = b.data[base + k * stride] as f64;
+    scratch.clear();
+    scratch.resize((n + 2 * r) * width + width, 0.0);
+    let (panel, acc) = scratch.split_at_mut((n + 2 * r) * width);
+    for p in 0..planes {
+        let base = p * plane_stride;
+        for k in 0..n {
+            let src = &b.data[base + k * stride..][..width];
+            for (l, &v) in panel[(r + k) * width..][..width].iter_mut().zip(src) {
+                *l = v as f64;
             }
-            for k in 0..r {
-                line[r - 1 - k] = line[r + reflect(-1 - k as isize, n)];
-                line[r + n + k] = line[r + reflect((n + k) as isize, n)];
+        }
+        for k in 0..r {
+            let below = r + reflect(-1 - k as isize, n);
+            panel.copy_within(below * width..(below + 1) * width, (r - 1 - k) * width);
+            let above = r + reflect((n + k) as isize, n);
+            panel.copy_within(above * width..(above + 1) * width, (r + n + k) * width);
+        }
+
+        for k in 0..n {
+            let c = r + k;
+            for (a, &l) in acc.iter_mut().zip(&panel[c * width..][..width]) {
+                *a = l * centre;
             }
-            for k in 0..n {
-                let c = r + k;
-                let mut acc = line[c] * centre;
-                for (j, &wj) in w[..r].iter().enumerate() {
-                    let off = r - j;
-                    acc += (line[c - off] + line[c + off]) * wj;
+            for (j, &wj) in w[..r].iter().enumerate() {
+                let off = r - j;
+                let lo = &panel[(c - off) * width..][..width];
+                let hi = &panel[(c + off) * width..][..width];
+                for ((a, &l), &h) in acc.iter_mut().zip(lo).zip(hi) {
+                    *a += (l + h) * wj;
                 }
-                b.data[base + k * stride] = acc as f32;
+            }
+
+            let out = &mut b.data[base + k * stride..][..width];
+            for (v, &a) in out.iter_mut().zip(acc.iter()) {
+                *v = a as f32;
             }
         }
     }
@@ -251,9 +315,9 @@ fn reflect(i: isize, n: usize) -> usize {
 }
 
 /// `gaussian_filter(block, sigma)` on float32: axes 0, 1, 2, each rounded to float32
-fn gaussian<A: Allocator>(b: &mut Block<A>, w: &[f64], line: &mut Vec<f64>) {
+fn gaussian<A: Allocator>(b: &mut Block<A>, w: &[f64], scratch: &mut Vec<f64>) {
     for axis in 0..3 {
-        correlate_axis(b, axis, w, line);
+        correlate_axis(b, axis, w, scratch);
     }
 }
 
@@ -355,7 +419,7 @@ fn tile_axes(tracing: &[Vol<u8>; 2], t: Shape, lapack: &Lapack, pool: &BufferPoo
     let mut xx = vec![128u8; n];
     let mut yy = vec![128u8; n];
     let (w09, w15) = (weights(W09), weights(W15));
-    let mut line = Vec::new();
+    let mut scratch = Vec::new();
     let (mut work, mut iwork) = (Vec::new(), Vec::new());
     for (family, ids) in ids.iter().enumerate() {
         if ids.is_empty() {
@@ -365,7 +429,7 @@ fn tile_axes(tracing: &[Vol<u8>; 2], t: Shape, lapack: &Lapack, pool: &BufferPoo
         let mut data = Vec::with_capacity_in(raw.len(), pool);
         data.extend(raw.iter().map(|&v| v as f32 / 255.0f32));
         let mut smooth = Block { dims, data };
-        gaussian(&mut smooth, &w09, &mut line);
+        gaussian(&mut smooth, &w09, &mut scratch);
         let grad = [0, 1, 2].map(|a| gradient(&smooth, a));
         drop(smooth);
         let mut tensor = vec![[0.0f32; 9]; ids.len()];
@@ -374,7 +438,7 @@ fn tile_axes(tracing: &[Vol<u8>; 2], t: Shape, lapack: &Lapack, pool: &BufferPoo
                 let mut data = Vec::with_capacity_in(grad[u].data.len(), pool);
                 data.extend(grad[u].data.iter().zip(&grad[v].data).map(|(a, b)| a * b));
                 let mut prod = Block { dims, data };
-                gaussian(&mut prod, &w15, &mut line);
+                gaussian(&mut prod, &w15, &mut scratch);
                 for (m, &(_, at)) in tensor.iter_mut().zip(ids) {
                     m[3 * u + v] = prod.data[at];
                     m[3 * v + u] = prod.data[at];
@@ -450,14 +514,73 @@ mod tests {
 
     #[test]
     fn correlate_matches_scipy_on_short_lines() {
-        let mut line = Vec::new();
+        let mut scratch = Vec::new();
         for (sigma, input, expected) in SCIPY_SHORT_LINES {
             let w = if sigma == 0.9 { weights(W09).to_vec() } else { weights(W15).to_vec() };
             let data = input.iter().map(|&b| f32::from_bits(b)).collect();
             let mut b = Block { dims: [1, 1, input.len()], data };
-            correlate_axis(&mut b, 2, &w, &mut line);
+            correlate_axis(&mut b, 2, &w, &mut scratch);
             let got: Vec<u32> = b.data.iter().map(|v| v.to_bits()).collect();
             assert_eq!(got, expected, "sigma {sigma}, n {}", input.len());
+        }
+    }
+
+    /// The per-line `correlate_axis` the row-at-a-time version replaced, kept as the bitwise reference
+    fn correlate_axis_per_line(b: &mut Block, axis: usize, w: &[f64]) {
+        let r = w.len() - 1;
+        let n = b.dims[axis];
+        let stride = b.stride(axis);
+        let centre = w[r];
+        let mut line = vec![0.0f64; n + 2 * r];
+        let others: Vec<usize> = (0..3).filter(|&a| a != axis).collect();
+        let (d0, d1) = (b.dims[others[0]], b.dims[others[1]]);
+        let (s0, s1) = (b.stride(others[0]), b.stride(others[1]));
+        for i0 in 0..d0 {
+            for i1 in 0..d1 {
+                let base = i0 * s0 + i1 * s1;
+                for k in 0..n {
+                    line[r + k] = b.data[base + k * stride] as f64;
+                }
+                for k in 0..r {
+                    line[r - 1 - k] = line[r + reflect(-1 - k as isize, n)];
+                    line[r + n + k] = line[r + reflect((n + k) as isize, n)];
+                }
+                for k in 0..n {
+                    let c = r + k;
+                    let mut acc = line[c] * centre;
+                    for (j, &wj) in w[..r].iter().enumerate() {
+                        let off = r - j;
+                        acc += (line[c - off] + line[c + off]) * wj;
+                    }
+                    b.data[base + k * stride] = acc as f32;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn correlate_matches_the_per_line_sum_bitwise() {
+        // tile-like blocks, including axes shorter than the kernel radius, of pseudo-random tensor-like values
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / (1u64 << 24) as f32 * 255.0 - 64.0
+        };
+        let mut scratch = Vec::new();
+        for dims in [[86, 86, 86], [3, 40, 17], [29, 2, 5], [7, 11, 1]] {
+            for w in [weights(W09).to_vec(), weights(W15).to_vec()] {
+                let data: Vec<f32> = (0..dims.iter().product::<usize>()).map(|_| next()).collect();
+                let mut got = Block { dims, data: data.clone() };
+                let mut want = Block { dims, data };
+                for axis in 0..3 {
+                    correlate_axis(&mut got, axis, &w, &mut scratch);
+                    correlate_axis_per_line(&mut want, axis, &w);
+                    let bits = |b: &Block| b.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&got), bits(&want), "dims {dims:?} axis {axis} radius {}", w.len() - 1);
+                }
+            }
         }
     }
 }

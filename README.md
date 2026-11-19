@@ -105,12 +105,12 @@ running on the machine each time. Runs 1 and 2 trace the same 512 × 8169 × 816
 | Run | Tool | Wall | CPU time | Peak memory |
 |---|---|---|---|---|
 | 1 | `avf-spline-generator` 0.2.0 | 11,840 s (3.3 h) | about 11,940 s | 4.6 GiB |
-| 1 | `fibrs` 0.1.1 | 191 s | 516 s | 12.4 GiB |
-| 2 | `avf-spline-generator` 0.2.0 | 4,686 s (1.3 h) | not measured | 4.6 GiB |
-| 2 | `fibrs` 0.1.0 | 172 s | not measured | 10.8 GiB |
-| 3 | `avf-spline-generator` 0.2.0 | 1,621 s (27 min) | 4,149 s | not measured |
-| 3 | `fibrs` 0.1.0 | 73.4 s | 191 s | not measured |
-| Speedup | | **22×–62×** | **about 22×–23× (runs 1 and 3)** | |
+| 1 | `fibrs`, built before 0.1.0 | 191 s | 516 s | 12.4 GiB |
+| 2 | `avf-spline-generator` 0.2.0 | 4,686 s (1.3 h) | 12,296 s | 4.6 GiB |
+| 2 | `fibrs` 0.1.0 | 172 s | 472 s | 10.8 GiB |
+| 3 | `avf-spline-generator` 0.2.0 | 1,621 s (27 min) | 4,149 s | 4.6 GiB |
+| 3 | `fibrs` 0.1.0 | 73.4 s | 191 s | 7.0 GiB |
+| Speedup | | **22×–62×** | **about 22×–26×** | |
 
 - Run 1: the one-minute load average was 17.5–18.8. The original's run was interrupted by a reboot and
   finished with `--resume`. Its wall time is the sum of the two parts, and the first part's CPU time is
@@ -119,12 +119,11 @@ running on the machine each time. Runs 1 and 2 trace the same 512 × 8169 × 816
 - Run 2: the one-minute load average averaged 13.9 during the original's run and 8.8 during fibrs's. The two
   `.afv` files held the same 149,680 fibres (compared logically, as each holds its own run uuid).
 - Run 3: the one-minute load average was 10.0 during the original's run and 7.4 during fibrs's. This band is
-  sparser, and the original kept about 2.6 cores busy on it. The two `.afv` files held the same 82,646 fibres
-  and 83,741 point blocks.
+  sparser. The two `.afv` files held the same 82,646 fibres and 83,741 point blocks.
 
-The ratio varies with the run and with the machine's load: the range is the lowest and highest of the measured
-runs. The gap is largest on dense bands, where the original tracer uses about one core whatever `--threads`
-says; on run 1's band the port kept about 2.7 busy.
+The original kept about 2.6 cores busy in runs 2 and 3, and about one in run 1 (whose CPU time is partly
+estimated); the port kept about 2.7. The ratio varies with the run and with the machine's load: the range is the
+lowest and highest of the measured runs.
 
 On dense bands, fibrs's speed also depends on how it reads the predictions and allocates memory. Take a
 512 × 2048 × 2048 crop of PHerc0358's densest area (z 1792–2304, y 2176–4224, x 2944–4992) with `--threads 8`
@@ -243,12 +242,13 @@ lists them and a resume that picks others is refused: keep the cache between a r
 
 | Mode | What it computes |
 |---|---|
-| `--mode villa` | the whole array, as villa main's `lasagna.qualzz_inference` computes it, with villa's rule for which tiles run (from the input's stored chunks) |
+| `--mode villa` | the whole array, as villa's `lasagna.qualzz_inference` computes it, with villa `97fb9336c`'s rule for absent input chunks: a 128³ output chunk that no stored input chunk overlaps is not written, so it reads as zero; villa main writes those chunks too, so the outputs differ there |
 | band mode (the default) | a z band `[z0, z1)`, reflected at the band's own edges, tiles whose input is all zero skipped |
 
-Use `--mode villa` when you want villa's output. Band mode is for splitting a scroll into z bands that run
-separately and resume: it does not reproduce villa's output, because villa runs the whole volume, so its tiles near
-a band's edges see the planes beyond it, and it also runs tiles of stored zeros.
+Use `--mode villa` when you want villa's output; on an input with absent chunks, see the table. Band mode is for
+splitting a scroll into z bands that run separately and resume: it does not reproduce villa's output, because villa
+runs the whole volume, so its tiles near a band's edges see the planes beyond it, and villa main runs every tile,
+even where the input is all zero.
 
 The network runs on one tile at a time in both modes. `--batch` (band mode, default 4, at most 16) is how many
 tiles go to the GPU together, and `--readers` (tile reader threads, default 4) how many read ahead; both change
@@ -258,9 +258,9 @@ mode's output unchanged; in band mode it is part of the run's settings, as in th
 ### Precision
 
 By default `fibrs predict` runs at the precision of villa's `lasagna.qualzz_inference` on PyTorch, to keep parity
-with it; `--mode villa` also computes the same tiles over the whole array, while band mode differs at the band's
-edges and in skipping all-zero tiles (see Modes). bf16 is opt-in, never the default and will never be used
-for published fibre sets.
+with it; `--mode villa` also computes the same tiles over the whole array when every input chunk is stored, while
+band mode differs at the band's edges and in skipping all-zero tiles (see Modes). bf16 is opt-in, never the default
+and will never be used for published fibre sets.
 
 - `--precision fp32` (default): float32 tensors with TF32 tensor-core convolutions, the precision PyTorch uses for
   the reference by default.
@@ -277,8 +277,11 @@ PyTorch's `fp32-ieee` and `fp16` modes are not offered.
 
 Against villa's `lasagna.qualzz_inference` on PyTorch, at its default precision (float32 with TF32 tensor-core
 convolutions). Both ran the same 726-tile crop of PHerc0826 (z 12032–12544, y 4096–5120, x 1536–2560) on one RTX
-5090 (driver 595.112.07). The runs alternated (ABBA), with 6 timed pairs per precision after 2 warm-up pairs, and
-each time is the whole command's wall time. The speedup is the mean of the per-pair ratios:
+5090 (driver 595.112.07). The runs alternated (ABBA), with 6 timed pairs per precision after one warm-up run of
+each. Each time is the whole command's wall time: both read the same CT crop and write arrays of the same shapes
+and chunk sizes, and the time includes those reads and writes, so it measures more than the network. On this crop
+villa ran 726 tiles and fibrs 864, as `--mode villa` runs a tile once for each of its columns that the tile's core
+overlaps. The speedup is the mean of the per-pair ratios:
 
 | `fibrs predict --mode villa` precision | villa, PyTorch fp32 (median) | fibrs (median) | Speedup, mean (95% CI) |
 |---|---|---|---|
@@ -299,7 +302,11 @@ fibrs, a pre-release build of 0.2.0 (`e9adcc9`), ran with cuDNN 9.27.0 and cuBLA
 
   The outputs aren't identical, as expected from a different implementation. The differences are of the same
   order as two runs of villa itself with `cudnn.benchmark` on (99.9th percentile 1).
-  Scoring the timed runs' outputs against the same bar is still in progress.
+  The timed runs' outputs were scored the same way. At fp32 they meet the bar: each of fibrs's seven runs
+  differs from villa's at 1.16% of voxel positions in `semantic` and 0.99% in `tracing`, by at most 3 of 255,
+  with the same counts in every run. At bf16 (opt-in) they differ from villa's fp32 at 10.7% and 11.5% of
+  positions, by at most 33 and 20 of 255; the 99.9th percentile over the foreground is 6 and 4, and the most
+  likely class agrees at 99.55% and 99.62% of voxels.
 - **Band mode** matches the reference engine value for value on a full PHerc0826 band, with 0 differences at
   fp32 and at bf16. fibrs doesn't store chunks that are entirely zero, so its output is smaller on disk; zarr
   reads a missing chunk as zero.
@@ -328,6 +335,38 @@ fibrs, a pre-release build of 0.2.0 (`e9adcc9`), ran with cuDNN 9.27.0 and cuBLA
 bytes that fibrs's Python band reference (`fibrs.predict` at fibrs PR #3) feeds it, on small synthetic CTs in band
 and villa mode (`tests/predict.rs`, `tests/fixtures/predict`, written by `scripts/predict_fixtures.py`), and that
 bad arguments are refused with the reference's messages.
+
+## Why the speed-up varies
+
+Each speed-up above depends on the data, so each is quoted as the range of the measured points where there is
+more than one:
+
+- **Density.** The share of a region that is papyrus rather than air changes from scroll to scroll and along
+  each scroll. The table gives it as the share of 128³ tiles that `fibrs predict --dry-run` would run (band mode,
+  tiles whose input isn't all zero), measured the same way for every row.
+- **Prediction skips air.** villa main runs every tile; band mode skips tiles whose input is all zero, so on a
+  sparse band it runs a fraction of villa's tiles and on a dense one about as many. `--mode villa` doesn't skip
+  all-zero tiles, and on the PHerc0826 crop it ran 864 tiles where villa ran 726, since it runs a tile once for
+  each of its columns that the tile's core overlaps. Every prediction time is the whole command's wall time,
+  reading the same CT crop and writing arrays of the same shapes and chunk sizes.
+- **Tracing varies with the run.** The tracer ratio varies with the run and with the machine's load, so it is
+  given as the lowest to highest measured. Pre-release builds of 0.2.0 traced dense data slower than 0.1.0;
+  0.2.0 is faster than 0.1.0 there (the last row).
+
+| Stage | Scroll | Region (z / y / x) | Tiles run | Original | fibrs | Ratio | Precision | Measured as |
+|---|---|---|---|---|---|---|---|---|
+| Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 11,840 s | 191 s | 62× | CPU | one run each (run 1; fibrs built before 0.1.0) |
+| Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 4,686 s | 172 s | 27× | CPU | one run each (run 2; fibrs 0.1.0) |
+| Tracing | PHerc1545 | z 1280–1792, whole plane | 8.4% | 1,621 s | 73.4 s | 22× | CPU | one run each (run 3; fibrs 0.1.0) |
+| Prediction, `--mode villa` | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 45.37 s | 26.77 s | 1.72× (1.66–1.78×) | fp32 | ABBA, 6 pairs: medians, mean ratio with 95% CI |
+| Prediction, `--mode villa` | PHerc0826 | same crop | 100% | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) | bf16 (opt-in) | ABBA, 6 pairs: medians, mean ratio with 95% CI |
+| End to end, prediction in band mode | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 387.5 s | 41.7 s | 9.3× | fp32 | one run of each stage |
+| Tracing, fibrs 0.1.0 → 0.2.0 | PHerc0358 | z 1792–2304 / y 2176–4224 / x 2944–4992 | 100% | 104 s (0.1.0) | 50–52 s (0.2.0) | 2.0–2.1× | CPU | back to back on one machine, `--threads 8`; not in the tracing range |
+
+"Original" is `avf-spline-generator` 0.2.0 for tracing and villa's `lasagna.qualzz_inference` (main `0bddf2757`,
+PyTorch fp32) for prediction; end to end is the two stages added, from a single run of each (prediction 45.4 s and
+27.0 s, `fibrs predict` in band mode, not the ABBA medians). Tracing ran with `--threads 4` for both tools unless
+the row says otherwise.
 
 ## Licence
 

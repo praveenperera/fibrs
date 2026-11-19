@@ -1,7 +1,7 @@
 //! `--mode villa`: which tiles run and which output chunks are written, as villa's `lasagna.qualzz_inference`
-//! does it
+//! did it at 97fb9336c
 //!
-//! villa main (97fb9336c) runs AFV V2 over a whole CT array with `lasagna.tiled_predict3d.run_tiled_inference_3d`.
+//! villa 97fb9336c runs AFV V2 over a whole CT array with `lasagna.tiled_predict3d.run_tiled_inference_3d`.
 //! It decides what to compute from what the input stores, not from its values:
 //!
 //! - an output chunk (128^3 on the volume's own lattice) is *supported* when any input chunk inside its
@@ -12,6 +12,9 @@
 //!   :3402-3431, `_needed_chunks` :3343-3369); an all-zero tile over stored chunks still runs
 //! - tiles add only into supported chunks and unsupported chunks are never written, so they read as the fill
 //!   value 0 (`_accumulate_group` :3433-3466, qualzz_inference.py `ProbabilityZarrOutputAdapter`)
+//!
+//! villa main at 0bddf2757 no longer passes the input to that skip (qualzz_inference.py:183-191), so it runs
+//! every tile; on an input with every chunk stored the two choose the same tiles
 //!
 //! villa forwards one tile at a time (the serial and worker paths default `max_batch_size` to 1,
 //! tiled_predict3d.py:2880, and qualzz_inference never sets it), so this mode runs batches of one
