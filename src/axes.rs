@@ -20,9 +20,9 @@ use crate::arena::BufferPool;
 use crate::vol::{Shape, Vol};
 
 /// Halo the tensor needs: 4 + 1 + 6
-const HALO: usize = 11;
+pub(crate) const HALO: usize = 11;
 /// Tile edge for the parallel sweep; a multiple of the brick edge
-const CORE: usize = 64;
+pub(crate) const CORE: usize = 64;
 
 /// SciPy's Gaussian weights for σ 0.9 (radius 4) and σ 1.5 (radius 6), outermost first, centre last;
 /// computed by `scipy.ndimage._gaussian_kernel1d` and stored as their float64 bit patterns
@@ -135,6 +135,19 @@ impl Lapack {
         // vt.astype(float32)
         Ok([a[0] as f32, a[1] as f32, a[2] as f32])
     }
+
+    /// A voxel's stored direction from its structure tensor `m` (row-major, axes z, y, x): the eigenvector of the
+    /// smallest eigenvalue, flipped so z >= 0, its x and y quantized to bytes as `prepare.tensor_axes` stores them
+    pub(crate) fn direction(&self, m: [f32; 9], work: &mut Vec<f64>, iwork: &mut Vec<i64>) -> Result<(u8, u8)> {
+        let v = self.smallest(m, work, iwork)?;
+        // xyz = v[::-1], flipped so z >= 0
+        let mut xyz = [v[2], v[1], v[0]];
+        if xyz[2] < 0.0 {
+            xyz = xyz.map(|c| -c);
+        }
+        let q = |c: f32| (c * 127.0f32 + 128.0f32).round_ties_even().clamp(1.0, 255.0) as u8;
+        Ok((q(xyz[0]), q(xyz[1])))
+    }
 }
 
 /// Find numpy's OpenBLAS: `FIBRS_LAPACK`, else the venv this executable was started from
@@ -187,6 +200,11 @@ fn openblas_in(dir: &Path) -> Option<PathBuf> {
 fn which(name: &Path) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| p.is_file())
 }
+
+/// The GPU kernels' certification of a voxel's direction, which the tests hold against dsyevd on the CPU
+#[cfg(test)]
+#[path = "../fibrs-kernels/src/eigen.rs"]
+mod eigen;
 
 fn weights<const N: usize>(bits: [u64; N]) -> [f64; N] {
     bits.map(f64::from_bits)
@@ -446,15 +464,7 @@ fn tile_axes(tracing: &[Vol<u8>; 2], t: Shape, lapack: &Lapack, pool: &BufferPoo
             }
         }
         for (m, &(local, _)) in tensor.iter().zip(ids) {
-            let v = lapack.smallest(*m, &mut work, &mut iwork)?;
-            // xyz = v[::-1], flipped so z >= 0
-            let mut xyz = [v[2], v[1], v[0]];
-            if xyz[2] < 0.0 {
-                xyz = xyz.map(|c| -c);
-            }
-            let q = |c: f32| (c * 127.0f32 + 128.0f32).round_ties_even().clamp(1.0, 255.0) as u8;
-            xx[local] = q(xyz[0]);
-            yy[local] = q(xyz[1]);
+            (xx[local], yy[local]) = lapack.direction(*m, &mut work, &mut iwork)?;
         }
     }
     Ok(Some((start, core_dims, xx, yy)))
@@ -556,6 +566,231 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Plain Rust arithmetic for the certification: each operation rounds to nearest on its own, as the kernels'
+    /// explicit intrinsics do, since Rust never contracts float operations
+    struct Plain;
+
+    impl eigen::Ops for Plain {
+        fn mul(a: f64, b: f64) -> f64 {
+            a * b
+        }
+
+        fn add(a: f64, b: f64) -> f64 {
+            a + b
+        }
+
+        fn div(a: f64, b: f64) -> f64 {
+            a / b
+        }
+
+        fn sqrt(a: f64) -> f64 {
+            a.sqrt()
+        }
+
+        fn mul32(a: f32, b: f32) -> f32 {
+            a * b
+        }
+
+        fn add32(a: f32, b: f32) -> f32 {
+            a + b
+        }
+    }
+
+    /// A small xorshift, so the test tensors need no dependency
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// Uniform in [0, 1)
+        fn unit(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+
+        /// Uniform in [-1, 1)
+        fn signed(&mut self) -> f64 {
+            2.0 * self.unit() - 1.0
+        }
+
+        /// Uniform over the integers lo..=hi
+        fn int(&mut self, lo: i32, hi: i32) -> i32 {
+            lo + (self.next() % (hi - lo + 1) as u64) as i32
+        }
+
+        /// 10 to a uniform integer power in lo..=hi
+        fn scale(&mut self, lo: i32, hi: i32) -> f64 {
+            10f64.powi(self.int(lo, hi))
+        }
+
+        fn vector(&mut self) -> [f64; 3] {
+            [self.signed(), self.signed(), self.signed()]
+        }
+    }
+
+    fn normalized(v: [f64; 3]) -> [f64; 3] {
+        let n = v.iter().map(|c| c * c).sum::<f64>().sqrt();
+        v.map(|c| c / n)
+    }
+
+    /// An orthonormal basis whose first vector is `u` normalized
+    fn basis(u: [f64; 3], rng: &mut Rng) -> [[f64; 3]; 3] {
+        let c0 = normalized(u);
+        let r = rng.vector();
+        let d = r[0] * c0[0] + r[1] * c0[1] + r[2] * c0[2];
+        let c1 = normalized([0, 1, 2].map(|i| r[i] - d * c0[i]));
+        let c2 = [c0[1] * c1[2] - c0[2] * c1[1], c0[2] * c1[0] - c0[0] * c1[2], c0[0] * c1[1] - c0[1] * c1[0]];
+        [c0, c1, c2]
+    }
+
+    /// The upper triangle [a00, a01, a02, a11, a12, a22] of the matrix with eigenvectors `cols` and eigenvalues
+    /// `lambda`, computed in f64 and rounded to f32 as a smoothed tensor is
+    fn spectral(cols: [[f64; 3]; 3], lambda: [f64; 3]) -> [f32; 6] {
+        let at = |i: usize, j: usize| (0..3).map(|k| cols[k][i] * lambda[k] * cols[k][j]).sum::<f64>() as f32;
+        [at(0, 0), at(0, 1), at(0, 2), at(1, 1), at(1, 2), at(2, 2)]
+    }
+
+    /// Three increasing eigenvalues of one scale, well apart, so only the vector under test is hard
+    fn separated(rng: &mut Rng) -> [f64; 3] {
+        let s = rng.scale(-12, 6);
+        let l0 = rng.signed() * s;
+        let l1 = l0 + s * (0.1 + rng.unit());
+        [l0, l1, l1 + s * (0.1 + rng.unit())]
+    }
+
+    fn full(m: [f32; 6]) -> [f32; 9] {
+        [m[0], m[1], m[2], m[1], m[3], m[4], m[2], m[4], m[5]]
+    }
+
+    /// Test tensors by kind; the kinds after `random_*` are the adversarial ones
+    fn tensors() -> Vec<(&'static str, [f32; 6])> {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut out = Vec::new();
+        for _ in 0..1_500_000 {
+            let s = rng.scale(-20, 20);
+            out.push(("random_symmetric", [(); 6].map(|_| (rng.signed() * s) as f32)));
+        }
+        // structure tensors are smoothed sums of gradient outer products, so positive semidefinite
+        for _ in 0..1_500_000 {
+            let s = rng.scale(-20, 8);
+            let mut a = [0.0f64; 6];
+            for _ in 0..rng.int(1, 3) {
+                let (g, w) = (rng.vector(), rng.unit());
+                let outer = [g[0] * g[0], g[0] * g[1], g[0] * g[2], g[1] * g[1], g[1] * g[2], g[2] * g[2]];
+                a = [0, 1, 2, 3, 4, 5].map(|k| a[k] + w * outer[k]);
+            }
+            out.push(("random_structure", a.map(|v| (v * s) as f32)));
+        }
+        for _ in 0..1_000_000 {
+            let cols = basis(rng.vector(), &mut rng);
+            let s = rng.scale(-15, 15);
+            out.push(("random_spectral", spectral(cols, [(); 3].map(|_| rng.unit() * s))));
+        }
+
+        out.extend([[0.0f32; 6], [-0.0; 6], [0.0, -0.0, 0.0, -0.0, 0.0, -0.0]].map(|m| ("zero", m)));
+        // exact diagonals, with ties drawn from a few values, so repeated eigenvalues and an axis-aligned smallest
+        // vector (|z| exactly 0 or 1) both occur
+        let values = [0.0, 1.0, 2.0, -1.0, 0.5, 1e-30, 1e30, 3.0e-38];
+        for _ in 0..100_000 {
+            let d = [(); 3].map(|_| values[rng.int(0, values.len() as i32 - 1) as usize] as f32);
+            out.push(("diagonal", [d[0], 0.0, 0.0, d[1], 0.0, d[2]]));
+            let r = [(); 3].map(|_| (rng.signed() * rng.scale(-10, 10)) as f32);
+            out.push(("diagonal", [r[0], 0.0, 0.0, r[1], 0.0, r[2]]));
+        }
+        for _ in 0..100_000 {
+            let cols = basis(rng.vector(), &mut rng);
+            let (a, b) = (rng.signed() * rng.scale(-10, 10), rng.signed() * rng.scale(-10, 10));
+            for lambda in [[a, a, b], [a, b, b], [a, a, a]] {
+                out.push(("repeated", spectral(cols, lambda)));
+            }
+        }
+        for _ in 0..200_000 {
+            let cols = basis(rng.vector(), &mut rng);
+            let a = rng.unit() * rng.scale(-10, 10);
+            let rho = rng.scale(-16, -1) * rng.unit();
+            out.push(("near_degenerate", spectral(cols, [a, a * (1.0 + rho), a * (2.0 + rng.unit())])));
+        }
+        // the smallest vector nearly in the x-y plane, where its z sign decides the flip
+        for _ in 0..200_000 {
+            let zeta = rng.signed() * rng.scale(-17, -1);
+            let cols = basis([zeta, rng.signed(), rng.signed()], &mut rng);
+            out.push(("small_z", spectral(cols, separated(&mut rng))));
+        }
+        for _ in 0..100_000 {
+            let s = if rng.next() & 1 == 0 { rng.scale(-46, -36) } else { rng.scale(30, 38) };
+            out.push(("extreme_scale", [(); 6].map(|_| (rng.signed() * s) as f32)));
+        }
+        // the smallest vector's x and y within a hair of a quantization step's edge, (n + 0.5 - 128) / 127
+        for _ in 0..300_000 {
+            let mut edge = || {
+                let n = rng.int(60, 195) as f64;
+                let hair = if rng.next().is_multiple_of(4) { 0.0 } else { rng.signed() * rng.scale(-14, -5) };
+                (n + 0.5 - 128.0) / 127.0 + hair
+            };
+            let (x, y) = (edge(), edge());
+            let z = (1.0 - x * x - y * y).max(0.0).sqrt();
+            let cols = basis([z, y, x], &mut rng);
+            out.push(("quantization_edge", spectral(cols, separated(&mut rng))));
+        }
+        out
+    }
+
+    /// Every direction `eigen::certify` certifies equals dsyevd's, quantized as the CPU path stores it, over random
+    /// tensors at many scales and adversarial ones; the certification falls back on the hard ones instead
+    #[test]
+    #[ignore = "needs numpy's OpenBLAS: FIBRS_LAPACK=.../numpy.libs/libscipy_openblas64_*.so cargo test --release \
+                certify_matches_dsyevd -- --ignored"]
+    fn certify_matches_dsyevd() {
+        let lapack = Lapack::init(&find_lapack().unwrap()).unwrap();
+        let cases = tensors();
+        // per case: whether it was certified, and how it differs from dsyevd when it does
+        let results: Vec<(bool, Option<String>)> = cases
+            .par_iter()
+            .map_init(
+                || (Vec::new(), Vec::new()),
+                |(work, iwork), &(kind, m)| {
+                    let Some(got) = eigen::certify::<Plain>(m) else { return (false, None) };
+                    let want = lapack.direction(full(m), work, iwork).unwrap();
+                    let bits = m.map(f32::to_bits);
+                    (true, (got != want).then(|| format!("{kind} {bits:08x?}: certified {got:?}, dsyevd {want:?}")))
+                },
+            )
+            .collect();
+
+        let mut kinds: Vec<(&str, usize, usize)> = Vec::new();
+        for (&(kind, _), &(certified, _)) in cases.iter().zip(&results) {
+            if kinds.last().is_none_or(|k| k.0 != kind) {
+                kinds.push((kind, 0, 0));
+            }
+            let k = kinds.last_mut().expect("pushed above");
+            k.1 += 1;
+            k.2 += certified as usize;
+        }
+        for (kind, n, certified) in &kinds {
+            eprintln!("{kind}: {certified} of {n} certified");
+        }
+        let mismatches: Vec<&String> = results.iter().filter_map(|r| r.1.as_ref()).collect();
+        assert!(
+            mismatches.is_empty(),
+            "{} certified mismatches, first: {:#?}",
+            mismatches.len(),
+            &mismatches[..5.min(mismatches.len())]
+        );
+
+        let count = |pred: &dyn Fn(&str) -> bool| -> (usize, usize) {
+            kinds.iter().filter(|k| pred(k.0)).fold((0, 0), |(n, c), k| (n + k.1, c + k.2))
+        };
+        let (n, certified) = count(&|k| k.starts_with("random_"));
+        assert!(certified as f64 > 0.95 * n as f64, "only {certified} of {n} random tensors certified");
+        assert_eq!(count(&|k| k == "zero").1, 0, "a zero tensor was certified");
+        let (n, certified) = count(&|k| !k.starts_with("random_"));
+        assert!(certified < n, "no adversarial tensor fell back");
     }
 
     #[test]

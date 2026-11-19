@@ -26,7 +26,7 @@ use crate::arena::BufferPool;
 use crate::axes::{Lapack, direction_field, find_lapack};
 use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
-use crate::gpu::Gpu;
+use crate::gpu::{AxesCounts, Gpu};
 use crate::input::Predictions;
 use crate::kernels::{Coverage, Fields, RawCurve, Scratch, trace_seed};
 use crate::log;
@@ -123,9 +123,9 @@ pub struct Args {
     /// Optional AFV scan identifier
     #[arg(long)]
     pub coordinate_space: Option<String>,
-    /// Where centrality runs (tracing always runs on the CPU): auto uses an NVIDIA GPU when one is usable and the
-    /// CPU otherwise, cpu never uses the GPU, and cuda fails without one. A GPU run writes the original's
-    /// --device cuda output, which can differ from its cpu output by a rounding
+    /// Where the direction field and centrality run (tracing always runs on the CPU): auto uses an NVIDIA GPU when
+    /// one is usable and the CPU otherwise, cpu never uses the GPU, and cuda fails without one. A GPU run writes the
+    /// original's --device cuda output, whose centrality can differ from its cpu output by a rounding
     #[arg(long, value_enum, default_value = "auto")]
     pub device: Device,
     /// Visible CUDA device index for the GPU
@@ -566,7 +566,8 @@ pub fn run(args: Args) -> Result<Summary> {
     if !pending.is_empty() {
         let cache_bytes = (args.native_cache_mib + args.field_cache_mib) as usize * 1024 * 1024;
         pool.install(|| {
-            trace_families(&native, supplied.as_ref(), &work, &pending, threads as usize, cache_bytes, gpu.as_ref())
+            let compute = Compute { threads: threads as usize, gpu: gpu.as_ref(), strict: args.device == Device::Cuda };
+            trace_families(&native, supplied.as_ref(), &work, &pending, cache_bytes, compute)
         })?;
     }
     let started = Instant::now();
@@ -716,30 +717,58 @@ fn trace_families(
     supplied: Option<&Predictions>,
     work: &Path,
     families: &[usize],
-    threads: usize,
     cache_bytes: usize,
-    gpu: Option<&Gpu>,
+    compute: Compute,
 ) -> Result<()> {
     let t = Instant::now();
     log!("Preparing tracing predictions");
     let tracing = load_tracing(native, supplied)?;
     let resident = tracing.iter().map(Vol::resident_bytes).sum::<usize>();
     log!("Tracing predictions: {:.1} s, {:.2} GiB resident", t.elapsed().as_secs_f64(), gib(resident));
-    let t = Instant::now();
     let lapack = Lapack::init(&find_lapack()?)?;
-    let (nx, ny) = direction_field(&tracing, lapack)?;
+    let (nx, ny) = direction_field_on(compute.gpu, compute.strict, &tracing, lapack)?;
     release_freed();
     debug_dump(work, "nx", || nx.read_block([0, 0, 0], nx.shape()))?;
     debug_dump(work, "ny", || ny.read_block([0, 0, 0], ny.shape()))?;
-    log!("Direction field: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem("direction field", &[("tracing", resident), ("nx", nx.resident_bytes()), ("ny", ny.resident_bytes())]);
     let pool = BufferPool::new(CHUNK_POOL_RETAIN);
     let cache = NativeCache::new(native, cache_bytes, &pool);
     for &family in families {
-        trace_family(&tracing, &nx, &ny, &cache, work, family, Compute { threads, gpu })?;
+        trace_family(&tracing, &nx, &ny, &cache, work, family, compute)?;
         release_freed();
     }
     Ok(())
+}
+
+/// The direction field, on `gpu` when there is one
+///
+/// Both devices give the same bytes, so when the GPU fails, such as out of memory, the CPU computes it instead,
+/// unless `strict` (`--device cuda`) asked for the GPU only
+fn direction_field_on(
+    gpu: Option<&Gpu>,
+    strict: bool,
+    tracing: &[Vol<u8>; 2],
+    lapack: &Lapack,
+) -> Result<(Vol<u8>, Vol<u8>)> {
+    let t = Instant::now();
+    let on_cpu = || -> Result<(Vol<u8>, Vol<u8>)> {
+        let field = direction_field(tracing, lapack)?;
+        log!("Direction field: {:.1} s", t.elapsed().as_secs_f64());
+        Ok(field)
+    };
+    let Some(gpu) = gpu else { return on_cpu() };
+    match gpu.direction_field(tracing, lapack) {
+        Ok((nx, ny, AxesCounts { present, fallback })) => {
+            let secs = t.elapsed().as_secs_f64();
+            log!("Direction field: {secs:.1} s, {fallback} of {present} voxels solved on the CPU");
+            Ok((nx, ny))
+        }
+        Err(e) if !strict => {
+            log!("Direction field on the CPU: the GPU failed ({e:#})");
+            on_cpu()
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// With `FIBRS_DEBUG_FIELDS` set, write a field densely as raw little-endian `NAME.raw` for comparison
@@ -838,11 +867,14 @@ fn gib(bytes: usize) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
 }
 
-/// Where a family's stages run: tracing and finishing on `threads` CPU threads, centrality on the GPU when given
+/// Where a run's stages run: tracing and finishing on `threads` CPU threads, the direction field and centrality on
+/// the GPU when given
 #[derive(Clone, Copy)]
 struct Compute<'a> {
     threads: usize,
     gpu: Option<&'a Gpu>,
+    /// Whether a GPU failure ends the run (`--device cuda`) instead of moving the direction field to the CPU
+    strict: bool,
 }
 
 /// The GPU centrality runs on, or None for the CPU
@@ -884,7 +916,7 @@ fn trace_family(
     cache: &NativeCache,
     work: &Path,
     family: usize,
-    Compute { threads, gpu }: Compute,
+    Compute { threads, gpu, .. }: Compute,
 ) -> Result<()> {
     let label = if family == 1 { "V" } else { "H" };
     let folder = family_dir(work, family);
