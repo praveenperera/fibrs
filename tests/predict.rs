@@ -151,6 +151,11 @@ fn a_ct_link_repointed_during_a_run_is_not_followed() {
         let moved = dir.join("current.zarr.new");
         symlink(&next, &moved).unwrap();
         fs::rename(&moved, &current).unwrap();
+        // the chunk is a regular file again before the held read is answered, so a later read of it (a villa
+        // chunk serves several tiles) finds it instead of a FIFO nothing will write to again
+        let restored = dir.join("held.chunk");
+        fs::write(&restored, &bytes).unwrap();
+        fs::rename(&restored, &fifo).unwrap();
         writer.write_all(&bytes).unwrap();
         drop(writer);
 
