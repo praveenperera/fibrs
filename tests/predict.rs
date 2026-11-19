@@ -216,58 +216,31 @@ fn an_output_that_overlaps_the_ct_is_refused() {
     let before: Vec<_> = fs::read_dir(&ct).unwrap().map(|e| e.unwrap().file_name()).collect();
     let dir = ct.parent().unwrap();
     std::os::unix::fs::symlink(&ct, dir.join("link.zarr")).unwrap();
-    // `missing` doesn't exist, so `missing/..` only resolves lexically, and a prefix that exists again after it may
-    // be a link to the CT
-    let outs = [
-        ct.clone(),
-        ct.join("pred.zarr"),
-        dir.to_path_buf(),
-        dir.join("missing/../band.zarr"),
-        dir.join("missing/../band.zarr/pred.zarr"),
-        dir.join("missing/../link.zarr"),
-        dir.join("missing/deeper/../../link.zarr/pred.zarr"),
-    ];
-    for out in outs {
-        let args = ["--ct", ct.to_str().unwrap(), "--z0", "0", "--z1", "8", "--model-dir", model.to_str().unwrap()];
+    std::os::unix::fs::symlink(dir.join("gone"), dir.join("broken")).unwrap();
+    fs::write(dir.join("done.txt"), "").unwrap();
+    let args = ["--ct", ct.to_str().unwrap(), "--z0", "0", "--z1", "8", "--model-dir", model.to_str().unwrap()];
+    let refused = |out: PathBuf, why: &str| {
         let run = predict(&[&args[..], &["--out", out.to_str().unwrap()]].concat());
         assert_eq!(run.status.code(), Some(1));
-        assert!(text(&run).contains("overlaps --ct"), "{}", text(&run));
+        assert!(text(&run).contains(why), "{}", text(&run));
+    };
+
+    // the part of a path that exists resolves as the system resolves it, links and `..` included
+    for out in [ct.clone(), ct.join("pred.zarr"), dir.to_path_buf(), ct.join("../band.zarr")] {
+        refused(out, "overlaps --ct");
     }
+    for out in [dir.join("link.zarr"), dir.join("link.zarr/pred.zarr")] {
+        refused(out, "overlaps --ct");
+    }
+    // a path the system would not open is refused, whatever it would name lexically
+    refused(dir.join("broken/../pred.zarr"), "which does not resolve");
+    refused(dir.join("done.txt/../pred.zarr"), "steps through");
+    refused(dir.join("missing/../pred.zarr"), "uses .. after");
+    refused(ct.join("0.0.0/../../pred.zarr"), "uses .. after");
+
     let after: Vec<_> = fs::read_dir(&ct).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(before, after);
-    assert!(!dir.join("missing").exists());
-}
-
-#[test]
-fn an_output_given_through_the_ct_is_written_where_it_resolves() {
-    let model = scratch("through-model");
-    for name in ["model.py", "plans.json", "dataset.json", "checkpoint_final.pth"] {
-        fs::write(model.join(name), name).unwrap();
-    }
-    let dir = scratch("through-ct");
-    let ct = dir.join("band.zarr");
-    fs::create_dir_all(&ct).unwrap();
-    for entry in fs::read_dir(fixtures().join("band.zarr")).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_file() {
-            fs::copy(entry.path(), ct.join(entry.file_name())).unwrap();
-        }
-    }
-    // `0.0.0` doesn't exist, so the path resolves to `dir/pred.zarr`, outside the CT; writing to it as given would
-    // create `0.0.0` inside the CT, where a chunk of a `.`-separated store would be
-    let out = ct.join("0.0.0/../../pred.zarr");
-    let args = ["--ct", ct.to_str().unwrap(), "--z0", "0", "--z1", "8", "--model-dir", model.to_str().unwrap()];
-    // without a GPU the run stops at the engine, after the attempt is recorded
-    let run = predict(&[&args[..], &["--out", out.to_str().unwrap()]].concat());
-    assert!(!ct.join("0.0.0").exists(), "{}", text(&run));
-    assert!(dir.join("pred.zarr/attempts.jsonl").exists(), "{}", text(&run));
-
-    // `..` after a file is refused, as the system would refuse it, not taken lexically
-    fs::write(dir.join("done.txt"), "").unwrap();
-    let run = predict(&[&args[..], &["--out", dir.join("done.txt/../other.zarr").to_str().unwrap()]].concat());
-    assert_eq!(run.status.code(), Some(1));
-    assert!(text(&run).contains("which is not a directory"), "{}", text(&run));
-    assert!(!dir.join("other.zarr").exists());
+    assert!(!dir.join("missing").exists() && !dir.join("pred.zarr").exists());
 }
 
 #[test]

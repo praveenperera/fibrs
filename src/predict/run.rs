@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, TryLockError};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -341,31 +341,35 @@ fn check_column_memory(c: &Checked, p: &Plan, e: &Opened) -> Result<()> {
     )
 }
 
-/// `path` made absolute with its links and `..` resolved, component by component: each prefix that exists is
-/// replaced by its canonical form, and the rest is joined as given, so an output that is not created yet compares
-/// with the CT too
+/// `path` made absolute and resolved as the system would open it: the part that exists is canonicalized, links
+/// and `..` included, and the rest, which a run creates, may hold only plain names, so the path given and the path
+/// resolved always name the same place
 fn resolved(path: &Path) -> Result<PathBuf> {
-    let mut out = PathBuf::new();
-    for part in std::path::absolute(path)?.components() {
-        match part {
-            Component::CurDir => {}
-            // `out` is canonical up to its first missing component, and a missing component is not a link, so its
-            // parent is the lexical one
-            Component::ParentDir => {
-                // the system would refuse `..` after a file, so the lexical parent must not be taken either
-                if out.exists() && !out.is_dir() {
-                    bail!("{} steps through {}, which is not a directory", path.display(), out.display());
-                }
-                out.pop();
-            }
-            part => {
-                out.push(part);
-                // a prefix that exists again after a `..` out of a missing directory may be a link
-                if let Ok(real) = out.canonicalize() {
-                    out = real;
-                }
-            }
+    let path = std::path::absolute(path)?;
+    let parts: Vec<Component> = path.components().filter(|c| *c != Component::CurDir).collect();
+    // the longest prefix that exists, walked as the system walks it: a missing part ends it, and any other error
+    // (a file followed by more of the path, say) refuses the path
+    let mut prefix = PathBuf::new();
+    let mut existing = 0;
+    for part in &parts {
+        prefix.push(part);
+        match fs::symlink_metadata(&prefix) {
+            Ok(_) => existing += 1,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+            Err(e) => bail!("{} steps through {}: {e}", path.display(), prefix.display()),
         }
+    }
+
+    let head: PathBuf = parts[..existing].iter().collect();
+    let Ok(mut out) = head.canonicalize() else {
+        bail!("{} steps through {}, which does not resolve", path.display(), head.display());
+    };
+    for part in &parts[existing..] {
+        let Component::Normal(name) = part else {
+            let missing: PathBuf = parts[..=existing].iter().collect();
+            bail!("{} uses .. after {}, which does not exist", path.display(), missing.display());
+        };
+        out.push(name);
     }
 
     Ok(out)
