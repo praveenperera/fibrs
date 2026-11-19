@@ -152,6 +152,8 @@ fn parse(argv: &[OsString]) -> Checked {
     }
     let column = usize::try_from(a.column).unwrap_or(0);
     let readers = a.readers as usize;
+    // chunks are read by the path resolved here for the whole run, which assumes the CT's parent directories are not
+    // renamed or swapped while it runs; holding a directory handle would cover that but is not worth it for a CLI
     let ct = fs::canonicalize(&a.ct).unwrap_or_else(|e| fail(format!("--ct {}: {e}", a.ct.display())));
     let out = resolved(&a.out).unwrap_or_else(|e| fail(format!("{e:#}")));
     Checked { a, ct, out, batch: batch as usize, readers, column, precision, device, t_start, started }
