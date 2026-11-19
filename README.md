@@ -113,7 +113,7 @@ a 512-plane band of PHerc0813 (z 2304–2816):
 | 3 | `fibrs` 0.1.0 | 73.4 s | 191 s | 7.0 GiB |
 | 4 | `avf-spline-generator` 0.2.0 | 15,632 s (4.3 h) | 32,739 s | 4.6 GiB |
 | 4 | `fibrs` 0.2.0 | 332 s | 902 s | 14.0 GiB |
-| 5 | `avf-spline-generator` 0.2.0 | 9,176 s (2.5 h) | about 27,460 s | 4.7 GiB |
+| 5 | `avf-spline-generator` 0.2.0 | about 9,176 s (2.5 h) | about 27,460 s | 4.7 GiB |
 | 5 | `fibrs` 0.2.0 | 202 s | 564 s | 11.8 GiB |
 | Speedup, runs 2 to 4 | | **22×–47×** | **about 22×–38×** (38× with the 853 s repeat of run 4) | |
 
@@ -127,13 +127,13 @@ a 512-plane band of PHerc0813 (z 2304–2816):
   sparser. The two `.afv` files held the same 82,646 fibres and 83,741 point blocks.
 - Run 4: the two runs were not at the same time. This is the densest band measured. The two `.afv` files
   held the same 448,286 fibres and 460,560 point blocks.
-- Run 5: the two runs were not at the same time. The original's first attempt was stopped after 5,074 s and
-  finished with `--resume` in 4,102 s. Its wall time is the sum of the two parts, and the first part's CPU time is
-  estimated from the second part's CPU-to-wall ratio (2.99). The resumed part loaded the direction field and the V
-  centrality instead of recomputing them; it restored 103,340 batches 105 s after it started and was tracing again
-  after 126 s. The ratios are about 45× on wall time and about 49× on CPU time; as the total is estimated, the run
-  sets neither end of the range. The two `.afv` files held the same 337,735 fibres and 344,279 point blocks.
-  Run 5's memory is the peak RSS of both tools.
+- Run 5: the two runs were not at the same time. The original's first attempt logged progress for 5,074 s before it
+  was stopped and finished with `--resume` in 4,102 s. Its wall time is the sum of the two parts, and the first
+  part's CPU time is estimated from the second part's CPU-to-wall ratio (2.99). The resumed part loaded the
+  direction field and the V centrality instead of recomputing them; it restored 103,340 batches 105 s after it
+  started and was tracing again after 126 s. The ratios are about 45× on wall time and about 49× on CPU time; as
+  the total is estimated, the run sets neither end of the range. The two `.afv` files held the same 337,735 fibres
+  and 344,279 point blocks. Run 5's memory is the peak RSS of both tools.
 
 The original kept about 2.1–3.0 cores busy in runs 2 to 5 and about one in run 1; the CPU times of runs 1 and 5 are
 partly estimated. The port kept about 2.6–2.8. The ratio varies with the run and with the machine's load: the
@@ -372,9 +372,10 @@ more than one:
   run on the whole PHerc0358 band; its time there is estimated, so that end-to-end ratio is an estimate too.
 - **Tracing varies with the run.** The tracer ratio varies with the run and with the machine's load, so it is given
   as the lowest to highest of the uninterrupted runs; the two runs whose original was interrupted and resumed have
-  estimated totals and set neither end. It also varies with the scroll and how dense the band is: the original
-  spends about 0.027 s per fibre on PHerc0813 and 0.035 s on the dense PHerc0358 band, while fibrs spends about
-  0.6–0.75 ms on both. Pre-release builds of 0.2.0 traced dense data slower than 0.1.0; 0.2.0 is faster than 0.1.0
+  estimated totals and set neither end. The original's time per fibre also differs between bands and between runs:
+  about 0.035 s on the dense PHerc0358 band (run 4) and about 0.027 s on PHerc0813 (run 5, estimated), and its two
+  uninterrupted runs on the same PHerc0826 band took 4,686 s and 12,728 s. fibrs took about 0.6–0.75 ms per fibre
+  on runs 4 and 5. Pre-release builds of 0.2.0 traced dense data slower than 0.1.0; 0.2.0 is faster than 0.1.0
   there (the last row).
 
 | Stage | Scroll | Region (z / y / x) | Tiles run | Original | fibrs | Ratio | Precision | Measured as |
