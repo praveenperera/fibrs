@@ -848,8 +848,9 @@ fn occ<T: crate::arena::Voxel>(name: &str, v: &Vol<T>) {
     let (nd, s8, s4) = v.occupancy();
     let sz = std::mem::size_of::<T>();
     log!(
-        "occ {name}: resident {:.3} GiB, non-default {:.3} GiB, as 8^3 {:.3} GiB, as 4^3 {:.3} GiB",
+        "occ {name}: resident {:.3} GiB, touched {:.3} GiB, non-default {:.3} GiB, as 8^3 {:.3} GiB, as 4^3 {:.3} GiB",
         gib(v.resident_bytes()),
+        gib(v.touched_bytes()),
         gib(nd * sz),
         gib(s8 * 512 * sz),
         gib(s4 * 64 * sz)
@@ -947,7 +948,7 @@ fn trace_family(
         debug_mem(label, &[("coverage", cov.resident_bytes()), ("cache", cache.bytes()), ("catalogue", 12 * total)]);
         if std::env::var_os("FIBRS_DEBUG_MEM").is_some() {
             let (nd, s8, s4) = cov.occupancy();
-            log!("occ coverage: non-default {:.3} GiB, as 8^3 {:.3} GiB, as 4^3 {:.3} GiB", gib(nd * 2), gib(s8 * 1024), gib(s4 * 128));
+            log!("occ coverage: touched {:.3} GiB, non-default {:.3} GiB, as 8^3 {:.3} GiB, as 4^3 {:.3} GiB", gib(cov.touched_bytes()), gib(nd * 2), gib(s8 * 1024), gib(s4 * 128));
         }
         Ok(count)
     };

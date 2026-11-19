@@ -140,6 +140,11 @@ impl<T: Voxel> Vol<T> {
         self.bricks.iter().filter(|b| b.is_some()).count() * BRICK * std::mem::size_of::<T>()
     }
 
+    /// Diagnostic: resident bytes of the brick store
+    pub fn touched_bytes(&self) -> usize {
+        self.store.touched_bytes()
+    }
+
     /// Diagnostic: (non-default voxels, allocated 8³ sub-bricks, allocated 4³ sub-bricks) over the allocated bricks
     pub fn occupancy(&self) -> (usize, usize, usize) {
         let (mut nd, mut s8, mut s4) = (0, 0, 0);

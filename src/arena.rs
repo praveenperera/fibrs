@@ -302,6 +302,21 @@ impl<T> Cursor<T> {
     }
 }
 
+impl<T: Voxel> BrickStore<T> {
+    /// Diagnostic: bytes of the store's segments resident now (mincore)
+    pub fn touched_bytes(&self) -> usize {
+        let cursor = self.cursor.lock().expect("brick store lock");
+        let page = 4096;
+        let mut n = 0;
+        for &(ptr, bytes) in &cursor.segments {
+            let mut vec = vec![0u8; bytes.div_ceil(page)];
+            unsafe { libc::mincore(ptr.as_ptr().cast(), bytes, vec.as_mut_ptr()) };
+            n += vec.iter().filter(|&&v| v & 1 != 0).count() * page;
+        }
+        n
+    }
+}
+
 impl<T: Voxel> Drop for BrickStore<T> {
     fn drop(&mut self) {
         let cursor = self.cursor.get_mut().expect("brick store lock");

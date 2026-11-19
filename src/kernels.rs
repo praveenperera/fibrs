@@ -337,6 +337,10 @@ impl Coverage {
         self.0.occupancy()
     }
 
+    pub fn touched_bytes(&self) -> usize {
+        self.0.touched_bytes()
+    }
+
     /// `is_covered_same_dir` (core.py:237)
     #[inline]
     pub fn covered_same_dir(&self, x: f64, y: f64, z: f64, tx: f64, ty: f64, tz: f64) -> bool {
