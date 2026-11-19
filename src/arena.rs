@@ -16,6 +16,7 @@ use std::alloc::{AllocError, Allocator, Global, Layout, handle_alloc_error};
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 /// Requests below this size go straight to the global allocator: they come from its per-thread caches and never
 /// map memory of their own
@@ -174,36 +175,47 @@ unsafe impl Voxel for u16 {
     const ZERO: Self = 0;
 }
 
+// SAFETY: every bit pattern is a valid `u32`, and all zero bits are 0; a volume's tables of sub-brick ids are stored
+// as bricks of `u32`
+unsafe impl Voxel for u32 {
+    const ZERO: Self = 0;
+}
+
 /// Bytes mapped per segment: large enough that the mappings of a dense window number in the hundreds, small
 /// enough that the unused tail of the last segment, which is never touched and so never resident, stays virtual
 const SEGMENT_BYTES: usize = 64 << 20;
 /// Bricks a parallel writer takes from the shared cursor at a time
 const RUN_BRICKS: usize = 64;
+/// Runs a store makes room for at once beyond its bricks: far more than the writers of one parallel fill
+const RUN_SLACK: usize = 4096;
 
-/// Bump storage for the bricks of one volume
+/// Bump storage for the bricks of one volume, each named by a 32-bit id
 ///
 /// Segments are anonymous mappings made directly, not through the global allocator, so their pages are zero and
 /// untouched until a brick is written, whatever allocator the process runs on. A brick of a zero default is
 /// handed out as it is; any other default is written into the brick when it is handed out, so only bricks in use
-/// are ever resident. Bricks are never freed one by one: the segments are unmapped when the store is dropped
+/// are ever resident. Bricks are never freed one by one: the segments are unmapped when the store is dropped.
+///
+/// An id is the brick's segment and its place in it, so [`BrickStore::get`] finds a brick from a table of segment
+/// addresses sized for the store's capacity up front: ids take half the room of pointers in the tables that hold
+/// them. Id 0 is the first brick handed out
 pub struct BrickStore<T: Voxel> {
     brick: usize,
     default: T,
-    segment_bricks: usize,
-    cursor: Mutex<Cursor<T>>,
+    /// Bricks per segment, as a shift; a power of two, so an id splits into segment and brick with a shift
+    shift: u32,
+    /// Each segment's first voxel once it is mapped; set under the cursor's lock, before any id in it is handed out
+    segments: Box<[AtomicPtr<T>]>,
+    cursor: Mutex<Cursor>,
 }
 
-/// The unused part of the newest segment, the unused tails of finished runs, and every segment mapped so far
-struct Cursor<T> {
-    next: *mut T,
+/// The unused ids of the newest segment, the unused tails of finished runs, and how many segments are mapped
+struct Cursor {
+    next: usize,
     left: usize,
-    spare: Vec<(*mut T, usize)>,
-    segments: Vec<(NonNull<u8>, usize)>,
+    spare: Vec<(usize, usize)>,
+    mapped: usize,
 }
-
-// SAFETY: the cursor's pointers address the store's own mappings, which live as long as the store; the cursor is
-// only reached through the store's lock or `&mut self`
-unsafe impl<T: Send> Send for Cursor<T> {}
 
 /// Bricks taken from a store for one writer, so parallel writers touch the shared cursor once per
 /// `RUN_BRICKS` bricks
@@ -213,55 +225,104 @@ unsafe impl<T: Send> Send for Cursor<T> {}
 /// over sparse rows use one brick or none
 pub struct BrickRun<'s, T: Voxel> {
     store: &'s BrickStore<T>,
-    next: *mut T,
+    next: usize,
     left: usize,
 }
 
 impl<T: Voxel> BrickStore<T> {
-    /// Storage for bricks of `brick` voxels of `T` reading `default` until written; `max_bricks` bounds how many the
-    /// volume can hold, so a small volume maps no more than it could use
+    /// Storage for up to `max_bricks` bricks of `brick` voxels of `T` reading `default` until written; a small
+    /// volume maps no more than it could use
+    ///
+    /// # Panics
+    ///
+    /// When a brick is not a power of two bytes, or `max_bricks` ids do not fit in 32 bits. Taking more bricks than
+    /// the store was sized for panics too
     pub fn new(brick: usize, default: T, max_bricks: usize) -> Self {
-        let per_segment = (SEGMENT_BYTES / (brick * size_of::<T>())).max(1);
-        let cursor = Cursor { next: std::ptr::null_mut(), left: 0, spare: Vec::new(), segments: Vec::new() };
-        Self { brick, default, segment_bricks: per_segment.min(max_bricks.max(1)), cursor: Mutex::new(cursor) }
+        let bytes = brick * size_of::<T>();
+        assert!(bytes.is_power_of_two(), "a brick of {bytes} bytes is not a power of two");
+        let per_segment = (SEGMENT_BYTES / bytes).max(1).min(max_bricks.max(1).next_power_of_two());
+        // runs in flight hold up to RUN_BRICKS ids each that they may not use, so the table has room for that many
+        // more bricks than the volume can hold, for up to RUN_SLACK runs at once
+        let count = (max_bricks.max(1) + RUN_SLACK * RUN_BRICKS).div_ceil(per_segment);
+        assert!(count * per_segment <= 1 << 32, "{max_bricks} bricks do not fit 32-bit ids");
+        let segments = (0..count).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect();
+        let cursor = Cursor { next: 0, left: 0, spare: Vec::new(), mapped: 0 };
+        Self { brick, default, shift: per_segment.trailing_zeros(), segments, cursor: Mutex::new(cursor) }
+    }
+
+    /// The first voxel of brick `id`, which the store has handed out
+    #[inline(always)]
+    pub fn get(&self, id: u32) -> NonNull<T> {
+        let id = id as usize;
+        debug_assert!(id >> self.shift < self.segments.len(), "brick {id} is past the store");
+        // SAFETY: a handed-out id lies in a mapped segment of `1 << shift` bricks, inside the table. The volume reads
+        // bricks on the hot paths of every stage, so the table's bounds check is left out
+        let base = unsafe { self.segments.get_unchecked(id >> self.shift) }.load(Ordering::Acquire);
+        debug_assert!(!base.is_null(), "brick {id} was never handed out");
+        // SAFETY: as above
+        unsafe { NonNull::new_unchecked(base.add((id & ((1 << self.shift) - 1)) * self.brick)) }
     }
 
     /// One brick filled with the default, from a store this thread owns
-    pub fn alloc(&mut self) -> NonNull<T> {
-        let (brick, segment_bricks) = (self.brick, self.segment_bricks);
-        let cursor = self.cursor.get_mut().expect("brick store lock");
-        let (ptr, _) = cursor.take(1, brick, segment_bricks);
-        self.fill(ptr)
+    pub fn alloc(&mut self) -> (u32, NonNull<T>) {
+        let (id, _) = self.take(1);
+        (id as u32, self.fill(id))
     }
 
     /// An empty run for a parallel writer; [`BrickRun::alloc`] fills it on first use
     pub fn run(&self) -> BrickRun<'_, T> {
-        BrickRun { store: self, next: std::ptr::null_mut(), left: 0 }
+        BrickRun { store: self, next: 0, left: 0 }
     }
 
-    fn fill(&self, ptr: *mut T) -> NonNull<T> {
+    /// The first id and the length of up to `want` bricks, from a finished run's tail or the newest segment,
+    /// mapping a new segment when both are used up
+    fn take(&self, want: usize) -> (usize, usize) {
+        let mut cursor = self.cursor.lock().expect("brick store lock");
+        if let Some((next, left)) = cursor.spare.pop() {
+            let n = want.min(left);
+            if n < left {
+                cursor.spare.push((next + n, left - n));
+            }
+            return (next, n);
+        }
+
+        if cursor.left == 0 {
+            let at = cursor.mapped;
+            assert!(at < self.segments.len(), "brick store is full");
+            let ptr = map_segment((self.brick * size_of::<T>()) << self.shift);
+            self.segments[at].store(ptr.as_ptr().cast(), Ordering::Release);
+            cursor.mapped += 1;
+            cursor.next = at << self.shift;
+            cursor.left = 1 << self.shift;
+        }
+        let n = want.min(cursor.left);
+        let next = cursor.next;
+        cursor.next += n;
+        cursor.left -= n;
+        (next, n)
+    }
+
+    fn fill(&self, id: usize) -> NonNull<T> {
+        let ptr = self.get(id as u32);
         if self.default != T::ZERO {
             // SAFETY: the brick is `brick` voxels inside a live segment, handed to this caller only
-            unsafe { std::slice::from_raw_parts_mut(ptr, self.brick) }.fill(self.default);
+            unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), self.brick) }.fill(self.default);
         }
-        NonNull::new(ptr).expect("segments are never at address zero")
+        ptr
     }
 }
 
 impl<T: Voxel> BrickRun<'_, T> {
-    /// One brick filled with the default, refilling the run from its store when it runs out
-    pub fn alloc(&mut self) -> NonNull<T> {
-        let store = self.store;
+    /// One brick filled with the default and its id, refilling the run from its store when it runs out
+    pub fn alloc(&mut self) -> (u32, NonNull<T>) {
         if self.left == 0 {
-            let mut cursor = store.cursor.lock().expect("brick store lock");
-            (self.next, self.left) = cursor.take(RUN_BRICKS, store.brick, store.segment_bricks);
+            (self.next, self.left) = self.store.take(RUN_BRICKS);
         }
 
-        let ptr = self.next;
-        // SAFETY: the run holds `left` more bricks of `brick` voxels from `next` on, inside one segment
-        self.next = unsafe { ptr.add(store.brick) };
+        let id = self.next;
+        self.next += 1;
         self.left -= 1;
-        store.fill(ptr)
+        (id as u32, self.store.fill(id))
     }
 }
 
@@ -273,41 +334,15 @@ impl<T: Voxel> Drop for BrickRun<'_, T> {
     }
 }
 
-impl<T> Cursor<T> {
-    /// The start and length of up to `want` bricks, from a finished run's tail or the newest segment, mapping a new
-    /// segment when both are used up
-    fn take(&mut self, want: usize, brick: usize, segment_bricks: usize) -> (*mut T, usize) {
-        if let Some((next, left)) = self.spare.pop() {
-            let n = want.min(left);
-            if n < left {
-                // SAFETY: the tail holds `left` bricks from `next` on, inside one segment
-                self.spare.push((unsafe { next.add(n * brick) }, left - n));
-            }
-            return (next, n);
-        }
-
-        if self.left == 0 {
-            let bytes = segment_bricks * brick * size_of::<T>();
-            let ptr = map_segment(bytes);
-            self.segments.push((ptr, bytes));
-            self.next = ptr.as_ptr().cast();
-            self.left = segment_bricks;
-        }
-        let n = want.min(self.left);
-        let next = self.next;
-        // SAFETY: `n` bricks remain in the newest segment from `next` on
-        self.next = unsafe { self.next.add(n * brick) };
-        self.left -= n;
-        (next, n)
-    }
-}
-
 impl<T: Voxel> Drop for BrickStore<T> {
     fn drop(&mut self) {
-        let cursor = self.cursor.get_mut().expect("brick store lock");
-        for &(ptr, bytes) in &cursor.segments {
-            // SAFETY: each segment was mapped by `map_segment` with this length, and no brick outlives the store
-            unsafe { libc::munmap(ptr.as_ptr().cast(), bytes) };
+        let bytes = (self.brick * size_of::<T>()) << self.shift;
+        for segment in &self.segments {
+            let ptr = segment.load(Ordering::Acquire);
+            if !ptr.is_null() {
+                // SAFETY: each segment was mapped by `map_segment` with this length, and no brick outlives the store
+                unsafe { libc::munmap(ptr.cast(), bytes) };
+            }
         }
     }
 }
@@ -391,24 +426,33 @@ mod tests {
     #[test]
     fn bricks_are_distinct_and_hold_the_default() {
         let mut store = BrickStore::new(4096, 128u8, 10_000);
-        let a = store.alloc();
-        let b = store.alloc();
+        let (ia, a) = store.alloc();
+        let (ib, b) = store.alloc();
+        assert_eq!((ia, ib), (0, 1));
         assert_eq!(unsafe { b.as_ptr().offset_from(a.as_ptr()) }, 4096);
-        let (c, d) = {
+        assert_eq!(store.get(ib), b);
+        let ((ic, c), (_, d)) = {
             let mut run = store.run();
             (run.alloc(), run.alloc())
         };
+        assert_eq!(store.get(ic), c);
         let brick = unsafe { std::slice::from_raw_parts(c.as_ptr(), 4096) };
         assert!(brick.iter().all(|&v| v == 128));
         // a dropped run's unused bricks go to the next run instead of being skipped
-        let e = store.run().alloc();
+        let (_, e) = store.run().alloc();
         assert_eq!(unsafe { e.as_ptr().offset_from(d.as_ptr()) }, 4096);
-        let fresh = store.run().alloc();
+        let (_, fresh) = store.run().alloc();
         assert_eq!(unsafe { fresh.as_ptr().offset_from(e.as_ptr()) }, 4096);
-        // a store sized for few bricks maps no more than it can hold, and maps again when that is used up
-        let mut small = BrickStore::new(4096, 0u16, 2);
+        // a store sized for few bricks maps no more than it can hold, and maps again when that is used up; ids
+        // keep naming their own bricks across segments
+        let mut small = BrickStore::new(2048, 0u16, 5);
         let bricks: Vec<_> = (0..5).map(|_| small.alloc()).collect();
-        assert_eq!(small.cursor.lock().unwrap().segments.len(), 3);
-        assert!(bricks.windows(2).all(|w| w[0] != w[1]));
+        assert_eq!(small.cursor.lock().unwrap().mapped, 1);
+        assert!(bricks.windows(2).all(|w| w[0].1 != w[1].1));
+        assert!(bricks.iter().all(|&(id, ptr)| small.get(id) == ptr));
+        let mut tiny = BrickStore::new(64, 0u8, 5_000_000);
+        let ids: Vec<_> = (0..(1 << 20) + 3).map(|_| tiny.alloc()).collect();
+        assert_eq!(tiny.cursor.lock().unwrap().mapped, 2);
+        assert!(ids.iter().step_by(4099).all(|&(id, ptr)| tiny.get(id) == ptr));
     }
 }
