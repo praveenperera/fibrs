@@ -4,7 +4,10 @@
 //! is cut to its tile's core box: runs of its points inside the box are kept, and where a run leaves through an
 //! interior face (a core face shared with another tile), the point where its segment crosses the face is added, so
 //! the run ends on it. Where the point outside is outside on more than one axis, the face the segment crosses
-//! first is the one it leaves through. At each interior face, a cut end from the core below the face and one from
+//! first is the one it leaves through. A segment whose two points both lie outside but which passes through the box,
+//! as one cutting across a tile corner can, gives a run of its entry and exit points, so the fibre is not split at
+//! the corner; halojoin cuts across one axis only and never meets it. At each interior face, a cut end from the core
+//! below the face and one from
 //! the core above it, of the same family and at most [`RADIUS`] voxels apart, are joined: shortest first (ties by
 //! run and end), each end once, and a join that would close a loop is skipped. Runs of fewer than two points are
 //! dropped. Nothing depends on hash order, so the same runs always give the same chains
@@ -64,6 +67,37 @@ impl CoreBox {
 
         first.expect("a point outside the box is outside on some axis").1
     }
+
+    /// Where the segment from `p` to `q`, both outside the box, passes through it: the faces it enters and leaves
+    /// by, the lower axis on a tie, or `None` when it misses the box or only touches it
+    fn passage(&self, p: &Point, q: &Point) -> Option<(Face, Face)> {
+        let (mut t_in, mut t_out) = (0.0, 1.0);
+        let (mut enter, mut leave) = (None, None);
+        for axis in 0..3 {
+            let d = q[axis] - p[axis];
+            if d == 0.0 {
+                if p[axis] < self.lo[axis] || p[axis] >= self.hi[axis] {
+                    return None;
+                }
+                continue;
+            }
+
+            let (near, far) = if d > 0.0 { (self.lo[axis], self.hi[axis]) } else { (self.hi[axis], self.lo[axis]) };
+            let (t_near, t_far) = ((near - p[axis]) / d, (far - p[axis]) / d);
+            if t_near > t_in {
+                (t_in, enter) = (t_near, Some(Face { axis, at: near }));
+            }
+            if t_far < t_out {
+                (t_out, leave) = (t_far, Some(Face { axis, at: far }));
+            }
+        }
+
+        // both ends lie outside, so a passage of positive length is bounded by a face on each side
+        if t_in >= t_out {
+            return None;
+        }
+        Some((enter?, leave?))
+    }
 }
 
 /// A fibre's run inside one tile's core
@@ -111,13 +145,23 @@ pub fn cut(points: Vec<Point>, family: usize, core: &CoreBox, interior: &[Face])
         return Cut::Whole(points);
     }
 
-    // the face a run leaves through between an inside and an outside point, when it is interior
-    let leaves = |inside: &Point, outside: &Point| Some(core.exit(inside, outside)).filter(|f| interior.contains(f));
-    let n = points.len();
+    let interior_face = |f: Face| Some(f).filter(|f| interior.contains(f));
     let mut runs = Vec::new();
+    let mut keep = |run: Vec<Point>, head: Option<Face>, tail: Option<Face>| {
+        if run.len() >= 2 {
+            runs.push(Run { points: run, family, head, tail, core_lo: core.lo });
+        }
+    };
+    let n = points.len();
     let mut i = 0;
     while i < n {
         if !inside[i] {
+            // two points outside whose segment passes through the core, across a corner
+            if let Some((enter, leave)) = points.get(i + 1).and_then(|q| core.passage(&points[i], q)) {
+                let (head, tail) = (interior_face(enter), interior_face(leave));
+                let ends = [head, tail].into_iter().flatten();
+                keep(ends.map(|f| crossing(&points[i], &points[i + 1], f)).collect(), head, tail);
+            }
             i += 1;
             continue;
         }
@@ -126,15 +170,13 @@ pub fn cut(points: Vec<Point>, family: usize, core: &CoreBox, interior: &[Face])
             j += 1;
         }
 
-        let head = if i > 0 { leaves(&points[i], &points[i - 1]) } else { None };
-        let tail = if j + 1 < n { leaves(&points[j], &points[j + 1]) } else { None };
+        let head = if i > 0 { interior_face(core.exit(&points[i], &points[i - 1])) } else { None };
+        let tail = if j + 1 < n { interior_face(core.exit(&points[j], &points[j + 1])) } else { None };
         let mut run = Vec::with_capacity(j + 3 - i);
         run.extend(head.map(|f| crossing(&points[i - 1], &points[i], f)));
         run.extend_from_slice(&points[i..=j]);
         run.extend(tail.map(|f| crossing(&points[j], &points[j + 1], f)));
-        if run.len() >= 2 {
-            runs.push(Run { points: run, family, head, tail, core_lo: core.lo });
-        }
+        keep(run, head, tail);
         i = j + 1;
     }
 
@@ -356,6 +398,37 @@ mod tests {
         assert!(!got[0].is_cut());
         // a run of one point inside is dropped
         assert!(runs(cut(line(&[-2.0, 1.0, -3.0], 0.0), 1, &left, &interior)).is_empty());
+    }
+
+    /// Four cores meeting at x = y = 10 (open on z, the outer faces not interior)
+    fn quadrants() -> ([CoreBox; 4], Vec<Face>) {
+        let core = |x: [f64; 2], y: [f64; 2]| CoreBox { lo: [x[0], y[0], -OPEN], hi: [x[1], y[1], OPEN] };
+        let (low, high) = ([0.0, 10.0], [10.0, 20.0]);
+        let cores = [core(low, low), core(high, low), core(low, high), core(high, high)];
+        (cores, vec![Face { axis: 0, at: 10.0 }, Face { axis: 1, at: 10.0 }])
+    }
+
+    /// A segment that cuts across the corner with no point in the core it passes through gives that core a run of
+    /// its entry and exit, and the three pieces join back into one fibre; a segment past the corner gives none
+    #[test]
+    fn a_fibre_across_a_corner_joins_through_the_core_between() {
+        let (cores, interior) = quadrants();
+        // y = 10 at t = 0.25, x = 10 at t = 0.75: through the low-x, high-y core between its two points
+        let points = vec![[8.0, 8.0, 5.0], [9.25, 9.75, 5.0], [10.25, 10.75, 5.0], [12.0, 12.0, 5.0]];
+        let pieces: Vec<Run> = cores.iter().flat_map(|c| runs(cut(points.clone(), 1, c, &interior))).collect();
+        let between: Vec<&Run> = pieces.iter().filter(|r| r.core_lo[..2] == [0.0, 10.0]).collect();
+        assert_eq!(between.len(), 1);
+        assert_eq!(between[0].points, vec![[9.5, 10.0, 5.0], [10.0, 10.5, 5.0]]);
+        assert_eq!((between[0].head, between[0].tail), (Some(interior[1]), Some(interior[0])));
+
+        let (chains, stats) = join(pieces, RADIUS);
+        assert_eq!((stats.cut_runs, stats.joins, stats.chains), (3, 2, 1));
+        assert_eq!(chains[0].1.first(), Some(&[8.0, 8.0, 5.0]));
+        assert_eq!(chains[0].1.last(), Some(&[12.0, 12.0, 5.0]));
+
+        // along x + y = 19.5, short of the high-x, high-y core, where x + y >= 20
+        let past = vec![[9.0, 10.5, 5.0], [10.5, 9.0, 5.0]];
+        assert!(runs(cut(past, 1, &cores[3], &interior)).is_empty());
     }
 
     fn end_run(points: Vec<Point>, family: usize, head: Option<Face>, tail: Option<Face>, core_lo: f64) -> Run {

@@ -77,7 +77,9 @@ fibrs --predictions P --array semantic --tracing-predictions P --tracing-array t
   they are of the same family and at most 1.5 native voxels apart: shortest first, each end once, and never into a
   loop. Pieces under two points are dropped. This is the rule the v2-run pipeline uses to join its Z bands. Near a
   seam the output can differ from an untiled run: a fibre traced from each side whose cut ends land more than 1.5
-  voxels apart stays split, and a tile sees its neighbours' data only as far as the halo reaches.
+  voxels apart stays split, and a tile sees its neighbours' data only as far as the halo reaches. A step of a fibre
+  that cuts across a tile corner, with no point in the tile it passes through, gives that tile the piece between
+  its two crossings, so the fibre joins through the corner.
 - **Output.** The `.afv` has the untiled run's metadata. Each family is written in the untiled order: every tile's
   uncut fibres in tile order (row by row), then the fibres joined across seams. A `--tiles-yx 1 1` run takes the
   tiled path and writes the same `.afv` as an untiled run, every row and metadata value but the uuid.
