@@ -726,6 +726,10 @@ fn trace_families(
     debug_dump(work, "ny", || ny.read_block([0, 0, 0], ny.shape()))?;
     log!("Direction field: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem("direction field", &[("tracing", resident), ("nx", nx.resident_bytes()), ("ny", ny.resident_bytes())]);
+    occ("tracing0", &tracing[0]);
+    occ("tracing1", &tracing[1]);
+    occ("nx", &nx);
+    occ("ny", &ny);
     let pool = BufferPool::new(CHUNK_POOL_RETAIN);
     let cache = NativeCache::new(native, cache_bytes, &pool);
     for &family in families {
@@ -825,6 +829,31 @@ fn debug_mem(stage: &str, parts: &[(&str, usize)]) {
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
     let parts: Vec<String> = parts.iter().map(|(k, v)| format!("{k} {:.2}", gib(*v))).collect();
     log!("mem {stage}: {} GiB; rss {:.2} GiB", parts.join(", "), gib(rss.unwrap_or(0) * page));
+    let mi = unsafe { libc::mallinfo2() };
+    log!(
+        "malloc {stage}: arena {:.3} GiB, in use {:.3}, free {:.3}, top-releasable {:.3}, mmapped {:.3} GiB in {} blocks",
+        gib(mi.arena),
+        gib(mi.uordblks),
+        gib(mi.fordblks),
+        gib(mi.keepcost),
+        gib(mi.hblkhd),
+        mi.hblks
+    );
+}
+
+fn occ<T: crate::arena::Voxel>(name: &str, v: &Vol<T>) {
+    if std::env::var_os("FIBRS_DEBUG_MEM").is_none() {
+        return;
+    }
+    let (nd, s8, s4) = v.occupancy();
+    let sz = std::mem::size_of::<T>();
+    log!(
+        "occ {name}: resident {:.3} GiB, non-default {:.3} GiB, as 8^3 {:.3} GiB, as 4^3 {:.3} GiB",
+        gib(v.resident_bytes()),
+        gib(nd * sz),
+        gib(s8 * 512 * sz),
+        gib(s4 * 64 * sz)
+    );
 }
 
 fn gib(bytes: usize) -> f64 {
@@ -848,6 +877,7 @@ fn trace_family(
     let FamilyFields { cent, seeds } = centrality(&pres, nx, ny);
     log!("{label} centrality: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem(label, &[("cent", cent.resident_bytes()), ("seeds", seeds.len() * std::mem::size_of::<Seed>())]);
+    occ("cent", &cent);
     let t = Instant::now();
     let cat = catalogue(&seeds, &cent);
     debug_dump(&folder, "presence", || pres.read_block([0, 0, 0], pres.shape()))?;
@@ -915,6 +945,10 @@ fn trace_family(
             let _ = tx.send(batch);
         }
         debug_mem(label, &[("coverage", cov.resident_bytes()), ("cache", cache.bytes()), ("catalogue", 12 * total)]);
+        if std::env::var_os("FIBRS_DEBUG_MEM").is_some() {
+            let (nd, s8, s4) = cov.occupancy();
+            log!("occ coverage: non-default {:.3} GiB, as 8^3 {:.3} GiB, as 4^3 {:.3} GiB", gib(nd * 2), gib(s8 * 1024), gib(s4 * 128));
+        }
         Ok(count)
     };
     let consume = |batch: Vec<RawCurve>| -> Result<()> {

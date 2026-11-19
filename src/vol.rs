@@ -140,6 +140,30 @@ impl<T: Voxel> Vol<T> {
         self.bricks.iter().filter(|b| b.is_some()).count() * BRICK * std::mem::size_of::<T>()
     }
 
+    /// Diagnostic: (non-default voxels, allocated 8³ sub-bricks, allocated 4³ sub-bricks) over the allocated bricks
+    pub fn occupancy(&self) -> (usize, usize, usize) {
+        let (mut nd, mut s8, mut s4) = (0, 0, 0);
+        for b in self.bricks.iter().flatten() {
+            let v = self.brick(*b);
+            let mut m8 = [false; 8];
+            let mut m4 = [false; 64];
+            for z in 0..EDGE {
+                for y in 0..EDGE {
+                    for x in 0..EDGE {
+                        if v[Self::offset(z, y, x)] != self.default {
+                            nd += 1;
+                            m8[(z >> 3) * 4 + (y >> 3) * 2 + (x >> 3)] = true;
+                            m4[(z >> 2) * 16 + (y >> 2) * 4 + (x >> 2)] = true;
+                        }
+                    }
+                }
+            }
+            s8 += m8.iter().filter(|&&m| m).count();
+            s4 += m4.iter().filter(|&&m| m).count();
+        }
+        (nd, s8, s4)
+    }
+
     /// Copy a dense C-order block with origin `lo` and extent `dims` into the volume; bricks that would
     /// stay all-default are not allocated
     pub fn write_block(&mut self, lo: Shape, dims: Shape, data: &[T]) {
