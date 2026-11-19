@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- **Centrality on the GPU.** `--device` now defaults to `auto`: centrality and the ridge seeds run on an NVIDIA GPU
+  of compute capability 8.0 or later when one is usable (Linux x86-64; a driver for CUDA 12.0 or newer is enough, no
+  CUDA toolkit), and on the CPU otherwise, with the reason in the log. `--device cpu` keeps them on the CPU,
+  `--device cuda` fails instead of falling back, and `--cuda-device N` picks the GPU (by default the first usable
+  one); `--device cuda` used to be rejected. A run keeps the rounding it started with when resumed, and one started
+  on the GPU can resume or finish on the CPU, which then computes centrality as the GPU does. The kernels are
+  written in Rust with cuda-oxide and ship inside the binary as PTX. On a PHerc1545 and a PHerc0826 band the `.afv`
+  was identical on the GPU and the CPU, and identical to the original's with either of its devices. With
+  `--threads 8`, centrality took 1.8 s instead of 8.1 s on the PHerc1545 band and 5.0 s instead of 20.4 s on the
+  PHerc0826 band. The direction field and tracing still run on the CPU (see the README's "Speed").
+- The README's "Same output" section now gives the PHerc0826 band's counts as measured: 149,680 fibres and 161,787
+  point blocks and spatial-index rows. It said 149,780 and 161,887.
 - `fibrs predict --voxel-size-um` sets the output's `voxel_size_um` attribute, which was always 9.362, the PHerc0826
   CT's voxel size, as in the reference. The default is still 9.362, so pass it for a CT with another voxel size
   (8.64 for example). Predictions are unchanged. A resume with a different value is refused.

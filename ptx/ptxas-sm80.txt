@@ -1,0 +1,26 @@
+ptxas info    : 128 bytes gmem, 32 bytes cmem[4]
+ptxas info    : Compiling entry function 'fb_slots' for 'sm_80'
+ptxas info    : Function properties for fb_slots
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 16 registers, used 0 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 44.341 ms
+ptxas info    : Compiling entry function 'fb_pack' for 'sm_80'
+ptxas info    : Function properties for fb_pack
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 9 registers, used 0 barriers, 384 bytes cmem[0]
+ptxas info    : Compile time = 1.667 ms
+ptxas info    : Compiling entry function 'fb_seeds' for 'sm_80'
+ptxas info    : Function properties for fb_seeds
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 0 barriers, 448 bytes cmem[0], 48 bytes cmem[2]
+ptxas info    : Compile time = 30.192 ms
+ptxas info    : Compiling entry function 'fb_centrality' for 'sm_80'
+ptxas info    : Function properties for fb_centrality
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 127 registers, used 0 barriers, 400 bytes cmem[0], 40 bytes cmem[2]
+ptxas info    : Compile time = 22.564 ms
+ptxas info    : Compiling entry function 'fb_gather' for 'sm_80'
+ptxas info    : Function properties for fb_gather
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 22 registers, used 0 barriers, 432 bytes cmem[0]
+ptxas info    : Compile time = 4.087 ms

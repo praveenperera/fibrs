@@ -7,8 +7,8 @@ point block and spatial-index row. The tracing algorithm, the AFV format and the
 predictions it reads are Qual's; this port changes how fast the tracer runs, not what it writes.
 
 With `--threads 4` for both tools, it traces 22×–47× faster across three uninterrupted runs on 512-plane bands of
-PHerc0826, PHerc1545 and PHerc0358 (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU and
-needs no GPU.
+PHerc0826, PHerc1545 and PHerc0358 (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU;
+centrality runs on an NVIDIA GPU when one is found, and on the CPU otherwise.
 
 `fibrs predict` runs the step before: Qual's AFV fibre model V2 over a CT volume on an NVIDIA GPU, without
 PyTorch, writing the probability zarr the tracer reads, as villa's inference writes it (see
@@ -30,10 +30,18 @@ x86-64 (glibc 2.28+) and Apple silicon (macOS 11+) are named `fibrs-<version>-<t
 
 ```sh
 fibrs --predictions P --array semantic --channel-order VH --tracing-predictions P \
-  --tracing-array tracing --voxel-size-um 9.362 --storage compressed --device cpu --threads 4 \
+  --tracing-array tracing --voxel-size-um 9.362 --storage compressed --threads 4 \
   --output fibers.afv --work-dir work
 python -m fibrs ARGS      # the same, from Python
 ```
+
+Centrality runs on the GPU when a usable one is found: Linux x86-64, an NVIDIA GPU of compute capability 8.0 or
+later, and a driver for CUDA 12.0 or newer (no CUDA toolkit). Otherwise it runs on the CPU, and the log says why.
+`--device cpu` keeps it on the CPU, `--device cuda` fails instead of falling back, and `--cuda-device N` picks the
+GPU (by default the first usable one). The GPU rounds some steps differently from the CPU (see "Differences from the
+original"), and a resumed run keeps the rounding it started with. A run started on the GPU can resume without one:
+the CPU then computes centrality as the GPU does, more slowly. `--device auto` does the same if the GPU fails
+mid-run, for example when it runs out of memory.
 
 `fibrs.run([...])` runs it from Python and returns the exit status.
 
@@ -86,11 +94,17 @@ from it; `cargo test` checks every case.
 
 ## Same output
 
-On that PHerc0826 band (z 12032–12544), the port's `.afv` is identical to the original's: 149,780 fibres,
-161,887 point blocks and 161,887 spatial-index rows, plus the metadata and schema. The 0.1.0 build was also
+On that PHerc0826 band (z 12032–12544), the port's `.afv` is identical to the original's: 149,680 fibres,
+161,787 point blocks and 161,787 spatial-index rows, plus the metadata and schema. The 0.1.0 build was also
 checked on a 512³ crop of the band: the wheel and the drop-in were installed into a fresh environment beside
 the original, and the crop was traced through `avf-spline-generator` and through `python -m fibrs`. Both
 outputs were identical to the original's `.afv`.
+
+Centrality on the GPU gives the same `.afv`. On the PHerc0826 band and on a 512-plane band of PHerc1545
+(z 1280–1792), with `--threads 4` and `--threads 8`, the port's output was identical with `--device cuda` and
+`--device cpu`, and identical to the original's with `--device cpu` and with `--device cuda`. The original's CUDA
+kernels round some multiply-adds as one operation where its CPU code rounds twice; the port reproduces each, and on
+these bands both roundings give the same `.afv`.
 
 CI traces a small synthetic input (`tests/fixtures/synthetic`) with every build's wheel on Linux and macOS,
 through the drop-in and through `python -m fibrs`. Both must write what the original wrote for it, compared by
@@ -147,6 +161,24 @@ On dense bands, fibrs's speed also depends on how it reads the predictions and a
 0.1.0, which took 104 s with a 3.5 GiB peak. One that decoded whole chunks took 69–72 s, and one that also gave
 each decoded chunk its own mapping spent 40% of its CPU time in the kernel.
 
+### Centrality on the GPU
+
+With `--threads 8` on an RTX 5090 host, each band ran four times back to back, CPU, GPU, GPU, CPU, with other work
+running on the machine:
+
+| Band | Centrality and seeds, CPU | Same, GPU | Whole run, CPU | Whole run, GPU |
+|---|---|---|---|---|
+| PHerc1545, z 1280–1792 | 8.1 s | 1.8 s | 44.2 s | 38.0 s |
+| PHerc0826, z 12032–12544 | 20.4 s | 5.0 s | 120 s | 105 s |
+
+Each figure is the mean of its two runs, and all eight `.afv` files were identical. The direction field (20–51 s
+here) and tracing still run on the CPU, so the whole run gains less, and its time moves with the machine's load
+(a mean one-minute load of 8–13 across these runs).
+
+The original's `--device cuda` doesn't make centrality faster. On the same bands with `--threads 8` its centrality
+took 52.6 s and 65.9 s with `--device cuda`, against 35.3 s and 59.3 s with `--device cpu`. Its kernels ran for
+2.2 s and 4.7 s of that; the rest went to host work and to copying each 128³ tile and its halo to the GPU and back.
+
 ## Differences from the original
 
 - Fields live in memory as sparse 16³ bricks instead of a Zarr work store, so peak memory is higher and grows
@@ -174,8 +206,10 @@ each decoded chunk its own mapping spent 40% of its CPU time in the kernel.
 - `--storage` and `--field-cache-mib` are validated, and `--storage` is recorded in `run.json` as the
   original records it, but neither selects anything. The chunk cache is bounded by `--native-cache-mib`
   plus `--field-cache-mib`.
-- `--device cuda` is rejected: the original uses CUDA only for centrality, and this port computes
-  centrality on the CPU.
+- `--device` defaults to `auto` (the GPU when one is usable) where the original defaults to `cpu`. On the GPU
+  the port writes what the original writes with `--device cuda`, whose kernels round some multiply-adds as one
+  fused operation, so its output can differ from the original's `--device cpu` output; pass `--device cpu` to
+  match that.
 - The command line replays argparse's pass, so exit status and selected values match, but help text and
   usage-error wording differ. Some argparse readings are not reproduced: numbers written with non-ASCII
   digits; non-UTF-8 bytes in the text options (`--array`, `--tracing-array`, `--coordinate-space`);
