@@ -780,8 +780,10 @@ impl Families<'_, '_, '_> {
 /// time so a dump holds one byte a voxel in either form
 fn dir_bytes<D: DirField>(dirs: &D, shift: u32) -> Vec<u8> {
     let [d, h, w] = dirs.shape().map(|n| n as i64);
+    let mut out = Vec::with_capacity(dirs.shape().iter().product());
     let voxels = (0..d).flat_map(|z| (0..h).flat_map(move |y| (0..w).map(move |x| [z, y, x])));
-    voxels.map(|[z, y, x]| (dirs.at(z, y, x) >> shift) as u8).collect()
+    out.extend(voxels.map(|[z, y, x]| (dirs.at(z, y, x) >> shift) as u8));
+    out
 }
 
 /// The direction field, on the GPU when there is one, in the form the run's centrality reads

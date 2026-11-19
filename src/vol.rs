@@ -99,6 +99,7 @@ impl<T: Voxel> Vol<T> {
     }
 
     /// The value every voxel outside an allocated brick reads as
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
     pub fn default_value(&self) -> T {
         self.default
     }
@@ -168,6 +169,7 @@ impl<T: Voxel> Vol<T> {
 
     /// The voxels of brick `bi` (C order over the brick grid) in brick order, or None where every voxel reads as
     /// the default
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
     pub fn brick_at(&self, bi: usize) -> Option<&[T; BRICK]> {
         let b = self.bricks[bi]?;
         Some(self.brick(b).try_into().expect("a brick holds BRICK voxels"))
@@ -175,6 +177,7 @@ impl<T: Voxel> Vol<T> {
 
     /// Replace brick `bi` with `data`, one brick's voxels in brick order; a brick that would hold only the default
     /// is not allocated
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
     pub fn set_brick(&mut self, bi: usize, data: &[T; BRICK]) {
         let b = match self.bricks[bi] {
             Some(b) => b,
