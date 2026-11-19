@@ -109,6 +109,18 @@ impl Grid<u8> for Presence<'_> {
     fn at(&self, z: i64, y: i64, x: i64) -> u8 {
         self.get(z as usize, y as usize, x as usize)
     }
+
+    #[inline(always)]
+    fn corners(&self, z: i64, y: i64, x: i64) -> [u8; 8] {
+        let at = [z, y, x].map(|v| v as usize);
+        let own = self.own.cell(at[0], at[1], at[2]);
+        // presence is 0 wherever the family's own prediction is, as in `get`
+        if own == [0; 8] {
+            return own;
+        }
+        let other = self.other.cell(at[0], at[1], at[2]);
+        std::array::from_fn(|c| presence(own[c], other[c]))
+    }
 }
 
 /// Presence from the family's own pooled prediction and the other's

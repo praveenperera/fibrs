@@ -143,6 +143,20 @@ impl<T: Voxel> Vol<T> {
         (self.sub(id), Self::offset(z, y, x))
     }
 
+    /// The 2 × 2 × 2 values from an in-bounds voxel to the one past it on every axis, which must be in bounds too,
+    /// in z, y, x order: corner `dz * 4 + dy * 2 + dx`
+    ///
+    /// The tracer's trilinear samples read cells like this; when the cell lies in one sub-brick, it is found once
+    #[inline(always)]
+    pub fn cell(&self, z: usize, y: usize, x: usize) -> [T; 8] {
+        if (z & SUB_MASK) != SUB_MASK && (y & SUB_MASK) != SUB_MASK && (x & SUB_MASK) != SUB_MASK {
+            let (sub, at) = self.locate(z, y, x);
+            let (dy, dz) = (SUB_EDGE, SUB_EDGE * SUB_EDGE);
+            return [0, 1, dy, dy + 1, dz, dz + 1, dz + dy, dz + dy + 1].map(|d| sub[at + d]);
+        }
+        std::array::from_fn(|c| self.get(z + (c >> 2), y + (c >> 1 & 1), x + (c & 1)))
+    }
+
     /// The value at a voxel given as signed coordinates, which must be in bounds
     #[inline(always)]
     pub fn at(&self, z: i64, y: i64, x: i64) -> T {
@@ -382,6 +396,15 @@ mod tests {
         let subs: std::collections::HashSet<_> = nonzero.iter().map(|p| p.map(|v| v >> SUB_SHIFT)).collect();
         let bricks: std::collections::HashSet<_> = nonzero.iter().map(|p| p.map(|v| v >> SHIFT)).collect();
         assert_eq!(filled.resident_bytes(), bricks.len() * SUBS * 4 + subs.len() * SUB);
+        // a cell reads the same values whether it lies in one sub-brick or spans several
+        for z in 0..shape[0] - 1 {
+            for y in 0..shape[1] - 1 {
+                for x in 0..shape[2] - 1 {
+                    let each = std::array::from_fn(|c| value(z + (c >> 2), y + (c >> 1 & 1), x + (c & 1)));
+                    assert_eq!(filled.cell(z, y, x), each);
+                }
+            }
+        }
         let [z, y, x] = nonzero[3];
         assert!(filled.any_allocated_in([z, y, x], [1, 1, 1], |_, _, _| true));
         assert!(!filled.any_allocated_in([z, y, x], [1, 1, 1], |a, b, c| value(a, b, c) == 9));
