@@ -1,14 +1,14 @@
 //! Memory reuse for the tracer's large and numerous allocations
 //!
-//! glibc serves each block of 1 MiB or more with its own mapping (see `run::fix_mmap_threshold`), so every native
+//! glibc serves each block of 1 MiB or more with its own mapping (see `run::fix_malloc_thresholds`), so every native
 //! chunk decoded and every direction-field tile computed costs an `mmap`, a `munmap` and a page fault for each of
 //! its pages, and it grows its per-thread heaps a few pages at a time with `mprotect` as bricks are added. Each of
 //! those calls takes the process's `mmap_lock` for writing, and every page fault on every thread waits for it: on
-//! the dense PHerc0358 windows the tracer spent most of its time there, at about half a core. Two owners take
+//! a dense PHerc0358 crop 40% of the CPU time went to the kernel and a run took twice as long. Two owners take
 //! these allocations off the system calls:
 //!
 //! - [`BufferPool`], an [`Allocator`] that keeps freed large buffers by size and hands them out again, for the
-//!   decoded native chunks and the direction field's tile buffers
+//!   native predictions (decoded slabs and compressed chunks) and the direction field's tile buffers
 //! - [`BrickStore`], the bump storage behind a [`Vol`](crate::vol::Vol)'s bricks: whole segments mapped at once and
 //!   carved into bricks in allocation order, freed together with the volume
 
