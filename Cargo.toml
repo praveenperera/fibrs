@@ -25,6 +25,8 @@ libc = "0.2"
 libloading = "0.9"
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode"] }
 memmap2 = "0.9"
+# an optional global allocator, measured against glibc malloc on dense windows (`--features mimalloc`)
+mimalloc = { version = "0.1.52", optional = true }
 rayon = "1.12"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde_json = { version = "1", features = ["preserve_order"] }
