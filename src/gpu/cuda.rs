@@ -490,7 +490,7 @@ impl Inputs {
         let grid = vols[0].grid();
         let n_box = nb.iter().product::<usize>();
         let mut table = vec![NO_BRICK; vols.len() * n_box];
-        let mut payloads: Vec<&[u8; BRICK]> = Vec::new();
+        let mut payloads: Vec<(&Vol<u8>, usize)> = Vec::new();
         let mut entry = table.iter_mut();
         for vol in vols {
             for bz in b0[0]..b0[0] + nb[0] {
@@ -498,9 +498,9 @@ impl Inputs {
                     let row = (bz * grid[1] + by) * grid[2];
                     for bx in b0[2]..b0[2] + nb[2] {
                         let slot = entry.next().expect("the table has an entry per volume and brick of the box");
-                        if let Some(b) = vol.brick_at(row + bx) {
+                        if vol.has_brick(row + bx) {
                             *slot = payloads.len() as u32;
-                            payloads.push(b);
+                            payloads.push((*vol, row + bx));
                         }
                     }
                 }
@@ -512,7 +512,9 @@ impl Inputs {
         fit_host(stream, &mut self.staging, n_pool, sys::CU_MEMHOSTALLOC_WRITECOMBINED)?;
         // the pool gathers the scattered bricks into pinned memory, so its upload is one asynchronous copy
         let host = &mut self.staging.as_mut_slice()?[..n_pool];
-        host.par_chunks_mut(BRICK).zip(payloads.par_iter()).for_each(|(d, s)| d.copy_from_slice(&s[..]));
+        host.par_chunks_exact_mut(BRICK)
+            .zip(payloads.par_iter())
+            .for_each(|(d, &(vol, bi))| vol.read_brick(bi, d.try_into().expect("a pool chunk holds BRICK voxels")));
         fit(stream, &mut self.pool, n_pool)?;
         fit(stream, &mut self.table, table.len())?;
         fit(stream, &mut self.desc, desc.len())?;

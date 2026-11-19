@@ -23,6 +23,13 @@ pub trait Grid<T: Copy>: Sync {
     fn dims(&self) -> [i64; 3];
     /// The value at an in-bounds voxel
     fn at(&self, z: i64, y: i64, x: i64) -> T;
+
+    /// The 2 × 2 × 2 values from an in-bounds voxel to the one past it on every axis, which must be in bounds too,
+    /// in z, y, x order: corner `dz * 4 + dy * 2 + dx`
+    #[inline(always)]
+    fn corners(&self, z: i64, y: i64, x: i64) -> [T; 8] {
+        std::array::from_fn(|c| self.at(z + (c >> 2) as i64, y + (c >> 1 & 1) as i64, x + (c & 1) as i64))
+    }
 }
 
 impl<T: Voxel> Grid<T> for Vol<T> {
@@ -34,6 +41,11 @@ impl<T: Voxel> Grid<T> for Vol<T> {
     #[inline(always)]
     fn at(&self, z: i64, y: i64, x: i64) -> T {
         self.get(z as usize, y as usize, x as usize)
+    }
+
+    #[inline(always)]
+    fn corners(&self, z: i64, y: i64, x: i64) -> [T; 8] {
+        self.cell(z as usize, y as usize, x as usize)
     }
 }
 
@@ -132,12 +144,12 @@ fn cell(d: [i64; 3], mut x: f64, mut y: f64, mut z: f64) -> ([i64; 3], [f32; 3])
 #[inline]
 pub fn trilin_u8<G: Grid<u8>>(arr: &G, x: f64, y: f64, z: f64) -> f64 {
     let ([iz, iy, ix], [fz, fy, fx]) = cell(arr.dims(), x, y, z);
-    let a = |z: i64, y: i64, x: i64| arr.at(z, y, x);
-    let lerp = |z: i64, y: i64| (1.0 - fx as f64) * a(z, y, ix) as f64 + (fx * a(z, y, ix + 1) as f32) as f64;
-    let p00 = lerp(iz, iy);
-    let p01 = lerp(iz, iy + 1);
-    let p10 = lerp(iz + 1, iy);
-    let p11 = lerp(iz + 1, iy + 1);
+    let c = arr.corners(iz, iy, ix);
+    let lerp = |i: usize| (1.0 - fx as f64) * c[i] as f64 + (fx * c[i + 1] as f32) as f64;
+    let p00 = lerp(0);
+    let p01 = lerp(2);
+    let p10 = lerp(4);
+    let p11 = lerp(6);
     let (fy, fz) = (fy as f64, fz as f64);
     (1.0 - fz) * ((1.0 - fy) * p00 + fy * p01) + fz * ((1.0 - fy) * p10 + fy * p11)
 }
@@ -147,12 +159,12 @@ pub fn trilin_u8<G: Grid<u8>>(arr: &G, x: f64, y: f64, z: f64) -> f64 {
 pub fn trilin_u16<G: Grid<u16>>(arr: &G, x: f64, y: f64, z: f64) -> f64 {
     let ([iz, iy, ix], [fz, fy, fx]) = cell(arr.dims(), x, y, z);
     let fx = fx as f64;
-    let a = |z: i64, y: i64, x: i64| arr.at(z, y, x) as f64;
-    let lerp = |z: i64, y: i64| (1.0 - fx) * a(z, y, ix) + fx * a(z, y, ix + 1);
-    let p00 = lerp(iz, iy);
-    let p01 = lerp(iz, iy + 1);
-    let p10 = lerp(iz + 1, iy);
-    let p11 = lerp(iz + 1, iy + 1);
+    let c = arr.corners(iz, iy, ix);
+    let lerp = |i: usize| (1.0 - fx) * c[i] as f64 + fx * c[i + 1] as f64;
+    let p00 = lerp(0);
+    let p01 = lerp(2);
+    let p10 = lerp(4);
+    let p11 = lerp(6);
     let (fy, fz) = (fy as f64, fz as f64);
     0.01f32 as f64 * ((1.0 - fz) * ((1.0 - fy) * p00 + fy * p01) + fz * ((1.0 - fy) * p10 + fy * p11))
 }
@@ -176,17 +188,16 @@ impl<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>> Fields<'_, P, C, N> {
         let ([iz, iy, ix], [fz, fy, fx]) = cell(self.pres.dims(), x, y, z);
         let (fx, fy, fz) = (fx as f64, fy as f64, fz as f64);
         let (mut vx, mut vy, mut vz) = (0.0f64, 0.0f64, 0.0f64);
+        let (pres, nx, ny) = (self.pres.corners(iz, iy, ix), self.nx.corners(iz, iy, ix), self.ny.corners(iz, iy, ix));
         for dz_i in 0..2 {
             let wz = if dz_i == 0 { 1.0 - fz } else { fz };
-            let zz = iz + dz_i;
             for dy_i in 0..2 {
                 let wy = wz * (if dy_i == 0 { 1.0 - fy } else { fy });
-                let yy = iy + dy_i;
                 for dx_i in 0..2 {
                     let w = wy * (if dx_i == 0 { 1.0 - fx } else { fx });
-                    let xx = ix + dx_i;
-                    let pw = w * (self.pres.at(zz, yy, xx) as f32 as f64 + 10.0);
-                    let [mut ux, mut uy, mut uz] = self.dir_at(zz, yy, xx);
+                    let c = (dz_i * 4 + dy_i * 2 + dx_i) as usize;
+                    let pw = w * (pres[c] as f32 as f64 + 10.0);
+                    let [mut ux, mut uy, mut uz] = decode_dir(nx[c], ny[c]);
                     if ux * rx + uy * ry + uz * rz < 0.0 {
                         ux = -ux;
                         uy = -uy;

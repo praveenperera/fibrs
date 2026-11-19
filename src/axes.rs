@@ -414,12 +414,16 @@ fn tile_axes(tracing: &[Vol<u8>; 2], t: Shape, lapack: &Lapack, pool: &BufferPoo
     let dims = [0, 1, 2].map(|a| hi[a] - lo[a]);
     // which family each core voxel belongs to, or none: presence = c0 + c1 >= 40, dominant = c1 > c0
     let mut ids: [Vec<(usize, usize)>; 2] = [Vec::new(), Vec::new()];
+    let mut rows = [vec![0u8; core_dims[2]], vec![0u8; core_dims[2]]];
     for z in 0..core_dims[0] {
         for y in 0..core_dims[1] {
+            let (gz, gy) = (start[0] + z, start[1] + y);
+            for (ch, row) in rows.iter_mut().enumerate() {
+                tracing[ch].read_row(gz, gy, start[2], row);
+            }
             for x in 0..core_dims[2] {
-                let (gz, gy, gx) = (start[0] + z, start[1] + y, start[2] + x);
-                let c0 = tracing[0].get(gz, gy, gx) as u16;
-                let c1 = tracing[1].get(gz, gy, gx) as u16;
+                let gx = start[2] + x;
+                let (c0, c1) = (rows[0][x] as u16, rows[1][x] as u16);
                 if c0 + c1 < 40 {
                     continue;
                 }

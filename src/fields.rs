@@ -72,25 +72,27 @@ impl<'a> Presence<'a> {
     /// The value at an in-bounds voxel
     #[inline(always)]
     pub fn get(&self, z: usize, y: usize, x: usize) -> u8 {
-        // the pooled predictions read 0 outside their bricks, and an own value of 0 gives presence 0 whatever
+        // the pooled predictions read 0 outside their sub-bricks, and an own value of 0 gives presence 0 whatever
         // the other is, so most air reads stop at the first lookup
         let (own, at) = self.own.locate(z, y, x);
-        let a = match own {
-            Some(b) if b[at] != 0 => b[at],
-            _ => return 0,
-        };
-        let b = self.other.locate(z, y, x).0.map_or(0, |b| b[at]);
-        if a < b { 0 } else { (a as u16 + b as u16).min(255) as u8 }
+        let a = own[at];
+        if a == 0 {
+            return 0;
+        }
+        presence(a, self.other.locate(z, y, x).0[at])
     }
 
     /// A dense C-order block with origin `lo` and extent `dims`
     pub fn read_block(&self, lo: Shape, dims: Shape) -> Vec<u8> {
         let mut out = vec![0u8; dims.iter().product()];
+        let mut other = vec![0u8; dims[2]];
         for z in 0..dims[0] {
             for y in 0..dims[1] {
                 let row = &mut out[(z * dims[1] + y) * dims[2]..][..dims[2]];
-                for (x, v) in row.iter_mut().enumerate() {
-                    *v = self.get(lo[0] + z, lo[1] + y, lo[2] + x);
+                self.own.read_row(lo[0] + z, lo[1] + y, lo[2], row);
+                self.other.read_row(lo[0] + z, lo[1] + y, lo[2], &mut other);
+                for (v, &b) in row.iter_mut().zip(&other) {
+                    *v = presence(*v, b);
                 }
             }
         }
@@ -114,6 +116,24 @@ impl Grid<u8> for Presence<'_> {
     fn at(&self, z: i64, y: i64, x: i64) -> u8 {
         self.get(z as usize, y as usize, x as usize)
     }
+
+    #[inline(always)]
+    fn corners(&self, z: i64, y: i64, x: i64) -> [u8; 8] {
+        let at = [z, y, x].map(|v| v as usize);
+        let own = self.own.cell(at[0], at[1], at[2]);
+        // presence is 0 wherever the family's own prediction is, as in `get`
+        if own == [0; 8] {
+            return own;
+        }
+        let other = self.other.cell(at[0], at[1], at[2]);
+        std::array::from_fn(|c| presence(own[c], other[c]))
+    }
+}
+
+/// Presence from the family's own pooled prediction and the other's
+#[inline(always)]
+fn presence(own: u8, other: u8) -> u8 {
+    if own < other { 0 } else { (own as u16 + other as u16).min(255) as u8 }
 }
 
 /// The reference's `tiles(shape, size)` order: C order over tile origins
