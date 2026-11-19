@@ -493,7 +493,7 @@ mod tests {
         assert_eq!(saved["voxel_size_um"], json!(8.64));
         fs::remove_dir_all(out).unwrap();
 
-        // a value whose shortest decimal has 17 digits reads back as the same f64, not as its 9.1 neighbour
+        // a value whose shortest decimal has 16 significant digits reads back as the same f64, not as its 9.1 neighbour
         let out = fresh("voxel-digits");
         let precise = 9.100000000000001;
         Output::open_or_create(&out, 4, 4, 4, &with(precise)).unwrap();
