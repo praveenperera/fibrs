@@ -229,19 +229,15 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         let n = ez / self.planes;
         let bytes = BufferPool::footprint(2 * half);
         let others = self.slabs.lock().expect("cache lock").capacity(bytes).saturating_sub(1);
-        let wanted: Vec<(SlabKey, Arc<Slab<'p>>)> = (s + 1..n)
-            .chain((0..s).rev())
-            .take(others)
-            .map(|i| ([chunk[0], chunk[1], chunk[2], i], Arc::new(slab(i))))
-            .collect();
-
-        // the copies above run outside the lock, so threads reading cached slabs do not wait on them
-        let mut slabs = self.slabs.lock().expect("cache lock");
-        for (key, cached) in wanted.into_iter().rev() {
-            slabs.insert(key, cached, bytes);
+        let wanted: Vec<usize> = (s + 1..n).chain((0..s).rev()).take(others).collect();
+        // each copy is made before the lock is taken, so threads reading cached slabs do not wait on it, and is
+        // inserted before the next is made, so a thread holds one copy outside the cache at a time instead of a
+        // chunk's worth
+        for &i in wanted.iter().rev() {
+            let cached = Arc::new(slab(i));
+            self.slabs.lock().expect("cache lock").insert([chunk[0], chunk[1], chunk[2], i], cached, bytes);
         }
 
-        drop(slabs);
         Ok(slab(s))
     }
 
