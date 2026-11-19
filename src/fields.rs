@@ -2,14 +2,15 @@
 
 use rayon::prelude::*;
 
-use crate::kernels::{Dense, Grid, stage1};
+use crate::kernels::{Dense, Grid};
 use crate::pyfmt::argsort_u16;
+use crate::stage1::{Arith, stage1};
 use crate::vol::{Shape, Vol};
 
 /// Tile edge and halo of the reference's centrality pass (prepare.py:148-150); the kernel clamps samples
 /// to its tile, so these are part of the output, not a tuning choice
-const TILE: usize = 128;
-const TILE_HALO: usize = 8;
+pub(crate) const TILE: usize = 128;
+pub(crate) const TILE_HALO: usize = 8;
 
 /// One family's centrality and its seeds
 pub struct FamilyFields {
@@ -26,7 +27,7 @@ pub struct Seed(u64);
 
 impl Seed {
     /// Volumes up to this many voxels have every index fit in 56 bits
-    const MAX_VOXELS: usize = 1 << 56;
+    pub(crate) const MAX_VOXELS: usize = 1 << 56;
 
     fn new(at: Shape, shape: Shape, priority: u8) -> Self {
         let index = (at[0] * shape[1] + at[1]) * shape[2] + at[2];
@@ -41,6 +42,12 @@ impl Seed {
 
     pub fn priority(self) -> u8 {
         self.0 as u8
+    }
+
+    /// A seed from its packed form, `index << 8 | priority`, as the GPU kernels write it
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self(raw)
     }
 }
 
@@ -132,7 +139,7 @@ impl Grid<u8> for Presence<'_> {
 }
 
 /// The reference's `tiles(shape, size)` order: C order over tile origins
-fn tiles(shape: Shape, size: usize) -> Vec<(Shape, Shape)> {
+pub(crate) fn tiles(shape: Shape, size: usize) -> Vec<(Shape, Shape)> {
     let grid = shape.map(|n| n.div_ceil(size));
     let mut out = Vec::with_capacity(grid.iter().product());
     for z in 0..grid[0] {
@@ -150,8 +157,9 @@ fn tiles(shape: Shape, size: usize) -> Vec<(Shape, Shape)> {
 /// One tile's core: origin, extent, centrality and seeds
 type TileFields = (Shape, Shape, Vec<u16>, Vec<u8>);
 
-/// Centrality and seeds over the reference's 128³ tiles with an 8-voxel halo, tiles in parallel
-pub fn centrality(pres: &Presence, dirs: &Vol<u16>) -> FamilyFields {
+/// Centrality and seeds over the reference's 128³ tiles with an 8-voxel halo, tiles in parallel, in the rounding
+/// of the reference's CPU kernel ([`crate::stage1::Separate`]) or its CUDA kernels ([`crate::stage1::Fused`])
+pub fn centrality<A: Arith>(pres: &Presence, dirs: &Vol<u16>) -> FamilyFields {
     let shape = pres.shape();
     assert!(
         shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d)).is_some_and(|n| n <= Seed::MAX_VOXELS),
@@ -164,7 +172,7 @@ pub fn centrality(pres: &Presence, dirs: &Vol<u16>) -> FamilyFields {
     // at once stay small; tile cores are disjoint, so the order they are written in does not matter
     for part in jobs.chunks(4 * rayon::current_num_threads()) {
         let results: Vec<Option<TileFields>> =
-            part.par_iter().map(|&(start, end)| centrality_tile(pres, dirs, start, end)).collect();
+            part.par_iter().map(|&(start, end)| centrality_tile::<A>(pres, dirs, start, end)).collect();
         for (start, inner, c, s) in results.into_iter().flatten() {
             cent.write_block(start, inner, &c);
             let mut i = 0;
@@ -188,7 +196,7 @@ pub fn centrality(pres: &Presence, dirs: &Vol<u16>) -> FamilyFields {
 }
 
 /// One tile's core centrality and seeds, or None when no voxel of the tile and its halo reaches presence 64
-fn centrality_tile(pres: &Presence, dirs: &Vol<u16>, start: Shape, end: Shape) -> Option<TileFields> {
+fn centrality_tile<A: Arith>(pres: &Presence, dirs: &Vol<u16>, start: Shape, end: Shape) -> Option<TileFields> {
     let shape = pres.shape();
     let lo = start.map(|v| v.saturating_sub(TILE_HALO));
     let hi = [0, 1, 2].map(|a| (end[a] + TILE_HALO).min(shape[a]));
@@ -198,7 +206,7 @@ fn centrality_tile(pres: &Presence, dirs: &Vol<u16>, start: Shape, end: Shape) -
         return None;
     }
     let pres = Dense { dims, data: pres.read_block(lo, dims) };
-    let (cent, seeds) = stage1(&pres, &Dense { dims, data: dirs.read_block(lo, dims) });
+    let (cent, seeds) = stage1::<A>(&pres, &Dense { dims, data: dirs.read_block(lo, dims) });
     let inner = [0, 1, 2].map(|a| end[a] - start[a]);
     let off = [0, 1, 2].map(|a| start[a] - lo[a]);
     let mut c = Vec::with_capacity(inner.iter().product());

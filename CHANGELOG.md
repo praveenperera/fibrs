@@ -2,8 +2,20 @@
 
 ## [Unreleased]
 
-### What's new
-
+- **Centrality on the GPU.** `--device` now defaults to `auto`: centrality and the ridge seeds run on an NVIDIA GPU
+  of compute capability 8.0 or later when one is usable (Linux x86-64; a driver for CUDA 12.0 or newer is enough, no
+  CUDA toolkit), and on the CPU otherwise, with the reason in the log. `--device cpu` keeps them on the CPU,
+  `--device cuda` fails instead of falling back, and `--cuda-device N` picks the GPU (by default the first usable
+  one); `--device cuda` used to be rejected. A run keeps the rounding it started with when resumed, and one started
+  on the GPU can resume or finish on the CPU, which then computes centrality as the GPU does. The kernels are
+  written in Rust with cuda-oxide and ship inside the binary as PTX. On a PHerc1545 and a PHerc0826 band the `.afv`
+  was identical on the GPU and the CPU, and identical to the original's with either of its devices. With
+  `--threads 8`, centrality took 1.8 s instead of 8.1 s on the PHerc1545 band and 5.0 s instead of 20.4 s on the
+  PHerc0826 band. Tracing still runs on the CPU (see the README's "Speed").
+- **Direction field on the GPU.** The direction field now runs on the GPU as well, under the same `--device` choice,
+  and its bytes are the CPU's: the GPU certifies each voxel's eigenvector against an error bound, and the CPU solves
+  the voxels it cannot certify with the same `dsyevd`, which the log line counts. If the GPU fails mid-run, the CPU
+  computes the direction field instead, unless `--device cuda` was given.
 - **Faster tracing on dense data.** Threads that finishing leaves idle now trace seeds ahead of the one being
   committed. A seed traced ahead is traced again if an earlier seed marked the region it read before it was
   committed, so the `.afv` is the same as before at every `--threads`. On a dense 512 × 2048 × 2048 crop of
@@ -11,6 +23,24 @@
 - **Tracing can run one thread beyond `--threads`.** One more thread commits the seeds in order. On that crop,
   tracing kept 4.2–4.5 cores busy at `--threads 4` and 7.7 at `--threads 8`, where 0.2.0 kept 2.9 and 4.0 busy.
   Size the cores you give a run with that in mind.
+- The README's "Same output" section now gives the PHerc0826 band's counts as measured: 149,680 fibres and 161,787
+  point blocks and spatial-index rows. It said 149,780 and 161,887.
+- `fibrs predict --voxel-size-um` sets the output's `voxel_size_um` attribute, which was always 9.362, the PHerc0826
+  CT's voxel size, as in the reference. The default is still 9.362, so pass it for a CT with another voxel size
+  (8.64 for example). Predictions are unchanged. A resume with a different value is refused.
+- The README's tracer speed range is now 22×–47× on wall time and about 22×–38× on CPU time, from the three
+  uninterrupted runs on bands of PHerc0826, PHerc1545 and PHerc0358. Two runs whose original was interrupted and
+  resumed, one of them on a band of PHerc0813, are listed with estimated totals. The original's time per fibre
+  differs between bands and between runs; on runs 4 and 5 fibrs's differed less.
+- `fibrs predict` reads the CT through the path its overlap check resolved. It used to open the CT again by the path
+  as given, so a link on that path changed during a run could make it read a different store from the one checked.
+- The README's dense PHerc0358 box prediction rows are now from fibrs `42c4710`, which has the 0.2.0 release's
+  prediction code: 85.3 s in band mode (1.94×) and 84.5 s with `--mode villa` (1.96×), with prediction values
+  identical to those of the pre-release build timed before.
+- Correction to the 0.2.0 notes: two tracer results there were not measured with the tagged release. The 50–52 s
+  run on the 512 × 2048 × 2048 PHerc0358 crop used a pre-release build of 0.2.0, and the 332 s run on the PHerc0358
+  band, which is also the tracing part of the 739 s end-to-end row, used `42c4710`, which lacks 0.2.0's chunk-cache
+  change.
 
 ## [0.2.0] - 2026-11-19
 

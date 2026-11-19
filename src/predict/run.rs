@@ -89,16 +89,30 @@ pub struct Args {
     /// GPU
     #[arg(long)]
     dry_run: bool,
+    /// The CT's voxel size in micrometres, written as the output's `voxel_size_um` attribute. The default is the
+    /// PHerc0826 CT's, which the reference writes for every CT
+    #[arg(long, default_value_t = 9.362, allow_negative_numbers = true)]
+    voxel_size_um: f64,
 }
 
 /// The arguments after the checks argparse makes in the reference
 struct Checked {
     a: Args,
+    /// `--ct` canonicalized once; every read of the CT goes through it, so the store the overlap check passed is the
+    /// one read even if a link on the given path changes during the run. The CT must exist by then, or a link made
+    /// later would be read through but recorded unresolved, and a resume would not match it
+    ct: PathBuf,
+    /// `--out` resolved once; every write goes through it, since the given path may step through the CT on its way
+    /// (`<ct>/0.0.0/../../pred.zarr`)
+    out: PathBuf,
     batch: usize,
     readers: usize,
     column: usize,
     precision: Precision,
     device: usize,
+    /// When the command started, before the paths were resolved, so `--max-minutes` and `this_run_wall_s` count it
+    t_start: f64,
+    started: Instant,
 }
 
 /// What each summary timing field measures here
@@ -117,6 +131,7 @@ fn usage_error(kind: ErrorKind, msg: impl std::fmt::Display) -> ! {
 }
 
 fn parse(argv: &[OsString]) -> Checked {
+    let (t_start, started) = (now_unix(), Instant::now());
     let a = Args::parse_from(std::iter::once(OsString::from("fibrs predict")).chain(argv.iter().cloned()));
     let batch = match (a.mode, a.batch) {
         (Mode::Band, b) => {
@@ -133,6 +148,9 @@ fn parse(argv: &[OsString]) -> Checked {
     };
     let precision = Precision::parse(&a.precision).unwrap_or_else(|e| usage_error(ErrorKind::InvalidValue, e));
     let device = engine::device_index(&a.device).unwrap_or_else(|e| usage_error(ErrorKind::InvalidValue, e));
+    if !(a.voxel_size_um.is_finite() && a.voxel_size_um > 0.0) {
+        usage_error(ErrorKind::InvalidValue, "--voxel-size-um must be a positive number of micrometres");
+    }
     if batch < 1 || a.readers < 1 {
         fail("--batch and --readers must be at least 1");
     }
@@ -141,7 +159,11 @@ fn parse(argv: &[OsString]) -> Checked {
     }
     let column = usize::try_from(a.column).unwrap_or(0);
     let readers = a.readers as usize;
-    Checked { a, batch: batch as usize, readers, column, precision, device }
+    // chunks are read by the path resolved here for the whole run, which assumes the CT's parent directories are not
+    // renamed or swapped while it runs; holding a directory handle would cover that but is not worth it for a CLI
+    let ct = fs::canonicalize(&a.ct).unwrap_or_else(|e| fail(format!("--ct {}: {e}", a.ct.display())));
+    let out = resolved(&a.out).unwrap_or_else(|e| fail(format!("{e:#}")));
+    Checked { a, ct, out, batch: batch as usize, readers, column, precision, device, t_start, started }
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -181,7 +203,7 @@ struct Plan {
 
 fn plan(c: &Checked, progress: &Path) -> Result<Plan> {
     let a = &c.a;
-    let ct = Arc::new(Ct::open(&a.ct)?);
+    let ct = Arc::new(Ct::open(&c.ct)?);
     let [d, ny, nx] = ct.shape;
     let (z0, z1) = match a.mode {
         Mode::Villa => {
@@ -246,7 +268,7 @@ fn plan(c: &Checked, progress: &Path) -> Result<Plan> {
         .map(|(i, &col)| (i, col, cols.tiles(col, &pz_all)))
         .collect();
     let selection = match a.mode {
-        Mode::Villa => Some(Arc::new(VillaSelection::new(&a.ct, ct.shape)?)),
+        Mode::Villa => Some(Arc::new(VillaSelection::new(&c.ct, ct.shape)?)),
         Mode::Band => None,
     };
     Ok(Plan { ct, z0, z1, nz, ny, nx, cols, todo, selection, progress_complete })
@@ -255,7 +277,7 @@ fn plan(c: &Checked, progress: &Path) -> Result<Plan> {
 fn start_feed(c: &Checked, p: &Plan) -> Result<TileFeed> {
     TileFeed::start(FeedPlan {
         ct: p.ct.clone(),
-        ct_path: c.a.ct.clone(),
+        ct_path: c.ct.clone(),
         z0: p.z0,
         z1: p.z1,
         columns: p.todo.iter().map(|(i, _, tiles)| (*i, tiles.clone())).collect(),
@@ -270,7 +292,7 @@ fn start_feed(c: &Checked, p: &Plan) -> Result<TileFeed> {
 
 /// `--dry-run`: each column's batches as the run would feed them, one JSON line per column
 fn dry_run(c: &Checked) -> Result<()> {
-    let p = plan(c, &resolved(&c.a.out)?.join("progress.jsonl"))?;
+    let p = plan(c, &c.out.join("progress.jsonl"))?;
     let feed = start_feed(c, &p)?;
     let (mut run, mut air) = (0, 0);
     let mut stdout = std::io::stdout().lock();
@@ -395,12 +417,11 @@ fn run(c: Checked) -> Result<()> {
     }
 
     let a = &c.a;
-    let t_start = now_unix();
-    let started = Instant::now();
+    let (t_start, started) = (c.t_start, c.started);
     // nothing is written before the arguments and the model folder are checked: an output in, at or around the CT
     // would write into the input store
-    let (ct, out) = (resolved(&a.ct)?, resolved(&a.out)?);
-    if out.starts_with(&ct) || ct.starts_with(&out) {
+    let out = &c.out;
+    if out.starts_with(&c.ct) || c.ct.starts_with(out) {
         bail!("--out {} overlaps --ct {}; write the output outside the input", a.out.display(), a.ct.display());
     }
     // the loader takes a fold_* folder's plans.json and dataset.json from its parent, so those hashed here
@@ -435,14 +456,12 @@ fn run(c: Checked) -> Result<()> {
     }
 
     // every run that passes the checks above is recorded before the model loads, so one capped or killed after
-    // that still shows it;
-    // every write goes to the resolved output, the path the overlap check passed, since the given one may step
-    // through the CT on its way (`<ct>/0.0.0/../../pred.zarr`)
-    fs::create_dir_all(&out)?;
+    // that still shows it
+    fs::create_dir_all(out)?;
     let mut attempts = fs::OpenOptions::new().create(true).append(true).open(out.join("attempts.jsonl"))?;
     // held until the run ends: two runs on one output, on different --only-columns say, would each rewrite the
     // chunks their columns share from what they read, losing the other's columns while both record progress
-    lock_output(&attempts, &out)?;
+    lock_output(&attempts, out)?;
     let attempt = py_dumps(&json!({"attempt": t_start, "start": t_start}), JsonStyle::DEFAULT);
     attempts.write_all(format!("{attempt}\n").as_bytes())?;
 
@@ -456,8 +475,14 @@ fn run(c: Checked) -> Result<()> {
     prov.insert("model_sha256".into(), Value::Object(hashes));
     let exe = std::env::current_exe()?;
     prov.insert("code_sha256".into(), json!({format!("fibrs {}", env!("CARGO_PKG_VERSION")): sha256(&exe)?}));
-    prov.insert("ct".into(), json!(fs::canonicalize(&a.ct)?.to_string_lossy()));
-    prov.insert("ct_identity".into(), json!(ct_identity(&a.ct, p.z0, p.z1)?));
+    // the CT was opened through `c.ct`; if a directory on it was replaced by a link since it was resolved, the store
+    // read is not the one recorded, and a resume could mix two stores whose metadata match
+    let now = fs::canonicalize(&c.ct)?;
+    if now != c.ct {
+        bail!("--ct {} now resolves to {}; it changed while the run started", c.ct.display(), now.display());
+    }
+    prov.insert("ct".into(), json!(c.ct.to_string_lossy()));
+    prov.insert("ct_identity".into(), json!(ct_identity(&c.ct, p.z0, p.z1)?));
     for (k, v) in [
         ("z0", json!(p.z0)),
         ("z1", json!(p.z1)),
@@ -489,10 +514,10 @@ fn run(c: Checked) -> Result<()> {
     let mut attrs = Map::new();
     attrs.insert("channel_order".into(), json!("VH"));
     attrs.insert("axes".into(), json!(["c", "z", "y", "x"]));
-    attrs.insert("voxel_size_um".into(), json!(9.362));
+    attrs.insert("voxel_size_um".into(), json!(a.voxel_size_um));
     attrs.insert("origin_zyx".into(), json!([p.z0, 0, 0]));
     attrs.insert("inference".into(), Value::Object(prov));
-    let output = Output::open_or_create(&out, p.nz, p.ny, p.nx, &attrs)?;
+    let output = Output::open_or_create(out, p.nz, p.ny, p.nx, &attrs)?;
 
     let feed = start_feed(&c, &p)?;
     if let Some(len) = p.progress_complete {
@@ -519,7 +544,7 @@ fn run(c: Checked) -> Result<()> {
         "attempt": t_start,
         "end": now_unix(),
         "complete": recs.len() == p.cols.cols.len(),
-        "identity": prediction_identity(&out)?,
+        "identity": prediction_identity(out)?,
         "columns_total": p.cols.cols.len(),
         "columns_done": recs.len(),
         "stopped_early": stopped,

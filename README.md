@@ -6,9 +6,9 @@ same flags and writes the same `.afv`: every metadata value except the per-run u
 point block and spatial-index row. The tracing algorithm, the AFV format and the fibre model whose
 predictions it reads are Qual's; this port changes how fast the tracer runs, not what it writes.
 
-With `--threads 4` for both tools, it traces 22×–62× faster across three measured runs on 512-plane bands of
-PHerc0826 and PHerc1545 (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU and needs no
-GPU.
+With `--threads 4` for both tools, it traces 22×–47× faster across three uninterrupted runs on 512-plane bands of
+PHerc0826, PHerc1545 and PHerc0358 (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU;
+the direction field and centrality run on an NVIDIA GPU when one is found, and on the CPU otherwise.
 
 `fibrs predict` runs the step before: Qual's AFV fibre model V2 over a CT volume on an NVIDIA GPU, without
 PyTorch, writing the probability zarr the tracer reads, as villa's inference writes it (see
@@ -30,10 +30,22 @@ x86-64 (glibc 2.28+) and Apple silicon (macOS 11+) are named `fibrs-<version>-<t
 
 ```sh
 fibrs --predictions P --array semantic --channel-order VH --tracing-predictions P \
-  --tracing-array tracing --voxel-size-um 9.362 --storage compressed --device cpu --threads 4 \
+  --tracing-array tracing --voxel-size-um 9.362 --storage compressed --threads 4 \
   --output fibers.afv --work-dir work
 python -m fibrs ARGS      # the same, from Python
 ```
+
+The direction field and centrality run on the GPU when a usable one is found: Linux x86-64, an NVIDIA GPU of compute
+capability 8.0 or later, and a driver for CUDA 12.0 or newer (no CUDA toolkit). Otherwise they run on the CPU, and
+the log says why. `--device cpu` keeps them on the CPU, `--device cuda` fails instead of falling back, and
+`--cuda-device N` picks the GPU (by default the first usable one). The GPU direction field is the CPU's bit for bit:
+the GPU certifies each voxel's eigenvector against an error bound, and any voxels it cannot certify, usually few, are
+solved on the CPU with the same `dsyevd` (the log line counts them). Centrality rounds some steps differently on the
+GPU (see "Differences from the original"), and a resumed run keeps the rounding it started with: one started on the
+CPU computes centrality there, and with `--device auto` only its direction field takes the GPU (`--device cuda`
+refuses to resume it). A run started on the GPU can resume without one: the CPU then computes centrality as the GPU
+does, more slowly. `--device auto` also moves the direction field or centrality to the CPU if the GPU fails mid-run,
+for example when it runs out of memory.
 
 `fibrs.run([...])` runs it from Python and returns the exit status.
 
@@ -69,8 +81,9 @@ manylinux_2_28`, and the macOS wheel `MACOSX_DEPLOYMENT_TARGET=11.0`).
 
 ## Numerics
 
-The direction field's eigenvectors come from `dsyevd` in numpy's own OpenBLAS, on float64 copies as
-`numpy.linalg.eigh` computes them, so they match `eigh` bit for bit. The binary finds that library from its
+On the CPU, the direction field's eigenvectors come from `dsyevd` in numpy's own OpenBLAS, on float64 copies as
+`numpy.linalg.eigh` computes them, so they match `eigh` bit for bit. On the GPU, each voxel's eigenvector is
+certified against an error bound to equal that result, and voxels that can't be certified go to the same `dsyevd`. The binary finds that library from its
 own path (`bin/../lib/python*/site-packages/numpy.libs/libscipy_openblas64_*.so`), then from
 `$VIRTUAL_ENV`, looking in each environment in numpy's copy first and then in the `scipy-openblas64`
 package (`site-packages/scipy_openblas64/lib`). `FIBRS_LAPACK` overrides both.
@@ -92,11 +105,17 @@ from it; `cargo test` checks every case.
 
 ## Same output
 
-On that PHerc0826 band (z 12032–12544), the port's `.afv` is identical to the original's: 149,780 fibres,
-161,887 point blocks and 161,887 spatial-index rows, plus the metadata and schema. The 0.1.0 build was also
+On that PHerc0826 band (z 12032–12544), the port's `.afv` is identical to the original's: 149,680 fibres,
+161,787 point blocks and 161,787 spatial-index rows, plus the metadata and schema. The 0.1.0 build was also
 checked on a 512³ crop of the band: the wheel and the drop-in were installed into a fresh environment beside
 the original, and the crop was traced through `avf-spline-generator` and through `python -m fibrs`. Both
 outputs were identical to the original's `.afv`.
+
+Centrality on the GPU gives the same `.afv`. On the PHerc0826 band and on a 512-plane band of PHerc1545
+(z 1280–1792), with `--threads 4` and `--threads 8`, the port's output was identical with `--device cuda` and
+`--device cpu`, and identical to the original's with `--device cpu` and with `--device cuda`. The original's CUDA
+kernels round some multiply-adds as one operation where its CPU code rounds twice; the port reproduces each, and on
+these bands both roundings give the same `.afv`.
 
 CI traces a small synthetic input (`tests/fixtures/synthetic`) with every build's wheel on Linux and macOS,
 through the drop-in and through `python -m fibrs`. Both must write what the original wrote for it, compared by
@@ -106,9 +125,10 @@ traced ahead traced again (`FIBRS_DEBUG_RETRACE=1`).
 
 ## Speed
 
-Three runs on an Intel Core Ultra 7 270K Plus (24 cores), with `--threads 4` for both tools and other work
-running on the machine each time. Runs 1 and 2 trace the same 512 × 8169 × 8169 band of PHerc0826, and run 3 a
-512-plane band of PHerc1545 (z 1280–1792):
+Five runs on an Intel Core Ultra 7 270K Plus (24 cores), with `--threads 4` for both tools and other work
+running on the machine each time. Runs 1 and 2 trace the same 512 × 8169 × 8169 band of PHerc0826, run 3 a
+512-plane band of PHerc1545 (z 1280–1792), run 4 a 512 × 7783 × 7783 band of PHerc0358 (z 2304–2816) and run 5
+a 512-plane band of PHerc0813 (z 2304–2816):
 
 | Run | Tool | Wall | CPU time | Peak memory |
 |---|---|---|---|---|
@@ -118,31 +138,63 @@ running on the machine each time. Runs 1 and 2 trace the same 512 × 8169 × 816
 | 2 | `fibrs` 0.1.0 | 172 s | 472 s | 10.8 GiB |
 | 3 | `avf-spline-generator` 0.2.0 | 1,621 s (27 min) | 4,149 s | 4.6 GiB |
 | 3 | `fibrs` 0.1.0 | 73.4 s | 191 s | 7.0 GiB |
-| Speedup | | **22×–62×** | **about 22×–26×** | |
+| 4 | `avf-spline-generator` 0.2.0 | 15,632 s (4.3 h) | 32,739 s | 4.6 GiB |
+| 4 | `fibrs` `42c4710` | 332 s | 902 s | 14.0 GiB |
+| 5 | `avf-spline-generator` 0.2.0 | about 9,176 s (2.5 h) | about 27,460 s | 4.7 GiB |
+| 5 | `fibrs` 0.2.0 | 202 s | 564 s | 11.8 GiB |
+| Speedup, runs 2 to 4 | | **22×–47×** | **about 22×–38×** (38× with the 853 s repeat of run 4) | |
 
 - Run 1: the one-minute load average was 17.5–18.8. The original's run was interrupted by a reboot and
   finished with `--resume`. Its wall time is the sum of the two parts, and the first part's CPU time is
   estimated from the second part's CPU-to-wall ratio (1.01). An earlier uninterrupted run of the original on
-  the same band took 12,728 s.
+  the same band took 12,728 s. Run 1's total is estimated, so it sets neither end of the range.
 - Run 2: the one-minute load average averaged 13.9 during the original's run and 8.8 during fibrs's. The two
   `.afv` files held the same 149,680 fibres (compared logically, as each holds its own run uuid).
 - Run 3: the one-minute load average was 10.0 during the original's run and 7.4 during fibrs's. This band is
   sparser. The two `.afv` files held the same 82,646 fibres and 83,741 point blocks.
+- Run 4: the two runs were not at the same time. This is the densest band measured. The two `.afv` files
+  held the same 448,286 fibres and 460,560 point blocks.
+- Run 5: the two runs were not at the same time. The original's first attempt logged progress for 5,074 s before it
+  was stopped and finished with `--resume` in 4,102 s. Its wall time is the sum of the two parts, and the first
+  part's CPU time is estimated from the second part's CPU-to-wall ratio (2.99). The resumed part loaded the
+  direction field and the V centrality instead of recomputing them; it restored 103,340 batches 105 s after it
+  started and was tracing again after 126 s. The ratios are about 45× on wall time and about 49× on CPU time; as
+  the total is estimated, the run sets neither end of the range. The two `.afv` files held the same 337,735 fibres
+  and 344,279 point blocks. Run 5's memory is the peak RSS of both tools.
 
-The original kept about 2.6 cores busy in runs 2 and 3, and about one in run 1 (whose CPU time is partly
-estimated); the port kept about 2.7. The ratio varies with the run and with the machine's load: the range is the
-lowest and highest of the measured runs.
+The original kept about 2.1–3.0 cores busy in runs 2 to 5 and about one in run 1; the CPU times of runs 1 and 5 are
+partly estimated. The port kept about 2.6–2.8. The ratio varies with the run and with the machine's load: the
+ranges are the lowest and highest of the uninterrupted runs, 2 to 4. The CPU range also covers a second run of the
+same build on the run 4 band, which used 853 s of CPU time (38×).
 
 On dense bands, fibrs's speed also depends on how it reads the predictions and allocates memory. Take a
-512 × 2048 × 2048 crop of PHerc0358's densest area (z 1792–2304, y 2176–4224, x 2944–4992) with `--threads 8`
-and `--field-cache-mib 224`, each pair of builds run back to back on the same busy machine. fibrs 0.2.0 takes
-50–52 s with a 2.6 GiB peak and writes the same `.afv` as 0.1.0, which took 104 s with a 3.5 GiB peak. A 0.2.0
-build that decoded whole chunks took 69–72 s, and one that also gave each decoded chunk its own mapping spent
-40% of its CPU time in the kernel.
+512 × 2048 × 2048 crop of PHerc0358's densest area (z 1792–2304, y 2176–4224, x 2944–4992) with `--threads 8` and
+`--field-cache-mib 224`, each pair of builds run back to back on the same busy machine. A pre-release build of
+0.2.0 that decodes the predictions 8 planes at a time took 50–52 s with a 2.6 GiB peak and wrote the same `.afv` as
+0.1.0, which took 104 s with a 3.5 GiB peak. One that decoded whole chunks took 69–72 s, and one that also gave
+each decoded chunk its own mapping spent 40% of its CPU time in the kernel.
 
-Tracing seeds ahead on idle threads (unreleased) takes that crop at `--threads 8` from 47–55 s to 41–43 s, in two
-pairs of runs pinned to the same eight cores on a busy machine: tracing V from 12.0–15.4 s to 8.5–9.9 s and H from
-8.7–10.2 s to 6.2–6.4 s. The `.afv` is the same, and the peak is 2.6 GiB for both.
+Tracing seeds ahead on idle threads (unreleased) takes that crop at `--threads 8` from 0.2.0's 47–55 s to 41–43 s,
+in two pairs of runs pinned to the same eight cores on a busy machine: tracing V from 12.0–15.4 s to 8.5–9.9 s and H
+from 8.7–10.2 s to 6.2–6.4 s. The `.afv` is the same, and the peak is 2.6 GiB for both.
+
+### Centrality on the GPU
+
+Measured before the direction field moved to the GPU, with `--threads 8` on an RTX 5090 host, each band ran four
+times back to back, CPU, GPU, GPU, CPU, with other work running on the machine:
+
+| Band | Centrality and seeds, CPU | Same, GPU | Whole run, CPU | Whole run, GPU |
+|---|---|---|---|---|
+| PHerc1545, z 1280–1792 | 8.1 s | 1.8 s | 44.2 s | 38.0 s |
+| PHerc0826, z 12032–12544 | 20.4 s | 5.0 s | 120 s | 105 s |
+
+Each figure is the mean of its two runs, and all eight `.afv` files were identical. The direction field (20–51 s
+here) and tracing ran on the CPU in these runs, so the whole run gains less, and its time moves with the machine's load
+(a mean one-minute load of 8–13 across these runs).
+
+The original's `--device cuda` doesn't make centrality faster. On the same bands with `--threads 8` its centrality
+took 52.6 s and 65.9 s with `--device cuda`, against 35.3 s and 59.3 s with `--device cpu`. Its kernels ran for
+2.2 s and 4.7 s of that; the rest went to host work and to copying each 128³ tile and its halo to the GPU and back.
 
 ## Differences from the original
 
@@ -171,8 +223,11 @@ pairs of runs pinned to the same eight cores on a busy machine: tracing V from 1
 - `--storage` and `--field-cache-mib` are validated, and `--storage` is recorded in `run.json` as the
   original records it, but neither selects anything. The chunk cache is bounded by `--native-cache-mib`
   plus `--field-cache-mib`.
-- `--device cuda` is rejected: the original uses CUDA only for centrality, and this port computes
-  centrality on the CPU.
+- `--device` defaults to `auto` (the GPU when one is usable) where the original defaults to `cpu`. On the GPU
+  the port writes what the original writes with `--device cuda`, whose centrality kernels round some multiply-adds
+  as one fused operation, so its output can differ from the original's `--device cpu` output; pass `--device cpu`
+  to match that. The original always computes the direction field on the CPU; the port computes it on the GPU
+  too, with the same result.
 - The command line replays argparse's pass, so exit status and selected values match, but help text and
   usage-error wording differ. Some argparse readings are not reproduced: numbers written with non-ASCII
   digits; non-UTF-8 bytes in the text options (`--array`, `--tracing-array`, `--coordinate-space`);
@@ -229,6 +284,7 @@ python -m fibrs predict ARGS   # the same, from Python
 ```
 
 `--ct` is a level-0 uint8 zarr v2 array (the `/0` directory of an OME-Zarr). `--device` is `cuda` or `cuda:N`.
+`--voxel-size-um` is the CT's voxel size, written as the output's `voxel_size_um` attribute (default 9.362).
 Run the same command again on the same `--out` to resume a capped (`--max-minutes`) or interrupted run at the
 first unfinished column; the resume must use the same settings, binary and GPU model, or it refuses the output.
 One run at a time may use an output: a run locks it until it ends, and a second run on the same `--out` is
@@ -300,13 +356,15 @@ overlaps. The speedup is the mean of the per-pair ratios:
 | fp32 (default) | 45.37 s | 26.77 s | 1.72× (1.66–1.78×) |
 | bf16 (opt-in) | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) |
 
-On a 512 × 2048 × 2048 box of PHerc0358 (z 2304–2816, y 2176–4224, x 2944–4992) with no all-zero tile, one run
-of each at fp32 on the same GPU took 165.6 s for villa, 85.4 s for fibrs in band mode (1.94×) and 84.8 s with
-`--mode villa` (1.95×). At fp32 the measured speedup is 1.68×–1.95×; the lowest is the single PHerc0826 run in
-band mode behind the end-to-end row under [Why the speed-up varies](#why-the-speed-up-varies) (45.4 s and 27.0 s).
+On a 512 × 2048 × 2048 box of PHerc0358 (z 2304–2816, y 2176–4224, x 2944–4992) with no all-zero tile, one run of
+each at fp32 on the same GPU, not at the same time, took 165.6 s for villa, 85.3 s for fibrs `42c4710` in band mode
+(1.94×) and 84.5 s with `--mode villa` (1.96×). At fp32 the measured speedup is 1.68×–1.96×; the lowest is the
+single PHerc0826 run in band mode behind the end-to-end row under
+[Why the speed-up varies](#why-the-speed-up-varies) (45.4 s and 27.0 s). `42c4710` has the same prediction code and
+dependencies as the 0.2.0 release, which adds one tracer change.
 
-fibrs, a pre-release build of 0.2.0 (`e9adcc9`), ran with cuDNN 9.27.0 and cuBLAS 13.4.1.3. villa ran PyTorch
-2.14.1 (CUDA 13.0) with cuDNN 9.24, at `0bddf2757`.
+On the PHerc0826 crop, fibrs was a pre-release build of 0.2.0 (`e9adcc9`); both fibrs builds ran with cuDNN 9.27.0
+and cuBLAS 13.4.1.3. villa ran PyTorch 2.14.1 (CUDA 13.0) with cuDNN 9.24, at `0bddf2757`.
 
 ### Parity
 
@@ -334,8 +392,9 @@ fibrs, a pre-release build of 0.2.0 (`e9adcc9`), ran with cuDNN 9.27.0 and cuBLA
 
 ### Limits
 
-- The output's `voxel_size_um` attribute is always 9.362, the PHerc0826 CT's voxel size. If your CT has another
-  voxel size, pass the real one to the tracer (`--voxel-size-um`), which reads its own flag, not the attribute.
+- The output's `voxel_size_um` attribute is 9.362, the PHerc0826 CT's voxel size, unless `--voxel-size-um` gives
+  another; the reference writes 9.362 for every CT. fibrs does not read it from the CT's OME-Zarr metadata. The
+  tracer doesn't read the attribute either: pass the CT's voxel size to it as `--voxel-size-um` too.
 - A column's accumulators span the whole band height on the GPU, about 14 bytes per voxel (a 480 × 480 column of
   8,000 planes needs about 24 GiB), and the engine takes at most 2^31 − 1 voxels in one column (a 480 × 480 column
   of up to 9,320 planes). A run whose pending columns don't fit, in the free GPU memory or in that limit, stops
@@ -367,23 +426,28 @@ more than one:
   each of its columns that the tile's core overlaps. Every measured prediction time is the whole command's wall
   time, reading the same CT crop and writing arrays of the same shapes and chunk sizes. villa's prediction was not
   run on the whole PHerc0358 band; its time there is estimated, so that end-to-end ratio is an estimate too.
-- **Tracing varies with the run.** The tracer ratio varies with the run and with the machine's load, so it is
-  given as the lowest to highest measured. Pre-release builds of 0.2.0 traced dense data slower than 0.1.0;
-  0.2.0 is faster than 0.1.0 there (the last row).
+- **Tracing varies with the run.** The tracer ratio varies with the run and with the machine's load, so it is given
+  as the lowest to highest of the uninterrupted runs; the two runs whose original was interrupted and resumed have
+  estimated totals and set neither end. The original's time per fibre also differs between bands and between runs:
+  about 0.035 s on the dense PHerc0358 band (run 4) and about 0.027 s on PHerc0813 (run 5, estimated), and its two
+  uninterrupted runs on the same PHerc0826 band took 4,686 s and 12,728 s. fibrs took about 0.6–0.75 ms per fibre
+  on runs 4 and 5. Pre-release builds of 0.2.0 traced dense data slower than 0.1.0; a later pre-release build is
+  faster than 0.1.0 there (the last row).
 
 | Stage | Scroll | Region (z / y / x) | Tiles run | Original | fibrs | Ratio | Precision | Measured as |
 |---|---|---|---|---|---|---|---|---|
-| Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 11,840 s | 191 s | 62× | CPU | one run each (run 1; fibrs built before 0.1.0) |
+| Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 11,840 s | 191 s | about 62× | CPU | one run each; the original was interrupted and resumed; total estimated (run 1; fibrs built before 0.1.0) |
 | Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 4,686 s | 172 s | 27× | CPU | one run each (run 2; fibrs 0.1.0) |
 | Tracing | PHerc1545 | z 1280–1792, whole plane | 8.4% | 1,621 s | 73.4 s | 22× | CPU | one run each (run 3; fibrs 0.1.0) |
-| Tracing | PHerc0358 | z 2304–2816, whole plane | 33.2% | 15,632 s | 332 s | 47× | CPU | one run each, not at the same time (fibrs 0.2.0) |
+| Tracing | PHerc0358 | z 2304–2816, whole plane | 33.2% | 15,632 s | 332 s | 47× | CPU | one run each, not at the same time (run 4; fibrs `42c4710`, before 0.2.0's chunk-cache change) |
+| Tracing | PHerc0813 | z 2304–2816, whole plane | 25.4% | 9,176 s | 202 s | about 45× | CPU | one run each, not at the same time; the original was interrupted and resumed; total estimated (run 5; fibrs 0.2.0) |
 | Prediction, `--mode villa` | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 45.37 s | 26.77 s | 1.72× (1.66–1.78×) | fp32 | ABBA, 6 pairs: medians, mean ratio with 95% CI |
 | Prediction, `--mode villa` | PHerc0826 | same crop | 100% | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) | bf16 (opt-in) | ABBA, 6 pairs: medians, mean ratio with 95% CI |
-| Prediction, band mode | PHerc0358 | z 2304–2816 / y 2176–4224 / x 2944–4992 | 100% | 165.6 s | 85.4 s | 1.94× | fp32 | one run each; fibrs `e9adcc9` |
-| Prediction, `--mode villa` | PHerc0358 | same box | 100% | 165.6 s | 84.8 s | 1.95× | fp32 | one run each, against the same villa run; fibrs `e9adcc9` |
+| Prediction, band mode | PHerc0358 | z 2304–2816 / y 2176–4224 / x 2944–4992 | 100% | 165.6 s | 85.3 s | 1.94× | fp32 | one run each, not at the same time; fibrs `42c4710` |
+| Prediction, `--mode villa` | PHerc0358 | same box | 100% | 165.6 s | 84.5 s | 1.96× | fp32 | one run each, not at the same time, against the same villa run; fibrs `42c4710` |
 | End to end, prediction in band mode | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 387.5 s | 41.7 s | 9.3× | fp32 | one run of each stage |
-| End to end, prediction in band mode | PHerc0358 | z 2304–2816, whole plane | 33.2% | 17,863 s, prediction estimated | 739 s | 24×, estimated | fp32 | villa's prediction time extrapolated from the box above; the rest one run of each stage, fibrs `e9adcc9` predicting; both tracers read fibrs's prediction |
-| Tracing, fibrs 0.1.0 → 0.2.0 | PHerc0358 | z 1792–2304 / y 2176–4224 / x 2944–4992 | 100% | 104 s (0.1.0) | 50–52 s (0.2.0) | 2.0–2.1× | CPU | back to back on one machine, `--threads 8`; not in the tracing range |
+| End to end, prediction in band mode | PHerc0358 | z 2304–2816, whole plane | 33.2% | 17,863 s, prediction estimated | 739 s | 24×, estimated | fp32 | villa's prediction time extrapolated from the box above; the rest one run of each stage, fibrs `e9adcc9` predicting and `42c4710` tracing; both tracers read fibrs's prediction |
+| Tracing, fibrs 0.1.0 → a pre-release build of 0.2.0 | PHerc0358 | z 1792–2304 / y 2176–4224 / x 2944–4992 | 100% | 104 s (0.1.0) | 50–52 s (pre-release 0.2.0) | 2.0–2.1× | CPU | back to back on one machine, `--threads 8`; not in the tracing range |
 
 "Original" is `avf-spline-generator` 0.2.0 for tracing and villa's `lasagna.qualzz_inference` (main `0bddf2757`,
 PyTorch fp32) for prediction; end to end is the two stages added, on the PHerc0826 crop from a single run of each

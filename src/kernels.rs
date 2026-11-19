@@ -12,7 +12,7 @@ use color_eyre::eyre::{Result, bail};
 
 use crate::arena::{OWN_MAPPING_BYTES, Voxel};
 use crate::pyfmt::{py_max, py_min};
-use crate::vol::{Place, SharedVol, SharedVolWriter, Vol};
+use crate::vol::{BRICK, Place, SharedVol, SharedVolWriter, Vol};
 
 /// cos(55°): the turn limit used throughout the tracer
 pub const COS55: f64 = 0.5735764363510462;
@@ -109,6 +109,38 @@ pub const fn pack_dir(nx: u8, ny: u8) -> u16 {
 #[inline(always)]
 pub fn decode_packed(d: u16) -> [f64; 3] {
     decode_dir((d >> 8) as u8, d as u8)
+}
+
+/// The direction field as the tracer reads it: `nx` and `ny` packed into one volume ([`pack_dir`])
+///
+/// One volume instead of two halves the brick lookups and cache lines of every direction read, which the tracer is
+/// bound by. The direction field and the GPU's centrality keep the two volumes the reference has; packing them
+/// takes their place, so it needs no more memory
+pub fn pack_dirs(nx: &Vol<u8>, ny: &Vol<u8>) -> Vol<u16> {
+    assert_eq!(nx.shape(), ny.shape(), "nx and ny cover the same voxels");
+    let mut dirs = Vol::new(nx.shape(), pack_dir(nx.default_value(), ny.default_value()));
+    let (blank_x, blank_y) = ([nx.default_value(); BRICK], [ny.default_value(); BRICK]);
+    for bi in 0..nx.grid().iter().product() {
+        let (bx, by) = (nx.brick_at(bi), ny.brick_at(bi));
+        if bx.is_none() && by.is_none() {
+            continue;
+        }
+        let (bx, by) = (bx.unwrap_or(&blank_x), by.unwrap_or(&blank_y));
+        dirs.set_brick(bi, &std::array::from_fn(|k| pack_dir(bx[k], by[k])));
+    }
+    dirs
+}
+
+/// `nx` and `ny` again from a packed direction field, for the GPU's centrality, which reads them as two volumes
+pub fn unpack_dirs(dirs: &Vol<u16>) -> (Vol<u8>, Vol<u8>) {
+    let d = dirs.default_value();
+    let (mut nx, mut ny) = (Vol::new(dirs.shape(), (d >> 8) as u8), Vol::new(dirs.shape(), d as u8));
+    for bi in 0..dirs.grid().iter().product() {
+        let Some(b) = dirs.brick_at(bi) else { continue };
+        nx.set_brick(bi, &std::array::from_fn(|k| (b[k] >> 8) as u8));
+        ny.set_brick(bi, &std::array::from_fn(|k| b[k] as u8));
+    }
+    (nx, ny)
 }
 
 /// `encode_dir` (core.py:23), with float32 tangents
@@ -545,94 +577,6 @@ impl CoverageWriter<'_> {
             self.written[Self::entry(m.at.slot)] = stamp;
         }
     }
-}
-
-/// Centrality and ridge seeds of one tile (`stage1_centrality_and_ridge`, core.py:254, seed stride 2);
-/// every coordinate and clamp is local to the tile, as in the reference
-pub fn stage1(pres: &Dense<u8>, dirs: &Dense<u16>) -> (Vec<u16>, Vec<u8>) {
-    let [d, h, w] = pres.dims();
-    let (df, hf, wf) = (d as f64, h as f64, w as f64);
-    let n = pres.data.len();
-    let mut cent = Dense { dims: pres.dims, data: vec![0u16; n] };
-    // the reference's literals, rounded to float32 as Numba does; not the library constant
-    #[allow(clippy::approx_constant)]
-    const COS_A: [f32; 8] = [1.0, 0.70710678, 0.0, -0.70710678, -1.0, -0.70710678, 0.0, 0.70710678];
-    #[allow(clippy::approx_constant)]
-    const SIN_A: [f32; 8] = [0.0, 0.70710678, 1.0, 0.70710678, 0.0, -0.70710678, -1.0, -0.70710678];
-    const RADII: [(f64, f64); 4] = [(1.0, 0.5), (1.8, 0.28), (2.7, 0.14), (3.6, 0.06)];
-    let dir = |z: i64, y: i64, x: i64| decode_packed(dirs.at(z, y, x));
-    for z in 0..d {
-        for y in 0..h {
-            for x in 0..w {
-                let p0 = pres.at(z, y, x) as f32;
-                if p0 < 64.0 {
-                    continue;
-                }
-                let (xf, yf, zf) = (x as f64, y as f64, z as f64);
-                let [ux, uy, uz] = dir(z, y, x);
-                let p_p = trilin_u8(pres, xf + ux, yf + uy, zf + uz);
-                let p_m = trilin_u8(pres, xf - ux, yf - uy, zf - uz);
-                let p_par = 0.5 * p0 as f64 + 0.25 * p_p + 0.25 * p_m;
-                let [e1x, e1y, e1z, e2x, e2y, e2z] = ortho_basis(ux, uy, uz);
-                let mut c_sum = 0.0f64;
-                for k in 0..8 {
-                    let (ca, sa) = (COS_A[k] as f64, SIN_A[k] as f64);
-                    let dx = ca * e1x + sa * e2x;
-                    let dy = ca * e1y + sa * e2y;
-                    let dz = ca * e1z + sa * e2z;
-                    for (r, wr) in RADII {
-                        let xx = py_min(py_max(xf + r * dx, 0.0), wf - 1.001);
-                        let yy = py_min(py_max(yf + r * dy, 0.0), hf - 1.001);
-                        let zz = py_min(py_max(zf + r * dz, 0.0), df - 1.001);
-                        let pr = trilin_u8(pres, xx, yy, zz);
-                        let [ux2, uy2, uz2] = dir((zz + 0.5) as i64, (yy + 0.5) as i64, (xx + 0.5) as i64);
-                        let dr = (ux * ux2 + uy * uy2 + uz * uz2).abs();
-                        if dr > 0.85 {
-                            c_sum += wr / 8.0 * pr * ((dr - 0.85) / 0.15);
-                        }
-                    }
-                }
-                let c = py_min(py_max((p_par + c_sum) * 100.0 + 0.5, 0.0), 65535.0);
-                cent.data[((z * h + y) * w + x) as usize] = c as u16;
-            }
-        }
-    }
-    let mut seeds = vec![0u8; n];
-    for z in 1..d - 1 {
-        for y in 1..h - 1 {
-            for x in 1..w - 1 {
-                if pres.at(z, y, x) < 79 || (x + y + z) & 1 != 0 {
-                    continue;
-                }
-                let c0 = cent.at(z, y, x) as f32 * 0.01f32;
-                let c0d = c0 as f64;
-                let (xf, yf, zf) = (x as f64, y as f64, z as f64);
-                let [ux, uy, uz] = dir(z, y, x);
-                let [e1x, e1y, e1z, e2x, e2y, e2z] = ortho_basis(ux, uy, uz);
-                let mut n_max = 0;
-                for k in 0..4 {
-                    let (ca, sa) = (COS_A[k] as f64, SIN_A[k] as f64);
-                    let dx = ca * e1x + sa * e2x;
-                    let dy = ca * e1y + sa * e2y;
-                    let dz = ca * e1z + sa * e2z;
-                    let cp = trilin_u16(&cent, xf + 1.15 * dx, yf + 1.15 * dy, zf + 1.15 * dz);
-                    let cm = trilin_u16(&cent, xf - 1.15 * dx, yf - 1.15 * dy, zf - 1.15 * dz);
-                    let cp2 = trilin_u16(&cent, xf + 2.0 * dx, yf + 2.0 * dy, zf + 2.0 * dz);
-                    let cm2 = trilin_u16(&cent, xf - 2.0 * dx, yf - 2.0 * dy, zf - 2.0 * dz);
-                    if c0d >= cp && c0d >= cm && c0d >= 0.5 * (cp2 + cm2) + 2.0 {
-                        n_max += 1;
-                    }
-                }
-                let i = ((z * h + y) * w + x) as usize;
-                if n_max == 4 {
-                    seeds[i] = 2;
-                } else if n_max == 3 && c0d >= 185.0 {
-                    seeds[i] = 1;
-                }
-            }
-        }
-    }
-    (cent.data, seeds)
 }
 
 /// Half-path capacity of `trace_seed_range` (`pts_f`/`pts_b`)
@@ -1207,6 +1151,29 @@ pub fn evaluate_curve(smoothed: &[[f32; 3]], n_out: usize, shape: [usize; 3]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GPU's centrality reads nx and ny unpacked from the tracer's packed field, so the round trip must give back
+    /// every voxel, including bricks only one of the two volumes had written
+    #[test]
+    fn packed_directions_unpack_to_the_same_volumes() {
+        let shape = [20, 33, 17];
+        let (mut nx, mut ny) = (Vol::new(shape, 128u8), Vol::new(shape, 128u8));
+        nx.set(1, 2, 3, 7);
+        ny.set(1, 2, 3, 250);
+        nx.set(18, 30, 16, 1);
+        ny.set(5, 20, 9, 129);
+
+        let dirs = pack_dirs(&nx, &ny);
+        assert_eq!(dirs.get(1, 2, 3), pack_dir(7, 250));
+        assert_eq!(dirs.get(18, 30, 16), pack_dir(1, 128));
+        assert_eq!(dirs.get(5, 20, 9), pack_dir(128, 129));
+        assert_eq!(dirs.get(10, 10, 10), pack_dir(128, 128));
+        assert_eq!(dirs.resident_bytes(), 3 * BRICK * 2, "only bricks either volume wrote are allocated");
+
+        let (ux, uy) = unpack_dirs(&dirs);
+        assert_eq!(ux.read_block([0; 3], shape), nx.read_block([0; 3], shape));
+        assert_eq!(uy.read_block([0; 3], shape), ny.read_block([0; 3], shape));
+    }
 
     #[test]
     fn decode_matches_reference_formula() {

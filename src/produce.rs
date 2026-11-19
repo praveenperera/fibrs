@@ -365,6 +365,7 @@ mod tests {
     use super::*;
     use crate::fields::{Presence, catalogue, centrality};
     use crate::kernels::{encode_dir, pack_dir};
+    use crate::stage1::Separate;
     use crate::vol::Vol;
 
     const SHAPE: [usize; 3] = [40, 96, 96];
@@ -439,7 +440,7 @@ mod tests {
     fn tracing_ahead_commits_the_serial_curves() {
         let (tracing, dirs) = fibres();
         let pres = Presence::new(&tracing, 1);
-        let fam = centrality(&pres, &dirs);
+        let fam = centrality::<Separate>(&pres, &dirs);
         let cat = catalogue(&fam.seeds, &fam.cent);
         let fields = Fields { pres: &pres, cent: &fam.cent, dirs: &dirs };
         let expected = serial(&fields, &cat);

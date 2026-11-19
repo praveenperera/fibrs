@@ -6,12 +6,14 @@ mod arena;
 mod axes;
 mod fields;
 mod finish;
+mod gpu;
 mod input;
 mod kernels;
 mod predict;
 mod produce;
 mod pyfmt;
 mod run;
+mod stage1;
 mod vol;
 
 use std::ffi::OsString;
