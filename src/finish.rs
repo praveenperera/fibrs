@@ -77,6 +77,11 @@ impl<K: Copy + Eq + Hash, V: Clone> Lru<K, V> {
         Some(value.clone())
     }
 
+    /// Entries of `bytes` each that the whole budget holds
+    fn capacity(&self, bytes: usize) -> usize {
+        self.budget / (bytes + ENTRY_BYTES)
+    }
+
     fn insert(&mut self, key: K, value: V, bytes: usize) {
         let bytes = bytes + ENTRY_BYTES;
         self.clock += 1;
@@ -200,8 +205,12 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         Ok(self.slab_at([cz, cy, cx], s, data))
     }
 
-    /// Decode a chunk whose Blosc blocks are larger than a slab once, cache each of its slabs but slab `s`, and
-    /// return that one; decoding it slab by slab would decode each block once for every slab it holds
+    /// Decode a chunk whose Blosc blocks are larger than a slab once, and return its slab `s`; decoding it slab by
+    /// slab would decode each block once for every slab it holds
+    ///
+    /// The chunk's other slabs nearest `s` are cached too, as many as the cache holds beside slab `s`, the nearest
+    /// last so they are dropped last; `slab` caches slab `s` after them. Caching every slab of a chunk larger than
+    /// the cache would drop the first ones cached before they are read, and decode the chunk again for each
     fn decode_whole(&self, chunk: Shape, s: usize, packed: &PackedChunk<&'p BufferPool>) -> Result<Slab<'p>> {
         let [ez, ey, ex] = self.edge;
         let channel = ez * ey * ex;
@@ -209,20 +218,21 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         all.resize(2 * channel, 0);
         self.pred.decode_planes(packed, 0..ez, &mut all).map_err(|e| eyre!("chunk {chunk:?}: {e}"))?;
         let half = self.planes * ey * ex;
-        let mut wanted = None;
-        for i in 0..ez / self.planes {
+        let slab = |i: usize| {
             let mut data = Vec::with_capacity_in(2 * half, self.pool);
             data.extend_from_slice(&all[i * half..(i + 1) * half]);
             data.extend_from_slice(&all[channel + i * half..channel + (i + 1) * half]);
-            let slab = self.slab_at(chunk, i, data);
-            if i == s {
-                wanted = Some(slab);
-                continue;
-            }
-            let bytes = BufferPool::footprint(slab.data.capacity());
-            self.slabs.lock().expect("cache lock").insert([chunk[0], chunk[1], chunk[2], i], Arc::new(slab), bytes);
+            self.slab_at(chunk, i, data)
+        };
+        let n = ez / self.planes;
+        let bytes = BufferPool::footprint(2 * half);
+        let others = self.slabs.lock().expect("cache lock").capacity(bytes).saturating_sub(1);
+        let nearest: Vec<usize> =
+            (1..n).flat_map(|d| [s.checked_sub(d), Some(s + d).filter(|&i| i < n)]).flatten().take(others).collect();
+        for &i in nearest.iter().rev() {
+            self.slabs.lock().expect("cache lock").insert([chunk[0], chunk[1], chunk[2], i], Arc::new(slab(i)), bytes);
         }
-        Ok(wanted.expect("slab `s` lies in its chunk"))
+        Ok(slab(s))
     }
 
     /// Slab `s` of `chunk`, holding `data`: V then H, each `planes × cy × cx`
@@ -443,37 +453,50 @@ mod tests {
         out
     }
 
+    /// A uint8 prediction store in `name` under the temp directory with one row of chunks of `edge`³ along x,
+    /// chunk x compressed in blocks of `blocks[x]` bytes
+    fn store(name: &str, edge: usize, blocks: &[usize]) -> (std::path::PathBuf, Predictions) {
+        let n = edge * edge * edge;
+        let dir = std::env::temp_dir().join(format!("fibrs-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for (x, &blocksize) in blocks.iter().enumerate() {
+            let data: Vec<u8> = (0..2 * n).map(|i| (i * 7 + i / 977 + 101 * x) as u8).collect();
+            fs::write(dir.join(format!("0.0.0.{x}")), frame(&data, blocksize)).unwrap();
+        }
+        let meta = serde_json::json!({
+            "zarr_format": 2, "shape": [2, edge, edge, blocks.len() * edge], "chunks": [2, edge, edge, edge],
+            "dtype": "|u1", "fill_value": 0, "order": "C", "filters": null, "dimension_separator": ".",
+            "compressor": {"id": "blosc", "cname": "zstd", "clevel": 3, "shuffle": 1, "blocksize": 0},
+        });
+        fs::write(dir.join(".zarray"), meta.to_string()).unwrap();
+        let pred = Predictions::open(&dir, None, "VH").unwrap();
+        (dir, pred)
+    }
+
+    /// A cache in slab mode with `slab_budget` bytes for slabs, as the probe chooses it when the chunk it lists
+    /// first fits; which chunk it lists first depends on the file system
+    fn slab_cache<'a, 'p>(pred: &'a Predictions, pool: &'p BufferPool, slab_budget: usize) -> NativeCache<'a, 'p> {
+        NativeCache {
+            pred,
+            edge: pred.slab_layout().unwrap(),
+            planes: SLAB_PLANES,
+            pool,
+            slabs: Mutex::new(Lru::new(slab_budget)),
+            packed: Mutex::new(Lru::new(16 << 20)),
+            counts: Mutex::default(),
+        }
+    }
+
     /// Through the slab cache, a store that mixes chunks of slab-sized Blosc blocks with a chunk compressed as one
     /// block reads the reference window reader's values, and the one-block chunk is decoded once for both its slabs
     #[test]
     fn mixed_block_sizes_read_the_window_values() {
         let edge = 2 * SLAB_PLANES;
         let n = edge * edge * edge;
-        let dir = std::env::temp_dir().join(format!("fibrs-mixed-blocks-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        for (x, blocksize) in [(0, SLAB_PLANES * edge * edge), (1, 2 * n)] {
-            let data: Vec<u8> = (0..2 * n).map(|i| (i * 7 + i / 977 + 101 * x) as u8).collect();
-            fs::write(dir.join(format!("0.0.0.{x}")), frame(&data, blocksize)).unwrap();
-        }
-        let meta = serde_json::json!({
-            "zarr_format": 2, "shape": [2, edge, edge, 2 * edge], "chunks": [2, edge, edge, edge],
-            "dtype": "|u1", "fill_value": 0, "order": "C", "filters": null, "dimension_separator": ".",
-            "compressor": {"id": "blosc", "cname": "zstd", "clevel": 3, "shuffle": 1, "blocksize": 0},
-        });
-        fs::write(dir.join(".zarray"), meta.to_string()).unwrap();
-        let pred = Predictions::open(&dir, None, "VH").unwrap();
+        let (dir, pred) = store("mixed-blocks", edge, &[SLAB_PLANES * edge * edge, 2 * n]);
         let pool = BufferPool::new(1 << 20);
-        // slab mode as the probe would choose it for the first chunk; which chunk it lists first varies
-        let cache = NativeCache {
-            pred: &pred,
-            edge: [edge; 3],
-            planes: SLAB_PLANES,
-            pool: &pool,
-            slabs: Mutex::new(Lru::new(64 << 20)),
-            packed: Mutex::new(Lru::new(16 << 20)),
-            counts: Mutex::default(),
-        };
+        let cache = slab_cache(&pred, &pool, 64 << 20);
         let mut sampler = NativeSampler::new(&cache);
         let shape = [edge, edge, 2 * edge];
         let window = pred.read_u8([0; 3], shape).unwrap();
@@ -488,6 +511,23 @@ mod tests {
         }
         // two slab decodes of the first chunk, one whole decode of the second
         assert_eq!(cache.decoded(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A one-block chunk of 8 slabs read slab by slab through a cache of 3 slabs is decoded again only once the
+    /// slabs cached with the last decode are used up: at slabs 0, 3, 5 and 7, where caching every slab of each
+    /// decode dropped the next ones before they were read and decoded the chunk 6 times
+    #[test]
+    fn a_one_block_chunk_in_a_small_cache_is_decoded_once_per_cached_run() {
+        let edge = 8 * SLAB_PLANES;
+        let (dir, pred) = store("small-cache", edge, &[2 * edge * edge * edge]);
+        let pool = BufferPool::new(1 << 20);
+        let slab = BufferPool::footprint(2 * SLAB_PLANES * edge * edge) + ENTRY_BYTES;
+        let cache = slab_cache(&pred, &pool, 3 * slab);
+        for s in 0..edge / SLAB_PLANES {
+            cache.slab([0, 0, 0, s]).unwrap();
+        }
+        assert_eq!(cache.decoded(), 4);
         let _ = fs::remove_dir_all(&dir);
     }
 }

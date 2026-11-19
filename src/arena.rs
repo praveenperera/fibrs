@@ -31,8 +31,9 @@ const POOL_ALIGN: usize = 64;
 /// Collections take it by reference (`Vec::with_capacity_in(n, &pool)`), so a buffer goes back to the pool when it
 /// is dropped, on whichever thread drops it, and the borrow checker keeps every such buffer from outliving the
 /// pool. Freed buffers are kept up to `retain` bytes, and a request no kept buffer fits releases kept buffers of
-/// other sizes until its own would fit, so sizes no longer asked for do not hold the pool; the rest, and everything
-/// kept, go back to the global allocator when the pool is dropped
+/// other sizes until its own would fit, so sizes no longer asked for do not hold the pool. A request larger than
+/// `retain` releases nothing, since its buffer is never kept. The rest, and everything kept, go back to the global
+/// allocator when the pool is dropped
 pub struct BufferPool {
     free: Mutex<FreeLists>,
     retain: usize,
