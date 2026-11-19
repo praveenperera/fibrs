@@ -30,8 +30,9 @@ const POOL_ALIGN: usize = 64;
 ///
 /// Collections take it by reference (`Vec::with_capacity_in(n, &pool)`), so a buffer goes back to the pool when it
 /// is dropped, on whichever thread drops it, and the borrow checker keeps every such buffer from outliving the
-/// pool. Freed buffers are kept up to `retain` bytes; the rest, and everything kept, go back to the global
-/// allocator when the pool is dropped
+/// pool. Freed buffers are kept up to `retain` bytes, and a request no kept buffer fits releases kept buffers of
+/// other sizes until its own would fit, so sizes no longer asked for do not hold the pool; the rest, and everything
+/// kept, go back to the global allocator when the pool is dropped
 pub struct BufferPool {
     free: Mutex<FreeLists>,
     retain: usize,
@@ -41,6 +42,22 @@ pub struct BufferPool {
 struct FreeLists {
     by_class: HashMap<usize, Vec<Block>>,
     bytes: usize,
+}
+
+impl FreeLists {
+    /// Take kept blocks out until a block of `class` would fit under `retain` once freed; the caller frees them
+    /// outside the lock. Called when no block of `class` is kept, so every block taken is of another size
+    fn release_for(&mut self, class: usize, retain: usize) -> Vec<(usize, Block)> {
+        let mut out = Vec::new();
+        while self.bytes + class > retain {
+            let Some((&c, blocks)) = self.by_class.iter_mut().find(|(_, b)| !b.is_empty()) else { break };
+            let block = blocks.pop().expect("a non-empty list");
+            self.bytes -= c;
+            out.push((c, block));
+        }
+        self.by_class.retain(|_, b| !b.is_empty());
+        out
+    }
 }
 
 /// A pooled buffer's address; the pool hands it to one owner at a time
@@ -83,14 +100,20 @@ impl BufferPool {
 unsafe impl Allocator for BufferPool {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let Some(class) = Self::class(layout) else { return Global.allocate(layout) };
-        let reused = {
+        let (reused, stale) = {
             let mut free = self.free.lock().expect("pool lock");
-            let block = free.by_class.get_mut(&class).and_then(Vec::pop);
-            if block.is_some() {
-                free.bytes -= class;
+            match free.by_class.get_mut(&class).and_then(Vec::pop) {
+                Some(block) => {
+                    free.bytes -= class;
+                    (Some(block), Vec::new())
+                }
+                None => (None, free.release_for(class, self.retain)),
             }
-            block
         };
+        for (class, Block(ptr)) in stale {
+            // SAFETY: kept blocks are owned by the pool alone and were allocated with their class's layout
+            unsafe { Global.deallocate(ptr, Self::class_layout(class)) }
+        }
         let ptr = match reused {
             Some(Block(ptr)) => ptr,
             None => Global.allocate(Self::class_layout(class))?.cast(),
@@ -330,6 +353,25 @@ mod tests {
         let bufs: Vec<Vec<u8, &BufferPool>> = (0..3).map(|_| Vec::with_capacity_in(1 << 20, &pool)).collect();
         drop(bufs);
         assert_eq!(pool.free.lock().unwrap().bytes, 1 << 20);
+    }
+
+    #[test]
+    fn a_new_size_releases_kept_buffers_of_other_sizes() {
+        // two 1 MiB buffers nearly fill a 2.5 MiB pool; a 1.5 MiB request then releases one of them to make room
+        // for its own buffer, which the pool keeps when it is freed
+        let pool = BufferPool::new(5 << 19);
+        let bufs: Vec<Vec<u8, &BufferPool>> = (0..2).map(|_| Vec::with_capacity_in(1 << 20, &pool)).collect();
+        drop(bufs);
+        let big: Vec<u8, &BufferPool> = Vec::with_capacity_in(3 << 19, &pool);
+        let at = big.as_ptr();
+        drop(big);
+        let free = pool.free.lock().unwrap();
+        assert_eq!(free.bytes, (1 << 20) + (3 << 19));
+        assert_eq!(free.by_class[&(1 << 20)].len(), 1);
+        assert_eq!(free.by_class[&(3 << 19)].len(), 1);
+        drop(free);
+        let again: Vec<u8, &BufferPool> = Vec::with_capacity_in(3 << 19, &pool);
+        assert_eq!(again.as_ptr(), at);
     }
 
     #[test]
