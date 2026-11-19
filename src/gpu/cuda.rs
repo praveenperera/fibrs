@@ -730,7 +730,7 @@ impl Drop for Slot {
 mod tests {
     use super::*;
     use crate::fields::{Presence, centrality};
-    use crate::kernels::pack_dirs;
+    use crate::kernels::SplitDirs;
 
     #[test]
     fn launches_match_the_embedded_ptx() {
@@ -808,7 +808,7 @@ mod tests {
         let shape = nx.shape();
         for family in [1, 2] {
             let got = gpu.centrality(&tracing, family, &nx, &ny).unwrap();
-            let want = centrality::<Fused>(&Presence::new(&tracing, family), &pack_dirs(&nx, &ny));
+            let want = centrality::<Fused, _>(&Presence::new(&tracing, family), &SplitDirs { nx: &nx, ny: &ny });
             let (a, b) = (got.cent.read_block([0; 3], shape), want.cent.read_block([0; 3], shape));
             let differ = a.iter().zip(&b).filter(|(a, b)| a != b).count();
             assert_eq!(differ, 0, "family {family}: {differ} centrality voxels differ");

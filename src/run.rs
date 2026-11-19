@@ -28,7 +28,7 @@ use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
 use crate::gpu::{AxesCounts, Gpu, Stages};
 use crate::input::Predictions;
-use crate::kernels::{Coverage, Fields, RawCurve, pack_dirs, unpack_dirs};
+use crate::kernels::{Coverage, DirField, Fields, RawCurve, SplitDirs};
 use crate::log;
 use crate::produce::{Flow, Producer, Speculation, Stats};
 use crate::stage1::{Fused, Separate};
@@ -740,44 +740,66 @@ fn trace_families(
     let resident = tracing.iter().map(Vol::resident_bytes).sum::<usize>();
     log!("Tracing predictions: {:.1} s, {:.2} GiB resident", t.elapsed().as_secs_f64(), gib(resident));
     let lapack = Lapack::init(&find_lapack()?)?;
-    let (nx, ny) = direction_field_on(cent.gpu.as_ref(), cent.strict, &tracing, lapack)?;
+    let dirs = direction_field_on(cent.gpu.as_ref(), cent.strict, &tracing, lapack)?;
     release_freed();
-    debug_dump(work, "nx", || nx.read_block([0, 0, 0], nx.shape()))?;
-    debug_dump(work, "ny", || ny.read_block([0, 0, 0], ny.shape()))?;
-    debug_mem("direction field", &[("tracing", resident), ("nx", nx.resident_bytes()), ("ny", ny.resident_bytes())]);
-    let dirs = pack_dirs(&nx, &ny);
-    drop((nx, ny));
     let pool = BufferPool::new(CHUNK_POOL_RETAIN);
     let cache = NativeCache::new(native, cache_bytes, &pool);
-    for &family in families {
-        trace_family(&tracing, &dirs, &cache, work, family, Compute { threads, cent })?;
-        release_freed();
+    let families = Families { tracing: &tracing, resident, cache: &cache, work, families, threads, cent };
+    match &dirs {
+        Directions::Packed(packed) => families.trace(packed),
+        Directions::Split { nx, ny } => families.trace(&SplitDirs { nx, ny }),
     }
-    Ok(())
+}
+
+/// The direction field in the form the device that computed it gives ([`DirField`])
+enum Directions {
+    Packed(Vol<u16>),
+    Split { nx: Vol<u8>, ny: Vol<u8> },
+}
+
+/// What tracing each pending family needs besides the direction field
+struct Families<'a, 'n, 'p> {
+    tracing: &'a [Vol<u8>; 2],
+    resident: usize,
+    cache: &'a NativeCache<'n, 'p>,
+    work: &'a Path,
+    families: &'a [usize],
+    threads: usize,
+    cent: &'a CentralityDevice,
+}
+
+impl Families<'_, '_, '_> {
+    fn trace<D: DirField>(&self, dirs: &D) -> Result<()> {
+        let whole = || dirs.packed_block([0, 0, 0], dirs.shape());
+        debug_dump(self.work, "nx", || whole().iter().map(|d| (d >> 8) as u8).collect())?;
+        debug_dump(self.work, "ny", || whole().iter().map(|&d| d as u8).collect())?;
+        debug_mem("direction field", &[("tracing", self.resident), ("directions", dirs.resident_bytes())]);
+        for &family in self.families {
+            let compute = Compute { threads: self.threads, cent: self.cent };
+            trace_family(self.tracing, dirs, self.cache, self.work, family, compute)?;
+            release_freed();
+        }
+        Ok(())
+    }
 }
 
 /// The direction field, on `gpu` when there is one
 ///
 /// Both devices give the same bytes, so when the GPU fails, such as out of memory, the CPU computes it instead,
 /// unless `strict` (`--device cuda`) asked for the GPU only
-fn direction_field_on(
-    gpu: Option<&Gpu>,
-    strict: bool,
-    tracing: &[Vol<u8>; 2],
-    lapack: &Lapack,
-) -> Result<(Vol<u8>, Vol<u8>)> {
+fn direction_field_on(gpu: Option<&Gpu>, strict: bool, tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<Directions> {
     let t = Instant::now();
-    let on_cpu = || -> Result<(Vol<u8>, Vol<u8>)> {
+    let on_cpu = || -> Result<Directions> {
         let field = direction_field(tracing, lapack)?;
         log!("Direction field: {:.1} s", t.elapsed().as_secs_f64());
-        Ok(field)
+        Ok(Directions::Packed(field))
     };
     let Some(gpu) = gpu else { return on_cpu() };
     match gpu.direction_field(tracing, lapack) {
         Ok((nx, ny, AxesCounts { present, fallback })) => {
             let secs = t.elapsed().as_secs_f64();
             log!("Direction field: {secs:.1} s, {fallback} of {present} voxels solved on the CPU");
-            Ok((nx, ny))
+            Ok(Directions::Split { nx, ny })
         }
         Err(e) if !strict => {
             log!("Direction field on the CPU: the GPU failed ({e:#})");
@@ -1003,31 +1025,39 @@ impl CentralityDevice {
     ///
     /// When the GPU fails, such as out of memory, the CPU computes the same CUDA rounding unless `--device cuda`
     /// asked for the GPU only
-    fn compute(&self, tracing: &[Vol<u8>; 2], family: usize, pres: &Presence, dirs: &Vol<u16>) -> Result<FamilyFields> {
+    fn compute<D: DirField>(
+        &self,
+        tracing: &[Vol<u8>; 2],
+        family: usize,
+        pres: &Presence,
+        dirs: &D,
+    ) -> Result<FamilyFields> {
         let gpu = match (self.rounding, &self.gpu) {
-            (Rounding::Cpu, _) => return Ok(centrality::<Separate>(pres, dirs)),
-            (Rounding::Cuda, None) => return Ok(centrality::<Fused>(pres, dirs)),
+            (Rounding::Cpu, _) => return Ok(centrality::<Separate, _>(pres, dirs)),
+            (Rounding::Cuda, None) => return Ok(centrality::<Fused, _>(pres, dirs)),
             (Rounding::Cuda, Some(gpu)) => gpu,
         };
-        // the GPU reads nx and ny as two volumes; they are held only while it computes
+        // the GPU reads nx and ny as two volumes: its own, or copies held only while it computes when the CPU
+        // computed the direction field
         let on_gpu = {
-            let (nx, ny) = unpack_dirs(dirs);
-            gpu.centrality(tracing, family, &nx, &ny)
+            let split = dirs.split();
+            let (nx, ny) = split.pair();
+            gpu.centrality(tracing, family, nx, ny)
         };
         match on_gpu {
             Ok(fields) => Ok(fields),
             Err(e) if !self.strict => {
                 log!("Centrality on the CPU, rounded as on the GPU: the GPU failed ({e:#})");
-                Ok(centrality::<Fused>(pres, dirs))
+                Ok(centrality::<Fused, _>(pres, dirs))
             }
             Err(e) => Err(e),
         }
     }
 }
 
-fn trace_family(
+fn trace_family<D: DirField>(
     tracing: &[Vol<u8>; 2],
-    dirs: &Vol<u16>,
+    dirs: &D,
     cache: &NativeCache,
     work: &Path,
     family: usize,

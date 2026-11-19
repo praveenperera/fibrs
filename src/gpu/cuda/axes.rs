@@ -445,6 +445,7 @@ mod tests {
     use super::*;
     use crate::axes::{direction_field, find_lapack};
     use crate::gpu::Stages;
+    use crate::kernels::DirField;
 
     /// A small xorshift, so the test volume needs no dependency
     struct Rng(u64);
@@ -498,8 +499,11 @@ mod tests {
         let tracing = volumes();
         let shape = tracing[0].shape();
         let (nx, ny, counts) = gpu.direction_field(&tracing, lapack).unwrap();
-        let (want_nx, want_ny) = direction_field(&tracing, lapack).unwrap();
-        for (name, got, want) in [("nx", &nx, &want_nx), ("ny", &ny, &want_ny)] {
+        // the CPU's field is packed; split it to compare each volume
+        let want = direction_field(&tracing, lapack).unwrap();
+        let want = want.split();
+        let (want_nx, want_ny) = want.pair();
+        for (name, got, want) in [("nx", &nx, want_nx), ("ny", &ny, want_ny)] {
             let (a, b) = (got.read_block([0; 3], shape), want.read_block([0; 3], shape));
             let differ = a.iter().zip(&b).filter(|(a, b)| a != b).count();
             assert_eq!(differ, 0, "{name}: {differ} voxels differ");

@@ -12,7 +12,7 @@ use color_eyre::eyre::{Result, bail};
 
 use crate::arena::{OWN_MAPPING_BYTES, Voxel};
 use crate::pyfmt::{py_max, py_min};
-use crate::vol::{BRICK, Place, SharedVol, SharedVolWriter, Vol};
+use crate::vol::{Place, Shape, SharedVol, SharedVolWriter, Vol};
 
 /// cos(55°): the turn limit used throughout the tracer
 pub const COS55: f64 = 0.5735764363510462;
@@ -111,36 +111,109 @@ pub fn decode_packed(d: u16) -> [f64; 3] {
     decode_dir((d >> 8) as u8, d as u8)
 }
 
-/// The direction field as the tracer reads it: `nx` and `ny` packed into one volume ([`pack_dir`])
+/// The direction field as centrality and the tracer read it: each voxel's `nx` and `ny` as one packed value
+/// ([`pack_dir`])
 ///
-/// One volume instead of two halves the brick lookups and cache lines of every direction read, which the tracer is
-/// bound by. The direction field and the GPU's centrality keep the two volumes the reference has; packing them
-/// takes their place, so it needs no more memory
-pub fn pack_dirs(nx: &Vol<u8>, ny: &Vol<u8>) -> Vol<u16> {
-    assert_eq!(nx.shape(), ny.shape(), "nx and ny cover the same voxels");
-    let mut dirs = Vol::new(nx.shape(), pack_dir(nx.default_value(), ny.default_value()));
-    let (blank_x, blank_y) = ([nx.default_value(); BRICK], [ny.default_value(); BRICK]);
-    for bi in 0..nx.grid().iter().product() {
-        let (bx, by) = (nx.brick_at(bi), ny.brick_at(bi));
-        if bx.is_none() && by.is_none() {
-            continue;
-        }
-        let (bx, by) = (bx.unwrap_or(&blank_x), by.unwrap_or(&blank_y));
-        dirs.set_brick(bi, &std::array::from_fn(|k| pack_dir(bx[k], by[k])));
-    }
-    dirs
+/// The CPU computes it as one packed volume, `Vol<u16>`: the tracer is bound by direction reads, and one volume
+/// instead of two halves their brick lookups and cache lines. The GPU computes and reads `nx` and `ny` as two
+/// volumes, which [`SplitDirs`] reads as packed values. Each is kept in the form it was computed in, since converting
+/// one into the other would hold both at once
+pub trait DirField: Grid<u16> {
+    fn shape(&self) -> Shape;
+
+    /// Bytes held by allocated bricks
+    fn resident_bytes(&self) -> usize;
+
+    /// A dense C-order block of packed values with origin `lo` and extent `dims`
+    fn packed_block(&self, lo: Shape, dims: Shape) -> Vec<u16>;
+
+    /// `nx` and `ny` as two volumes, for the GPU's centrality
+    fn split(&self) -> Split<'_>;
 }
 
-/// `nx` and `ny` again from a packed direction field, for the GPU's centrality, which reads them as two volumes
-pub fn unpack_dirs(dirs: &Vol<u16>) -> (Vol<u8>, Vol<u8>) {
-    let d = dirs.default_value();
-    let (mut nx, mut ny) = (Vol::new(dirs.shape(), (d >> 8) as u8), Vol::new(dirs.shape(), d as u8));
-    for bi in 0..dirs.grid().iter().product() {
-        let Some(b) = dirs.brick_at(bi) else { continue };
-        nx.set_brick(bi, &std::array::from_fn(|k| (b[k] >> 8) as u8));
-        ny.set_brick(bi, &std::array::from_fn(|k| b[k] as u8));
+/// `nx` and `ny` as two volumes: the field's own, or copies made from a packed field
+pub enum Split<'a> {
+    Borrowed(&'a Vol<u8>, &'a Vol<u8>),
+    Owned(Box<(Vol<u8>, Vol<u8>)>),
+}
+
+impl Split<'_> {
+    pub fn pair(&self) -> (&Vol<u8>, &Vol<u8>) {
+        match self {
+            Split::Borrowed(nx, ny) => (nx, ny),
+            Split::Owned(pair) => (&pair.0, &pair.1),
+        }
     }
-    (nx, ny)
+}
+
+impl DirField for Vol<u16> {
+    fn shape(&self) -> Shape {
+        Vol::shape(self)
+    }
+
+    fn resident_bytes(&self) -> usize {
+        Vol::resident_bytes(self)
+    }
+
+    fn packed_block(&self, lo: Shape, dims: Shape) -> Vec<u16> {
+        self.read_block(lo, dims)
+    }
+
+    /// Copies, made only when the CPU computed the direction field and the GPU then computes centrality, as when
+    /// the GPU failed during the direction field
+    fn split(&self) -> Split<'_> {
+        let d = self.default_value();
+        let (mut nx, mut ny) = (Vol::new(self.shape(), (d >> 8) as u8), Vol::new(self.shape(), d as u8));
+        for bi in 0..self.grid().iter().product() {
+            let Some(b) = self.brick_at(bi) else { continue };
+            nx.set_brick(bi, &std::array::from_fn(|k| (b[k] >> 8) as u8));
+            ny.set_brick(bi, &std::array::from_fn(|k| b[k] as u8));
+        }
+        Split::Owned(Box::new((nx, ny)))
+    }
+}
+
+/// A direction field the GPU computed: its `nx` and `ny` volumes, read as packed values
+pub struct SplitDirs<'a> {
+    pub nx: &'a Vol<u8>,
+    pub ny: &'a Vol<u8>,
+}
+
+impl Grid<u16> for SplitDirs<'_> {
+    #[inline(always)]
+    fn dims(&self) -> [i64; 3] {
+        self.nx.dims()
+    }
+
+    #[inline(always)]
+    fn at(&self, z: i64, y: i64, x: i64) -> u16 {
+        pack_dir(self.nx.at(z, y, x), self.ny.at(z, y, x))
+    }
+
+    #[inline(always)]
+    fn corners(&self, z: i64, y: i64, x: i64) -> [u16; 8] {
+        let (nx, ny) = (Grid::corners(self.nx, z, y, x), Grid::corners(self.ny, z, y, x));
+        std::array::from_fn(|k| pack_dir(nx[k], ny[k]))
+    }
+}
+
+impl DirField for SplitDirs<'_> {
+    fn shape(&self) -> Shape {
+        self.nx.shape()
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.nx.resident_bytes() + self.ny.resident_bytes()
+    }
+
+    fn packed_block(&self, lo: Shape, dims: Shape) -> Vec<u16> {
+        let (nx, ny) = (self.nx.read_block(lo, dims), self.ny.read_block(lo, dims));
+        nx.iter().zip(&ny).map(|(&x, &y)| pack_dir(x, y)).collect()
+    }
+
+    fn split(&self) -> Split<'_> {
+        Split::Borrowed(self.nx, self.ny)
+    }
 }
 
 /// `encode_dir` (core.py:23), with float32 tangents
@@ -1158,27 +1231,31 @@ pub fn evaluate_curve(smoothed: &[[f32; 3]], n_out: usize, shape: [usize; 3]) ->
 mod tests {
     use super::*;
 
-    /// The GPU's centrality reads nx and ny unpacked from the tracer's packed field, so the round trip must give back
-    /// every voxel, including bricks only one of the two volumes had written
+    /// The tracer reads the GPU's two volumes and the CPU's packed volume as the same values, and a packed field
+    /// split for the GPU's centrality gives back the two volumes, including bricks only one of them had written
     #[test]
-    fn packed_directions_unpack_to_the_same_volumes() {
+    fn both_direction_forms_read_the_same() {
         let shape = [20, 33, 17];
         let (mut nx, mut ny) = (Vol::new(shape, 128u8), Vol::new(shape, 128u8));
-        nx.set(1, 2, 3, 7);
-        ny.set(1, 2, 3, 250);
-        nx.set(18, 30, 16, 1);
-        ny.set(5, 20, 9, 129);
+        let mut packed = Vol::new(shape, pack_dir(128, 128));
+        for ([z, y, x], bx, by) in
+            [([1, 2, 3], 7, 250), ([1, 2, 4], 9, 128), ([18, 30, 16], 1, 128), ([5, 20, 9], 128, 129)]
+        {
+            nx.set(z, y, x, bx);
+            ny.set(z, y, x, by);
+            packed.set(z, y, x, pack_dir(bx, by));
+        }
 
-        let dirs = pack_dirs(&nx, &ny);
-        assert_eq!(dirs.get(1, 2, 3), pack_dir(7, 250));
-        assert_eq!(dirs.get(18, 30, 16), pack_dir(1, 128));
-        assert_eq!(dirs.get(5, 20, 9), pack_dir(128, 129));
-        assert_eq!(dirs.get(10, 10, 10), pack_dir(128, 128));
-        assert_eq!(dirs.resident_bytes(), 3 * BRICK * 2, "only bricks either volume wrote are allocated");
+        let split = SplitDirs { nx: &nx, ny: &ny };
+        assert_eq!(split.at(1, 2, 3), pack_dir(7, 250));
+        assert_eq!(split.corners(1, 2, 3), packed.corners(1, 2, 3));
+        assert_eq!(split.corners(1, 2, 3)[1], pack_dir(9, 128));
+        assert_eq!(split.packed_block([0; 3], shape), packed.packed_block([0; 3], shape));
 
-        let (ux, uy) = unpack_dirs(&dirs);
-        assert_eq!(ux.read_block([0; 3], shape), nx.read_block([0; 3], shape));
-        assert_eq!(uy.read_block([0; 3], shape), ny.read_block([0; 3], shape));
+        let back = packed.split();
+        let (bx, by) = back.pair();
+        assert_eq!(bx.read_block([0; 3], shape), nx.read_block([0; 3], shape));
+        assert_eq!(by.read_block([0; 3], shape), ny.read_block([0; 3], shape));
     }
 
     #[test]

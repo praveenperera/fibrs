@@ -2,7 +2,7 @@
 
 use rayon::prelude::*;
 
-use crate::kernels::{Dense, Grid};
+use crate::kernels::{Dense, DirField, Grid};
 use crate::pyfmt::argsort_u16;
 use crate::stage1::{Arith, stage1};
 use crate::vol::{Shape, Vol};
@@ -159,7 +159,7 @@ type TileFields = (Shape, Shape, Vec<u16>, Vec<u8>);
 
 /// Centrality and seeds over the reference's 128³ tiles with an 8-voxel halo, tiles in parallel, in the rounding
 /// of the reference's CPU kernel ([`crate::stage1::Separate`]) or its CUDA kernels ([`crate::stage1::Fused`])
-pub fn centrality<A: Arith>(pres: &Presence, dirs: &Vol<u16>) -> FamilyFields {
+pub fn centrality<A: Arith, D: DirField>(pres: &Presence, dirs: &D) -> FamilyFields {
     let shape = pres.shape();
     assert!(
         shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d)).is_some_and(|n| n <= Seed::MAX_VOXELS),
@@ -172,7 +172,7 @@ pub fn centrality<A: Arith>(pres: &Presence, dirs: &Vol<u16>) -> FamilyFields {
     // at once stay small; tile cores are disjoint, so the order they are written in does not matter
     for part in jobs.chunks(4 * rayon::current_num_threads()) {
         let results: Vec<Option<TileFields>> =
-            part.par_iter().map(|&(start, end)| centrality_tile::<A>(pres, dirs, start, end)).collect();
+            part.par_iter().map(|&(start, end)| centrality_tile::<A, D>(pres, dirs, start, end)).collect();
         for (start, inner, c, s) in results.into_iter().flatten() {
             cent.write_block(start, inner, &c);
             let mut i = 0;
@@ -196,7 +196,7 @@ pub fn centrality<A: Arith>(pres: &Presence, dirs: &Vol<u16>) -> FamilyFields {
 }
 
 /// One tile's core centrality and seeds, or None when no voxel of the tile and its halo reaches presence 64
-fn centrality_tile<A: Arith>(pres: &Presence, dirs: &Vol<u16>, start: Shape, end: Shape) -> Option<TileFields> {
+fn centrality_tile<A: Arith, D: DirField>(pres: &Presence, dirs: &D, start: Shape, end: Shape) -> Option<TileFields> {
     let shape = pres.shape();
     let lo = start.map(|v| v.saturating_sub(TILE_HALO));
     let hi = [0, 1, 2].map(|a| (end[a] + TILE_HALO).min(shape[a]));
@@ -206,7 +206,7 @@ fn centrality_tile<A: Arith>(pres: &Presence, dirs: &Vol<u16>, start: Shape, end
         return None;
     }
     let pres = Dense { dims, data: pres.read_block(lo, dims) };
-    let (cent, seeds) = stage1::<A>(&pres, &Dense { dims, data: dirs.read_block(lo, dims) });
+    let (cent, seeds) = stage1::<A>(&pres, &Dense { dims, data: dirs.packed_block(lo, dims) });
     let inner = [0, 1, 2].map(|a| end[a] - start[a]);
     let off = [0, 1, 2].map(|a| start[a] - lo[a]);
     let mut c = Vec::with_capacity(inner.iter().product());

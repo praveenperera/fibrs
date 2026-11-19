@@ -443,7 +443,7 @@ mod tests {
     fn tracing_ahead_commits_the_serial_curves() {
         let (tracing, dirs) = fibres();
         let pres = Presence::new(&tracing, 1);
-        let fam = centrality::<Separate>(&pres, &dirs);
+        let fam = centrality::<Separate, _>(&pres, &dirs);
         let cat = catalogue(&fam.seeds, &fam.cent);
         let fields = Fields { pres: &pres, cent: &fam.cent, dirs: &dirs };
         let expected = serial(&fields, &cat);
