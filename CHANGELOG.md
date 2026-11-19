@@ -3,8 +3,9 @@
 ## [0.3.0] - 2026-11-19
 
 fibrs 0.3.0 runs the tracer's direction field and centrality on an NVIDIA GPU when one is usable, and on the CPU
-otherwise. The direction field is the CPU's bit for bit; on the PHerc1545 and PHerc0826 bands checked, the whole
-`.afv` was the same on the GPU as on the CPU. `fibrs predict` can now record the CT's voxel size.
+otherwise. The GPU direction field is the CPU's bit for bit. With both on the GPU, the `.afv` of a PHerc1545 band
+matched the CPU's in every fibre, point block, spatial-index row and metadata value but the per-run uuid. With
+centrality alone on the GPU, a PHerc0826 band matched too. `fibrs predict` can now record the CT's voxel size.
 
 ### What's new
 
