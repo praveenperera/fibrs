@@ -26,9 +26,11 @@ use crate::arena::BufferPool;
 use crate::axes::{Lapack, direction_field, find_lapack};
 use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
+use crate::gpu::Gpu;
 use crate::input::Predictions;
 use crate::kernels::{Coverage, Fields, RawCurve, Scratch, trace_seed};
 use crate::log;
+use crate::stage1::Separate;
 use crate::vol::{EDGE, Shape, Vol};
 
 /// The reference release whose interface and output this reproduces
@@ -54,6 +56,9 @@ pub enum Family {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Device {
+    /// The GPU when a usable one is found, else the CPU
+    #[value(name = "auto")]
+    Auto,
     #[value(name = "cpu")]
     Cpu,
     #[value(name = "cuda")]
@@ -118,10 +123,12 @@ pub struct Args {
     /// Optional AFV scan identifier
     #[arg(long)]
     pub coordinate_space: Option<String>,
-    /// Centrality backend; tracing always runs on CPU
-    #[arg(long, value_enum, default_value = "cpu")]
+    /// Where centrality runs (tracing always runs on the CPU): auto uses an NVIDIA GPU when one is usable and the
+    /// CPU otherwise, cpu never uses the GPU, and cuda fails without one. A GPU run writes the original's
+    /// --device cuda output, which can differ from its cpu output by a rounding
+    #[arg(long, value_enum, default_value = "auto")]
     pub device: Device,
-    /// Visible CUDA device index
+    /// Visible CUDA device index for the GPU
     #[arg(long, default_value_t = 0)]
     pub cuda_device: i64,
     #[arg(long)]
@@ -491,10 +498,7 @@ pub fn run(args: Args) -> Result<Summary> {
             bail!("Output cannot be inside an input Zarr store");
         }
     }
-    if args.device == Device::Cuda {
-        // centrality is the only CUDA stage in the reference; this port computes it on the CPU only
-        bail!("fibrs computes centrality on the CPU; use --device cpu");
-    }
+    let gpu = centrality_device(args.device, args.cuda_device as usize, &work)?;
     fs::create_dir_all(&work)?;
     let _lock = WorkLock::acquire(&work.join(".lock"))?;
     let family_name = match args.family {
@@ -511,7 +515,7 @@ pub fn run(args: Args) -> Result<Summary> {
         "tracing_array": args.tracing_array,
         "channel_order": order,
         "shape": native.shape,
-        "device": "cpu",
+        "device": if gpu.is_some() { "cuda" } else { "cpu" },
         "storage": match args.storage { Storage::Dense => "dense", Storage::Compressed => "compressed" },
         "family": family_name,
         "voxel_size_um": args.voxel_size_um,
@@ -561,7 +565,9 @@ pub fn run(args: Args) -> Result<Summary> {
     let pending: Vec<usize> = families.iter().copied().filter(|&f| !family_complete(&work, f)).collect();
     if !pending.is_empty() {
         let cache_bytes = (args.native_cache_mib + args.field_cache_mib) as usize * 1024 * 1024;
-        pool.install(|| trace_families(&native, supplied.as_ref(), &work, &pending, threads as usize, cache_bytes))?;
+        pool.install(|| {
+            trace_families(&native, supplied.as_ref(), &work, &pending, threads as usize, cache_bytes, gpu.as_ref())
+        })?;
     }
     let started = Instant::now();
     let opt = ExportOptions {
@@ -712,6 +718,7 @@ fn trace_families(
     families: &[usize],
     threads: usize,
     cache_bytes: usize,
+    gpu: Option<&Gpu>,
 ) -> Result<()> {
     let t = Instant::now();
     log!("Preparing tracing predictions");
@@ -729,7 +736,7 @@ fn trace_families(
     let pool = BufferPool::new(CHUNK_POOL_RETAIN);
     let cache = NativeCache::new(native, cache_bytes, &pool);
     for &family in families {
-        trace_family(&tracing, &nx, &ny, &cache, work, family, threads)?;
+        trace_family(&tracing, &nx, &ny, &cache, work, family, Compute { threads, gpu })?;
         release_freed();
     }
     Ok(())
@@ -831,6 +838,45 @@ fn gib(bytes: usize) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
 }
 
+/// Where a family's stages run: tracing and finishing on `threads` CPU threads, centrality on the GPU when given
+#[derive(Clone, Copy)]
+struct Compute<'a> {
+    threads: usize,
+    gpu: Option<&'a Gpu>,
+}
+
+/// The GPU centrality runs on, or None for the CPU
+///
+/// `auto` resumes a run on the device it started on, so one run never mixes the two roundings; otherwise it takes
+/// the GPU when one opens and falls back to the CPU, saying why
+fn centrality_device(device: Device, index: usize, work: &Path) -> Result<Option<Gpu>> {
+    let started_on = || -> Option<String> {
+        let saved: Value = serde_json::from_str(&fs::read_to_string(work.join("run.json")).ok()?).ok()?;
+        saved.get("native")?;
+        Some(saved["device"].as_str()?.to_owned())
+    };
+    let gpu = match (device, started_on().as_deref()) {
+        (Device::Cpu, _) | (Device::Auto, Some("cpu")) => None,
+        (Device::Cuda, _) => {
+            Some(Gpu::open(index).map_err(|e| eyre!("--device cuda needs a usable NVIDIA GPU: {e:#}"))?)
+        }
+        (Device::Auto, Some("cuda")) => {
+            Some(Gpu::open(index).map_err(|e| eyre!("This run started on the GPU and resumes only on one: {e:#}"))?)
+        }
+        (Device::Auto, _) => match Gpu::open(index) {
+            Ok(gpu) => Some(gpu),
+            Err(e) => {
+                log!("Centrality on the CPU: no usable GPU ({e:#})");
+                None
+            }
+        },
+    };
+    if let Some(gpu) = &gpu {
+        log!("Centrality on {} (--device cpu to use the CPU)", gpu.name());
+    }
+    Ok(gpu)
+}
+
 fn trace_family(
     tracing: &[Vol<u8>; 2],
     nx: &Vol<u8>,
@@ -838,14 +884,17 @@ fn trace_family(
     cache: &NativeCache,
     work: &Path,
     family: usize,
-    threads: usize,
+    Compute { threads, gpu }: Compute,
 ) -> Result<()> {
     let label = if family == 1 { "V" } else { "H" };
     let folder = family_dir(work, family);
     fs::create_dir_all(&folder)?;
     let t = Instant::now();
     let pres = Presence::new(tracing, family);
-    let FamilyFields { cent, seeds } = centrality(&pres, nx, ny);
+    let FamilyFields { cent, seeds } = match gpu {
+        None => centrality::<Separate>(&pres, nx, ny),
+        Some(gpu) => gpu.centrality(tracing, family, nx, ny)?,
+    };
     log!("{label} centrality: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem(label, &[("cent", cent.resident_bytes()), ("seeds", seeds.len() * std::mem::size_of::<Seed>())]);
     let t = Instant::now();

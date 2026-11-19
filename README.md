@@ -7,8 +7,8 @@ point block and spatial-index row. The tracing algorithm, the AFV format and the
 predictions it reads are Qual's; this port changes how fast the tracer runs, not what it writes.
 
 With `--threads 4` for both tools, it traces 22×–47× faster across three uninterrupted runs on 512-plane bands of
-PHerc0826, PHerc1545 and PHerc0358 (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU and
-needs no GPU.
+PHerc0826, PHerc1545 and PHerc0358 (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU;
+centrality runs on an NVIDIA GPU when one is found, and on the CPU otherwise.
 
 `fibrs predict` runs the step before: Qual's AFV fibre model V2 over a CT volume on an NVIDIA GPU, without
 PyTorch, writing the probability zarr the tracer reads, as villa's inference writes it (see
@@ -30,10 +30,15 @@ x86-64 (glibc 2.28+) and Apple silicon (macOS 11+) are named `fibrs-<version>-<t
 
 ```sh
 fibrs --predictions P --array semantic --channel-order VH --tracing-predictions P \
-  --tracing-array tracing --voxel-size-um 9.362 --storage compressed --device cpu --threads 4 \
+  --tracing-array tracing --voxel-size-um 9.362 --storage compressed --threads 4 \
   --output fibers.afv --work-dir work
 python -m fibrs ARGS      # the same, from Python
 ```
+
+Centrality runs on the GPU when a usable one is found: Linux x86-64, an NVIDIA GPU of compute capability 8.0 or
+later, and its driver (no CUDA toolkit). Otherwise it runs on the CPU, and the log says why. `--device cpu` keeps
+it on the CPU, `--device cuda` fails instead of falling back, and `--cuda-device N` picks the GPU. A resumed run
+stays on the device it started on.
 
 `fibrs.run([...])` runs it from Python and returns the exit status.
 
@@ -174,8 +179,10 @@ each decoded chunk its own mapping spent 40% of its CPU time in the kernel.
 - `--storage` and `--field-cache-mib` are validated, and `--storage` is recorded in `run.json` as the
   original records it, but neither selects anything. The chunk cache is bounded by `--native-cache-mib`
   plus `--field-cache-mib`.
-- `--device cuda` is rejected: the original uses CUDA only for centrality, and this port computes
-  centrality on the CPU.
+- `--device` defaults to `auto` (the GPU when one is usable) where the original defaults to `cpu`. On the GPU
+  the port writes what the original writes with `--device cuda`, whose kernels round some multiply-adds as one
+  fused operation, so its output can differ from the original's `--device cpu` output; pass `--device cpu` to
+  match that.
 - The command line replays argparse's pass, so exit status and selected values match, but help text and
   usage-error wording differ. Some argparse readings are not reproduced: numbers written with non-ASCII
   digits; non-UTF-8 bytes in the text options (`--array`, `--tracing-array`, `--coordinate-space`);
