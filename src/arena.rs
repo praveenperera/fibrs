@@ -107,6 +107,8 @@ unsafe impl Allocator for BufferPool {
                     free.bytes -= class;
                     (Some(block), Vec::new())
                 }
+                // a buffer larger than the pool keeps can never be kept, so it makes no room
+                None if class > self.retain => (None, Vec::new()),
                 None => (None, free.release_for(class, self.retain)),
             }
         };
@@ -372,6 +374,17 @@ mod tests {
         drop(free);
         let again: Vec<u8, &BufferPool> = Vec::with_capacity_in(3 << 19, &pool);
         assert_eq!(again.as_ptr(), at);
+    }
+
+    #[test]
+    fn a_buffer_larger_than_the_pool_releases_nothing() {
+        let pool = BufferPool::new(5 << 19);
+        let bufs: Vec<Vec<u8, &BufferPool>> = (0..2).map(|_| Vec::with_capacity_in(1 << 20, &pool)).collect();
+        drop(bufs);
+        let huge: Vec<u8, &BufferPool> = Vec::with_capacity_in(4 << 20, &pool);
+        assert_eq!(pool.free.lock().unwrap().bytes, 2 << 20);
+        drop(huge);
+        assert_eq!(pool.free.lock().unwrap().bytes, 2 << 20);
     }
 
     #[test]
