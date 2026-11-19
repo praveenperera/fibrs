@@ -15,8 +15,8 @@ over a CT volume on an NVIDIA GPU, natively in the `fibrs` binary, with no PyTor
   The network, softmax, blend and finalise run on the GPU through [volkit](https://github.com/praveenperera/volkit).
   The weights are read from the model's `checkpoint_final.pth` directly.
 - **Two modes:**
-  - `--mode villa` computes villa's tiles over the whole array. A 128³ output chunk with no stored input chunk
-    inside it is not computed or written, as in villa `97fb9336c`; villa main computes every chunk.
+  - `--mode villa` computes villa's tiles over the whole array. A 128³ output chunk that no stored input chunk
+    overlaps is not computed or written, as in villa `97fb9336c`; villa main computes every chunk.
   - Band mode, the default, computes a resumable z band (`--z0`, `--z1`) column by column.
 
   Band mode can be capped with `--max-minutes` and resumed by running the same command again.
@@ -77,9 +77,10 @@ By default `fibrs predict` keeps parity with villa's `lasagna.qualzz_inference` 
 Against villa's `lasagna.qualzz_inference` on PyTorch, at its default precision (float32 with TF32 tensor-core
 convolutions). Both ran the same 726-tile crop of PHerc0826 (z 12032–12544, y 4096–5120, x 1536–2560) on one RTX
 5090 (driver 595.112.07). The runs alternated (ABBA), with 6 timed pairs per precision after one warm-up run of
-each. Each time is the whole command's wall time on the same input and output, reading the CT and writing the zarr
-included, so it measures more than the network. On this crop villa ran 726 tiles and fibrs 864, as `--mode villa`
-runs a tile that straddles two of its columns once for each. The speedup is the mean of the per-pair ratios:
+each. Each time is the whole command's wall time: both read the same CT crop and write the same zarr layout, and
+the time includes those reads and writes, so it measures more than the network. On this crop villa ran 726 tiles
+and fibrs 864, as `--mode villa` runs a tile once for each of its columns that the tile's core overlaps. The
+speedup is the mean of the per-pair ratios:
 
 | `fibrs predict --mode villa` precision | villa, PyTorch fp32 (median) | fibrs (median) | Speedup, mean (95% CI) |
 |---|---|---|---|
@@ -123,9 +124,9 @@ more than one:
   tiles whose input isn't all zero), measured the same way for every row.
 - **Prediction skips air.** villa main runs every tile; band mode skips tiles whose input is all zero, so on a
   sparse band it runs a fraction of villa's tiles and on a dense one about as many. `--mode villa` doesn't skip
-  all-zero tiles, and on the PHerc0826 crop it ran 864 tiles where villa ran 726, since it runs a tile that
-  straddles two of its columns once for each. Every prediction time is the whole command's wall time on the same
-  input and output.
+  all-zero tiles, and on the PHerc0826 crop it ran 864 tiles where villa ran 726, since it runs a tile once for
+  each of its columns that the tile's core overlaps. Every prediction time is the whole command's wall time,
+  reading the same CT and writing the same zarr layout.
 - **Tracing varies with the run.** The tracer ratio varies with the run and with the machine's load, so it is
   given as the lowest to highest measured. Pre-release builds of 0.2.0 traced dense data slower than 0.1.0;
   0.2.0 is faster than 0.1.0 there (the last row).
