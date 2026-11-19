@@ -1145,7 +1145,7 @@ fn trace_family<D: DirField>(
         if !batch.is_empty() {
             let _ = tx.send(batch);
         }
-        let (Stats { seeds, retraced, committer }, window) = (stats, spec.window);
+        let Stats { seeds, window, retraced, committer } = stats;
         let share = 100.0 * retraced as f64 / seeds.max(1) as f64;
         log!("{label} window {window}: {retraced} seeds traced again ({share:.3}%), {committer} on the committer");
         debug_mem(label, &[("coverage", cov.resident_bytes()), ("cache", cache.bytes()), ("catalogue", 12 * total)]);

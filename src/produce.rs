@@ -59,6 +59,8 @@ impl Speculation {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub seeds: usize,
+    /// The window traced in, cut to the catalogue
+    pub window: usize,
     /// Seeds traced ahead whose bricks changed before their commit, so the committer traced them again
     pub retraced: usize,
     /// Seeds no other thread had started when they reached the commit point, so the committer traced them
@@ -323,7 +325,7 @@ impl<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Producer<'_, P, C, D> {
         let mut writer = self.cov.writer();
         let mut scratch = Scratch::default();
         let mut own = Traced::default();
-        let mut stats = Stats { seeds: total, ..Stats::default() };
+        let mut stats = Stats { seeds: total, window: self.window, ..Stats::default() };
         top_up();
         for i in 0..total {
             let traced = match self.ready(i)? {
@@ -371,7 +373,6 @@ mod tests {
     use crate::kernels::{encode_dir, pack_dir};
     use crate::stage1::Separate;
     use crate::vol::Vol;
-    use std::time::Duration;
 
     const SHAPE: [usize; 3] = [40, 96, 96];
 
@@ -423,13 +424,15 @@ mod tests {
         out
     }
 
-    /// The producer's curves and stats with `spec`, holding the first seed's delivery for `hold` so the threads
-    /// tracing ahead can fill the window against the coverage of that one commit
+    /// The producer's curves and stats with `spec`
+    ///
+    /// The first seed's delivery waits until every other seed of the first window has been traced ahead, so each
+    /// was traced before any commit: whether one is stale then depends on the fixture, not on when the pool's
+    /// threads ran
     fn speculative<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
         f: &Fields<P, C, D>,
         cat: &Catalogue,
         spec: Speculation,
-        hold: Duration,
     ) -> (Vec<Vec<[f32; 3]>>, Stats) {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
         let cov = Coverage::new(SHAPE);
@@ -437,8 +440,10 @@ mod tests {
         let mut out = Vec::new();
         let stats = producer
             .run(&pool, |i, curves| {
-                if i == 0 {
-                    std::thread::sleep(hold);
+                let first = 1..producer.window.min(cat.coords.len());
+                let traced_ahead = |j: usize| producer.slots[j % producer.window].done.load(Ordering::Acquire) == j + 1;
+                while i == 0 && !first.clone().all(traced_ahead) {
+                    std::thread::yield_now();
                 }
                 out.extend(curves.drain(..).map(|c| c.pts));
                 Ok(Flow::Continue)
@@ -458,27 +463,27 @@ mod tests {
         assert!(expected.len() >= 100, "the fixture should accept many curves, not {}", expected.len());
         let seeds = cat.coords.len();
 
-        // holding the first delivery lets the window fill with seeds traced before most commits, so some read a
-        // brick a later commit marks, however the pool's threads are scheduled
-        let hold = Duration::from_millis(200);
-        let (curves, stats) = speculative(&fields, &cat, Speculation { window: WINDOW, retrace_all: false }, hold);
+        // the first window is traced before any commit, so the seeds in it that read a brick an earlier seed marks
+        // are stale whenever the pool's threads run
+        let (curves, stats) = speculative(&fields, &cat, Speculation { window: WINDOW, retrace_all: false });
         assert!(curves == expected, "window {WINDOW}: {} curves, {} expected", curves.len(), expected.len());
         assert_eq!(stats.seeds, seeds);
         // the fibres are close enough that some seeds traced ahead read a brick an earlier commit then marked
         assert!(stats.retraced > 0, "no seed was traced again, so nothing was checked: {stats:?}");
 
         // a window of one only ever traces the seed at the commit point, so nothing is ever stale
-        let (curves, stats) = speculative(&fields, &cat, Speculation { window: 1, retrace_all: false }, hold);
+        let (curves, stats) = speculative(&fields, &cat, Speculation { window: 1, retrace_all: false });
         assert!(curves == expected, "window 1: {} curves, {} expected", curves.len(), expected.len());
         assert_eq!(stats.retraced, 0);
 
         // every seed traced ahead is traced again on the committer, so every seed is traced serially
-        let (curves, stats) = speculative(&fields, &cat, Speculation { window: WINDOW, retrace_all: true }, hold);
+        let (curves, stats) = speculative(&fields, &cat, Speculation { window: WINDOW, retrace_all: true });
         assert!(curves == expected, "all retraced: {} curves, {} expected", curves.len(), expected.len());
         assert_eq!(stats.retraced + stats.committer, seeds);
 
         // a window far wider than the catalogue is cut to it rather than allocating a slot for each
-        let (curves, _) = speculative(&fields, &cat, Speculation { window: usize::MAX, retrace_all: false }, hold);
+        let (curves, stats) = speculative(&fields, &cat, Speculation { window: usize::MAX, retrace_all: false });
         assert!(curves == expected, "window usize::MAX: {} curves, {} expected", curves.len(), expected.len());
+        assert_eq!(stats.window, seeds);
     }
 }
