@@ -177,7 +177,7 @@ here) and tracing still run on the CPU, so the whole run gains less, and its tim
 
 The original's `--device cuda` doesn't make centrality faster. On the same bands with `--threads 8` its centrality
 took 52.6 s and 65.9 s with `--device cuda`, against 35.3 s and 59.3 s with `--device cpu`. Its kernels ran for
-2.2 s and 4.7 s of that; the rest went to host work and to copying 256³ tiles to the GPU and back.
+2.2 s and 4.7 s of that; the rest went to host work and to copying each 128³ tile and its halo to the GPU and back.
 
 ## Differences from the original
 

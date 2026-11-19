@@ -110,6 +110,8 @@ pub struct Gpu {
     k: Kernels,
     /// Most tiles per unit, so both slots' buffers fit in half the device memory free when it opened
     unit_tiles: usize,
+    /// Whether the device had room for a full tile in each slot when it opened
+    roomy: bool,
     /// `decode_dir` in the reference's CUDA rounding for every `nx << 8 | ny`, four float64 per entry
     dirs: CudaSlice<f64>,
 }
@@ -140,14 +142,22 @@ impl Gpu {
             return Self::open_device(device);
         }
 
-        // a host can list an older GPU first, so each visible device gets its turn
+        // a host can list an older or busier GPU first, so each visible device gets its turn: the first with room
+        // for a full tile in each slot wins, and failing that the first that opened, which a small volume may fit
         let count = CudaContext::device_count().map_err(|e| eyre!("count the CUDA devices: {e:?}"))?;
         let mut reasons = Vec::new();
+        let mut cramped = None;
         for device in 0..count as usize {
             match Self::open_device(device) {
-                Ok(gpu) => return Ok(gpu),
+                Ok(gpu) if gpu.roomy => return Ok(gpu),
+                Ok(gpu) => {
+                    cramped.get_or_insert(gpu);
+                }
                 Err(e) => reasons.push(format!("{e:#}")),
             }
+        }
+        if let Some(gpu) = cramped {
+            return Ok(gpu);
         }
         match reasons.len() {
             0 => bail!("no CUDA device is visible"),
@@ -182,18 +192,14 @@ impl Gpu {
         let stream = ctx.default_stream();
         let dirs = stream.clone_htod(&table)?;
         stream.synchronize()?;
-        // the other half is left for the driver, other processes and later stages; a device too full for one tile
-        // in each slot is unusable, so without --cuda-device the next visible device gets its turn
+        // the other half is left for the driver, other processes and later stages; a device too full for even one
+        // tile per unit fails in `centrality` unless the volume's tiles are small, which `--device auto` answers by
+        // running on the CPU
         let (free, _) = ctx.mem_get_info()?;
-        ensure!(
-            free >= 2 * TILE_DEVICE_BYTES,
-            "CUDA device {device} has {} MiB free; fibrs needs {} MiB",
-            free >> 20,
-            (2 * TILE_DEVICE_BYTES).div_ceil(1 << 20)
-        );
+        let roomy = free >= 2 * TILE_DEVICE_BYTES;
         let unit_tiles = (free / 2 / (2 * TILE_DEVICE_BYTES)).clamp(1, UNIT_TILES);
         let name = format!("CUDA device {device}, {} (compute capability {major}.{minor})", ctx.name()?);
-        Ok(Self { ctx, name, k, unit_tiles, dirs })
+        Ok(Self { ctx, name, k, unit_tiles, roomy, dirs })
     }
 
     pub fn name(&self) -> &str {

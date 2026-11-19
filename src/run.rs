@@ -508,9 +508,26 @@ pub fn run(args: Args) -> Result<Summary> {
     };
     fs::create_dir_all(&work)?;
     let _lock = WorkLock::acquire(&work.join(".lock"))?;
-    // under the lock, so the saved rounding and the finished families are the ones this run resumes
+    // the work directory is checked under the lock, so the saved rounding and the finished families are the ones
+    // this run resumes, and before the GPU opens, so a run that cannot start says why rather than why the GPU is
+    // missing
+    let manifest = work.join("run.json");
+    let saved = match (manifest.exists(), args.resume) {
+        (true, false) => bail!("Work directory already contains a run; use --resume"),
+        (false, true) => bail!("No run to resume in this work directory"),
+        (true, true) => Some(saved_run(&manifest)?),
+        (false, false) => {
+            for entry in fs::read_dir(&work)? {
+                if entry?.file_name() != ".lock" {
+                    bail!("A new run requires an empty work directory");
+                }
+            }
+            None
+        }
+    };
+    let started_on = saved.as_ref().and_then(|s| s["device"].as_str());
     let tracing_needed = families.iter().any(|&f| !family_complete(&work, f));
-    let cent = CentralityDevice::choose(args.device, args.cuda_device.map(|d| d as usize), &work, tracing_needed)?;
+    let cent = CentralityDevice::choose(args.device, args.cuda_device.map(|d| d as usize), started_on, tracing_needed)?;
     let family_name = match args.family {
         Family::Both => "both",
         Family::V => "V",
@@ -535,36 +552,10 @@ pub fn run(args: Args) -> Result<Summary> {
         "input_signatures": signatures,
         "native": {"tool": "fibrs", "version": env!("CARGO_PKG_VERSION"), "checkpoint": 1},
     });
-    let manifest = work.join("run.json");
-    if manifest.exists() {
-        if !args.resume {
-            bail!("Work directory already contains a run; use --resume");
-        }
-        let saved: Value = serde_json::from_str(&fs::read_to_string(&manifest)?)?;
-        if saved.get("native").is_none() {
-            bail!("Work directory holds a reference avf-spline-generator run; use a new work directory");
-        }
-        // the checkpoints carry no format of their own beyond the release that wrote them
-        let started_by = &saved["native"]["version"];
-        if started_by != &config["native"]["version"] {
-            bail!(
-                "Work directory was started by fibrs {}; resume it with that version, or use a new work directory",
-                started_by.as_str().unwrap_or("of another version")
-            );
-        }
-        if saved != config {
-            bail!("Inputs or tracing settings changed; use a new work directory");
-        }
-    } else {
-        if args.resume {
-            bail!("No run to resume in this work directory");
-        }
-        for entry in fs::read_dir(&work)? {
-            if entry?.file_name() != ".lock" {
-                bail!("A new run requires an empty work directory");
-            }
-        }
-        save_json(&manifest, &config)?;
+    match saved {
+        Some(saved) if saved != config => bail!("Inputs or tracing settings changed; use a new work directory"),
+        Some(_) => {}
+        None => save_json(&manifest, &config)?,
     }
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads as usize).build()?;
     let pending: Vec<usize> = families.iter().copied().filter(|&f| !family_complete(&work, f)).collect();
@@ -868,6 +859,23 @@ impl Rounding {
     }
 }
 
+/// A resumable run's `run.json`: one this release of fibrs started
+fn saved_run(manifest: &Path) -> Result<Value> {
+    let saved: Value = serde_json::from_str(&fs::read_to_string(manifest)?)?;
+    if saved.get("native").is_none() {
+        bail!("Work directory holds a reference avf-spline-generator run; use a new work directory");
+    }
+    // the checkpoints carry no format of their own beyond the release that wrote them
+    let started_by = &saved["native"]["version"];
+    if started_by.as_str() != Some(env!("CARGO_PKG_VERSION")) {
+        bail!(
+            "Work directory was started by fibrs {}; resume it with that version, or use a new work directory",
+            started_by.as_str().unwrap_or("of another version")
+        );
+    }
+    Ok(saved)
+}
+
 /// How a run computes centrality: the rounding it reproduces and, for the CUDA rounding, the GPU when one runs it
 /// (without one, the CPU computes the CUDA rounding, more slowly)
 struct CentralityDevice {
@@ -882,12 +890,7 @@ impl CentralityDevice {
     /// it on, opened only when a family still needs centrality
     ///
     /// `auto` takes the GPU when one opens, and otherwise the CPU, saying why
-    fn choose(device: Device, index: Option<usize>, work: &Path, tracing_needed: bool) -> Result<Self> {
-        let started_on = || -> Option<String> {
-            let saved: Value = serde_json::from_str(&fs::read_to_string(work.join("run.json")).ok()?).ok()?;
-            saved.get("native")?;
-            Some(saved["device"].as_str()?.to_owned())
-        };
+    fn choose(device: Device, index: Option<usize>, started_on: Option<&str>, tracing_needed: bool) -> Result<Self> {
         let strict = device == Device::Cuda;
         let cpu = |rounding| Self { rounding, gpu: None, strict };
         let on_gpu = |gpu: Gpu| {
@@ -895,7 +898,7 @@ impl CentralityDevice {
             Self { rounding: Rounding::Cuda, gpu: Some(gpu), strict }
         };
         let open = || Gpu::open(index);
-        let chosen = match (started_on().as_deref(), device) {
+        let chosen = match (started_on, device) {
             (Some("cpu"), Device::Cuda) => {
                 bail!("This run started with centrality on the CPU and resumes only there; use --device cpu or auto")
             }
