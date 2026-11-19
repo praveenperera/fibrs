@@ -39,12 +39,13 @@ The direction field and centrality run on the GPU when a usable one is found: Li
 capability 8.0 or later, and a driver for CUDA 12.0 or newer (no CUDA toolkit). Otherwise they run on the CPU, and
 the log says why. `--device cpu` keeps them on the CPU, `--device cuda` fails instead of falling back, and
 `--cuda-device N` picks the GPU (by default the first usable one). The GPU direction field is the CPU's bit for bit:
-the GPU certifies each voxel's eigenvector against an error bound, and the few voxels it cannot certify are solved
-on the CPU with the same `dsyevd` (the log line counts them). Centrality rounds some steps differently on the GPU
-(see "Differences from the original"), and a resumed run keeps the rounding it started with: one started on the CPU
-computes centrality there, and only its direction field takes the GPU. A run started on the GPU can resume without
-one: the CPU then computes centrality as the GPU does, more slowly. `--device auto` also moves the direction field
-or centrality to the CPU if the GPU fails mid-run, for example when it runs out of memory.
+the GPU certifies each voxel's eigenvector against an error bound, and any voxels it cannot certify, usually few, are
+solved on the CPU with the same `dsyevd` (the log line counts them). Centrality rounds some steps differently on the
+GPU (see "Differences from the original"), and a resumed run keeps the rounding it started with: one started on the
+CPU computes centrality there, and with `--device auto` only its direction field takes the GPU (`--device cuda`
+refuses to resume it). A run started on the GPU can resume without one: the CPU then computes centrality as the GPU
+does, more slowly. `--device auto` also moves the direction field or centrality to the CPU if the GPU fails mid-run,
+for example when it runs out of memory.
 
 `fibrs.run([...])` runs it from Python and returns the exit status.
 
