@@ -10,6 +10,7 @@ mod gpu;
 mod input;
 mod kernels;
 mod predict;
+mod produce;
 mod pyfmt;
 mod run;
 mod stage1;
