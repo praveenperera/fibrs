@@ -28,8 +28,10 @@ otherwise. The direction field is the CPU's bit for bit; on the PHerc1545 and PH
 
 ### Upgrading
 
-- A tracer work directory started by 0.2.0 is not resumed by 0.3.0: finish it with 0.2.0, or start a new one. A
-  `fibrs predict` band output started by 0.2.0 is refused on resume too, as it is by any other binary.
+- Unfinished runs only: a tracer work directory started by 0.2.0 is not resumed by 0.3.0, so finish it with 0.2.0
+  or start a new one, and a `fibrs predict` band output that 0.2.0 started is refused on resume too, as it is by any
+  other binary. Predictions that 0.2.0 finished are traced by 0.3.0 as before: the tracer takes the voxel size from
+  `--voxel-size-um`, not from the prediction's attributes.
 - `--device` now defaults to `auto`. Pass `--device cpu` to keep the direction field and centrality on the CPU, or to
   match the original's default `--device cpu` output, whose centrality can round differently from the GPU's.
 
