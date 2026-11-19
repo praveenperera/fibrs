@@ -131,7 +131,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
     /// occupy; one of each is always kept. Freed buffers the pool keeps for reuse are outside the budget
     pub fn new(pred: &'a Predictions, budget_bytes: usize, pool: &'p BufferPool) -> Self {
         // whole Zarr chunks are the unit of reading; NPY input uses the reference's 64³ blocks
-        let edge = pred.chunk_shape().unwrap_or([64, 64, 64]);
+        let edge = pred.read_unit();
         // a chunk of one slab is decoded whole either way, and needs no cache of compressed chunks
         let sliced = pred.slab_layout().is_some_and(|e| e[0] > SLAB_PLANES && e[0].is_multiple_of(SLAB_PLANES))
             && pred.blocks_fit_planes(SLAB_PLANES);
@@ -517,6 +517,31 @@ mod tests {
         }
         // two slab decodes of the first chunk, one whole decode of the second
         assert_eq!(cache.decoded(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The cache over a crop, keyed by the crop's own chunks, reads the whole array's values at the crop's offset,
+    /// by slabs and by whole decodes alike
+    #[test]
+    fn a_cropped_cache_reads_the_array_at_the_crop_offset() {
+        let edge = 2 * SLAB_PLANES;
+        let n = edge * edge * edge;
+        let (dir, pred) = store("crop-cache", edge, &[2 * n, SLAB_PLANES * edge * edge, 2 * n]);
+        let crop = pred.crop([0, 0, edge], [edge, edge, 3 * edge]).unwrap();
+        let pool = BufferPool::new(1 << 20);
+        let cache = slab_cache(&crop, &pool, 64 << 20);
+        let mut sampler = NativeSampler::new(&cache);
+        let shape = [edge, edge, 2 * edge];
+        let window = pred.read_u8([0, 0, edge], [edge, edge, 3 * edge]).unwrap();
+        let plane = shape.iter().product::<usize>();
+        for z in 0..shape[0] {
+            for y in 0..shape[1] {
+                for x in 0..shape[2] {
+                    let at = (z * shape[1] + y) * shape[2] + x;
+                    assert_eq!(sampler.value(z, y, x).unwrap(), [window[at], window[plane + at]], "{z} {y} {x}");
+                }
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
