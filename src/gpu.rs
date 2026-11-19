@@ -17,6 +17,14 @@ pub use cuda::Gpu;
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 pub use unsupported::Gpu;
 
+/// The stages a run gives the GPU, which set how much free memory [`Gpu::open`] looks for when it picks a device
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stages {
+    /// A run that keeps centrality on the CPU it started on
+    DirectionField,
+    DirectionFieldAndCentrality,
+}
+
 /// How many voxels the GPU direction field found present, and how many of those the kernels could not certify,
 /// so the host solved them with `dsyevd` as the CPU path does
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -29,7 +37,7 @@ pub struct AxesCounts {
 mod unsupported {
     use color_eyre::eyre::{Result, bail};
 
-    use super::AxesCounts;
+    use super::{AxesCounts, Stages};
     use crate::axes::Lapack;
     use crate::fields::FamilyFields;
     use crate::vol::Vol;
@@ -38,7 +46,7 @@ mod unsupported {
     pub enum Gpu {}
 
     impl Gpu {
-        pub fn open(_device: Option<usize>) -> Result<Self> {
+        pub fn open(_device: Option<usize>, _stages: Stages) -> Result<Self> {
             bail!("fibrs runs on the GPU on Linux x86_64 only")
         }
 

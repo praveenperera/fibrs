@@ -22,6 +22,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::Ptx;
 use rayon::prelude::*;
 
+use super::Stages;
 use crate::fields::{FamilyFields, Seed, TILE, TILE_HALO, tiles};
 use crate::stage1::{Arith, Fused};
 use crate::vol::{BRICK, EDGE, SHIFT, Shape, Vol};
@@ -130,8 +131,8 @@ pub struct Gpu {
     unit_tiles: usize,
     /// Most direction field tiles per unit, sized the same way
     axes_unit_tiles: usize,
-    /// Whether the device had room for a full tile in each slot when it opened
-    roomy: bool,
+    /// Device memory free when it opened
+    free: usize,
     /// `decode_dir` in the reference's CUDA rounding for every `nx << 8 | ny`, four float64 per entry
     dirs: CudaSlice<f64>,
     /// Every byte of a pooled prediction as the direction field's float32, `v as f32 / 255.0` as the CPU computes it
@@ -140,8 +141,8 @@ pub struct Gpu {
 
 impl Gpu {
     /// Open CUDA device `device` (an index among the visible devices), or the first usable visible device, and load
-    /// the kernels
-    pub fn open(device: Option<usize>) -> Result<Self> {
+    /// the kernels; `stages` sets the room a visible device needs to be picked first
+    pub fn open(device: Option<usize>, stages: Stages) -> Result<Self> {
         // SAFETY: probing for the driver library has no preconditions; cudarc panics on first use without it
         if !unsafe { sys::is_culib_present() } {
             bail!("no NVIDIA driver found (libcuda.so)");
@@ -165,13 +166,18 @@ impl Gpu {
         }
 
         // a host can list an older or busier GPU first, so each visible device gets its turn: the first with room
-        // for a full tile in each slot wins, and failing that the first that opened, which a small volume may fit
+        // for a full tile of each stage the run gives it in each slot wins, and failing that the first that opened,
+        // which a small volume may fit
+        let tile = match stages {
+            Stages::DirectionField => axes::AXES_TILE_DEVICE_BYTES,
+            Stages::DirectionFieldAndCentrality => TILE_DEVICE_BYTES.max(axes::AXES_TILE_DEVICE_BYTES),
+        };
         let count = CudaContext::device_count().map_err(|e| eyre!("count the CUDA devices: {e:?}"))?;
         let mut reasons = Vec::new();
         let mut cramped = None;
         for device in 0..count as usize {
             match Self::open_device(device) {
-                Ok(gpu) if gpu.roomy => return Ok(gpu),
+                Ok(gpu) if gpu.free >= 2 * tile => return Ok(gpu),
                 Ok(gpu) => {
                     cramped.get_or_insert(gpu);
                 }
@@ -229,11 +235,10 @@ impl Gpu {
         // tile per unit fails in `centrality` or `direction_field` unless the volume's tiles are small, which
         // `--device auto` answers by running on the CPU
         let (free, _) = ctx.mem_get_info()?;
-        let roomy = free >= 2 * TILE_DEVICE_BYTES.max(axes::AXES_TILE_DEVICE_BYTES);
         let unit_tiles = (free / 2 / (2 * TILE_DEVICE_BYTES)).clamp(1, UNIT_TILES);
         let axes_unit_tiles = axes::unit_tiles(free / 2);
         let name = format!("CUDA device {device}, {} (compute capability {major}.{minor})", ctx.name()?);
-        Ok(Self { ctx, name, k, unit_tiles, axes_unit_tiles, roomy, dirs, unit })
+        Ok(Self { ctx, name, k, unit_tiles, axes_unit_tiles, free, dirs, unit })
     }
 
     pub fn name(&self) -> &str {
@@ -421,9 +426,20 @@ fn fit_host<T: DeviceRepr + ValidAsZeroBits>(
     n: usize,
     flags: u32,
 ) -> Result<()> {
+    fit_host_upto(stream, buf, n, usize::MAX, flags)
+}
+
+/// [`fit_host`] for a buffer that never needs more than `most` elements, so its spare half stops there
+fn fit_host_upto<T: DeviceRepr + ValidAsZeroBits>(
+    stream: &Arc<CudaStream>,
+    buf: &mut PinnedHostSlice<T>,
+    n: usize,
+    most: usize,
+    flags: u32,
+) -> Result<()> {
     if buf.len() < n {
         stream.synchronize()?;
-        *buf = pinned(stream.context(), n + n / 2, flags)?;
+        *buf = pinned(stream.context(), (n + n / 2).clamp(n, most.max(n)), flags)?;
     }
     Ok(())
 }
@@ -769,7 +785,7 @@ mod tests {
     #[test]
     #[ignore = "needs an NVIDIA GPU; run through the GPU queue"]
     fn gpu_matches_fused_cpu() {
-        let gpu = Gpu::open(None).unwrap();
+        let gpu = Gpu::open(None, Stages::DirectionFieldAndCentrality).unwrap();
         let (tracing, nx, ny) = volumes();
         let shape = nx.shape();
         for family in [1, 2] {

@@ -19,7 +19,8 @@ use cudarc::driver::{
 use rayon::prelude::*;
 
 use super::{
-    BLOCK, DESC, Gpu, Inputs, TileSpan, brick_box, core_bricks, fit, fit_host, grid_1d, group, pinned, region,
+    BLOCK, DESC, Gpu, Inputs, TileSpan, brick_box, core_bricks, fit, fit_host, fit_host_upto, grid_1d, group, pinned,
+    region,
 };
 use crate::axes::{CORE, HALO, Lapack};
 use crate::fields::tiles;
@@ -389,7 +390,7 @@ impl Slot {
         for start in (0..n_fb).step_by(FB_CHUNK) {
             let n_records = RECORD * FB_CHUNK.min(n_fb - start);
             let from = RECORD * start;
-            fit_host(&self.stream, &mut self.host_fb, n_records, 0)?;
+            fit_host_upto(&self.stream, &mut self.host_fb, n_records, RECORD * FB_CHUNK, 0)?;
             let records = &mut self.host_fb.as_mut_slice()?[..n_records];
             self.stream.memcpy_dtoh(&self.fb.slice(from..from + n_records), records)?;
             self.stream.synchronize().wrap_err("copy the fallback voxels back")?;
@@ -442,6 +443,7 @@ fn fallback(
 mod tests {
     use super::*;
     use crate::axes::{direction_field, find_lapack};
+    use crate::gpu::Stages;
 
     /// A small xorshift, so the test volume needs no dependency
     struct Rng(u64);
@@ -490,7 +492,7 @@ mod tests {
     #[test]
     #[ignore = "needs an NVIDIA GPU and numpy's OpenBLAS (FIBRS_LAPACK); run through the GPU queue"]
     fn gpu_direction_matches_cpu() {
-        let gpu = Gpu::open(None).unwrap();
+        let gpu = Gpu::open(None, Stages::DirectionField).unwrap();
         let lapack = Lapack::init(&find_lapack().unwrap()).unwrap();
         let tracing = volumes();
         let shape = tracing[0].shape();

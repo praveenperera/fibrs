@@ -26,7 +26,7 @@ use crate::arena::BufferPool;
 use crate::axes::{Lapack, direction_field, find_lapack};
 use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
-use crate::gpu::{AxesCounts, Gpu};
+use crate::gpu::{AxesCounts, Gpu, Stages};
 use crate::input::Predictions;
 use crate::kernels::{Coverage, Fields, RawCurve, Scratch, trace_seed};
 use crate::log;
@@ -929,12 +929,12 @@ impl CentralityDevice {
             log!("Direction field and centrality on {} (--device cpu to use the CPU)", gpu.name());
             Self { rounding: Rounding::Cuda, gpu: Some(gpu), strict }
         };
-        let open = || Gpu::open(index);
+        let open = || Gpu::open(index, Stages::DirectionFieldAndCentrality);
         let chosen = match (started_on, device) {
             (Some("cpu"), Device::Cuda) => {
                 bail!("This run started with centrality on the CPU and resumes only there; use --device cpu or auto")
             }
-            (Some("cpu"), Device::Auto) if tracing_needed => match open() {
+            (Some("cpu"), Device::Auto) if tracing_needed => match Gpu::open(index, Stages::DirectionField) {
                 Ok(gpu) => {
                     log!(
                         "Direction field on {}, centrality on the CPU this run started on (--device cpu to use the CPU)",
