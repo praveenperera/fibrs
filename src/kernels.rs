@@ -6,6 +6,7 @@
 //! type are float64, `int()` truncates, and two-argument `min`/`max` keep the first argument on ties.
 //! Line numbers refer to `core.py` at bee798f7
 
+use std::cell::Cell;
 use std::sync::OnceLock;
 
 use color_eyre::eyre::{Result, bail};
@@ -312,19 +313,77 @@ pub fn ortho_basis(ux: f64, uy: f64, uz: f64) -> [f64; 6] {
 /// 0 is a count of 0 and 1 a count of 2, whose direction the reference never reads; a count of 1 stores the
 /// direction as `nx << 8 | ny`, which is at least 256 because `encode_dir` never returns a 0 byte. One volume
 /// instead of three saves a byte per covered voxel
-pub struct Coverage(Vol<u16>);
+pub struct Coverage(Vol<u16>, pub Probe);
+
+/// Step-0 instrumentation: per brick slot, the 1-based index of the last seed that wrote it
+pub struct Probe {
+    last: Vec<u32>,
+    pub seq: u32,
+    pub newest: Cell<u32>,
+    pub reads: Cell<u32>,
+    prev: Cell<usize>,
+    pub writes: u32,
+    pub stage: Cell<u8>,
+    pub mark_ns: u64,
+}
+
+impl Probe {
+    /// Start seed `seq` (1-based)
+    pub fn begin(&mut self, seq: u32) {
+        self.seq = seq;
+        self.newest.set(0);
+        self.reads.set(0);
+        self.prev.set(usize::MAX);
+        self.writes = 0;
+        self.stage.set(0);
+        self.mark_ns = 0;
+    }
+
+    #[inline]
+    fn read(&self, slot: usize) {
+        if slot != self.prev.get() {
+            self.prev.set(slot);
+            self.reads.set(self.reads.get() + 1);
+        }
+        let w = self.last[slot];
+        if w > self.newest.get() {
+            self.newest.set(w);
+        }
+    }
+
+    #[inline]
+    fn write(&mut self, slot: usize) {
+        if self.last[slot] != self.seq {
+            self.writes += 1;
+        }
+        self.last[slot] = self.seq;
+    }
+}
 
 const UNCOVERED: u16 = 0;
 const COVERED_TWICE: u16 = 1;
 
 impl Coverage {
     pub fn new(shape: [usize; 3]) -> Self {
-        Self(Vol::new(shape, UNCOVERED))
+        let v = Vol::new(shape, UNCOVERED);
+        let slots = v.grid().iter().product();
+        let probe = Probe {
+            last: vec![0; slots],
+            seq: 0,
+            newest: Cell::new(0),
+            reads: Cell::new(0),
+            prev: Cell::new(usize::MAX),
+            writes: 0,
+            stage: Cell::new(0),
+            mark_ns: 0,
+        };
+        Self(v, probe)
     }
 
     /// Whether a voxel has been marked at all
     #[inline]
     pub fn is_covered(&self, z: i64, y: i64, x: i64) -> bool {
+        self.1.read(self.0.slot(z as usize, y as usize, x as usize));
         self.0.at(z, y, x) != UNCOVERED
     }
 
@@ -343,6 +402,7 @@ impl Coverage {
         if ix < 0 || ix >= w || iy < 0 || iy >= h || iz < 0 || iz >= d {
             return false;
         }
+        self.1.read(self.0.slot(iz as usize, iy as usize, ix as usize));
         let c = self.0.at(iz, iy, ix);
         if c == UNCOVERED {
             return false;
@@ -411,6 +471,7 @@ impl Coverage {
                         let c = self.0.get(zu, yu, xu);
                         if c == UNCOVERED {
                             debug_assert!(bnx != 0);
+                            self.1.write(self.0.slot(zu, yu, xu));
                             self.0.set(zu, yu, xu, (bnx as u16) << 8 | bny as u16);
                             continue;
                         }
@@ -420,6 +481,7 @@ impl Coverage {
                         }
                         let [ux0, uy0, uz0] = decode_dir((c >> 8) as u8, c as u8);
                         if (ux0 * tx + uy0 * ty + uz0 * tz).abs() <= 0.85 {
+                            self.1.write(self.0.slot(zu, yu, xu));
                             self.0.set(zu, yu, xu, COVERED_TWICE);
                         }
                     }
@@ -750,18 +812,22 @@ pub fn trace_seed<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>>(
 ) -> Result<()> {
     let [sz, sy, sx] = seed.map(|v| v as i64);
     if !primary && cov.is_covered(sz, sy, sx) {
+        cov.1.stage.set(1);
         return Ok(());
     }
     let [ux, uy, uz] = f.dir_at(sz, sy, sx);
     let (sxf, syf, szf) = (sx as f64, sy as f64, sz as f64);
     if cov.covered_same_dir(sxf, syf, szf, ux, uy, uz) {
+        cov.1.stage.set(2);
         return Ok(());
     }
     let [cx, cy, cz] = f.recenter(sx as f32 as f64, sy as f32 as f64, sz as f32 as f64, ux, uy, uz, 1.5, 4);
     if cov.covered_same_dir(cx, cy, cz, ux, uy, uz) {
+        cov.1.stage.set(3);
         return Ok(());
     }
     if trilin_u8(f.pres, cx, cy, cz) < 76.5 {
+        cov.1.stage.set(4);
         return Ok(());
     }
     let [ux, uy, uz] = f.dir_aligned(cx, cy, cz, ux, uy, uz);
@@ -794,6 +860,7 @@ pub fn trace_seed<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>>(
     }
     let ntot = nb + 1 + nf;
     if ntot < 8 {
+        cov.1.stage.set(5);
         return Ok(());
     }
     let mut idx = 0;
@@ -822,9 +889,12 @@ pub fn trace_seed<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>>(
         if (arc_len as f64) < req_len {
             continue;
         }
+        let tm = std::time::Instant::now();
         cov.mark(f, &s.pts_c[a..b], &s.tans_c[a..b]);
+        cov.1.mark_ns += tm.elapsed().as_nanos() as u64;
         out.push(RawCurve { pts: s.pts_c[a..b].to_vec() });
     }
+    cov.1.stage.set(if cov.1.mark_ns > 0 { 7 } else { 6 });
     Ok(())
 }
 

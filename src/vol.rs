@@ -85,6 +85,12 @@ impl<T: Voxel> Vol<T> {
         unsafe { std::slice::from_raw_parts_mut(b.0.as_ptr(), BRICK) }
     }
 
+    /// The brick slot of an in-bounds voxel
+    #[inline(always)]
+    pub fn slot(&self, z: usize, y: usize, x: usize) -> usize {
+        self.brick_index(z, y, x)
+    }
+
     #[inline(always)]
     fn brick_index(&self, z: usize, y: usize, x: usize) -> usize {
         ((z >> SHIFT) * self.grid[1] + (y >> SHIFT)) * self.grid[2] + (x >> SHIFT)

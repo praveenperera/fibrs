@@ -889,20 +889,36 @@ fn trace_family(
         let mut points = 0;
         let mut count = 0;
         let mut last_log = Instant::now();
+        let mut probe: Vec<u8> = Vec::with_capacity(17 * total);
+        let mut send_ns = 0u64;
+        let tprod = Instant::now();
         for r in 0..cat.starts.len() - 1 {
             let (start, end) = (cat.starts[r], cat.starts[r + 1]);
             let primary_end = start + cat.primary[r];
             for (i, &seed) in cat.coords.iter().enumerate().take(end).skip(start) {
                 let before = batch.len();
+                cov.1.begin((i + 1) as u32);
+                let ts = Instant::now();
                 trace_seed(&fields, &mut cov, &mut scratch, seed, i < primary_end, &mut batch)?;
+                let ns = ts.elapsed().as_nanos().min(u32::MAX as u128) as u32;
+                let p = &cov.1;
+                let dist = if p.newest.get() == 0 { u32::MAX } else { p.seq - p.newest.get() };
+                probe.extend_from_slice(&dist.to_le_bytes());
+                probe.extend_from_slice(&ns.to_le_bytes());
+                probe.extend_from_slice(&(p.mark_ns.min(u32::MAX as u64) as u32).to_le_bytes());
+                probe.extend_from_slice(&(p.reads.get().min(65535) as u16).to_le_bytes());
+                probe.extend_from_slice(&(p.writes.min(65535) as u16).to_le_bytes());
+                probe.push(p.stage.get());
                 points += batch[before..].iter().map(|c| c.pts.len()).sum::<usize>();
                 if batch.len() >= FINISH_BATCH || points >= FINISH_POINTS {
                     count += batch.len();
                     points = 0;
                     // a closed channel means finishing failed; its error is the one reported
+                    let tsend = Instant::now();
                     if tx.send(std::mem::take(&mut batch)).is_err() {
                         return Ok(count);
                     }
+                    send_ns += tsend.elapsed().as_nanos() as u64;
                 }
                 if last_log.elapsed().as_secs_f64() >= 10.0 {
                     log!("{label} seeds: {}/{total}; {} raw curves", i + 1, count + batch.len());
@@ -913,6 +929,14 @@ fn trace_family(
         count += batch.len();
         if !batch.is_empty() {
             let _ = tx.send(batch);
+        }
+        log!(
+            "{label} probe: producer {:.2} s, blocked on send {:.2} s",
+            tprod.elapsed().as_secs_f64(),
+            send_ns as f64 * 1e-9
+        );
+        if let Some(dir) = std::env::var_os("FIBRS_PROBE") {
+            fs::write(Path::new(&dir).join(format!("probe-{label}.bin")), &probe)?;
         }
         debug_mem(label, &[("coverage", cov.resident_bytes()), ("cache", cache.bytes()), ("catalogue", 12 * total)]);
         Ok(count)
