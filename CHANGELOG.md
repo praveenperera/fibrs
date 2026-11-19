@@ -3,15 +3,15 @@
 ## [Unreleased]
 
 - **Centrality on the GPU.** `--device` now defaults to `auto`: centrality and the ridge seeds run on an NVIDIA GPU
-  of compute capability 8.0 or later when one is usable (Linux x86-64; the driver is enough, no CUDA toolkit), and
-  on the CPU otherwise, with the reason in the log. `--device cpu` keeps them on the CPU, `--device cuda` fails
-  instead of falling back, and `--cuda-device N` picks the GPU (by default the first usable one); `--device cuda`
-  used to be rejected. A run keeps the rounding it started with when resumed, and one started on the GPU can resume
-  or finish on the CPU, which then computes centrality as the GPU does. The kernels are written in Rust with
-  cuda-oxide and ship inside the binary as PTX. On a PHerc1545 and a PHerc0826 band the `.afv` was identical on the
-  GPU and the CPU, and identical to the original's with either of its devices. With `--threads 8`, centrality took
-  1.8 s instead of 8.1 s on the PHerc1545 band and 5.0 s instead of 20.4 s on the PHerc0826 band. Tracing still
-  runs on the CPU (see the README's "Speed").
+  of compute capability 8.0 or later when one is usable (Linux x86-64; a driver for CUDA 12.0 or newer is enough, no
+  CUDA toolkit), and on the CPU otherwise, with the reason in the log. `--device cpu` keeps them on the CPU,
+  `--device cuda` fails instead of falling back, and `--cuda-device N` picks the GPU (by default the first usable
+  one); `--device cuda` used to be rejected. A run keeps the rounding it started with when resumed, and one started
+  on the GPU can resume or finish on the CPU, which then computes centrality as the GPU does. The kernels are
+  written in Rust with cuda-oxide and ship inside the binary as PTX. On a PHerc1545 and a PHerc0826 band the `.afv`
+  was identical on the GPU and the CPU, and identical to the original's with either of its devices. With
+  `--threads 8`, centrality took 1.8 s instead of 8.1 s on the PHerc1545 band and 5.0 s instead of 20.4 s on the
+  PHerc0826 band. Tracing still runs on the CPU (see the README's "Speed").
 - **Direction field on the GPU.** The direction field now runs on the GPU as well, under the same `--device` choice,
   and its bytes are the CPU's: the GPU certifies each voxel's eigenvector against an error bound, and the CPU solves
   the voxels it cannot certify with the same `dsyevd`, which the log line counts. If the GPU fails mid-run, the CPU

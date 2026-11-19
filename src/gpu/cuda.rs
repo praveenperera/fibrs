@@ -40,6 +40,9 @@ const BLOCK: u32 = 256;
 /// Most tiles in one unit: bounds the pinned host memory each of the two units in flight holds (at most about
 /// 16 MB of bricks and 8 MB of centrality per tile, far less in a band's mostly empty bricks)
 const UNIT_TILES: usize = 32;
+/// Oldest driver fibrs opens, as `cuDriverGetVersion` reports it (1000 × major + 10 × minor): cudarc's bindings are
+/// CUDA 12's
+const MIN_DRIVER: i32 = 12000;
 /// Most device memory one tile can need in a slot, `fit`'s spare half included: the brick pool and tables of the
 /// four volumes over its region's bricks, three u8 and one u16 scratch arrays over its region, the u16 output and
 /// its packed copy, the seed list, and the per-brick flags, slots and ids
@@ -141,6 +144,20 @@ impl Gpu {
         if !unsafe { sys::is_culib_present() } {
             bail!("no NVIDIA driver found (libcuda.so)");
         }
+        // cudarc loads each driver function on first call and panics when the driver lacks it, so an older driver
+        // is turned away before any of them runs
+        let mut version = 0;
+        // SAFETY: cuDriverGetVersion only writes the version through the pointer, and exists in every driver
+        let status = unsafe { sys::cuDriverGetVersion(&mut version) };
+        ensure!(status == sys::CUresult::CUDA_SUCCESS, "read the NVIDIA driver version: {status:?}");
+        ensure!(
+            version >= MIN_DRIVER,
+            "the NVIDIA driver supports CUDA {}.{}; fibrs needs a driver for CUDA {}.{} or newer",
+            version / 1000,
+            version % 1000 / 10,
+            MIN_DRIVER / 1000,
+            MIN_DRIVER % 1000 / 10
+        );
         if let Some(device) = device {
             return Self::open_device(device);
         }
@@ -196,10 +213,16 @@ impl Gpu {
         let dirs = stream.clone_htod(&table)?;
         let unit = stream.clone_htod(&unit)?;
         stream.synchronize()?;
-        // the other half is left for the driver, other processes and later stages; a device too full for even one
-        // tile per unit fails in `centrality` or `direction_field`, which `--device auto` answers by running on
-        // the CPU
+        // the other half is left for the driver, other processes and later stages; a device too full for one tile
+        // in each slot is unusable, so without --cuda-device the next visible device gets its turn
         let (free, _) = ctx.mem_get_info()?;
+        let min_free = 2 * TILE_DEVICE_BYTES.max(axes::AXES_TILE_DEVICE_BYTES);
+        ensure!(
+            free >= min_free,
+            "CUDA device {device} has {} MiB free; fibrs needs {} MiB",
+            free >> 20,
+            min_free.div_ceil(1 << 20)
+        );
         let unit_tiles = (free / 2 / (2 * TILE_DEVICE_BYTES)).clamp(1, UNIT_TILES);
         let axes_unit_tiles = axes::unit_tiles(free / 2);
         let name = format!("CUDA device {device}, {} (compute capability {major}.{minor})", ctx.name()?);

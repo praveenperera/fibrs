@@ -32,7 +32,7 @@ const AXES_UNIT_TILES: usize = 32;
 /// pooled predictions over its box's bricks, the predictions and twelve float32 channels over its box, and over its
 /// core the presence lists, the fallback records (which have room for every core voxel) and both output arrays;
 /// about 68 MB for an interior tile
-const AXES_TILE_DEVICE_BYTES: usize = {
+pub(super) const AXES_TILE_DEVICE_BYTES: usize = {
     let side = CORE + 2 * HALO;
     let bricks = (side.div_ceil(EDGE) + 1).pow(3);
     let core = CORE.pow(3);
