@@ -171,7 +171,8 @@ pub struct Output {
 
 impl Output {
     /// Opens the group at `out`, creating it with `attrs` when it is not yet created; an existing output must
-    /// carry the same `inference` provenance, or the run would mix two predictions
+    /// carry the same `inference` provenance, or the run would mix two predictions, and the same other `attrs`, or
+    /// its metadata would describe another CT
     ///
     /// The group's `inference` attribute is written last, so it marks a finished creation. A group without it is
     /// created again only while it holds no prediction yet (no chunks and no progress), as a run stopped part way
@@ -201,6 +202,16 @@ impl Output {
         let changed = changed_keys(&saved["inference"], &attrs["inference"]);
         if !changed.is_empty() {
             bail!("output exists with different provenance ({}); use a new output", changed.join(", "));
+        }
+
+        // attributes outside the provenance, such as `voxel_size_um`, are kept from the run that created the group
+        let differ: Vec<String> = attrs
+            .iter()
+            .filter(|(k, v)| *k != "inference" && !saved.get(*k).is_some_and(|s| same_json(s, v)))
+            .map(|(k, v)| format!("{k} {} there, {v} now", saved.get(k).unwrap_or(&Value::Null)))
+            .collect();
+        if !differ.is_empty() {
+            bail!("output exists with different attributes ({}); resume with the same arguments", differ.join(", "));
         }
         Ok(Self { semantic: OutArray::open(&out.join("semantic"))?, tracing: OutArray::open(&out.join("tracing"))? })
     }
@@ -463,6 +474,32 @@ mod tests {
         Output::open_or_create(&out, 4, 4, 4, &with("IMPLICIT_PRECOMP_GEMM")).unwrap();
         let err = Output::open_or_create(&out, 4, 4, 4, &with("WINOGRAD_NONFUSED")).err().unwrap();
         assert!(err.to_string().contains("different provenance (cudnn_algos)"), "{err}");
+        fs::remove_dir_all(out).unwrap();
+    }
+
+    #[test]
+    fn a_resume_with_another_voxel_size_is_refused() {
+        let out = fresh("voxel");
+        let with = |um: f64| {
+            let mut a = attrs();
+            a.insert("voxel_size_um".into(), json!(um));
+            a
+        };
+        Output::open_or_create(&out, 4, 4, 4, &with(8.64)).unwrap();
+        Output::open_or_create(&out, 4, 4, 4, &with(8.64)).unwrap();
+        let err = Output::open_or_create(&out, 4, 4, 4, &with(9.362)).err().unwrap();
+        assert!(err.to_string().contains("different attributes (voxel_size_um 8.64 there, 9.362 now)"), "{err}");
+        let saved: Value = serde_json::from_slice(&fs::read(out.join(".zattrs")).unwrap()).unwrap();
+        assert_eq!(saved["voxel_size_um"], json!(8.64));
+        fs::remove_dir_all(out).unwrap();
+
+        // a value whose shortest decimal has 16 significant digits reads back as the same f64, not as its 9.1 neighbour
+        let out = fresh("voxel-digits");
+        let precise = 9.100000000000001;
+        Output::open_or_create(&out, 4, 4, 4, &with(precise)).unwrap();
+        Output::open_or_create(&out, 4, 4, 4, &with(precise)).unwrap();
+        let err = Output::open_or_create(&out, 4, 4, 4, &with(9.1)).err().unwrap();
+        assert!(err.to_string().contains("voxel_size_um 9.100000000000001 there, 9.1 now"), "{err}");
         fs::remove_dir_all(out).unwrap();
     }
 
