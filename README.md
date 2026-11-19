@@ -303,13 +303,14 @@ overlaps. The speedup is the mean of the per-pair ratios:
 | fp32 (default) | 45.37 s | 26.77 s | 1.72× (1.66–1.78×) |
 | bf16 (opt-in) | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) |
 
-On a 512 × 2048 × 2048 box of PHerc0358 (z 2304–2816, y 2176–4224, x 2944–4992) with no all-zero tile, one run
-of each at fp32 on the same GPU took 165.6 s for villa, 85.4 s for fibrs in band mode (1.94×) and 84.8 s with
-`--mode villa` (1.95×). At fp32 the measured speedup is 1.68×–1.95×; the lowest is the single PHerc0826 run in
-band mode behind the end-to-end row under [Why the speed-up varies](#why-the-speed-up-varies) (45.4 s and 27.0 s).
+On a 512 × 2048 × 2048 box of PHerc0358 (z 2304–2816, y 2176–4224, x 2944–4992) with no all-zero tile, one run of
+each at fp32 on the same GPU, not at the same time, took 165.6 s for villa, 85.3 s for fibrs 0.2.0 in band mode
+(1.94×) and 84.5 s with `--mode villa` (1.96×). At fp32 the measured speedup is 1.68×–1.96×; the lowest is the
+single PHerc0826 run in band mode behind the end-to-end row under
+[Why the speed-up varies](#why-the-speed-up-varies) (45.4 s and 27.0 s).
 
-fibrs, a pre-release build of 0.2.0 (`e9adcc9`), ran with cuDNN 9.27.0 and cuBLAS 13.4.1.3. villa ran PyTorch
-2.14.1 (CUDA 13.0) with cuDNN 9.24, at `0bddf2757`.
+On the PHerc0826 crop, fibrs was a pre-release build of 0.2.0 (`e9adcc9`); both fibrs builds ran with cuDNN 9.27.0
+and cuBLAS 13.4.1.3. villa ran PyTorch 2.14.1 (CUDA 13.0) with cuDNN 9.24, at `0bddf2757`.
 
 ### Parity
 
@@ -387,8 +388,8 @@ more than one:
 | Tracing | PHerc0813 | z 2304–2816, whole plane | 25.4% | 9,176 s | 202 s | about 45× | CPU | one run each, not at the same time; the original was interrupted and resumed; total estimated (run 5; fibrs 0.2.0) |
 | Prediction, `--mode villa` | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 45.37 s | 26.77 s | 1.72× (1.66–1.78×) | fp32 | ABBA, 6 pairs: medians, mean ratio with 95% CI |
 | Prediction, `--mode villa` | PHerc0826 | same crop | 100% | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) | bf16 (opt-in) | ABBA, 6 pairs: medians, mean ratio with 95% CI |
-| Prediction, band mode | PHerc0358 | z 2304–2816 / y 2176–4224 / x 2944–4992 | 100% | 165.6 s | 85.4 s | 1.94× | fp32 | one run each; fibrs `e9adcc9` |
-| Prediction, `--mode villa` | PHerc0358 | same box | 100% | 165.6 s | 84.8 s | 1.95× | fp32 | one run each, against the same villa run; fibrs `e9adcc9` |
+| Prediction, band mode | PHerc0358 | z 2304–2816 / y 2176–4224 / x 2944–4992 | 100% | 165.6 s | 85.3 s | 1.94× | fp32 | one run each, not at the same time; fibrs 0.2.0 |
+| Prediction, `--mode villa` | PHerc0358 | same box | 100% | 165.6 s | 84.5 s | 1.96× | fp32 | one run each, not at the same time, against the same villa run; fibrs 0.2.0 |
 | End to end, prediction in band mode | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 387.5 s | 41.7 s | 9.3× | fp32 | one run of each stage |
 | End to end, prediction in band mode | PHerc0358 | z 2304–2816, whole plane | 33.2% | 17,863 s, prediction estimated | 739 s | 24×, estimated | fp32 | villa's prediction time extrapolated from the box above; the rest one run of each stage, fibrs `e9adcc9` predicting; both tracers read fibrs's prediction |
 | Tracing, fibrs 0.1.0 → 0.2.0 | PHerc0358 | z 1792–2304 / y 2176–4224 / x 2944–4992 | 100% | 104 s (0.1.0) | 50–52 s (0.2.0) | 2.0–2.1× | CPU | back to back on one machine, `--threads 8`; not in the tracing range |

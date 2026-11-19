@@ -5,9 +5,11 @@
 - The README's tracer speed range is now 22×–47× on wall time and about 22×–38× on CPU time, from the three
   uninterrupted runs on bands of PHerc0826, PHerc1545 and PHerc0358. Two runs whose original was interrupted and
   resumed, one of them on a band of PHerc0813, are listed with estimated totals. The original's time per fibre
-  differs between bands and between runs; fibrs's differed less on the runs measured.
+  differs between bands and between runs; on runs 4 and 5 fibrs's differed less.
 - `fibrs predict` reads the CT through the path its overlap check resolved. It used to open the CT again by the path
   as given, so a link on that path changed during a run could make it read a different store from the one checked.
+- The README's dense PHerc0358 box prediction rows are now from fibrs 0.2.0: 85.3 s in band mode (1.94×) and 84.5 s
+  with `--mode villa` (1.96×), with outputs identical to those of the pre-release build timed before.
 
 ## [0.2.0] - 2026-11-19
 
