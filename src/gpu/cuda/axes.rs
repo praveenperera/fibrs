@@ -28,6 +28,9 @@ use crate::vol::{BRICK, EDGE, Shape, Vol};
 
 /// Most tiles in one unit, however much device memory is free
 const AXES_UNIT_TILES: usize = 32;
+/// Most fallback records copied back and solved at once, so a unit where most voxels fall back (a volume of flat
+/// predictions) holds 32 MiB of pinned memory per slot instead of 32 bytes per voxel
+const FB_CHUNK: usize = 1 << 20;
 /// Most device memory one tile can need in a slot, `fit`'s spare half included: the brick pool and tables of both
 /// pooled predictions over its box's bricks, the predictions and twelve float32 channels over its box, and over its
 /// core the presence lists, the fallback records (which have room for every core voxel) and both output arrays;
@@ -374,13 +377,6 @@ impl Slot {
         ensure!(n_fb <= m.fb_cap, "{n_fb} fallbacks overflow a unit's list of {}", m.fb_cap);
         ensure!(n_fb <= present, "{n_fb} fallbacks of {present} present voxels");
 
-        let n_records = RECORD * n_fb;
-        fit_host(&self.stream, &mut self.host_fb, n_records, 0)?;
-        if n_fb > 0 {
-            self.stream.memcpy_dtoh(&self.fb.slice(..n_records), &mut self.host_fb.as_mut_slice()?[..n_records])?;
-            self.stream.synchronize().wrap_err("copy the fallback voxels back")?;
-        }
-
         let n_out = m.bricks.len() * BRICK;
         let nx = self.host_nx.as_slice()?[..n_out].as_chunks::<BRICK>().0;
         let ny = self.host_ny.as_slice()?[..n_out].as_chunks::<BRICK>().0;
@@ -390,14 +386,22 @@ impl Slot {
         }
 
         // the voxels the kernels could not certify, finished as the CPU path finishes every voxel
-        let records = &self.host_fb.as_slice()?[..n_records];
-        let solved: Vec<(Shape, (u8, u8))> = records
-            .par_chunks_exact(RECORD)
-            .map_init(|| (Vec::new(), Vec::new()), |(work, iwork), r| fallback(r, m, lapack, work, iwork))
-            .collect::<Result<_>>()?;
-        for ([z, y, x], (a, b)) in solved {
-            field.nx.set(z, y, x, a);
-            field.ny.set(z, y, x, b);
+        for start in (0..n_fb).step_by(FB_CHUNK) {
+            let n_records = RECORD * FB_CHUNK.min(n_fb - start);
+            let from = RECORD * start;
+            fit_host(&self.stream, &mut self.host_fb, n_records, 0)?;
+            let records = &mut self.host_fb.as_mut_slice()?[..n_records];
+            self.stream.memcpy_dtoh(&self.fb.slice(from..from + n_records), records)?;
+            self.stream.synchronize().wrap_err("copy the fallback voxels back")?;
+
+            let solved: Vec<(Shape, (u8, u8))> = records
+                .par_chunks_exact(RECORD)
+                .map_init(|| (Vec::new(), Vec::new()), |(work, iwork), r| fallback(r, m, lapack, work, iwork))
+                .collect::<Result<_>>()?;
+            for ([z, y, x], (a, b)) in solved {
+                field.nx.set(z, y, x, a);
+                field.ny.set(z, y, x, b);
+            }
         }
         field.counts.present += present;
         field.counts.fallback += n_fb;
