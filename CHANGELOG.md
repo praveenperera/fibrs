@@ -29,10 +29,11 @@ centrality alone on the GPU, a PHerc0826 band matched too. `fibrs predict` can n
 
 ### Upgrading
 
-- Unfinished runs only: a tracer work directory started by 0.2.0 is not resumed by 0.3.0, so finish it with 0.2.0
-  or start a new one, and a `fibrs predict` band output that 0.2.0 started is refused on resume too, as it is by any
-  other binary. Predictions that 0.2.0 finished are traced by 0.3.0 as before: the tracer takes the voxel size from
-  `--voxel-size-um`, not from the prediction's attributes.
+- 0.3.0 doesn't resume a tracer work directory that 0.2.0 started, finished or not, so a `--resume` that only
+  writes the `.afv` again needs 0.2.0 too; otherwise start a new work directory. A `fibrs predict` band output that
+  0.2.0 started is refused on resume as well, as it is by any other binary. Predictions that 0.2.0 finished are
+  traced by 0.3.0 as before: the tracer takes the voxel size from `--voxel-size-um`, not from the prediction's
+  attributes.
 - `--device` now defaults to `auto`. Pass `--device cpu` to keep the direction field and centrality on the CPU, or to
   match the original's default `--device cpu` output, whose centrality can round differently from the GPU's.
 
