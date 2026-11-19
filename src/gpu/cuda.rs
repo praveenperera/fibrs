@@ -210,7 +210,9 @@ impl Gpu {
         let table: Vec<f64> = Fused::dir_table().iter().flat_map(|d| [d[0], d[1], d[2], 0.0]).collect();
         let unit: Vec<f32> = (0..=255u8).map(|v| v as f32 / 255.0f32).collect();
         let stream = ctx.default_stream();
+        // each pageable source is dropped on an early return, so its copy finishes before the next can fail
         let dirs = stream.clone_htod(&table)?;
+        stream.synchronize()?;
         let unit = stream.clone_htod(&unit)?;
         stream.synchronize()?;
         // the other half is left for the driver, other processes and later stages; a device too full for one tile

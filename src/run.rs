@@ -125,7 +125,8 @@ pub struct Args {
     pub coordinate_space: Option<String>,
     /// Where the direction field and centrality run (tracing always runs on the CPU): auto uses an NVIDIA GPU when
     /// one is usable and the CPU otherwise, cpu never uses the GPU, and cuda fails without one. A GPU run writes the
-    /// original's --device cuda output, whose centrality can differ from its cpu output by a rounding
+    /// original's --device cuda output, whose centrality can differ from its cpu output by a rounding. A resumed
+    /// run keeps the rounding it started with, so one started on the CPU keeps centrality there
     #[arg(long, value_enum, default_value = "auto")]
     pub device: Device,
     /// Visible CUDA device index for the GPU; without it, the first usable visible GPU
@@ -897,8 +898,9 @@ impl Rounding {
     }
 }
 
-/// How a run computes centrality: the rounding it reproduces and, for the CUDA rounding, the GPU when one runs it
-/// (without one, the CPU computes the CUDA rounding, more slowly)
+/// How a run computes the direction field and centrality: the centrality rounding it reproduces, and the GPU when
+/// one runs the direction field and, in the CUDA rounding, centrality (without one, the CPU computes either rounding,
+/// the CUDA one more slowly)
 struct CentralityDevice {
     rounding: Rounding,
     gpu: Option<Gpu>,
@@ -910,7 +912,8 @@ impl CentralityDevice {
     /// The rounding a new run takes from `device`, or a resumed run from its `run.json`, and the GPU to compute
     /// it on, opened only when a family still needs centrality
     ///
-    /// `auto` takes the GPU when one opens, and otherwise the CPU, saying why
+    /// `auto` takes the GPU when one opens, and otherwise the CPU, saying why. A run started on the CPU keeps
+    /// centrality there, but its direction field, the same bytes on either device, still takes the GPU
     fn choose(device: Device, index: Option<usize>, work: &Path, tracing_needed: bool) -> Result<Self> {
         let started_on = || -> Option<String> {
             let saved: Value = serde_json::from_str(&fs::read_to_string(work.join("run.json")).ok()?).ok()?;
@@ -928,24 +931,40 @@ impl CentralityDevice {
             (Some("cpu"), Device::Cuda) => {
                 bail!("This run started with centrality on the CPU and resumes only there; use --device cpu or auto")
             }
+            (Some("cpu"), Device::Auto) if tracing_needed => match open() {
+                Ok(gpu) => {
+                    log!(
+                        "Direction field on {}, centrality on the CPU this run started on (--device cpu to use the CPU)",
+                        gpu.name()
+                    );
+                    Self { rounding: Rounding::Cpu, gpu: Some(gpu), strict }
+                }
+                Err(e) => {
+                    log!("Direction field and centrality on the CPU: no usable GPU ({e:#})");
+                    cpu(Rounding::Cpu)
+                }
+            },
             (Some("cpu"), _) | (None, Device::Cpu) => cpu(Rounding::Cpu),
             (Some(_), _) if !tracing_needed => cpu(Rounding::Cuda),
             (Some(_), Device::Cpu) => {
-                log!("Centrality on the CPU, rounded as on the GPU this run started on");
+                log!("Direction field and centrality on the CPU, centrality rounded as on the GPU this run started on");
                 cpu(Rounding::Cuda)
             }
             (_, Device::Cuda) => on_gpu(open().map_err(|e| eyre!("--device cuda needs a usable NVIDIA GPU: {e:#}"))?),
             (Some(_), Device::Auto) => match open() {
                 Ok(gpu) => on_gpu(gpu),
                 Err(e) => {
-                    log!("Centrality on the CPU, rounded as on the GPU this run started on: no usable GPU ({e:#})");
+                    log!(
+                        "Direction field and centrality on the CPU, centrality rounded as on the GPU this run started \
+                         on: no usable GPU ({e:#})"
+                    );
                     cpu(Rounding::Cuda)
                 }
             },
             (None, Device::Auto) => match open() {
                 Ok(gpu) => on_gpu(gpu),
                 Err(e) => {
-                    log!("Centrality on the CPU: no usable GPU ({e:#})");
+                    log!("Direction field and centrality on the CPU: no usable GPU ({e:#})");
                     cpu(Rounding::Cpu)
                 }
             },
