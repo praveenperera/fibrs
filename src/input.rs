@@ -404,28 +404,50 @@ impl Predictions {
     /// Whether the array's Blosc blocks each fall within runs of `planes` planes, so decoding those planes decodes
     /// no more than they hold
     ///
-    /// Judged by the first stored chunk, since a writer compresses every chunk of an array alike; a frame
-    /// compressed as one block, for example, would be decoded whole for every run of planes
+    /// Judged by one stored chunk, since a writer compresses every chunk of an array alike; a frame compressed as
+    /// one block, for example, would be decoded whole for every run of planes
     pub fn blocks_fit_planes(&self, planes: usize) -> bool {
         let Some(edge) = self.slab_layout() else { return false };
         let run = planes * edge[1] * edge[2];
-        let grid = [0, 1, 2].map(|a| self.shape[a].div_ceil(edge[a]));
-        let keys = (0..grid[0]).flat_map(|z| (0..grid[1]).flat_map(move |y| (0..grid[2]).map(move |x| [z, y, x])));
-        for key in keys.take(PROBED_CHUNKS) {
-            match self.packed_chunk_in(key, Global) {
-                Ok(PackedChunk::Fill(_)) => continue,
-                Ok(PackedChunk::Blosc(bytes)) => return blocks_fit(&bytes, run),
-                Err(_) => return false,
+        match self.stored_chunk().map(|key| self.packed_chunk_in(key, Global)) {
+            Some(Ok(PackedChunk::Blosc(bytes))) => blocks_fit(&bytes, run),
+            // an array with no chunk stored holds only its fill value, which no decode reads
+            None => true,
+            Some(Ok(PackedChunk::Fill(_)) | Err(_)) => false,
+        }
+    }
+
+    /// The key of a chunk the array stores, found by listing its directory, or `None` when it stores none
+    ///
+    /// Listing instead of opening keys in grid order finds a chunk however sparse the array is
+    fn stored_chunk(&self) -> Option<[usize; 3]> {
+        let Store::Zarr { dir, sep, chunks, .. } = &self.store else { return None };
+        let grid = [0, 1, 2].map(|a| self.shape[a].div_ceil(chunks[a + 1]));
+        let key = |parts: &[&str]| -> Option<[usize; 3]> {
+            let [c, z, y, x] = parts else { return None };
+            let k = [z.parse().ok()?, y.parse().ok()?, x.parse().ok()?];
+            (*c == "0" && (0..3).all(|a| k[a] < grid[a])).then_some(k)
+        };
+        let names = |d: &Path| -> Vec<String> {
+            fs::read_dir(d).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok()).collect()
+        };
+        if *sep != '/' {
+            return names(dir).iter().find_map(|n| key(&n.split(*sep).collect::<Vec<_>>()));
+        }
+
+        // nested keys: 0/z/y/x
+        for z in names(&dir.join("0")) {
+            for y in names(&dir.join("0").join(&z)) {
+                for x in names(&dir.join("0").join(&z).join(&y)) {
+                    if let Some(k) = key(&["0", &z, &y, &x]) {
+                        return Some(k);
+                    }
+                }
             }
         }
-        // nothing stored near the start to judge by; missing chunks decode to their fill value either way
-        true
+        None
     }
 }
-
-/// Chunks [`Predictions::blocks_fit_planes`] looks through for a stored one, in grid order; a missing chunk costs
-/// one failed open
-const PROBED_CHUNKS: usize = 4096;
 
 /// A chunk of a [`Predictions::slab_layout`] array as stored, for [`Predictions::decode_planes`]
 pub enum PackedChunk<A: Allocator> {
@@ -569,7 +591,8 @@ fn frame_channel_ranges(bytes: &[u8], channel: usize, start: usize, parts: [&mut
     ensure!(parts[1].len() == len && start + len <= channel, "bytes {start}.. lie outside a channel");
     let starts = [start, channel + start];
     let ts = frame.typesize;
-    if ts > 0 && len.is_multiple_of(ts) && starts.iter().all(|s| s.is_multiple_of(ts)) {
+    if item_ranges_decode_whole_blocks(&frame) && len.is_multiple_of(ts) && starts.iter().all(|s| s.is_multiple_of(ts))
+    {
         for (at, part) in starts.into_iter().zip(parts) {
             blosc_getitem(bytes, at, part)?;
         }
@@ -577,7 +600,7 @@ fn frame_channel_ranges(bytes: &[u8], channel: usize, start: usize, parts: [&mut
     }
 
     // c-blosc reads a range in whole items of the frame's typesize, so a frame whose items straddle the range's
-    // bounds is decoded whole
+    // bounds is decoded whole, as is one whose blocks a range read could take short
     let all = blosc_decompress(bytes)?;
     for (at, part) in starts.into_iter().zip(parts) {
         part.copy_from_slice(&all[at..at + len]);
@@ -588,17 +611,30 @@ fn frame_channel_ranges(bytes: &[u8], channel: usize, start: usize, parts: [&mut
 /// Whether decoding `run` aligned bytes of a frame decodes no more than they hold: its blocks are no larger, and
 /// its items divide the run
 fn blocks_fit(bytes: &[u8], run: usize) -> bool {
-    blosc_frame_info(bytes).is_ok_and(|f| f.blocksize <= run && f.typesize > 0 && run.is_multiple_of(f.typesize))
+    blosc_frame_info(bytes)
+        .is_ok_and(|f| f.blocksize <= run && item_ranges_decode_whole_blocks(&f) && run.is_multiple_of(f.typesize))
+}
+
+/// Whether c-blosc's `blosc_getitem` decodes every block of the frame in full
+///
+/// A block is compressed as `typesize` streams of `blocksize / typesize` bytes each. When the type size does not
+/// divide the block size, which c-blosc never writes but a damaged header can claim, the streams cover less than
+/// the block; `blosc_getitem` does not check how much it decoded and copies the rest from its scratch buffer,
+/// where decoding the whole frame fails
+fn item_ranges_decode_whole_blocks(frame: &FrameInfo) -> bool {
+    frame.typesize > 0 && frame.blocksize > 0 && frame.blocksize.is_multiple_of(frame.typesize)
 }
 
 /// Decode bytes `start..start + out.len()` of one Blosc 1 frame into `out`, decoding only the blocks they fall in
 fn blosc_getitem(src: &[u8], start: usize, out: &mut [u8]) -> Result<()> {
-    let FrameInfo { nbytes, typesize, .. } = blosc_frame_info(src)?;
-    // c-blosc counts `start` and the length in items of the frame's typesize
+    let frame = blosc_frame_info(src)?;
+    let FrameInfo { nbytes, typesize, blocksize } = frame;
     ensure!(
-        typesize > 0 && start.is_multiple_of(typesize) && out.len().is_multiple_of(typesize),
-        "bytes {start}.. split a Blosc item"
+        item_ranges_decode_whole_blocks(&frame),
+        "Blosc frame has {blocksize}-byte blocks of {typesize}-byte items"
     );
+    // c-blosc counts `start` and the length in items of the frame's typesize
+    ensure!(start.is_multiple_of(typesize) && out.len().is_multiple_of(typesize), "bytes {start}.. split a Blosc item");
     ensure!(start + out.len() <= nbytes && nbytes <= i32::MAX as usize, "bytes {start}.. lie outside the frame");
     let (first, items) = ((start / typesize) as i32, (out.len() / typesize) as i32);
     // SAFETY: the frame was validated against `src.len()` and the range lies inside it, so c-blosc writes exactly
@@ -695,11 +731,12 @@ fn fill_value(v: &Value) -> Result<f64> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
 
     use serde_json::Value;
 
-    use super::{NativeChunk, Predictions, blocks_fit, frame_channel_ranges};
+    use super::{NativeChunk, Predictions, blocks_fit, blosc_getitem, frame_channel_ranges};
     use crate::arena::BufferPool;
 
     /// Every case in `tests/fixtures/readers` (the expected values were written by the reference's own
@@ -880,5 +917,49 @@ mod tests {
         let frame = blosc_frame(&data[..channel], 1, run);
         let (mut a, mut b) = (vec![0u8; run], vec![0u8; run]);
         assert!(frame_channel_ranges(&frame, channel / 2 + 1, 0, [&mut a, &mut b]).is_err());
+    }
+
+    /// A header whose block size its type size does not divide, which c-blosc never writes, is refused as decoding
+    /// the whole frame refuses it, where reading item ranges would fill part of each block from scratch memory
+    #[test]
+    fn a_damaged_block_size_is_refused() {
+        let channel = 8 * 64 * 64;
+        let data: Vec<u8> = (0..2 * channel).map(|i| (i * 7 + i / 977) as u8).collect();
+        let run = 2 * 64 * 64;
+        let mut frame = blosc_frame(&data, 4, run / 2);
+        frame[8..12].copy_from_slice(&(run as u32 / 2 - 2).to_le_bytes());
+        assert!(!blocks_fit(&frame, run));
+        assert!(blosc_getitem(&frame, 0, &mut vec![0u8; run]).is_err());
+        let (mut a, mut b) = (vec![0u8; run], vec![0u8; run]);
+        assert!(frame_channel_ranges(&frame, channel, 0, [&mut a, &mut b]).is_err());
+    }
+
+    /// The probe judges an array by a chunk it stores even when every chunk before it in grid order is missing,
+    /// with either key separator
+    #[test]
+    fn a_sparse_array_is_judged_by_a_stored_chunk() {
+        let edge = 16;
+        let data: Vec<u8> = (0..2 * edge * edge * edge).map(|i| (i * 7 + i / 977) as u8).collect();
+        // one Blosc block for the whole chunk: decoding 8 planes would decode all 16
+        let frame = blosc_frame(&data, 1, data.len());
+        let root = std::env::temp_dir().join(format!("fibrs-sparse-probe-{}", std::process::id()));
+        for sep in [".", "/"] {
+            let dir = root.join(if sep == "." { "flat" } else { "nested" });
+            let _ = fs::remove_dir_all(&dir);
+            // 64 × 65 chunk positions: the stored one is past the first 4,096 in grid order
+            let last = "0/0/63/64".replace('/', sep);
+            fs::create_dir_all(dir.join(&last).parent().unwrap()).unwrap();
+            fs::write(dir.join(&last), &frame).unwrap();
+            let meta = serde_json::json!({
+                "zarr_format": 2, "shape": [2, edge, 64 * edge, 65 * edge], "chunks": [2, edge, edge, edge],
+                "dtype": "|u1", "fill_value": 0, "order": "C", "filters": null, "dimension_separator": sep,
+                "compressor": {"id": "blosc", "cname": "zstd", "clevel": 5, "shuffle": 0, "blocksize": 0},
+            });
+            fs::write(dir.join(".zarray"), meta.to_string()).unwrap();
+            let p = Predictions::open(&dir, None, "VH").unwrap();
+            assert_eq!(p.stored_chunk(), Some([0, 63, 64]), "separator {sep}");
+            assert!(!p.blocks_fit_planes(8), "separator {sep}");
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 }
