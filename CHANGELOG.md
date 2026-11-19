@@ -2,9 +2,10 @@
 
 ## [Unreleased]
 
-- Tracing predictions whose Blosc blocks hold more than 8 planes takes less memory at once. A finishing thread that
-  decoded such a chunk copied out every slab it would cache before caching any, so each thread could hold a second
-  copy of a chunk; it now caches each slab as it is copied.
+- Tracing predictions that are decoded 8 planes at a time takes less memory at once when some chunks have Blosc
+  blocks of more than 8 planes. A finishing thread decodes such a chunk whole, and it used to copy out every slab it
+  would cache before caching any, so each thread could hold a second copy of the chunk; it now caches each slab as it
+  is copied.
 
 ## [0.2.0] - 2026-11-19
 
