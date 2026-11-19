@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- **Centrality on the GPU.** `--device` now defaults to `auto`: centrality and the ridge seeds run on an NVIDIA
+  GPU of compute capability 8.0 or later when one is usable (Linux x86-64; the driver is enough, no CUDA toolkit),
+  and on the CPU otherwise, with the reason in the log. `--device cpu` keeps them on the CPU, `--device cuda` fails
+  instead of falling back, and `--cuda-device N` picks the GPU; `--device cuda` used to be rejected. The kernels are
+  written in Rust with cuda-oxide and ship inside the binary as PTX. On a PHerc1545 and a PHerc0826 band the `.afv`
+  was identical on the GPU and the CPU, and identical to the original's with either of its devices. With
+  `--threads 8`, centrality took 1.8 s instead of 8.1 s on the PHerc1545 band and 5.0 s instead of 20.4 s on the
+  PHerc0826 band. The direction field and tracing still run on the CPU (see the README's "Speed").
+- The README's "Same output" section now gives the PHerc0826 band's counts as measured: 149,680 fibres and 161,787
+  point blocks and spatial-index rows. It said 149,780 and 161,887.
 - The README's tracer speed range is now 22×–47× on wall time and about 22×–38× on CPU time, from the three
   uninterrupted runs on bands of PHerc0826, PHerc1545 and PHerc0358. Two runs whose original was interrupted and
   resumed, one of them on a band of PHerc0813, are listed with estimated totals. The original's time per fibre

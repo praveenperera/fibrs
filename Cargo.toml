@@ -37,7 +37,7 @@ zstd = "0.13"
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 volkit = "0.1"
 # the free device memory for the column check, from the cudarc volkit already brings into the tree
-cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12040"] }
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12040"] }
 
 [profile.release]
 debug = 1

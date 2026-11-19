@@ -85,6 +85,12 @@ impl<T: Voxel> Vol<T> {
         unsafe { std::slice::from_raw_parts_mut(b.0.as_ptr(), BRICK) }
     }
 
+    /// The value every voxel outside an allocated brick reads as
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    pub fn default_value(&self) -> T {
+        self.default
+    }
+
     #[inline(always)]
     fn brick_index(&self, z: usize, y: usize, x: usize) -> usize {
         ((z >> SHIFT) * self.grid[1] + (y >> SHIFT)) * self.grid[2] + (x >> SHIFT)
@@ -133,6 +139,30 @@ impl<T: Voxel> Vol<T> {
             }
         };
         self.brick_mut(b)[Self::offset(z, y, x)] = value;
+    }
+
+    /// The voxels of brick `bi` (C order over the brick grid) in brick order, or None where every voxel reads as
+    /// the default
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    pub fn brick_at(&self, bi: usize) -> Option<&[T; BRICK]> {
+        let b = self.bricks[bi]?;
+        Some(self.brick(b).try_into().expect("a brick holds BRICK voxels"))
+    }
+
+    /// Replace brick `bi` with `data`, one brick's voxels in brick order; a brick that would hold only the default
+    /// is not allocated
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    pub fn set_brick(&mut self, bi: usize, data: &[T; BRICK]) {
+        let b = match self.bricks[bi] {
+            Some(b) => b,
+            None if data.iter().all(|&v| v == self.default) => return,
+            None => {
+                let b = Brick(self.store.alloc());
+                self.bricks[bi] = Some(b);
+                b
+            }
+        };
+        self.brick_mut(b).copy_from_slice(data);
     }
 
     /// Bytes held by allocated bricks
