@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+- Tracing predictions that are decoded 8 planes at a time takes less memory at once when some chunks have Blosc
+  blocks of more than 8 planes. A finishing thread decodes such a chunk whole, and it used to copy out every slab it
+  would cache before caching any, so each thread could hold a second copy of the chunk; it now caches each slab as it
+  is copied.
+
 ## [0.2.0] - 2026-11-19
 
 fibrs 0.2.0 adds `fibrs predict`. It runs Qual's [AFV fibre model V2](https://huggingface.co/Qualzz20/afv_fiber_9um_v2)
