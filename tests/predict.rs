@@ -261,6 +261,13 @@ fn an_output_given_through_the_ct_is_written_where_it_resolves() {
     let run = predict(&[&args[..], &["--out", out.to_str().unwrap()]].concat());
     assert!(!ct.join("0.0.0").exists(), "{}", text(&run));
     assert!(dir.join("pred.zarr/attempts.jsonl").exists(), "{}", text(&run));
+
+    // `..` after a file is refused, as the system would refuse it, not taken lexically
+    fs::write(dir.join("done.txt"), "").unwrap();
+    let run = predict(&[&args[..], &["--out", dir.join("done.txt/../other.zarr").to_str().unwrap()]].concat());
+    assert_eq!(run.status.code(), Some(1));
+    assert!(text(&run).contains("which is not a directory"), "{}", text(&run));
+    assert!(!dir.join("other.zarr").exists());
 }
 
 #[test]

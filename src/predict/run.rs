@@ -352,6 +352,10 @@ fn resolved(path: &Path) -> Result<PathBuf> {
             // `out` is canonical up to its first missing component, and a missing component is not a link, so its
             // parent is the lexical one
             Component::ParentDir => {
+                // the system would refuse `..` after a file, so the lexical parent must not be taken either
+                if out.exists() && !out.is_dir() {
+                    bail!("{} steps through {}, which is not a directory", path.display(), out.display());
+                }
                 out.pop();
             }
             part => {
@@ -426,7 +430,8 @@ fn run(c: Checked) -> Result<()> {
         }
     }
 
-    // every attempt is recorded at its start, before the model loads, so a capped or killed run still shows it;
+    // every run that passes the checks above is recorded before the model loads, so one capped or killed after
+    // that still shows it;
     // every write goes to the resolved output, the path the overlap check passed, since the given one may step
     // through the CT on its way (`<ct>/0.0.0/../../pred.zarr`)
     fs::create_dir_all(&out)?;
