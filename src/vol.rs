@@ -199,6 +199,9 @@ impl<T: Voxel> Vol<T> {
     /// Fill the bricks whose z index lies in `rows` in parallel, leaving the others as they are:
     /// `f(brick_lo, brick_dims, out)` writes one brick's voxels in C order (dims clipped at the volume edge) and
     /// returns whether any differs from the default
+    ///
+    /// Each row of bricks may be filled once: the store does not take bricks back, so a brick replaced by a second
+    /// fill would stay allocated, uncounted by [`Vol::resident_bytes`], until the volume is dropped
     pub fn fill_brick_rows<F>(&mut self, rows: Range<usize>, f: F)
     where
         F: Fn(Shape, Shape, &mut [T]) -> bool + Sync,
@@ -209,6 +212,7 @@ impl<T: Voxel> Vol<T> {
         let plane = grid[1] * grid[2];
         let store = &self.store;
         let slab = &mut self.bricks[rows.start * plane..rows.end * plane];
+        debug_assert!(slab.iter().all(Option::is_none), "brick rows {rows:?} are filled a second time");
         // each writer takes bricks from its own run of the store and reuses one dense buffer
         let init = || (store.run(), Vec::with_capacity(BRICK));
         slab.par_iter_mut().enumerate().for_each_init(init, |(run, dense), (i, slot)| {

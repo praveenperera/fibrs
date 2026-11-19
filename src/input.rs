@@ -154,18 +154,25 @@ impl Predictions {
 
     /// Read `(2, hi - lo)` as uint8 in V, H order (`Predictions.read(lo, hi)`)
     pub fn read_u8(&self, lo: [usize; 3], hi: [usize; 3]) -> Result<Vec<u8>> {
-        let raw = self.read_raw(lo, hi)?;
+        self.read_u8_in(lo, hi, Global)
+    }
+
+    /// [`Predictions::read_u8`] into a buffer from `alloc`; uint8 arrays are read straight into it
+    fn read_u8_in<A: Allocator + Clone>(&self, lo: [usize; 3], hi: [usize; 3], alloc: A) -> Result<Vec<u8, A>> {
+        let raw = self.read_raw_in(lo, hi, alloc.clone())?;
         if self.dtype.kind == Kind::U8 {
             return Ok(raw);
         }
         let floats = self.to_f32(&raw)?;
         // np.rint(block * 255).astype("u1") in float32; values are already checked to lie in [0, 1]
-        Ok(floats.iter().map(|&v| (v * 255.0f32).round_ties_even() as u8).collect())
+        let mut out = Vec::with_capacity_in(floats.len(), alloc);
+        out.extend(floats.iter().map(|&v| (v * 255.0f32).round_ties_even() as u8));
+        Ok(out)
     }
 
     /// Read `(2, hi - lo)` as float32 without quantization (`read(..., quantized=False)`)
     pub fn read_f32(&self, lo: [usize; 3], hi: [usize; 3]) -> Result<Vec<f32>> {
-        let raw = self.read_raw(lo, hi)?;
+        let raw = self.read_raw_in(lo, hi, Global)?;
         if self.dtype.kind == Kind::U8 {
             return Ok(raw.iter().map(|&v| v as f32).collect());
         }
@@ -185,11 +192,12 @@ impl Predictions {
     }
 
     /// Raw element bytes of `(2, hi - lo)`, C order, channels already in V, H order
-    fn read_raw(&self, lo: [usize; 3], hi: [usize; 3]) -> Result<Vec<u8>> {
+    fn read_raw_in<A: Allocator>(&self, lo: [usize; 3], hi: [usize; 3], alloc: A) -> Result<Vec<u8, A>> {
         let dims = [0, 1, 2].map(|a| hi[a] - lo[a]);
         let es = self.dtype.size();
         let plane = dims.iter().product::<usize>() * es;
-        let mut out = vec![0u8; 2 * plane];
+        let mut out = Vec::with_capacity_in(2 * plane, alloc);
+        out.resize(2 * plane, 0u8);
         match &self.store {
             Store::Npy { map, offset, fortran } => {
                 let s = self.shape;
@@ -289,7 +297,7 @@ impl Predictions {
     ///
     /// A whole uint8 Blosc chunk holding both channels, which is what prediction writers store, is decoded
     /// straight into the returned buffer, its compressed bytes read into another buffer from `alloc`; anything
-    /// else goes through [`Predictions::read_u8`] and is copied
+    /// else is read through [`Predictions::read_u8`]'s path into a buffer from `alloc`
     pub fn read_chunk_in<A: Allocator + Copy>(
         &self,
         key: [usize; 3],
@@ -302,10 +310,7 @@ impl Predictions {
         if let Some(data) = self.whole_chunk_in(key, edge, dims, alloc)? {
             return Ok(NativeChunk { lo, dims, data });
         }
-        let read = self.read_u8(lo, hi)?;
-        let mut data = Vec::with_capacity_in(read.len(), alloc);
-        data.extend_from_slice(&read);
-        Ok(NativeChunk { lo, dims, data })
+        Ok(NativeChunk { lo, dims, data: self.read_u8_in(lo, hi, alloc)? })
     }
 
     /// The fast path of [`Predictions::read_chunk_in`]: the chunk's decoded bytes are already `(2, dims)` in C order
