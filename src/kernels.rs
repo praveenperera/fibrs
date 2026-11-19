@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 
 use color_eyre::eyre::{Result, bail};
 
+use crate::arena::Voxel;
 use crate::pyfmt::{py_max, py_min};
 use crate::vol::Vol;
 
@@ -24,7 +25,7 @@ pub trait Grid<T: Copy>: Sync {
     fn at(&self, z: i64, y: i64, x: i64) -> T;
 }
 
-impl<T: Copy + PartialEq + Send + Sync> Grid<T> for Vol<T> {
+impl<T: Voxel> Grid<T> for Vol<T> {
     #[inline(always)]
     fn dims(&self) -> [i64; 3] {
         self.shape().map(|n| n as i64)

@@ -5,6 +5,7 @@
 //! orders are read. Zarr chunks are decoded by the c-blosc release numcodecs 0.15 bundles, or by
 //! numcodecs' Zstd, Zlib, GZip and LZ4 formats
 
+use std::alloc::{Allocator, Global};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -283,14 +284,79 @@ impl Predictions {
         }
     }
 
-    /// One whole spatial chunk as uint8 `(2, cz, cy, cx)` in V, H order, clipped to the array shape;
-    /// returns the chunk's origin and extent too. NPY input is served in blocks of the same size
-    pub fn read_chunk_u8(&self, key: [usize; 3], edge: [usize; 3]) -> Result<([usize; 3], [usize; 3], Vec<u8>)> {
+    /// One whole spatial chunk as uint8 `(2, cz, cy, cx)` in V, H order, clipped to the array shape, in a buffer
+    /// from `alloc`; returns the chunk's origin and extent too. NPY input is served in blocks of the same size
+    ///
+    /// A whole uint8 Blosc chunk holding both channels, which is what prediction writers store, is decoded
+    /// straight into the returned buffer, its compressed bytes read into another buffer from `alloc`; anything
+    /// else goes through [`Predictions::read_u8`] and is copied
+    pub fn read_chunk_in<A: Allocator + Copy>(
+        &self,
+        key: [usize; 3],
+        edge: [usize; 3],
+        alloc: A,
+    ) -> Result<NativeChunk<A>> {
         let lo = [0, 1, 2].map(|a| key[a] * edge[a]);
         let hi = [0, 1, 2].map(|a| (lo[a] + edge[a]).min(self.shape[a]));
         let dims = [0, 1, 2].map(|a| hi[a] - lo[a]);
-        Ok((lo, dims, self.read_u8(lo, hi)?))
+        if let Some(data) = self.whole_chunk_in(key, edge, dims, alloc)? {
+            return Ok(NativeChunk { lo, dims, data });
+        }
+        let read = self.read_u8(lo, hi)?;
+        let mut data = Vec::with_capacity_in(read.len(), alloc);
+        data.extend_from_slice(&read);
+        Ok(NativeChunk { lo, dims, data })
     }
+
+    /// The fast path of [`Predictions::read_chunk_in`]: the chunk's decoded bytes are already `(2, dims)` in C order
+    /// when its file holds both channels of an unclipped uint8 C-order chunk, so `read_raw`'s copy is the identity;
+    /// `None` when the chunk is not of that kind
+    fn whole_chunk_in<A: Allocator + Copy>(
+        &self,
+        key: [usize; 3],
+        edge: [usize; 3],
+        dims: [usize; 3],
+        alloc: A,
+    ) -> Result<Option<Vec<u8, A>>> {
+        let Store::Zarr { dir, chunks, sep, fill, compressor, fortran } = &self.store else { return Ok(None) };
+        let whole = chunks[0] == 2 && [chunks[1], chunks[2], chunks[3]] == edge && dims == edge;
+        if !whole || *fortran || *compressor != Compressor::Blosc || self.dtype.kind != Kind::U8 {
+            return Ok(None);
+        }
+        let n = 2 * dims.iter().product::<usize>();
+        let name = format!("0{sep}{}{sep}{}{sep}{}", key[0], key[1], key[2]);
+        let path = dir.join(&name);
+        let mut file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // a uint8 fill value is one byte, the same in both channels, so channel order does not matter
+                let mut out = Vec::with_capacity_in(n, alloc);
+                out.resize(n, fill[0]);
+                return Ok(Some(out));
+            }
+            Err(e) => return Err(eyre!("{}: {e}", path.display())),
+        };
+        let size = file.metadata().map_err(|e| eyre!("{}: {e}", path.display()))?.len() as usize;
+        let mut bytes = Vec::with_capacity_in(size, alloc);
+        bytes.resize(size, 0);
+        file.read_exact(&mut bytes).map_err(|e| eyre!("{}: {e}", path.display()))?;
+        let mut out = blosc_decompress_in(&bytes, alloc).map_err(|e| eyre!("chunk {name}: {e}"))?;
+        ensure!(out.len() == n, "chunk {name} decoded to {} bytes, expected {n}", out.len());
+        if self.reverse {
+            let (a, b) = out.split_at_mut(n / 2);
+            a.swap_with_slice(b);
+        }
+        Ok(Some(out))
+    }
+}
+
+/// One spatial chunk of predictions read by [`Predictions::read_chunk_in`]: uint8 `(2, dims)` in V, H order, C order
+pub struct NativeChunk<A: Allocator> {
+    /// Origin in voxels, z, y, x
+    pub lo: [usize; 3],
+    /// Extent in voxels, clipped to the array
+    pub dims: [usize; 3],
+    pub data: Vec<u8, A>,
 }
 
 /// Copy `count` elements of `es` bytes, `stride` elements apart from element `first`, contiguously into `out`
@@ -366,18 +432,25 @@ pub(crate) fn decode(compressor: Compressor, bytes: Vec<u8>, n: usize) -> Result
 
 /// Decompress one Blosc 1 frame with c-blosc
 pub(crate) fn blosc_decompress(src: &[u8]) -> Result<Vec<u8>> {
+    blosc_decompress_in(src, Global)
+}
+
+/// Decompress one Blosc 1 frame with c-blosc into a buffer from `alloc`
+pub(crate) fn blosc_decompress_in<A: Allocator>(src: &[u8], alloc: A) -> Result<Vec<u8, A>> {
     let mut nbytes = 0usize;
     // SAFETY: c-blosc reads at most `src.len()` bytes of the header to validate it
     let valid = unsafe { blosc_src::blosc_cbuffer_validate(src.as_ptr().cast(), src.len(), &mut nbytes) };
     ensure!(valid == 0, "not a valid Blosc frame");
-    let mut out = vec![0u8; nbytes];
+    let mut out = Vec::with_capacity_in(nbytes, alloc);
     if nbytes == 0 {
         return Ok(out);
     }
-    // SAFETY: the frame was validated against `src.len()`, and c-blosc writes at most `nbytes` bytes;
-    // the context call keeps no global state, so rayon threads may decode at once
+    // SAFETY: the frame was validated against `src.len()`, and c-blosc writes at most `nbytes` bytes into the
+    // buffer's capacity; the context call keeps no global state, so rayon threads may decode at once
     let n = unsafe { blosc_src::blosc_decompress_ctx(src.as_ptr().cast(), out.as_mut_ptr().cast(), nbytes, 1) };
     ensure!(n >= 0 && n as usize == nbytes, "Blosc frame failed to decode ({n})");
+    // SAFETY: c-blosc reported writing all `nbytes` bytes
+    unsafe { out.set_len(nbytes) };
     Ok(out)
 }
 
@@ -472,7 +545,8 @@ mod tests {
 
     use serde_json::Value;
 
-    use super::Predictions;
+    use super::{NativeChunk, Predictions};
+    use crate::arena::BufferPool;
 
     /// Every case in `tests/fixtures/readers` (the expected values were written by the reference's own
     /// reader): the same bytes as `Predictions.read`, quantized and not, over the whole
@@ -515,5 +589,39 @@ mod tests {
                 (Err(e), None) => panic!("{name}: {e}"),
             }
         }
+    }
+
+    /// Every chunk of every readable fixture, read through a pool as the native cache does, holds the same
+    /// bytes as the reference reader's window over it, whether it takes the direct Blosc path or not
+    #[test]
+    fn pooled_chunk_reads_match_window_reads() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/readers");
+        let manifest: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(root.join("manifest.json")).expect("manifest"))
+                .expect("manifest json");
+        let pool = BufferPool::new(1 << 20);
+        let (mut checked, mut direct) = (0, 0);
+        for case in manifest.iter().filter(|c| c["error"].is_null()) {
+            let p = Predictions::open(
+                &root.join(case["path"].as_str().unwrap()),
+                case["key"].as_str(),
+                case["order"].as_str().unwrap(),
+            )
+            .unwrap();
+            let edge = p.chunk_shape().unwrap_or([64, 64, 64]);
+            let grid = [0, 1, 2].map(|a| p.shape[a].div_ceil(edge[a]));
+            for z in 0..grid[0] {
+                for y in 0..grid[1] {
+                    for x in 0..grid[2] {
+                        let NativeChunk { lo, dims, data } = p.read_chunk_in([z, y, x], edge, &pool).unwrap();
+                        let hi = [0, 1, 2].map(|a| lo[a] + dims[a]);
+                        assert_eq!(&data[..], &p.read_u8(lo, hi).unwrap()[..], "{}", case["name"]);
+                        checked += 1;
+                        direct += p.whole_chunk_in([z, y, x], edge, dims, &pool).unwrap().is_some() as usize;
+                    }
+                }
+            }
+        }
+        assert!(checked > 30 && direct > 10, "too few chunks checked: {checked}, {direct} directly");
     }
 }
