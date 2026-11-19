@@ -37,8 +37,10 @@ python -m fibrs ARGS      # the same, from Python
 
 Centrality runs on the GPU when a usable one is found: Linux x86-64, an NVIDIA GPU of compute capability 8.0 or
 later, and its driver (no CUDA toolkit). Otherwise it runs on the CPU, and the log says why. `--device cpu` keeps
-it on the CPU, `--device cuda` fails instead of falling back, and `--cuda-device N` picks the GPU. A resumed run
-stays on the device it started on.
+it on the CPU, `--device cuda` fails instead of falling back, and `--cuda-device N` picks the GPU. The GPU rounds
+some steps differently from the CPU (see "Differences from the original"), and a resumed run keeps the rounding it
+started with. A run started on the GPU can resume without one: the CPU then computes centrality as the GPU does,
+more slowly. `--device auto` does the same if the GPU fails mid-run, for example when it runs out of memory.
 
 `fibrs.run([...])` runs it from Python and returns the exit status.
 

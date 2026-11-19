@@ -30,7 +30,7 @@ use crate::gpu::Gpu;
 use crate::input::Predictions;
 use crate::kernels::{Coverage, Fields, RawCurve, Scratch, trace_seed};
 use crate::log;
-use crate::stage1::Separate;
+use crate::stage1::{Fused, Separate};
 use crate::vol::{EDGE, Shape, Vol};
 
 /// The reference release whose interface and output this reproduces
@@ -498,7 +498,13 @@ pub fn run(args: Args) -> Result<Summary> {
             bail!("Output cannot be inside an input Zarr store");
         }
     }
-    let gpu = centrality_device(args.device, args.cuda_device as usize, &work)?;
+    let families: Vec<usize> = match args.family {
+        Family::Both => vec![1, 2],
+        Family::V => vec![1],
+        Family::H => vec![2],
+    };
+    let tracing_needed = families.iter().any(|&f| !family_complete(&work, f));
+    let cent = CentralityDevice::choose(args.device, args.cuda_device as usize, &work, tracing_needed)?;
     fs::create_dir_all(&work)?;
     let _lock = WorkLock::acquire(&work.join(".lock"))?;
     let family_name = match args.family {
@@ -515,7 +521,7 @@ pub fn run(args: Args) -> Result<Summary> {
         "tracing_array": args.tracing_array,
         "channel_order": order,
         "shape": native.shape,
-        "device": if gpu.is_some() { "cuda" } else { "cpu" },
+        "device": cent.rounding.name(),
         "storage": match args.storage { Storage::Dense => "dense", Storage::Compressed => "compressed" },
         "family": family_name,
         "voxel_size_um": args.voxel_size_um,
@@ -557,16 +563,11 @@ pub fn run(args: Args) -> Result<Summary> {
         save_json(&manifest, &config)?;
     }
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads as usize).build()?;
-    let families: Vec<usize> = match args.family {
-        Family::Both => vec![1, 2],
-        Family::V => vec![1],
-        Family::H => vec![2],
-    };
     let pending: Vec<usize> = families.iter().copied().filter(|&f| !family_complete(&work, f)).collect();
     if !pending.is_empty() {
         let cache_bytes = (args.native_cache_mib + args.field_cache_mib) as usize * 1024 * 1024;
         pool.install(|| {
-            trace_families(&native, supplied.as_ref(), &work, &pending, threads as usize, cache_bytes, gpu.as_ref())
+            trace_families(&native, supplied.as_ref(), &work, &pending, threads as usize, cache_bytes, &cent)
         })?;
     }
     let started = Instant::now();
@@ -718,7 +719,7 @@ fn trace_families(
     families: &[usize],
     threads: usize,
     cache_bytes: usize,
-    gpu: Option<&Gpu>,
+    cent: &CentralityDevice,
 ) -> Result<()> {
     let t = Instant::now();
     log!("Preparing tracing predictions");
@@ -736,7 +737,7 @@ fn trace_families(
     let pool = BufferPool::new(CHUNK_POOL_RETAIN);
     let cache = NativeCache::new(native, cache_bytes, &pool);
     for &family in families {
-        trace_family(&tracing, &nx, &ny, &cache, work, family, Compute { threads, gpu })?;
+        trace_family(&tracing, &nx, &ny, &cache, work, family, Compute { threads, cent })?;
         release_freed();
     }
     Ok(())
@@ -838,43 +839,113 @@ fn gib(bytes: usize) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
 }
 
-/// Where a family's stages run: tracing and finishing on `threads` CPU threads, centrality on the GPU when given
+/// Where a family's stages run: tracing and finishing on `threads` CPU threads, centrality as `cent` says
 #[derive(Clone, Copy)]
 struct Compute<'a> {
     threads: usize,
-    gpu: Option<&'a Gpu>,
+    cent: &'a CentralityDevice,
 }
 
-/// The GPU centrality runs on, or None for the CPU
-///
-/// `auto` resumes a run on the device it started on, so one run never mixes the two roundings; otherwise it takes
-/// the GPU when one opens and falls back to the CPU, saying why
-fn centrality_device(device: Device, index: usize, work: &Path) -> Result<Option<Gpu>> {
-    let started_on = || -> Option<String> {
-        let saved: Value = serde_json::from_str(&fs::read_to_string(work.join("run.json")).ok()?).ok()?;
-        saved.get("native")?;
-        Some(saved["device"].as_str()?.to_owned())
-    };
-    let gpu = match (device, started_on().as_deref()) {
-        (Device::Cpu, _) | (Device::Auto, Some("cpu")) => None,
-        (Device::Cuda, _) => {
-            Some(Gpu::open(index).map_err(|e| eyre!("--device cuda needs a usable NVIDIA GPU: {e:#}"))?)
+/// Which of the original's devices a run's centrality reproduces: its CPU kernel rounds some multiply-adds twice
+/// where its CUDA kernels round them once (`stage1.rs`). `run.json` records it as `device`, so one run never mixes
+/// the two, while the hardware a resumed run computes it on may change
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rounding {
+    Cpu,
+    Cuda,
+}
+
+impl Rounding {
+    fn name(self) -> &'static str {
+        match self {
+            Rounding::Cpu => "cpu",
+            Rounding::Cuda => "cuda",
         }
-        (Device::Auto, Some("cuda")) => {
-            Some(Gpu::open(index).map_err(|e| eyre!("This run started on the GPU and resumes only on one: {e:#}"))?)
-        }
-        (Device::Auto, _) => match Gpu::open(index) {
-            Ok(gpu) => Some(gpu),
-            Err(e) => {
-                log!("Centrality on the CPU: no usable GPU ({e:#})");
-                None
-            }
-        },
-    };
-    if let Some(gpu) = &gpu {
-        log!("Centrality on {} (--device cpu to use the CPU)", gpu.name());
     }
-    Ok(gpu)
+}
+
+/// How a run computes centrality: the rounding it reproduces and, for the CUDA rounding, the GPU when one runs it
+/// (without one, the CPU computes the CUDA rounding, more slowly)
+struct CentralityDevice {
+    rounding: Rounding,
+    gpu: Option<Gpu>,
+    /// Whether a GPU failure mid-run ends the run (`--device cuda`) instead of moving to the CPU
+    strict: bool,
+}
+
+impl CentralityDevice {
+    /// The rounding a new run takes from `device`, or a resumed run from its `run.json`, and the GPU to compute
+    /// it on, opened only when a family still needs centrality
+    ///
+    /// `auto` takes the GPU when one opens, and otherwise the CPU, saying why
+    fn choose(device: Device, index: usize, work: &Path, tracing_needed: bool) -> Result<Self> {
+        let started_on = || -> Option<String> {
+            let saved: Value = serde_json::from_str(&fs::read_to_string(work.join("run.json")).ok()?).ok()?;
+            saved.get("native")?;
+            Some(saved["device"].as_str()?.to_owned())
+        };
+        let strict = device == Device::Cuda;
+        let cpu = |rounding| Self { rounding, gpu: None, strict };
+        let on_gpu = |gpu: Gpu| {
+            log!("Centrality on {} (--device cpu to use the CPU)", gpu.name());
+            Self { rounding: Rounding::Cuda, gpu: Some(gpu), strict }
+        };
+        let open = || Gpu::open(index);
+        let chosen = match (started_on().as_deref(), device) {
+            (Some("cpu"), Device::Cuda) => {
+                bail!("This run started with centrality on the CPU and resumes only there; use --device cpu or auto")
+            }
+            (Some("cpu"), _) | (None, Device::Cpu) => cpu(Rounding::Cpu),
+            (Some(_), _) if !tracing_needed => cpu(Rounding::Cuda),
+            (Some(_), Device::Cpu) => {
+                log!("Centrality on the CPU, rounded as on the GPU this run started on");
+                cpu(Rounding::Cuda)
+            }
+            (_, Device::Cuda) => on_gpu(open().map_err(|e| eyre!("--device cuda needs a usable NVIDIA GPU: {e:#}"))?),
+            (Some(_), Device::Auto) => match open() {
+                Ok(gpu) => on_gpu(gpu),
+                Err(e) => {
+                    log!("Centrality on the CPU, rounded as on the GPU this run started on: no usable GPU ({e:#})");
+                    cpu(Rounding::Cuda)
+                }
+            },
+            (None, Device::Auto) => match open() {
+                Ok(gpu) => on_gpu(gpu),
+                Err(e) => {
+                    log!("Centrality on the CPU: no usable GPU ({e:#})");
+                    cpu(Rounding::Cpu)
+                }
+            },
+        };
+        Ok(chosen)
+    }
+
+    /// One family's centrality and seeds in the run's rounding
+    ///
+    /// When the GPU fails, such as out of memory, the CPU computes the same CUDA rounding unless `--device cuda`
+    /// asked for the GPU only
+    fn compute(
+        &self,
+        tracing: &[Vol<u8>; 2],
+        family: usize,
+        pres: &Presence,
+        nx: &Vol<u8>,
+        ny: &Vol<u8>,
+    ) -> Result<FamilyFields> {
+        let gpu = match (self.rounding, &self.gpu) {
+            (Rounding::Cpu, _) => return Ok(centrality::<Separate>(pres, nx, ny)),
+            (Rounding::Cuda, None) => return Ok(centrality::<Fused>(pres, nx, ny)),
+            (Rounding::Cuda, Some(gpu)) => gpu,
+        };
+        match gpu.centrality(tracing, family, nx, ny) {
+            Ok(fields) => Ok(fields),
+            Err(e) if !self.strict => {
+                log!("Centrality on the CPU, rounded as on the GPU: the GPU failed ({e:#})");
+                Ok(centrality::<Fused>(pres, nx, ny))
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 fn trace_family(
@@ -884,17 +955,14 @@ fn trace_family(
     cache: &NativeCache,
     work: &Path,
     family: usize,
-    Compute { threads, gpu }: Compute,
+    Compute { threads, cent }: Compute,
 ) -> Result<()> {
     let label = if family == 1 { "V" } else { "H" };
     let folder = family_dir(work, family);
     fs::create_dir_all(&folder)?;
     let t = Instant::now();
     let pres = Presence::new(tracing, family);
-    let FamilyFields { cent, seeds } = match gpu {
-        None => centrality::<Separate>(&pres, nx, ny),
-        Some(gpu) => gpu.centrality(tracing, family, nx, ny)?,
-    };
+    let FamilyFields { cent, seeds } = cent.compute(tracing, family, &pres, nx, ny)?;
     log!("{label} centrality: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem(label, &[("cent", cent.resident_bytes()), ("seeds", seeds.len() * std::mem::size_of::<Seed>())]);
     let t = Instant::now();

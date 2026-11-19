@@ -36,6 +36,18 @@ const BLOCK: u32 = 256;
 /// Most tiles in one unit: bounds the pinned host memory each of the two units in flight holds (at most about
 /// 16 MB of bricks and 8 MB of centrality per tile, far less in a band's mostly empty bricks)
 const UNIT_TILES: usize = 32;
+/// Most device memory one tile can need in a slot, `fit`'s spare half included: the brick pool and tables of the
+/// four volumes over its region's bricks, three u8 and one u16 scratch arrays over its region, the u16 output and
+/// its packed copy, the seed list, and the per-brick flags, slots and ids
+const TILE_DEVICE_BYTES: usize = {
+    let side = TILE + 2 * TILE_HALO;
+    let region = side.pow(3);
+    let region_bricks = (side / EDGE + 1).pow(3);
+    let core = TILE.pow(3);
+    let bytes =
+        4 * region_bricks * (BRICK + 4) + 5 * region + 2 * 2 * core + 8 * core.div_ceil(2) + 3 * 4 * core / BRICK;
+    bytes + bytes / 2
+};
 
 /// One PTX parameter's kind
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +105,8 @@ pub struct Gpu {
     /// The device's index, model and compute capability, for the log
     name: String,
     k: Kernels,
+    /// Most tiles per unit, so both slots' buffers fit in half the device memory free when it opened
+    unit_tiles: usize,
     /// `decode_dir` in the reference's CUDA rounding for every `nx << 8 | ny`, four float64 per entry
     dirs: CudaSlice<f64>,
 }
@@ -104,6 +118,8 @@ impl Gpu {
         if !unsafe { sys::is_culib_present() } {
             bail!("no NVIDIA driver found (libcuda.so)");
         }
+        // cudarc passes the index to the driver as an i32, so a larger one would wrap to another device
+        ensure!(i32::try_from(device).is_ok(), "CUDA device index {device} is out of range");
         let ctx = CudaContext::new(device).map_err(|e| {
             let reason = e.error_string().map_or_else(|_| format!("{e:?}"), |s| s.to_string_lossy().into_owned());
             eyre!("cannot open CUDA device {device}: {reason}")
@@ -127,8 +143,12 @@ impl Gpu {
         let stream = ctx.default_stream();
         let dirs = stream.clone_htod(&table)?;
         stream.synchronize()?;
+        // the other half is left for the driver, other processes and later stages; a device too full for even one
+        // tile per unit fails in `centrality`, which `--device auto` answers by running on the CPU
+        let (free, _) = ctx.mem_get_info()?;
+        let unit_tiles = (free / 2 / (2 * TILE_DEVICE_BYTES)).clamp(1, UNIT_TILES);
         let name = format!("CUDA device {device}, {} (compute capability {major}.{minor})", ctx.name()?);
-        Ok(Self { ctx, name, k, dirs })
+        Ok(Self { ctx, name, k, unit_tiles, dirs })
     }
 
     pub fn name(&self) -> &str {
@@ -154,7 +174,7 @@ impl Gpu {
                 && shape.iter().all(|&n| u32::try_from(n).is_ok()),
             "volume of {shape:?} voxels is too large to index seeds"
         );
-        let units = units(&tracing[family - 1], shape);
+        let units = units(&tracing[family - 1], shape, self.unit_tiles);
         let mut cent = Vol::new(shape, 0u16);
         let mut seeds = Vec::new();
         let mut slots = [Slot::new(&self.ctx)?, Slot::new(&self.ctx)?];
@@ -189,11 +209,11 @@ fn region((start, end): TileSpan, shape: Shape) -> (Shape, Shape) {
     (lo, [0, 1, 2].map(|a| hi[a] - lo[a]))
 }
 
-/// The family's tiles in the reference's order, grouped into units of adjacent tiles along x
+/// The family's tiles in the reference's order, grouped into units of up to `unit_tiles` adjacent tiles along x
 ///
 /// A tile whose region holds no brick of the family's own pooled prediction has presence 0 throughout, so no
 /// centrality and no seeds, and is left out; the CPU path skips those tiles and every other tile under presence 64
-fn units(own: &Vol<u8>, shape: Shape) -> Vec<Vec<TileSpan>> {
+fn units(own: &Vol<u8>, shape: Shape, unit_tiles: usize) -> Vec<Vec<TileSpan>> {
     let all = tiles(shape, TILE);
     let keep: Vec<bool> = all
         .par_iter()
@@ -212,7 +232,7 @@ fn units(own: &Vol<u8>, shape: Shape) -> Vec<Vec<TileSpan>> {
         let start = t.0;
         let adjacent = prev.is_some_and(|p| p[0] == start[0] && p[1] == start[1] && p[2] + TILE == start[2]);
         match units.last_mut() {
-            Some(unit) if adjacent && unit.len() < UNIT_TILES => unit.push(t),
+            Some(unit) if adjacent && unit.len() < unit_tiles => unit.push(t),
             _ => units.push(vec![t]),
         }
         prev = Some(start);
@@ -240,7 +260,6 @@ struct Meta {
 
 /// One unit in flight: a stream with the device buffers and pinned host buffers it uses, grown as units need
 struct Slot {
-    ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     desc: CudaSlice<u32>,
     table: CudaSlice<u32>,
@@ -273,11 +292,28 @@ fn fit<T: DeviceRepr + ValidAsZeroBits>(stream: &Arc<CudaStream>, buf: &mut Cuda
     Ok(())
 }
 
+/// `n` elements of pinned host memory, zeroed, so the typed slices made over it never cover uninitialized memory
+fn pinned<T: DeviceRepr + ValidAsZeroBits>(ctx: &Arc<CudaContext>, n: usize, flags: u32) -> Result<PinnedHostSlice<T>> {
+    // SAFETY: the allocation is zeroed below, before any slice is made over it
+    let mut buf = unsafe { ctx.alloc_pinned_with_flags::<T>(n, flags) }.wrap_err("allocate pinned host memory")?;
+    // SAFETY: the pointer is valid for `n` elements, and all-zero bytes are a valid `T`
+    unsafe { buf.as_mut_ptr()?.write_bytes(0, n) };
+    Ok(buf)
+}
+
 /// Grow a pinned host buffer to hold `n` elements, as [`fit`] does
-fn fit_host<T: DeviceRepr>(ctx: &Arc<CudaContext>, buf: &mut PinnedHostSlice<T>, n: usize, flags: u32) -> Result<()> {
+///
+/// The copies take plain slices of these buffers, which cudarc does not track, so the stream is synchronized
+/// before the old buffer is freed
+fn fit_host<T: DeviceRepr + ValidAsZeroBits>(
+    stream: &Arc<CudaStream>,
+    buf: &mut PinnedHostSlice<T>,
+    n: usize,
+    flags: u32,
+) -> Result<()> {
     if buf.len() < n {
-        // SAFETY: every element is written (by the host or a copy from the device) before it is read
-        *buf = unsafe { ctx.alloc_pinned_with_flags(n + n / 2, flags) }.wrap_err("allocate pinned host memory")?;
+        stream.synchronize()?;
+        *buf = pinned(stream.context(), n + n / 2, flags)?;
     }
     Ok(())
 }
@@ -289,19 +325,12 @@ fn grid_1d(n: usize) -> Result<u32> {
 impl Slot {
     fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         let stream = ctx.new_stream()?;
-        let wc = sys::CU_MEMHOSTALLOC_WRITECOMBINED;
-        // SAFETY: as in fit_host; these hold nothing until grown and written
-        let (staging, host_count, host_packed, host_ids, host_seeds) = unsafe {
-            (
-                ctx.alloc_pinned_with_flags(1, wc)?,
-                ctx.alloc_pinned_with_flags(2, 0)?,
-                ctx.alloc_pinned_with_flags(1, 0)?,
-                ctx.alloc_pinned_with_flags(1, 0)?,
-                ctx.alloc_pinned_with_flags(1, 0)?,
-            )
-        };
         Ok(Self {
-            ctx: ctx.clone(),
+            staging: pinned(ctx, 1, sys::CU_MEMHOSTALLOC_WRITECOMBINED)?,
+            host_count: pinned(ctx, 2, 0)?,
+            host_packed: pinned(ctx, 1, 0)?,
+            host_ids: pinned(ctx, 1, 0)?,
+            host_seeds: pinned(ctx, 1, 0)?,
             desc: stream.alloc_zeros(1)?,
             table: stream.alloc_zeros(1)?,
             pool: stream.alloc_zeros(1)?,
@@ -317,11 +346,6 @@ impl Slot {
             seeds: stream.alloc_zeros(1)?,
             count: stream.alloc_zeros(2)?,
             stream,
-            staging,
-            host_count,
-            host_packed,
-            host_ids,
-            host_seeds,
         })
     }
 
@@ -386,7 +410,7 @@ impl Slot {
         ensure!(base <= u32::MAX as usize && out <= u32::MAX as usize, "a unit is too large for the kernels' indices");
 
         let n_pool = payloads.len() * BRICK;
-        fit_host(&self.ctx, &mut self.staging, n_pool, sys::CU_MEMHOSTALLOC_WRITECOMBINED)?;
+        fit_host(&self.stream, &mut self.staging, n_pool, sys::CU_MEMHOSTALLOC_WRITECOMBINED)?;
         // the pool gathers the scattered bricks into pinned memory, so its upload is one asynchronous copy
         let host = &mut self.staging.as_mut_slice()?[..n_pool];
         host.par_chunks_mut(BRICK).zip(payloads.par_iter()).for_each(|(d, s)| d.copy_from_slice(&s[..]));
@@ -513,9 +537,9 @@ impl Slot {
         ensure!(n_seeds <= m.cap, "{n_seeds} seeds overflow a unit's list of {}", m.cap);
         ensure!(n_packed <= m.bricks.len(), "{n_packed} packed bricks of {}", m.bricks.len());
         let n_values = n_packed * BRICK;
-        fit_host(&self.ctx, &mut self.host_packed, n_values, 0)?;
-        fit_host(&self.ctx, &mut self.host_ids, n_packed, 0)?;
-        fit_host(&self.ctx, &mut self.host_seeds, n_seeds, 0)?;
+        fit_host(&self.stream, &mut self.host_packed, n_values, 0)?;
+        fit_host(&self.stream, &mut self.host_ids, n_packed, 0)?;
+        fit_host(&self.stream, &mut self.host_seeds, n_seeds, 0)?;
         if n_packed > 0 {
             self.stream
                 .memcpy_dtoh(&self.packed.slice(..n_values), &mut self.host_packed.as_mut_slice()?[..n_values])?;
@@ -531,6 +555,15 @@ impl Slot {
         }
         seeds.extend(self.host_seeds.as_slice()?[..n_seeds].iter().map(|&raw| Seed::from_raw(raw)));
         Ok(())
+    }
+}
+
+impl Drop for Slot {
+    /// Wait for the slot's queued copies before its pinned buffers are freed: cudarc does not track the plain
+    /// slices they were given, and an error can leave a copy queued after `stage` or `launch` returns early
+    fn drop(&mut self) {
+        // a failed sync means the context is broken, and freeing then is all that is left to do
+        let _ = self.stream.synchronize();
     }
 }
 

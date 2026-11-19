@@ -403,8 +403,9 @@ pub unsafe fn fb_seeds(
     let first = t.out / BRICK;
     unsafe { *out.add(t.out as usize + (brick * BRICK + at) as usize) = c };
     if c != 0 {
-        // every writer stores the same 1, so the racing stores need no atomic
-        unsafe { *flags.add((first + brick) as usize) = 1 };
+        // many threads mark the same brick; a relaxed atomic store makes those concurrent writes well defined
+        // SAFETY: `flags` holds one u32 per output brick of the unit, zeroed by the host
+        unsafe { DeviceAtomicU32::from_ptr(flags.add((first + brick) as usize)).store(1, AtomicOrdering::Relaxed) };
     }
     let interior = z >= 1 && y >= 1 && x >= 1 && z < t.dims[0] - 1 && y < t.dims[1] - 1 && x < t.dims[2] - 1;
     if !interior {
