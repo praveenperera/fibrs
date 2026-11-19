@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+- **Faster tracing on dense data.** Threads that finishing leaves idle now trace seeds ahead of the one being
+  committed. A seed traced ahead is traced again if an earlier seed marked the region it read before it was
+  committed, so the `.afv` is the same as before at every `--threads`. On a dense 512 × 2048 × 2048 crop of
+  PHerc0358 at `--threads 8`, a run took 41–43 s instead of 47–55 s, with the same 2.6 GiB peak.
+- **Tracing can run one thread beyond `--threads`.** One more thread commits the seeds in order. On that crop,
+  tracing kept 4.2–4.5 cores busy at `--threads 4` and 7.7 at `--threads 8`, where 0.3.0 kept 2.9 and 4.0 busy.
+  Size the cores you give a run with that in mind.
+
+## [0.3.0] - 2026-11-19
+
+fibrs 0.3.0 runs the tracer's direction field and centrality on an NVIDIA GPU when one is usable, and on the CPU
+otherwise. The GPU direction field is the CPU's bit for bit. With both on the GPU, the `.afv` of a PHerc1545 band
+matched the CPU's in every fibre, point block, spatial-index row and metadata value but the per-run uuid. With
+centrality alone on the GPU, a PHerc0826 band matched too. `fibrs predict` can now record the CT's voxel size.
+
+### What's new
+
 - **Centrality on the GPU.** `--device` now defaults to `auto`: centrality and the ridge seeds run on an NVIDIA GPU
   of compute capability 8.0 or later when one is usable (Linux x86-64; a driver for CUDA 12.0 or newer is enough, no
   CUDA toolkit), and on the CPU otherwise, with the reason in the log. `--device cpu` keeps them on the CPU,
@@ -16,24 +33,34 @@
   and its bytes are the CPU's: the GPU certifies each voxel's eigenvector against an error bound, and the CPU solves
   the voxels it cannot certify with the same `dsyevd`, which the log line counts. If the GPU fails mid-run, the CPU
   computes the direction field instead, unless `--device cuda` was given.
-- **Faster tracing on dense data.** Threads that finishing leaves idle now trace seeds ahead of the one being
-  committed. A seed traced ahead is traced again if an earlier seed marked the region it read before it was
-  committed, so the `.afv` is the same as before at every `--threads`. On a dense 512 × 2048 × 2048 crop of
-  PHerc0358 at `--threads 8`, a run took 41–43 s instead of 47–55 s, with the same 2.6 GiB peak.
-- **Tracing can run one thread beyond `--threads`.** One more thread commits the seeds in order. On that crop,
-  tracing kept 4.2–4.5 cores busy at `--threads 4` and 7.7 at `--threads 8`, where 0.2.0 kept 2.9 and 4.0 busy.
-  Size the cores you give a run with that in mind.
+- **`fibrs predict --voxel-size-um`** sets the output's `voxel_size_um` attribute, which was always 9.362, the
+  PHerc0826 CT's voxel size, as in the reference. The default is still 9.362, so pass it for a CT with another voxel
+  size (8.64 for example). Predictions are unchanged. A resume with a different value is refused.
+
+### Upgrading
+
+- 0.3.0 doesn't resume a tracer work directory that 0.2.0 started, finished or not, so a `--resume` that only
+  writes the `.afv` again needs 0.2.0 too; otherwise start a new work directory. A `fibrs predict` band output that
+  0.2.0 started is refused on resume as well, as it is by any other binary. Predictions that 0.2.0 finished are
+  traced by 0.3.0 as before: the tracer takes the voxel size from `--voxel-size-um`, not from the prediction's
+  attributes.
+- `--device` now defaults to `auto`. Pass `--device cpu` to keep the direction field and centrality on the CPU, or to
+  match the original's default `--device cpu` output, whose centrality can round differently from the GPU's.
+
+### Fixes
+
+- `fibrs predict` reads the CT through the path its overlap check resolved. It used to open the CT again by the path
+  as given, so a link on that path changed during a run could make it read a different store from the one checked. A
+  test repoints such a link mid-run and checks that every tile still reads the CT that was checked.
+
+### Documentation
+
 - The README's "Same output" section now gives the PHerc0826 band's counts as measured: 149,680 fibres and 161,787
   point blocks and spatial-index rows. It said 149,780 and 161,887.
-- `fibrs predict --voxel-size-um` sets the output's `voxel_size_um` attribute, which was always 9.362, the PHerc0826
-  CT's voxel size, as in the reference. The default is still 9.362, so pass it for a CT with another voxel size
-  (8.64 for example). Predictions are unchanged. A resume with a different value is refused.
 - The README's tracer speed range is now 22×–47× on wall time and about 22×–38× on CPU time, from the three
   uninterrupted runs on bands of PHerc0826, PHerc1545 and PHerc0358. Two runs whose original was interrupted and
   resumed, one of them on a band of PHerc0813, are listed with estimated totals. The original's time per fibre
   differs between bands and between runs; on runs 4 and 5 fibrs's differed less.
-- `fibrs predict` reads the CT through the path its overlap check resolved. It used to open the CT again by the path
-  as given, so a link on that path changed during a run could make it read a different store from the one checked.
 - The README's dense PHerc0358 box prediction rows are now from fibrs `42c4710`, which has the 0.2.0 release's
   prediction code: 85.3 s in band mode (1.94×) and 84.5 s with `--mode villa` (1.96×), with prediction values
   identical to those of the pre-release build timed before.
@@ -241,6 +268,7 @@ The first release.
   Python module, and a CLI archive for each with `scripts/install-dropin.sh`
 - `--version` prints `0.2.0`, the original's version, as a drop-in has to
 
+[0.3.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.3.0
 [0.2.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.2.0
 [0.1.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.1.1
 [0.1.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.1.0
