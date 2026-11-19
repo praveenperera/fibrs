@@ -112,7 +112,7 @@ a 512-plane band of PHerc0813 (z 2304–2816):
 | 3 | `avf-spline-generator` 0.2.0 | 1,621 s (27 min) | 4,149 s | 4.6 GiB |
 | 3 | `fibrs` 0.1.0 | 73.4 s | 191 s | 7.0 GiB |
 | 4 | `avf-spline-generator` 0.2.0 | 15,632 s (4.3 h) | 32,739 s | 4.6 GiB |
-| 4 | `fibrs` 0.2.0 | 332 s | 902 s | 14.0 GiB |
+| 4 | `fibrs` `42c4710` | 332 s | 902 s | 14.0 GiB |
 | 5 | `avf-spline-generator` 0.2.0 | about 9,176 s (2.5 h) | about 27,460 s | 4.7 GiB |
 | 5 | `fibrs` 0.2.0 | 202 s | 564 s | 11.8 GiB |
 | Speedup, runs 2 to 4 | | **22×–47×** | **about 22×–38×** (38× with the 853 s repeat of run 4) | |
@@ -137,8 +137,8 @@ a 512-plane band of PHerc0813 (z 2304–2816):
 
 The original kept about 2.1–3.0 cores busy in runs 2 to 5 and about one in run 1; the CPU times of runs 1 and 5 are
 partly estimated. The port kept about 2.6–2.8. The ratio varies with the run and with the machine's load: the
-ranges are the lowest and highest of the uninterrupted runs, 2 to 4. The CPU range also covers a second fibrs 0.2.0
-run on the run 4 band, which used 853 s of CPU time (38×).
+ranges are the lowest and highest of the uninterrupted runs, 2 to 4. The CPU range also covers a second run of the
+same build on the run 4 band, which used 853 s of CPU time (38×).
 
 On dense bands, fibrs's speed also depends on how it reads the predictions and allocates memory. Take a
 512 × 2048 × 2048 crop of PHerc0358's densest area (z 1792–2304, y 2176–4224, x 2944–4992) with `--threads 8`
@@ -304,10 +304,11 @@ overlaps. The speedup is the mean of the per-pair ratios:
 | bf16 (opt-in) | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) |
 
 On a 512 × 2048 × 2048 box of PHerc0358 (z 2304–2816, y 2176–4224, x 2944–4992) with no all-zero tile, one run of
-each at fp32 on the same GPU, not at the same time, took 165.6 s for villa, 85.3 s for fibrs 0.2.0 in band mode
+each at fp32 on the same GPU, not at the same time, took 165.6 s for villa, 85.3 s for fibrs `42c4710` in band mode
 (1.94×) and 84.5 s with `--mode villa` (1.96×). At fp32 the measured speedup is 1.68×–1.96×; the lowest is the
 single PHerc0826 run in band mode behind the end-to-end row under
-[Why the speed-up varies](#why-the-speed-up-varies) (45.4 s and 27.0 s).
+[Why the speed-up varies](#why-the-speed-up-varies) (45.4 s and 27.0 s). `42c4710` has the same prediction code and
+dependencies as the 0.2.0 release, which adds one tracer change.
 
 On the PHerc0826 crop, fibrs was a pre-release build of 0.2.0 (`e9adcc9`); both fibrs builds ran with cuDNN 9.27.0
 and cuBLAS 13.4.1.3. villa ran PyTorch 2.14.1 (CUDA 13.0) with cuDNN 9.24, at `0bddf2757`.
@@ -384,12 +385,12 @@ more than one:
 | Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 11,840 s | 191 s | about 62× | CPU | one run each; the original was interrupted and resumed; total estimated (run 1; fibrs built before 0.1.0) |
 | Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 4,686 s | 172 s | 27× | CPU | one run each (run 2; fibrs 0.1.0) |
 | Tracing | PHerc1545 | z 1280–1792, whole plane | 8.4% | 1,621 s | 73.4 s | 22× | CPU | one run each (run 3; fibrs 0.1.0) |
-| Tracing | PHerc0358 | z 2304–2816, whole plane | 33.2% | 15,632 s | 332 s | 47× | CPU | one run each, not at the same time (run 4; fibrs 0.2.0) |
+| Tracing | PHerc0358 | z 2304–2816, whole plane | 33.2% | 15,632 s | 332 s | 47× | CPU | one run each, not at the same time (run 4; fibrs `42c4710`, before 0.2.0's chunk-cache change) |
 | Tracing | PHerc0813 | z 2304–2816, whole plane | 25.4% | 9,176 s | 202 s | about 45× | CPU | one run each, not at the same time; the original was interrupted and resumed; total estimated (run 5; fibrs 0.2.0) |
 | Prediction, `--mode villa` | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 45.37 s | 26.77 s | 1.72× (1.66–1.78×) | fp32 | ABBA, 6 pairs: medians, mean ratio with 95% CI |
 | Prediction, `--mode villa` | PHerc0826 | same crop | 100% | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) | bf16 (opt-in) | ABBA, 6 pairs: medians, mean ratio with 95% CI |
-| Prediction, band mode | PHerc0358 | z 2304–2816 / y 2176–4224 / x 2944–4992 | 100% | 165.6 s | 85.3 s | 1.94× | fp32 | one run each, not at the same time; fibrs 0.2.0 |
-| Prediction, `--mode villa` | PHerc0358 | same box | 100% | 165.6 s | 84.5 s | 1.96× | fp32 | one run each, not at the same time, against the same villa run; fibrs 0.2.0 |
+| Prediction, band mode | PHerc0358 | z 2304–2816 / y 2176–4224 / x 2944–4992 | 100% | 165.6 s | 85.3 s | 1.94× | fp32 | one run each, not at the same time; fibrs `42c4710` |
+| Prediction, `--mode villa` | PHerc0358 | same box | 100% | 165.6 s | 84.5 s | 1.96× | fp32 | one run each, not at the same time, against the same villa run; fibrs `42c4710` |
 | End to end, prediction in band mode | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 387.5 s | 41.7 s | 9.3× | fp32 | one run of each stage |
 | End to end, prediction in band mode | PHerc0358 | z 2304–2816, whole plane | 33.2% | 17,863 s, prediction estimated | 739 s | 24×, estimated | fp32 | villa's prediction time extrapolated from the box above; the rest one run of each stage, fibrs `e9adcc9` predicting; both tracers read fibrs's prediction |
 | Tracing, fibrs 0.1.0 → 0.2.0 | PHerc0358 | z 1792–2304 / y 2176–4224 / x 2944–4992 | 100% | 104 s (0.1.0) | 50–52 s (0.2.0) | 2.0–2.1× | CPU | back to back on one machine, `--threads 8`; not in the tracing range |
