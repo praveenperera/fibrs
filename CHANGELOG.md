@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### What's new
+
+- **Faster tracing on dense data.** Threads that finishing leaves idle now trace seeds ahead of the one being
+  committed. A seed traced ahead is traced again if an earlier seed marked the region it read before it was
+  committed, so the `.afv` is the same as before at every `--threads`. On a dense 512 × 2048 × 2048 crop of
+  PHerc0358 at `--threads 8`, a run took 41–43 s instead of 47–55 s, with the same 2.6 GiB peak.
+- **Tracing can run one thread beyond `--threads`.** One more thread commits the seeds in order. On that crop,
+  tracing kept 4.2–4.5 cores busy at `--threads 4` and 7.7 at `--threads 8`, where 0.2.0 kept 2.9 and 4.0 busy.
+  Size the cores you give a run with that in mind.
+
 ## [0.2.0] - 2026-11-19
 
 fibrs 0.2.0 adds `fibrs predict`. It runs Qual's [AFV fibre model V2](https://huggingface.co/Qualzz20/afv_fiber_9um_v2)

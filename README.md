@@ -37,6 +37,12 @@ python -m fibrs ARGS      # the same, from Python
 
 `fibrs.run([...])` runs it from Python and returns the exit status.
 
+`--threads N` sets the threads that trace and finish curves. Threads that finishing leaves idle trace seeds ahead of
+the one being committed, and one more thread commits the seeds in order, so tracing can run one thread beyond
+`--threads`. On a dense 512 × 2048 × 2048 crop of PHerc0358, tracing kept 4.2–4.5 cores busy at `--threads 4` and
+7.7 at `--threads 8`. A seed traced ahead is traced again if an earlier seed marked the region it read before it was
+committed, so the output is the same at every `--threads`.
+
 To make an environment's `avf-spline-generator` run the port, so scripts that call it need no change:
 
 ```sh
@@ -94,7 +100,9 @@ outputs were identical to the original's `.afv`.
 
 CI traces a small synthetic input (`tests/fixtures/synthetic`) with every build's wheel on Linux and macOS,
 through the drop-in and through `python -m fibrs`. Both must write what the original wrote for it, compared by
-`scripts/compare_afv.py`: every metadata value except the per-run uuid, the schema and every table row.
+`scripts/compare_afv.py`: every metadata value except the per-run uuid, the schema and every table row. The drop-in
+must also write it with no seed traced ahead of the one being committed (`FIBRS_DEBUG_WINDOW=1`) and with every seed
+traced ahead traced again (`FIBRS_DEBUG_RETRACE=1`).
 
 ## Speed
 
@@ -131,6 +139,10 @@ and `--field-cache-mib 224`, each pair of builds run back to back on the same bu
 50–52 s with a 2.6 GiB peak and writes the same `.afv` as 0.1.0, which took 104 s with a 3.5 GiB peak. A 0.2.0
 build that decoded whole chunks took 69–72 s, and one that also gave each decoded chunk its own mapping spent
 40% of its CPU time in the kernel.
+
+Tracing seeds ahead on idle threads (unreleased) takes that crop at `--threads 8` from 47–55 s to 41–43 s, in two
+pairs of runs pinned to the same eight cores on a busy machine: tracing V from 12.0–15.4 s to 8.5–9.9 s and H from
+8.7–10.2 s to 6.2–6.4 s. The `.afv` is the same, and the peak is 2.6 GiB for both.
 
 ## Differences from the original
 
