@@ -112,12 +112,34 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    /// Open CUDA device `device` (an index among the visible devices) and load the kernels
-    pub fn open(device: usize) -> Result<Self> {
+    /// Open CUDA device `device` (an index among the visible devices), or the first usable visible device, and load
+    /// the kernels
+    pub fn open(device: Option<usize>) -> Result<Self> {
         // SAFETY: probing for the driver library has no preconditions; cudarc panics on first use without it
         if !unsafe { sys::is_culib_present() } {
             bail!("no NVIDIA driver found (libcuda.so)");
         }
+        if let Some(device) = device {
+            return Self::open_device(device);
+        }
+
+        // a host can list an older GPU first, so each visible device gets its turn
+        let count = CudaContext::device_count().map_err(|e| eyre!("count the CUDA devices: {e:?}"))?;
+        let mut reasons = Vec::new();
+        for device in 0..count as usize {
+            match Self::open_device(device) {
+                Ok(gpu) => return Ok(gpu),
+                Err(e) => reasons.push(format!("{e:#}")),
+            }
+        }
+        match reasons.len() {
+            0 => bail!("no CUDA device is visible"),
+            1 => bail!("{}", reasons[0]),
+            _ => bail!("no CUDA device is usable: {}", reasons.join("; ")),
+        }
+    }
+
+    fn open_device(device: usize) -> Result<Self> {
         // cudarc passes the index to the driver as an i32, so a larger one would wrap to another device
         ensure!(i32::try_from(device).is_ok(), "CUDA device index {device} is out of range");
         let ctx = CudaContext::new(device).map_err(|e| {
@@ -282,6 +304,10 @@ struct Slot {
     host_packed: PinnedHostSlice<u16>,
     host_ids: PinnedHostSlice<u32>,
     host_seeds: PinnedHostSlice<u64>,
+    /// The table and descriptors of the unit in flight: the driver may read pageable memory after an asynchronous
+    /// copy returns, so they live until the slot's stream is synchronized
+    host_table: Vec<u32>,
+    host_desc: Vec<u32>,
 }
 
 /// Grow a device buffer to hold `n` elements, by half again beyond, so slowly growing units reallocate rarely
@@ -331,6 +357,8 @@ impl Slot {
             host_packed: pinned(ctx, 1, 0)?,
             host_ids: pinned(ctx, 1, 0)?,
             host_seeds: pinned(ctx, 1, 0)?,
+            host_table: Vec::new(),
+            host_desc: Vec::new(),
             desc: stream.alloc_zeros(1)?,
             table: stream.alloc_zeros(1)?,
             pool: stream.alloc_zeros(1)?,
@@ -417,9 +445,11 @@ impl Slot {
         fit(&self.stream, &mut self.pool, n_pool)?;
         fit(&self.stream, &mut self.table, table.len())?;
         fit(&self.stream, &mut self.desc, desc.len())?;
-        // the table and descriptors are pageable, so the driver has copied them out by the time these return
-        self.stream.memcpy_htod(&table, &mut self.table.slice_mut(..table.len()))?;
-        self.stream.memcpy_htod(&desc, &mut self.desc.slice_mut(..desc.len()))?;
+        // the slot's previous unit was collected, so its stream no longer reads the buffers replaced here
+        self.host_table = table;
+        self.host_desc = desc;
+        self.stream.memcpy_htod(&self.host_table, &mut self.table.slice_mut(..self.host_table.len()))?;
+        self.stream.memcpy_htod(&self.host_desc, &mut self.desc.slice_mut(..self.host_desc.len()))?;
         if n_pool > 0 {
             // pinned: the copy runs after this returns, and the staging buffer is not written again until this
             // slot's stream is synchronized in `collect`
@@ -559,7 +589,7 @@ impl Slot {
 }
 
 impl Drop for Slot {
-    /// Wait for the slot's queued copies before its pinned buffers are freed: cudarc does not track the plain
+    /// Wait for the slot's queued copies before its host buffers are freed: cudarc does not track the plain
     /// slices they were given, and an error can leave a copy queued after `stage` or `launch` returns early
     fn drop(&mut self) {
         // a failed sync means the context is broken, and freeing then is all that is left to do
@@ -627,7 +657,7 @@ mod tests {
     #[test]
     #[ignore = "needs an NVIDIA GPU; run through the GPU queue"]
     fn gpu_matches_fused_cpu() {
-        let gpu = Gpu::open(0).unwrap();
+        let gpu = Gpu::open(None).unwrap();
         let (tracing, nx, ny) = volumes();
         let shape = nx.shape();
         for family in [1, 2] {

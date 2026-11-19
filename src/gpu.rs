@@ -26,7 +26,7 @@ mod unsupported {
     pub enum Gpu {}
 
     impl Gpu {
-        pub fn open(_device: usize) -> Result<Self> {
+        pub fn open(_device: Option<usize>) -> Result<Self> {
             bail!("fibrs runs centrality on the GPU on Linux x86_64 only")
         }
 

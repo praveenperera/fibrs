@@ -128,9 +128,9 @@ pub struct Args {
     /// --device cuda output, which can differ from its cpu output by a rounding
     #[arg(long, value_enum, default_value = "auto")]
     pub device: Device,
-    /// Visible CUDA device index for the GPU
-    #[arg(long, default_value_t = 0)]
-    pub cuda_device: i64,
+    /// Visible CUDA device index for the GPU; without it, the first usable visible GPU
+    #[arg(long)]
+    pub cuda_device: Option<i64>,
     #[arg(long)]
     pub threads: Option<i64>,
     #[arg(long, default_value_t = 128)]
@@ -428,7 +428,10 @@ pub fn run(args: Args) -> Result<Summary> {
     {
         bail!("Voxel size must be positive and minimum length nonnegative");
     }
-    if args.origin_xyz.iter().min().copied().unwrap_or(0) < 0 || args.native_cache_mib < 1 || args.cuda_device < 0 {
+    if args.origin_xyz.iter().min().copied().unwrap_or(0) < 0
+        || args.native_cache_mib < 1
+        || args.cuda_device.is_some_and(|d| d < 0)
+    {
         bail!("Invalid origin, cache size or CUDA device");
     }
     fix_malloc_thresholds();
@@ -503,10 +506,11 @@ pub fn run(args: Args) -> Result<Summary> {
         Family::V => vec![1],
         Family::H => vec![2],
     };
-    let tracing_needed = families.iter().any(|&f| !family_complete(&work, f));
-    let cent = CentralityDevice::choose(args.device, args.cuda_device as usize, &work, tracing_needed)?;
     fs::create_dir_all(&work)?;
     let _lock = WorkLock::acquire(&work.join(".lock"))?;
+    // under the lock, so the saved rounding and the finished families are the ones this run resumes
+    let tracing_needed = families.iter().any(|&f| !family_complete(&work, f));
+    let cent = CentralityDevice::choose(args.device, args.cuda_device.map(|d| d as usize), &work, tracing_needed)?;
     let family_name = match args.family {
         Family::Both => "both",
         Family::V => "V",
@@ -878,7 +882,7 @@ impl CentralityDevice {
     /// it on, opened only when a family still needs centrality
     ///
     /// `auto` takes the GPU when one opens, and otherwise the CPU, saying why
-    fn choose(device: Device, index: usize, work: &Path, tracing_needed: bool) -> Result<Self> {
+    fn choose(device: Device, index: Option<usize>, work: &Path, tracing_needed: bool) -> Result<Self> {
         let started_on = || -> Option<String> {
             let saved: Value = serde_json::from_str(&fs::read_to_string(work.join("run.json")).ok()?).ok()?;
             saved.get("native")?;
