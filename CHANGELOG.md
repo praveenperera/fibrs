@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- The tracer stores its fields in 4³ sub-bricks within each 16³ brick, allocating only the sub-bricks that hold
+  data, so dense windows need less memory and write the same `.afv`. On PHerc0358's densest 1,024-plane window
+  with `--threads 8`, the peak fell from 21.6 GiB to 15.4 GiB with `--field-cache-mib 4096`, and from 17.7 GiB to
+  11.1 GiB with the default of 1024. No option or default changed.
 - The README's tracer speed range is now 22×–47× on wall time and about 22×–38× on CPU time, from the three
   uninterrupted runs on bands of PHerc0826, PHerc1545 and PHerc0358. Two runs whose original was interrupted and
   resumed, one of them on a band of PHerc0813, are listed with estimated totals. The original's time per fibre
