@@ -27,7 +27,8 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "saf
 memmap2 = "0.9"
 rayon = "1.12"
 rusqlite = { version = "0.40", features = ["bundled"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+# float_roundtrip parses each JSON number to the f64 Python reads, so a value written and read back compares equal
+serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
 sha2 = "0.10"
 zstd = "0.13"
 

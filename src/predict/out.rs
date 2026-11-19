@@ -492,6 +492,15 @@ mod tests {
         let saved: Value = serde_json::from_slice(&fs::read(out.join(".zattrs")).unwrap()).unwrap();
         assert_eq!(saved["voxel_size_um"], json!(8.64));
         fs::remove_dir_all(out).unwrap();
+
+        // a value whose shortest decimal has 17 digits reads back as the same f64, not as its 9.1 neighbour
+        let out = fresh("voxel-digits");
+        let precise = 9.100000000000001;
+        Output::open_or_create(&out, 4, 4, 4, &with(precise)).unwrap();
+        Output::open_or_create(&out, 4, 4, 4, &with(precise)).unwrap();
+        let err = Output::open_or_create(&out, 4, 4, 4, &with(9.1)).err().unwrap();
+        assert!(err.to_string().contains("voxel_size_um 9.100000000000001 there, 9.1 now"), "{err}");
+        fs::remove_dir_all(out).unwrap();
     }
 
     #[test]
