@@ -7,6 +7,10 @@
 //! pool of payloads and a table per volume, and runs five kernels over its tiles: gather, centrality, seeds, then
 //! slots and pack, which pack the nonzero centrality bricks densely for the download. Two units are in flight at a
 //! time on two streams, so the host stages one unit's bricks and installs another's results while the device works
+//!
+//! The direction field runs the same way over its own tiles (`axes.rs`)
+
+mod axes;
 
 use std::sync::Arc;
 
@@ -18,6 +22,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::Ptx;
 use rayon::prelude::*;
 
+use super::Stages;
 use crate::fields::{FamilyFields, Seed, TILE, TILE_HALO, tiles};
 use crate::stage1::{Arith, Fused};
 use crate::vol::{BRICK, EDGE, SHIFT, Shape, Vol};
@@ -61,14 +66,21 @@ enum Param {
 
 use Param::{Ptr, U32};
 
-/// Each kernel's PTX params, in the order every launch below passes them; checked against the embedded PTX when
-/// the device opens, so a stale PTX fails there instead of launching with mismatched arguments
-const KERNELS: [(&str, &[Param]); 5] = [
+/// Each kernel's PTX params, in the order every launch here and in `axes.rs` passes them; checked against the
+/// embedded PTX when the device opens, so a stale PTX fails there instead of launching with mismatched arguments
+const KERNELS: [(&str, &[Param]); 12] = [
     ("fb_gather", &[Ptr, Ptr, Ptr, U32, U32, U32, U32, U32, U32, U32, Ptr, Ptr, Ptr]),
     ("fb_centrality", &[Ptr, Ptr, Ptr, Ptr, Ptr, Ptr]),
     ("fb_seeds", &[Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, U32, Ptr, Ptr, Ptr, U32, Ptr]),
     ("fb_slots", &[Ptr, U32, Ptr, Ptr, Ptr]),
     ("fb_pack", &[Ptr, U32, Ptr, Ptr]),
+    ("fb_ax_gather", &[Ptr, Ptr, Ptr, U32, U32, U32, U32, U32, U32, U32, U32, Ptr, Ptr, Ptr]),
+    ("fb_ax_smooth0", &[Ptr, Ptr, U32, U32, Ptr, Ptr, Ptr]),
+    ("fb_ax_smooth", &[Ptr, Ptr, U32, U32, Ptr, Ptr]),
+    ("fb_ax_grad", &[Ptr, Ptr, U32, U32, Ptr, Ptr]),
+    ("fb_ax_tensor_z", &[Ptr, Ptr, U32, U32, Ptr, Ptr]),
+    ("fb_ax_tensor_y", &[Ptr, Ptr, U32, U32, Ptr, Ptr]),
+    ("fb_ax_eigen", &[Ptr, Ptr, U32, U32, U32, Ptr, Ptr, Ptr, Ptr, Ptr, U32, Ptr]),
 ];
 
 /// The params of kernel `name` in `ptx`, in order, read from the PTX text
@@ -100,6 +112,13 @@ struct Kernels {
     seeds: CudaFunction,
     slots: CudaFunction,
     pack: CudaFunction,
+    ax_gather: CudaFunction,
+    ax_smooth0: CudaFunction,
+    ax_smooth: CudaFunction,
+    ax_grad: CudaFunction,
+    ax_tensor_z: CudaFunction,
+    ax_tensor_y: CudaFunction,
+    ax_eigen: CudaFunction,
 }
 
 /// An open CUDA device with the kernels loaded
@@ -112,12 +131,14 @@ pub struct Gpu {
     free: usize,
     /// `decode_dir` in the reference's CUDA rounding for every `nx << 8 | ny`, four float64 per entry
     dirs: CudaSlice<f64>,
+    /// Every byte of a pooled prediction as the direction field's float32, `v as f32 / 255.0` as the CPU computes it
+    unit: CudaSlice<f32>,
 }
 
 impl Gpu {
     /// Open CUDA device `device` (an index among the visible devices), or the first usable visible device, and load
-    /// the kernels
-    pub fn open(device: Option<usize>) -> Result<Self> {
+    /// the kernels; `stages` sets the room a visible device needs to be picked first
+    pub fn open(device: Option<usize>, stages: Stages) -> Result<Self> {
         // SAFETY: probing for the driver library has no preconditions; cudarc panics on first use without it
         if !unsafe { sys::is_culib_present() } {
             bail!("no NVIDIA driver found (libcuda.so)");
@@ -141,14 +162,18 @@ impl Gpu {
         }
 
         // a host can list an older or busier GPU first, so each visible device gets its turn: the first with room
-        // for a full tile in each slot wins, and failing that the one with the most free memory, which a small
-        // volume may fit
+        // for a full tile of each stage the run gives it in each slot wins, and failing that the one with the most
+        // free memory, which a small volume may fit
+        let tile = match stages {
+            Stages::DirectionField => axes::AXES_TILE_DEVICE_BYTES,
+            Stages::DirectionFieldAndCentrality => TILE_DEVICE_BYTES.max(axes::AXES_TILE_DEVICE_BYTES),
+        };
         let count = CudaContext::device_count().map_err(|e| eyre!("count the CUDA devices: {e:?}"))?;
         let mut reasons = Vec::new();
         let mut cramped = None;
         for device in 0..count as usize {
             match Self::open_device(device) {
-                Ok(gpu) if gpu.free >= 2 * TILE_DEVICE_BYTES => return Ok(gpu),
+                Ok(gpu) if gpu.free >= 2 * tile => return Ok(gpu),
                 Ok(gpu) if cramped.as_ref().is_none_or(|c: &Gpu| gpu.free > c.free) => cramped = Some(gpu),
                 Ok(_) => {}
                 Err(e) => reasons.push(format!("{e:#}")),
@@ -185,14 +210,25 @@ impl Gpu {
             seeds: function("fb_seeds")?,
             slots: function("fb_slots")?,
             pack: function("fb_pack")?,
+            ax_gather: function("fb_ax_gather")?,
+            ax_smooth0: function("fb_ax_smooth0")?,
+            ax_smooth: function("fb_ax_smooth")?,
+            ax_grad: function("fb_ax_grad")?,
+            ax_tensor_z: function("fb_ax_tensor_z")?,
+            ax_tensor_y: function("fb_ax_tensor_y")?,
+            ax_eigen: function("fb_ax_eigen")?,
         };
         let table: Vec<f64> = Fused::dir_table().iter().flat_map(|d| [d[0], d[1], d[2], 0.0]).collect();
+        let unit: Vec<f32> = (0..=255u8).map(|v| v as f32 / 255.0f32).collect();
         let stream = ctx.default_stream();
+        // each pageable source is dropped on an early return, so its copy finishes before the next can fail
         let dirs = stream.clone_htod(&table)?;
+        stream.synchronize()?;
+        let unit = stream.clone_htod(&unit)?;
         stream.synchronize()?;
         let (free, _) = ctx.mem_get_info()?;
         let name = format!("CUDA device {device}, {} (compute capability {major}.{minor})", ctx.name()?);
-        Ok(Self { ctx, name, k, free, dirs })
+        Ok(Self { ctx, name, k, free, dirs, unit })
     }
 
     pub fn name(&self) -> &str {
@@ -204,7 +240,7 @@ impl Gpu {
     ///
     /// The other half is left for the driver, other processes and later stages. A device too full for even one tile
     /// per unit fails in `centrality` unless the volume's tiles are small, which `--device auto` answers by running
-    /// on the CPU
+    /// on the CPU; `direction_field` sizes its units the same way
     fn unit_tiles(&self) -> Result<usize> {
         let (free, _) = self.ctx.mem_get_info()?;
         Ok((free / 2 / (2 * TILE_DEVICE_BYTES)).clamp(1, UNIT_TILES))
@@ -257,10 +293,10 @@ impl Gpu {
 /// A tile core's origin and end
 type TileSpan = (Shape, Shape);
 
-/// The region a tile's kernels read: its core and halo, clipped to the volume, as origin and extent
-fn region((start, end): TileSpan, shape: Shape) -> (Shape, Shape) {
-    let lo = start.map(|v| v.saturating_sub(TILE_HALO));
-    let hi = [0, 1, 2].map(|a| (end[a] + TILE_HALO).min(shape[a]));
+/// The region a tile's kernels read: its core and `halo` beyond it, clipped to the volume, as origin and extent
+fn region((start, end): TileSpan, shape: Shape, halo: usize) -> (Shape, Shape) {
+    let lo = start.map(|v| v.saturating_sub(halo));
+    let hi = [0, 1, 2].map(|a| (end[a] + halo).min(shape[a]));
     (lo, [0, 1, 2].map(|a| hi[a] - lo[a]))
 }
 
@@ -273,26 +309,55 @@ fn units(own: &Vol<u8>, shape: Shape, unit_tiles: usize) -> Vec<Vec<TileSpan>> {
     let keep: Vec<bool> = all
         .par_iter()
         .map(|&t| {
-            let (lo, dims) = region(t, shape);
+            let (lo, dims) = region(t, shape, TILE_HALO);
             own.any_allocated_in(lo, dims, |_, _, _| true)
         })
         .collect();
+    group(&all, &keep, unit_tiles)
+}
+
+/// The kept tiles of `all` (in C order over the tile grid), grouped into runs of up to `most` tiles adjacent along x
+/// that share their z and y tile rows
+fn group(all: &[TileSpan], keep: &[bool], most: usize) -> Vec<Vec<TileSpan>> {
     let mut units: Vec<Vec<TileSpan>> = Vec::new();
-    let mut prev: Option<Shape> = None;
-    for (&t, keep) in all.iter().zip(keep) {
+    let mut prev: Option<TileSpan> = None;
+    for (&t, &keep) in all.iter().zip(keep) {
         if !keep {
             prev = None;
             continue;
         }
         let start = t.0;
-        let adjacent = prev.is_some_and(|p| p[0] == start[0] && p[1] == start[1] && p[2] + TILE == start[2]);
+        let adjacent = prev.is_some_and(|(p, end)| p[0] == start[0] && p[1] == start[1] && end[2] == start[2]);
         match units.last_mut() {
-            Some(unit) if adjacent && unit.len() < unit_tiles => unit.push(t),
+            Some(unit) if adjacent && unit.len() < most => unit.push(t),
             _ => units.push(vec![t]),
         }
-        prev = Some(start);
+        prev = Some(t);
     }
     units
+}
+
+/// The box of the brick grid that holds every region of a unit, as first brick and extent
+fn brick_box(regions: &[(Shape, Shape)]) -> (Shape, Shape) {
+    // the tiles share their z and y rows and run along x, so the first and last regions bound the unit
+    let lo = regions[0].0;
+    let (last_lo, last_dims) = regions[regions.len() - 1];
+    let hi = [0, 1, 2].map(|a| last_lo[a] + last_dims[a]);
+    let b0 = lo.map(|v| v >> SHIFT);
+    let nb = [0, 1, 2].map(|a| ((hi[a] - 1) >> SHIFT) + 1 - b0[a]);
+    (b0, nb)
+}
+
+/// Append the volume brick index of each brick of a tile core starting at `start` (brick aligned) with extent
+/// `core`, in the order the kernels lay the core out in the output: C order over the core's bricks
+fn core_bricks(start: Shape, core: Shape, grid: Shape, bricks: &mut Vec<usize>) {
+    let cb = core.map(|n| n.div_ceil(EDGE));
+    let sb = start.map(|v| v >> SHIFT);
+    for z in sb[0]..sb[0] + cb[0] {
+        for y in sb[1]..sb[1] + cb[1] {
+            bricks.extend((sb[2]..sb[2] + cb[2]).map(|x| (z * grid[1] + y) * grid[2] + x));
+        }
+    }
 }
 
 /// What a staged unit's launches and collection need besides its device buffers
@@ -316,9 +381,7 @@ struct Meta {
 /// One unit in flight: a stream with the device buffers and pinned host buffers it uses, grown as units need
 struct Slot {
     stream: Arc<CudaStream>,
-    desc: CudaSlice<u32>,
-    table: CudaSlice<u32>,
-    pool: CudaSlice<u8>,
+    inputs: Inputs,
     pres: CudaSlice<u8>,
     nx: CudaSlice<u8>,
     ny: CudaSlice<u8>,
@@ -331,16 +394,10 @@ struct Slot {
     seeds: CudaSlice<u64>,
     /// The seed list's length and the number of packed bricks
     count: CudaSlice<u32>,
-    /// Write-combined, as the host only writes it
-    staging: PinnedHostSlice<u8>,
     host_count: PinnedHostSlice<u32>,
     host_packed: PinnedHostSlice<u16>,
     host_ids: PinnedHostSlice<u32>,
     host_seeds: PinnedHostSlice<u64>,
-    /// The table and descriptors of the unit in flight: the driver may read pageable memory after an asynchronous
-    /// copy returns, so they live until the slot's stream is synchronized
-    host_table: Vec<u32>,
-    host_desc: Vec<u32>,
 }
 
 /// Grow a device buffer to hold `n` elements, by half again beyond, so slowly growing units reallocate rarely
@@ -370,9 +427,20 @@ fn fit_host<T: DeviceRepr + ValidAsZeroBits>(
     n: usize,
     flags: u32,
 ) -> Result<()> {
+    fit_host_upto(stream, buf, n, usize::MAX, flags)
+}
+
+/// [`fit_host`] for a buffer that never needs more than `most` elements, so its spare half stops there
+fn fit_host_upto<T: DeviceRepr + ValidAsZeroBits>(
+    stream: &Arc<CudaStream>,
+    buf: &mut PinnedHostSlice<T>,
+    n: usize,
+    most: usize,
+    flags: u32,
+) -> Result<()> {
     if buf.len() < n {
         stream.synchronize()?;
-        *buf = pinned(stream.context(), n + n / 2, flags)?;
+        *buf = pinned(stream.context(), (n + n / 2).clamp(n, most.max(n)), flags)?;
     }
     Ok(())
 }
@@ -381,20 +449,96 @@ fn grid_1d(n: usize) -> Result<u32> {
     u32::try_from(n.div_ceil(BLOCK as usize)).map_err(|_| eyre!("launch of {n} threads is too large"))
 }
 
+/// A unit's inputs on the device: its tile descriptors, and the bricks of its box of the brick grid from each
+/// volume the kernels read, as one pool of payloads and a table per volume from each brick of the box to its slot in
+/// the pool, or [`NO_BRICK`]
+struct Inputs {
+    desc: CudaSlice<u32>,
+    table: CudaSlice<u32>,
+    pool: CudaSlice<u8>,
+    /// Write-combined, as the host only writes it
+    staging: PinnedHostSlice<u8>,
+    /// The table and descriptors of the unit in flight: the driver may read pageable memory after an asynchronous
+    /// copy returns, so they live until the stream is synchronized
+    host_table: Vec<u32>,
+    host_desc: Vec<u32>,
+}
+
+impl Inputs {
+    fn new(stream: &Arc<CudaStream>) -> Result<Self> {
+        Ok(Self {
+            desc: stream.alloc_zeros(1)?,
+            table: stream.alloc_zeros(1)?,
+            pool: stream.alloc_zeros(1)?,
+            staging: pinned(stream.context(), 1, sys::CU_MEMHOSTALLOC_WRITECOMBINED)?,
+            host_table: Vec::new(),
+            host_desc: Vec::new(),
+        })
+    }
+
+    /// Start the upload of the descriptors `desc` and of the bricks of `vols` in the box from brick `b0` with
+    /// extent `nb`
+    ///
+    /// The staging buffer must not be in use: the stream's previous unit was synchronized
+    fn upload(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        vols: &[&Vol<u8>],
+        (b0, nb): (Shape, Shape),
+        desc: Vec<u32>,
+    ) -> Result<()> {
+        let grid = vols[0].grid();
+        let n_box = nb.iter().product::<usize>();
+        let mut table = vec![NO_BRICK; vols.len() * n_box];
+        let mut payloads: Vec<&[u8; BRICK]> = Vec::new();
+        let mut entry = table.iter_mut();
+        for vol in vols {
+            for bz in b0[0]..b0[0] + nb[0] {
+                for by in b0[1]..b0[1] + nb[1] {
+                    let row = (bz * grid[1] + by) * grid[2];
+                    for bx in b0[2]..b0[2] + nb[2] {
+                        let slot = entry.next().expect("the table has an entry per volume and brick of the box");
+                        if let Some(b) = vol.brick_at(row + bx) {
+                            *slot = payloads.len() as u32;
+                            payloads.push(b);
+                        }
+                    }
+                }
+            }
+        }
+        ensure!(payloads.len() < NO_BRICK as usize, "a unit holds too many bricks");
+
+        let n_pool = payloads.len() * BRICK;
+        fit_host(stream, &mut self.staging, n_pool, sys::CU_MEMHOSTALLOC_WRITECOMBINED)?;
+        // the pool gathers the scattered bricks into pinned memory, so its upload is one asynchronous copy
+        let host = &mut self.staging.as_mut_slice()?[..n_pool];
+        host.par_chunks_mut(BRICK).zip(payloads.par_iter()).for_each(|(d, s)| d.copy_from_slice(&s[..]));
+        fit(stream, &mut self.pool, n_pool)?;
+        fit(stream, &mut self.table, table.len())?;
+        fit(stream, &mut self.desc, desc.len())?;
+        // the stream's previous unit was synchronized, so it no longer reads the buffers replaced here
+        self.host_table = table;
+        self.host_desc = desc;
+        stream.memcpy_htod(&self.host_table, &mut self.table.slice_mut(..self.host_table.len()))?;
+        stream.memcpy_htod(&self.host_desc, &mut self.desc.slice_mut(..self.host_desc.len()))?;
+        if n_pool > 0 {
+            // pinned: the copy runs after this returns, and the staging buffer is not written again until the
+            // stream is synchronized after the unit's launches
+            stream.memcpy_htod(&self.staging.as_slice()?[..n_pool], &mut self.pool.slice_mut(..n_pool))?;
+        }
+        Ok(())
+    }
+}
+
 impl Slot {
     fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         let stream = ctx.new_stream()?;
         Ok(Self {
-            staging: pinned(ctx, 1, sys::CU_MEMHOSTALLOC_WRITECOMBINED)?,
+            inputs: Inputs::new(&stream)?,
             host_count: pinned(ctx, 2, 0)?,
             host_packed: pinned(ctx, 1, 0)?,
             host_ids: pinned(ctx, 1, 0)?,
             host_seeds: pinned(ctx, 1, 0)?,
-            host_table: Vec::new(),
-            host_desc: Vec::new(),
-            desc: stream.alloc_zeros(1)?,
-            table: stream.alloc_zeros(1)?,
-            pool: stream.alloc_zeros(1)?,
             pres: stream.alloc_zeros(1)?,
             nx: stream.alloc_zeros(1)?,
             ny: stream.alloc_zeros(1)?,
@@ -413,36 +557,11 @@ impl Slot {
     /// Build a unit's brick pool, tables and tile descriptors and start their upload
     fn stage(&mut self, unit: &[TileSpan], vols: &[&Vol<u8>; 4], shape: Shape) -> Result<Meta> {
         let grid = vols[0].grid();
-        let regions: Vec<(Shape, Shape)> = unit.iter().map(|&t| region(t, shape)).collect();
-        // the tiles share their z and y rows and run along x, so the first and last regions bound the unit
-        let lo = regions[0].0;
-        let (last_lo, last_dims) = regions[regions.len() - 1];
-        let hi = [0, 1, 2].map(|a| last_lo[a] + last_dims[a]);
-        let b0 = lo.map(|v| v >> SHIFT);
-        let nb = [0, 1, 2].map(|a| ((hi[a] - 1) >> SHIFT) + 1 - b0[a]);
-        let n_box = nb.iter().product::<usize>();
-        let mut table = vec![NO_BRICK; 4 * n_box];
-        let mut payloads: Vec<&[u8; BRICK]> = Vec::new();
-        let mut entry = table.iter_mut();
-        for vol in vols {
-            for bz in b0[0]..b0[0] + nb[0] {
-                for by in b0[1]..b0[1] + nb[1] {
-                    let row = (bz * grid[1] + by) * grid[2];
-                    for bx in b0[2]..b0[2] + nb[2] {
-                        let slot = entry.next().expect("the table has 4 entries per brick of the box");
-                        if let Some(b) = vol.brick_at(row + bx) {
-                            *slot = payloads.len() as u32;
-                            payloads.push(b);
-                        }
-                    }
-                }
-            }
-        }
-        ensure!(payloads.len() < NO_BRICK as usize, "a unit holds too many bricks");
-
+        let regions: Vec<(Shape, Shape)> = unit.iter().map(|&t| region(t, shape, TILE_HALO)).collect();
+        let (b0, nb) = brick_box(&regions);
         let mut desc = Vec::with_capacity(unit.len() * DESC);
         let mut bricks = Vec::new();
-        let (mut base, mut out, mut cap) = (0usize, 0usize, 0usize);
+        let (mut base, mut cap) = (0usize, 0usize);
         let (mut max_region, mut max_band, mut max_core) = (0, 0, 0);
         for (&(start, end), &(rlo, dims)) in unit.iter().zip(&regions) {
             let off = [0, 1, 2].map(|a| start[a] - rlo[a]);
@@ -451,43 +570,19 @@ impl Slot {
                 [0, 1, 2].map(|a| (off[a] + core[a] + BAND_REACH).min(dims[a]) - off[a].saturating_sub(BAND_REACH));
             let fields = [rlo, dims, off, core].concat();
             desc.extend(fields.iter().map(|&v| v as u32));
-            desc.extend([base as u32, out as u32, 0, 0]);
-            let cb = core.map(|n| n.div_ceil(EDGE));
-            let sb = start.map(|v| v >> SHIFT);
-            for z in sb[0]..sb[0] + cb[0] {
-                for y in sb[1]..sb[1] + cb[1] {
-                    bricks.extend((sb[2]..sb[2] + cb[2]).map(|x| (z * grid[1] + y) * grid[2] + x));
-                }
-            }
+            desc.extend([base as u32, (bricks.len() * BRICK) as u32, 0, 0]);
+            core_bricks(start, core, grid, &mut bricks);
             let region_voxels = dims.iter().product::<usize>();
             base += region_voxels;
-            out += cb.iter().product::<usize>() * BRICK;
             cap += core.iter().product::<usize>().div_ceil(2);
             max_region = max_region.max(region_voxels);
             max_band = max_band.max(band.iter().product());
             max_core = max_core.max(core.iter().product());
         }
         // the kernels index the scratch arrays and the output in u32
+        let out = bricks.len() * BRICK;
         ensure!(base <= u32::MAX as usize && out <= u32::MAX as usize, "a unit is too large for the kernels' indices");
-
-        let n_pool = payloads.len() * BRICK;
-        fit_host(&self.stream, &mut self.staging, n_pool, sys::CU_MEMHOSTALLOC_WRITECOMBINED)?;
-        // the pool gathers the scattered bricks into pinned memory, so its upload is one asynchronous copy
-        let host = &mut self.staging.as_mut_slice()?[..n_pool];
-        host.par_chunks_mut(BRICK).zip(payloads.par_iter()).for_each(|(d, s)| d.copy_from_slice(&s[..]));
-        fit(&self.stream, &mut self.pool, n_pool)?;
-        fit(&self.stream, &mut self.table, table.len())?;
-        fit(&self.stream, &mut self.desc, desc.len())?;
-        // the slot's previous unit was collected, so its stream no longer reads the buffers replaced here
-        self.host_table = table;
-        self.host_desc = desc;
-        self.stream.memcpy_htod(&self.host_table, &mut self.table.slice_mut(..self.host_table.len()))?;
-        self.stream.memcpy_htod(&self.host_desc, &mut self.desc.slice_mut(..self.host_desc.len()))?;
-        if n_pool > 0 {
-            // pinned: the copy runs after this returns, and the staging buffer is not written again until this
-            // slot's stream is synchronized in `collect`
-            self.stream.memcpy_htod(&self.staging.as_slice()?[..n_pool], &mut self.pool.slice_mut(..n_pool))?;
-        }
+        self.inputs.upload(&self.stream, vols, (b0, nb), desc)?;
         Ok(Meta { tiles: unit.len() as u32, b0, nb, region_voxels: base, max_region, max_band, max_core, bricks, cap })
     }
 
@@ -528,11 +623,12 @@ impl Slot {
         // SAFETY: each launch passes the kernel's params in its PTX order (checked in `Gpu::open`), every buffer
         // holds what the kernel indexes (sized above from the descriptors), and all run in order on this stream
         unsafe {
+            let inputs = &self.inputs;
             stream
                 .launch_builder(&gpu.k.gather)
-                .arg(&self.desc)
-                .arg(&self.pool)
-                .arg(&self.table)
+                .arg(&inputs.desc)
+                .arg(&inputs.pool)
+                .arg(&inputs.table)
                 .arg(&nb_total)
                 .arg(&bz0)
                 .arg(&by0)
@@ -546,7 +642,7 @@ impl Slot {
                 .launch(per_tile(m.max_region)?)?;
             stream
                 .launch_builder(&gpu.k.centrality)
-                .arg(&self.desc)
+                .arg(&inputs.desc)
                 .arg(&self.pres)
                 .arg(&self.nx)
                 .arg(&self.ny)
@@ -555,7 +651,7 @@ impl Slot {
                 .launch(per_tile(m.max_band)?)?;
             stream
                 .launch_builder(&gpu.k.seeds)
-                .arg(&self.desc)
+                .arg(&inputs.desc)
                 .arg(&self.pres)
                 .arg(&self.nx)
                 .arg(&self.ny)
@@ -706,7 +802,7 @@ mod tests {
     #[test]
     #[ignore = "needs an NVIDIA GPU; run through the GPU queue"]
     fn gpu_matches_fused_cpu() {
-        let gpu = Gpu::open(None).unwrap();
+        let gpu = Gpu::open(None, Stages::DirectionFieldAndCentrality).unwrap();
         let (tracing, nx, ny) = volumes();
         let shape = nx.shape();
         for family in [1, 2] {

@@ -26,7 +26,7 @@ use crate::arena::BufferPool;
 use crate::axes::{Lapack, direction_field, find_lapack};
 use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
-use crate::gpu::Gpu;
+use crate::gpu::{AxesCounts, Gpu, Stages};
 use crate::input::Predictions;
 use crate::kernels::{Coverage, Fields, RawCurve, Scratch, trace_seed};
 use crate::log;
@@ -123,9 +123,10 @@ pub struct Args {
     /// Optional AFV scan identifier
     #[arg(long)]
     pub coordinate_space: Option<String>,
-    /// Where centrality runs (tracing always runs on the CPU): auto uses an NVIDIA GPU when one is usable and the
-    /// CPU otherwise, cpu never uses the GPU, and cuda fails without one. A GPU run writes the original's
-    /// --device cuda output, which can differ from its cpu output by a rounding
+    /// Where the direction field and centrality run (tracing always runs on the CPU): auto uses an NVIDIA GPU when
+    /// one is usable and the CPU otherwise, cpu never uses the GPU, and cuda fails without one. A GPU run writes the
+    /// original's --device cuda output, whose centrality can differ from its cpu output by a rounding. A resumed
+    /// run keeps the rounding it started with, so one started on the CPU keeps centrality there
     #[arg(long, value_enum, default_value = "auto")]
     pub device: Device,
     /// Visible CUDA device index for the GPU; without it, the first usable visible GPU
@@ -737,13 +738,11 @@ fn trace_families(
     let tracing = load_tracing(native, supplied)?;
     let resident = tracing.iter().map(Vol::resident_bytes).sum::<usize>();
     log!("Tracing predictions: {:.1} s, {:.2} GiB resident", t.elapsed().as_secs_f64(), gib(resident));
-    let t = Instant::now();
     let lapack = Lapack::init(&find_lapack()?)?;
-    let (nx, ny) = direction_field(&tracing, lapack)?;
+    let (nx, ny) = direction_field_on(cent.gpu.as_ref(), cent.strict, &tracing, lapack)?;
     release_freed();
     debug_dump(work, "nx", || nx.read_block([0, 0, 0], nx.shape()))?;
     debug_dump(work, "ny", || ny.read_block([0, 0, 0], ny.shape()))?;
-    log!("Direction field: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem("direction field", &[("tracing", resident), ("nx", nx.resident_bytes()), ("ny", ny.resident_bytes())]);
     let pool = BufferPool::new(CHUNK_POOL_RETAIN);
     let cache = NativeCache::new(native, cache_bytes, &pool);
@@ -752,6 +751,37 @@ fn trace_families(
         release_freed();
     }
     Ok(())
+}
+
+/// The direction field, on `gpu` when there is one
+///
+/// Both devices give the same bytes, so when the GPU fails, such as out of memory, the CPU computes it instead,
+/// unless `strict` (`--device cuda`) asked for the GPU only
+fn direction_field_on(
+    gpu: Option<&Gpu>,
+    strict: bool,
+    tracing: &[Vol<u8>; 2],
+    lapack: &Lapack,
+) -> Result<(Vol<u8>, Vol<u8>)> {
+    let t = Instant::now();
+    let on_cpu = || -> Result<(Vol<u8>, Vol<u8>)> {
+        let field = direction_field(tracing, lapack)?;
+        log!("Direction field: {:.1} s", t.elapsed().as_secs_f64());
+        Ok(field)
+    };
+    let Some(gpu) = gpu else { return on_cpu() };
+    match gpu.direction_field(tracing, lapack) {
+        Ok((nx, ny, AxesCounts { present, fallback })) => {
+            let secs = t.elapsed().as_secs_f64();
+            log!("Direction field: {secs:.1} s, {fallback} of {present} voxels solved on the CPU");
+            Ok((nx, ny))
+        }
+        Err(e) if !strict => {
+            log!("Direction field on the CPU: the GPU failed ({e:#})");
+            on_cpu()
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// With `FIBRS_DEBUG_FIELDS` set, write a field densely as raw little-endian `NAME.raw` for comparison
@@ -892,8 +922,9 @@ fn saved_run(manifest: &Path) -> Result<Value> {
     Ok(saved)
 }
 
-/// How a run computes centrality: the rounding it reproduces and, for the CUDA rounding, the GPU when one runs it
-/// (without one, the CPU computes the CUDA rounding, more slowly)
+/// How a run computes the direction field and centrality: the centrality rounding it reproduces, and the GPU when
+/// one runs the direction field and, in the CUDA rounding, centrality (without one, the CPU computes either rounding,
+/// the CUDA one more slowly)
 struct CentralityDevice {
     rounding: Rounding,
     gpu: Option<Gpu>,
@@ -905,7 +936,8 @@ impl CentralityDevice {
     /// The rounding a new run takes from `device`, or a resumed run from its `run.json`, and the GPU to compute
     /// it on, opened only when a family still needs centrality
     ///
-    /// `auto` takes the GPU when one opens, and otherwise the CPU, saying why
+    /// `auto` takes the GPU when one opens, and otherwise the CPU, saying why. A run started on the CPU keeps
+    /// centrality there, but its direction field, the same bytes on either device, still takes the GPU
     fn choose(
         device: Device,
         index: Option<usize>,
@@ -915,32 +947,48 @@ impl CentralityDevice {
         let strict = device == Device::Cuda;
         let cpu = |rounding| Self { rounding, gpu: None, strict };
         let on_gpu = |gpu: Gpu| {
-            log!("Centrality on {} (--device cpu to use the CPU)", gpu.name());
+            log!("Direction field and centrality on {} (--device cpu to use the CPU)", gpu.name());
             Self { rounding: Rounding::Cuda, gpu: Some(gpu), strict }
         };
-        let open = || Gpu::open(index);
+        let open = || Gpu::open(index, Stages::DirectionFieldAndCentrality);
         let chosen = match (started_on, device) {
             (Some(Rounding::Cpu), Device::Cuda) => {
                 bail!("This run started with centrality on the CPU and resumes only there; use --device cpu or auto")
             }
+            (Some(Rounding::Cpu), Device::Auto) if tracing_needed => match Gpu::open(index, Stages::DirectionField) {
+                Ok(gpu) => {
+                    log!(
+                        "Direction field on {}, centrality on the CPU this run started on (--device cpu to use the CPU)",
+                        gpu.name()
+                    );
+                    Self { rounding: Rounding::Cpu, gpu: Some(gpu), strict }
+                }
+                Err(e) => {
+                    log!("Direction field and centrality on the CPU: no usable GPU ({e:#})");
+                    cpu(Rounding::Cpu)
+                }
+            },
             (Some(Rounding::Cpu), _) | (None, Device::Cpu) => cpu(Rounding::Cpu),
             (Some(Rounding::Cuda), _) if !tracing_needed => cpu(Rounding::Cuda),
             (Some(Rounding::Cuda), Device::Cpu) => {
-                log!("Centrality on the CPU, rounded as on the GPU this run started on");
+                log!("Direction field and centrality on the CPU, centrality rounded as on the GPU this run started on");
                 cpu(Rounding::Cuda)
             }
             (_, Device::Cuda) => on_gpu(open().map_err(|e| eyre!("--device cuda needs a usable NVIDIA GPU: {e:#}"))?),
             (Some(Rounding::Cuda), Device::Auto) => match open() {
                 Ok(gpu) => on_gpu(gpu),
                 Err(e) => {
-                    log!("Centrality on the CPU, rounded as on the GPU this run started on: no usable GPU ({e:#})");
+                    log!(
+                        "Direction field and centrality on the CPU, centrality rounded as on the GPU this run started \
+                         on: no usable GPU ({e:#})"
+                    );
                     cpu(Rounding::Cuda)
                 }
             },
             (None, Device::Auto) => match open() {
                 Ok(gpu) => on_gpu(gpu),
                 Err(e) => {
-                    log!("Centrality on the CPU: no usable GPU ({e:#})");
+                    log!("Direction field and centrality on the CPU: no usable GPU ({e:#})");
                     cpu(Rounding::Cpu)
                 }
             },

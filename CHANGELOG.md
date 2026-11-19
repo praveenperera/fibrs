@@ -11,7 +11,11 @@
   written in Rust with cuda-oxide and ship inside the binary as PTX. On a PHerc1545 and a PHerc0826 band the `.afv`
   was identical on the GPU and the CPU, and identical to the original's with either of its devices. With
   `--threads 8`, centrality took 1.8 s instead of 8.1 s on the PHerc1545 band and 5.0 s instead of 20.4 s on the
-  PHerc0826 band. The direction field and tracing still run on the CPU (see the README's "Speed").
+  PHerc0826 band. Tracing still runs on the CPU (see the README's "Speed").
+- **Direction field on the GPU.** The direction field now runs on the GPU as well, under the same `--device` choice,
+  and its bytes are the CPU's: the GPU certifies each voxel's eigenvector against an error bound, and the CPU solves
+  the voxels it cannot certify with the same `dsyevd`, which the log line counts. If the GPU fails mid-run, the CPU
+  computes the direction field instead, unless `--device cuda` was given.
 - The README's "Same output" section now gives the PHerc0826 band's counts as measured: 149,680 fibres and 161,787
   point blocks and spatial-index rows. It said 149,780 and 161,887.
 - `fibrs predict --voxel-size-um` sets the output's `voxel_size_um` attribute, which was always 9.362, the PHerc0826
