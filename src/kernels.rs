@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 use color_eyre::eyre::{Result, bail};
 
-use crate::arena::Voxel;
+use crate::arena::{OWN_MAPPING_BYTES, Voxel};
 use crate::pyfmt::{py_max, py_min};
 use crate::vol::{Place, SharedVol, SharedVolWriter, Vol};
 
@@ -680,9 +680,15 @@ pub struct Traced {
     pub reads: ReadSet,
 }
 
-/// Marks a [`Traced`] keeps room for between seeds, 128 KiB: a seed whose curves are accepted makes thousands, but
-/// a window of seeds traced ahead each keeping room for the largest it has held would add hundreds of MiB
-const MARKS_KEPT: usize = 1 << 13;
+/// Marks a [`Traced`] keeps room for between seeds: as many as fit a page below the size glibc maps on its own,
+/// leaving room for its chunk header
+///
+/// A seed whose curves are accepted makes thousands, and a window of seeds traced ahead each keeping room for the
+/// largest it has held would add hundreds of MiB. Room below that size stays in a thread's heap, where shrinking it
+/// after each seed made glibc delete and map again a 64 MiB heap for nearly every curve traced: on a dense
+/// PHerc0358 crop that was 110,000 `munmap`s, each one stalling every thread's page faults. Room kept below that
+/// size is never freed, and only the rare larger list is mapped and unmapped
+const MARKS_KEPT: usize = (OWN_MAPPING_BYTES - 4096) / size_of::<Mark>();
 
 impl Traced {
     /// Give back the room for marks beyond [`MARKS_KEPT`]

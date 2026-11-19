@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::afv::{ExportOptions, MinLength, Summary, export_afv};
-use crate::arena::BufferPool;
+use crate::arena::{BufferPool, OWN_MAPPING_BYTES};
 use crate::axes::{Lapack, direction_field, find_lapack};
 use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
@@ -798,7 +798,7 @@ fn fix_malloc_thresholds() {
     {
         // SAFETY: mallopt only changes how later allocations are served; it touches no live allocation
         unsafe {
-            libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
+            libc::mallopt(libc::M_MMAP_THRESHOLD, OWN_MAPPING_BYTES as libc::c_int);
         }
     }
     // fixing the mmap threshold also fixes the trim threshold at 128 KiB, so each finishing thread's heap gave
