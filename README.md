@@ -6,9 +6,9 @@ same flags and writes the same `.afv`: every metadata value except the per-run u
 point block and spatial-index row. The tracing algorithm, the AFV format and the fibre model whose
 predictions it reads are Qual's; this port changes how fast the tracer runs, not what it writes.
 
-On a 512 × 8169 × 8169 band of PHerc0826, with `--threads 4` for both tools, it traces 27×–62× faster
-across two measured runs (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU and needs
-no GPU.
+With `--threads 4` for both tools, it traces 22×–62× faster across three measured runs on 512-plane bands of
+PHerc0826 and PHerc1545 (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU and needs no
+GPU.
 
 `fibrs predict` runs the step before: Qual's AFV fibre model V2 over a CT volume on an NVIDIA GPU, without
 PyTorch, writing the probability zarr the tracer reads, as villa's inference writes it (see
@@ -97,8 +97,9 @@ through the drop-in and through `python -m fibrs`. Both must write what the orig
 
 ## Speed
 
-Two runs on the same band, on an Intel Core Ultra 7 270K Plus (24 cores), with `--threads 4` for both tools and
-other work running on the machine each time:
+Three runs on an Intel Core Ultra 7 270K Plus (24 cores), with `--threads 4` for both tools and other work
+running on the machine each time. Runs 1 and 2 trace the same 512 × 8169 × 8169 band of PHerc0826, and run 3 a
+512-plane band of PHerc1545 (z 1280–1792):
 
 | Run | Tool | Wall | CPU time | Peak memory |
 |---|---|---|---|---|
@@ -106,7 +107,9 @@ other work running on the machine each time:
 | 1 | `fibrs` 0.1.1 | 191 s | 516 s | 12.4 GiB |
 | 2 | `avf-spline-generator` 0.2.0 | 4,686 s (1.3 h) | not measured | 4.6 GiB |
 | 2 | `fibrs` 0.1.0 | 172 s | not measured | 10.8 GiB |
-| Speedup | | **27×–62×** | **about 23× (run 1 only)** | |
+| 3 | `avf-spline-generator` 0.2.0 | 1,621 s (27 min) | 4,149 s | not measured |
+| 3 | `fibrs` 0.1.0 | 73.4 s | 191 s | not measured |
+| Speedup | | **22×–62×** | **about 22×–23× (runs 1 and 3)** | |
 
 - Run 1: the one-minute load average was 17.5–18.8. The original's run was interrupted by a reboot and
   finished with `--resume`. Its wall time is the sum of the two parts, and the first part's CPU time is
@@ -114,9 +117,13 @@ other work running on the machine each time:
   the same band took 12,728 s.
 - Run 2: the one-minute load average averaged 13.9 during the original's run and 8.8 during fibrs's. The two
   `.afv` files held the same 149,680 fibres (compared logically, as each holds its own run uuid).
+- Run 3: the one-minute load average was 10.0 during the original's run and 7.4 during fibrs's. This band is
+  sparser, and the original kept about 2.6 cores busy on it. The two `.afv` files held the same 82,646 fibres
+  and 83,741 point blocks.
 
 The ratio varies with the run and with the machine's load: the range is the lowest and highest of the measured
-runs. The original uses about one core whatever `--threads` says, and the port keeps about 2.7 busy (run 1).
+runs. The gap is largest on dense bands, where the original tracer uses about one core whatever `--threads`
+says; on run 1's band the port kept about 2.7 busy.
 
 ## Differences from the original
 
@@ -232,10 +239,10 @@ mode's output unchanged; in band mode it is part of the run's settings, as in th
 
 ### Precision
 
-By default `fibrs predict` runs at the precision of the current best implementation, villa's
-`lasagna.qualzz_inference` on PyTorch, to keep parity with it; `--mode villa` also computes the same tiles over the
-whole array, while band mode differs at the band's edges and in skipping all-zero tiles (see Modes). bf16 is
-opt-in, never the default and never used for the published fibre sets.
+By default `fibrs predict` runs at the precision of villa's `lasagna.qualzz_inference` on PyTorch, to keep parity
+with it; `--mode villa` also computes the same tiles over the whole array, while band mode differs at the band's
+edges and in skipping all-zero tiles (see Modes). bf16 is opt-in, never the default and will never be used
+for published fibre sets.
 
 - `--precision fp32` (default): float32 tensors with TF32 tensor-core convolutions, the precision PyTorch uses for
   the reference by default.
@@ -250,19 +257,18 @@ PyTorch's `fp32-ieee` and `fp16` modes are not offered.
 
 ### Speed
 
-Against villa's `lasagna.qualzz_inference` on PyTorch, the current best implementation, at its default
-precision (float32 with TF32 tensor-core convolutions). Both ran the same 726-tile crop of PHerc0826 (z
-12032–12544, y 4096–5120, x 1536–2560) on one RTX 5090 (driver 595.112.07). The runs alternated (ABBA), with 6
-timed pairs per precision after 2 warm-up pairs, and each time is the whole command's wall time. The speedup is
-the mean of the per-pair ratios:
+Against villa's `lasagna.qualzz_inference` on PyTorch, at its default precision (float32 with TF32 tensor-core
+convolutions). Both ran the same 726-tile crop of PHerc0826 (z 12032–12544, y 4096–5120, x 1536–2560) on one RTX
+5090 (driver 595.112.07). The runs alternated (ABBA), with 6 timed pairs per precision after 2 warm-up pairs, and
+each time is the whole command's wall time. The speedup is the mean of the per-pair ratios:
 
 | `fibrs predict --mode villa` precision | villa, PyTorch fp32 (median) | fibrs (median) | Speedup, mean (95% CI) |
 |---|---|---|---|
 | fp32 (default) | 45.37 s | 26.77 s | 1.72× (1.66–1.78×) |
 | bf16 (opt-in) | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) |
 
-fibrs ran with cuDNN 9.27.0 and cuBLAS 13.4.1.3. villa ran PyTorch 2.14.1 (CUDA 13.0) with cuDNN 9.24, at
-`0bddf2757`.
+fibrs, a pre-release build of 0.2.0 (`e9adcc9`), ran with cuDNN 9.27.0 and cuBLAS 13.4.1.3. villa ran PyTorch
+2.14.1 (CUDA 13.0) with cuDNN 9.24, at `0bddf2757`.
 
 ### Parity
 
@@ -279,6 +285,9 @@ fibrs ran with cuDNN 9.27.0 and cuBLAS 13.4.1.3. villa ran PyTorch 2.14.1 (CUDA 
 - **Band mode** matches the reference engine value for value on a full PHerc0826 band, with 0 differences at
   fp32 and at bf16. fibrs doesn't store chunks that are entirely zero, so its output is smaller on disk; zarr
   reads a missing chunk as zero.
+- **Libraries:** running the release build with the cuDNN 9.28.1 and cuBLAS 12.9 that `fibrs[predict]` installs,
+  instead of a system cuDNN 9.27.0 and cuBLAS 13.4, left its outputs unchanged on three band columns at fp32 and
+  bf16. With the pip cuDNN alone, the villa-mode crop at fp32 was unchanged too.
 - **bf16 (opt-in)** against fp32: the figures under Precision.
 
 ### Limits

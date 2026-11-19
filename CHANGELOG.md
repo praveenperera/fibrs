@@ -48,13 +48,12 @@ fibrs predict --mode villa --ct scroll.zarr/0 --model-dir afv_fiber_9um_v2 --out
 
 ### Precision
 
-By default `fibrs predict` keeps parity with the current best implementation, villa's `lasagna.qualzz_inference` on
-PyTorch.
+By default `fibrs predict` keeps parity with villa's `lasagna.qualzz_inference` on PyTorch.
 
 - **`--precision fp32` (default):** float32 tensors with TF32 tensor-core convolutions. This is the precision
   PyTorch uses for the reference by default.
-- **`--precision bf16` (opt-in):** faster, with small output differences. It is never the default and is never
-  used for the published fibre sets. It was measured against fp32 on 512-plane bands of PHerc0826 and PHerc0813,
+- **`--precision bf16` (opt-in):** faster, with small output differences. It is never the default and will never
+  be used for published fibre sets. It was measured against fp32 on 512-plane bands of PHerc0826 and PHerc0813,
   traced with `fibrs`:
   - the traced fibre length agreed to about 99% (99.2–99.4%, V and H fibres);
   - 97.0–97.8% of fibres matched;
@@ -64,19 +63,18 @@ PyTorch.
 
 ### Speed
 
-Against villa's `lasagna.qualzz_inference` on PyTorch, the current best implementation, at its default
-precision (float32 with TF32 tensor-core convolutions). Both ran the same 726-tile crop of PHerc0826 (z
-12032–12544, y 4096–5120, x 1536–2560) on one RTX 5090 (driver 595.112.07). The runs alternated (ABBA), with 6
-timed pairs per precision after 2 warm-up pairs, and each time is the whole command's wall time. The speedup is
-the mean of the per-pair ratios:
+Against villa's `lasagna.qualzz_inference` on PyTorch, at its default precision (float32 with TF32 tensor-core
+convolutions). Both ran the same 726-tile crop of PHerc0826 (z 12032–12544, y 4096–5120, x 1536–2560) on one RTX
+5090 (driver 595.112.07). The runs alternated (ABBA), with 6 timed pairs per precision after 2 warm-up pairs, and
+each time is the whole command's wall time. The speedup is the mean of the per-pair ratios:
 
 | `fibrs predict --mode villa` precision | villa, PyTorch fp32 (median) | fibrs (median) | Speedup, mean (95% CI) |
 |---|---|---|---|
 | fp32 (default) | 45.37 s | 26.77 s | 1.72× (1.66–1.78×) |
 | bf16 (opt-in) | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) |
 
-fibrs ran with cuDNN 9.27.0 and cuBLAS 13.4.1.3. villa ran PyTorch 2.14.1 (CUDA 13.0) with cuDNN 9.24, at
-`0bddf2757`.
+fibrs, a pre-release build of 0.2.0 (`e9adcc9`), ran with cuDNN 9.27.0 and cuBLAS 13.4.1.3. villa ran PyTorch
+2.14.1 (CUDA 13.0) with cuDNN 9.24, at `0bddf2757`.
 
 ### Parity
 
@@ -93,6 +91,9 @@ fibrs ran with cuDNN 9.27.0 and cuBLAS 13.4.1.3. villa ran PyTorch 2.14.1 (CUDA 
 - **Band mode** matches the reference engine value for value on a full PHerc0826 band, with 0 differences at
   fp32 and at bf16. fibrs doesn't store chunks that are entirely zero, so its output is smaller on disk; zarr
   reads a missing chunk as zero.
+- **Libraries:** running the release build with the cuDNN 9.28.1 and cuBLAS 12.9 that `fibrs[predict]` installs,
+  instead of a system cuDNN 9.27.0 and cuBLAS 13.4, left its outputs unchanged on three band columns at fp32 and
+  bf16. With the pip cuDNN alone, the villa-mode crop at fp32 was unchanged too.
 - **bf16 (opt-in)** against fp32: the figures under Precision.
 
 ### Known limitations
@@ -127,7 +128,7 @@ The first release.
 
 - `fibrs`, a native, multi-threaded drop-in for Qual's `avf-spline-generator` 0.2.0
   ([AVF_SPLINE_GENERATOR](https://github.com/Qualzz/AVF_SPLINE_GENERATOR) @ `bee798f`): the same flags and the
-  same `.afv`, 27×–62× faster across two measured runs on a 512 × 8169 × 8169 band of PHerc0826 at
+  same `.afv`, 22×–62× faster across three measured runs on 512-plane bands of PHerc0826 and PHerc1545 at
   `--threads 4`
 - wheels for Linux x86-64 (glibc 2.28+) and Apple silicon (macOS 11+), with the `fibrs` command and the `fibrs`
   Python module, and a CLI archive for each with `scripts/install-dropin.sh`
