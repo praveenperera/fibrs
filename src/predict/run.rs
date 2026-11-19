@@ -3,8 +3,8 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, TryLockError};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::{self, Write};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -270,7 +270,7 @@ fn start_feed(c: &Checked, p: &Plan) -> Result<TileFeed> {
 
 /// `--dry-run`: each column's batches as the run would feed them, one JSON line per column
 fn dry_run(c: &Checked) -> Result<()> {
-    let p = plan(c, &c.a.out.join("progress.jsonl"))?;
+    let p = plan(c, &resolved(&c.a.out)?.join("progress.jsonl"))?;
     let feed = start_feed(c, &p)?;
     let (mut run, mut air) = (0, 0);
     let mut stdout = std::io::stdout().lock();
@@ -341,22 +341,38 @@ fn check_column_memory(c: &Checked, p: &Plan, e: &Opened) -> Result<()> {
     )
 }
 
-/// `path` made absolute with its links resolved, as far as it exists: the part that does not exist yet is kept as
-/// given, so an output that is not created yet compares with the CT too
+/// `path` made absolute and resolved as the system would open it: the part that exists is canonicalized, links
+/// and `..` included, and the rest, which a run creates, may hold only plain names, so the path given and the path
+/// resolved always name the same place
 fn resolved(path: &Path) -> Result<PathBuf> {
     let path = std::path::absolute(path)?;
-    let mut missing = Vec::new();
-    let mut existing = path.as_path();
-    loop {
-        if let Ok(real) = existing.canonicalize() {
-            return Ok(missing.iter().rev().fold(real, |p: PathBuf, part| p.join(part)));
+    let parts: Vec<Component> = path.components().filter(|c| *c != Component::CurDir).collect();
+    // the longest prefix that exists, walked as the system walks it: a missing part ends it, and any other error
+    // (a file followed by more of the path, say) refuses the path
+    let mut prefix = PathBuf::new();
+    let mut existing = 0;
+    for part in &parts {
+        prefix.push(part);
+        match fs::symlink_metadata(&prefix) {
+            Ok(_) => existing += 1,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+            Err(e) => bail!("{} steps through {}: {e}", path.display(), prefix.display()),
         }
-        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
-            return Ok(path);
-        };
-        missing.push(name.to_os_string());
-        existing = parent;
     }
+
+    let head: PathBuf = parts[..existing].iter().collect();
+    let Ok(mut out) = head.canonicalize() else {
+        bail!("{} steps through {}, which does not resolve", path.display(), head.display());
+    };
+    for part in &parts[existing..] {
+        let Component::Normal(name) = part else {
+            let missing: PathBuf = parts[..=existing].iter().collect();
+            bail!("{} uses .. after {}, which does not exist", path.display(), missing.display());
+        };
+        out.push(name);
+    }
+
+    Ok(out)
 }
 
 /// Locks the output for this process; the lock goes with the process, so a killed run leaves none behind
@@ -381,22 +397,12 @@ fn run(c: Checked) -> Result<()> {
     let a = &c.a;
     let t_start = now_unix();
     let started = Instant::now();
-    // before the first write: an output in, at or around the CT would write into the input store
+    // nothing is written before the arguments and the model folder are checked: an output in, at or around the CT
+    // would write into the input store
     let (ct, out) = (resolved(&a.ct)?, resolved(&a.out)?);
     if out.starts_with(&ct) || ct.starts_with(&out) {
         bail!("--out {} overlaps --ct {}; write the output outside the input", a.out.display(), a.ct.display());
     }
-    // every attempt is recorded at its start, before the model loads, so a capped or killed run still shows it
-    fs::create_dir_all(&a.out)?;
-    let mut attempts = fs::OpenOptions::new().create(true).append(true).open(a.out.join("attempts.jsonl"))?;
-    // held until the run ends: two runs on one output, on different --only-columns say, would each rewrite the
-    // chunks their columns share from what they read, losing the other's columns while both record progress
-    lock_output(&attempts, &a.out)?;
-    let attempt = py_dumps(&json!({"attempt": t_start, "start": t_start}), JsonStyle::DEFAULT);
-    attempts.write_all(format!("{attempt}\n").as_bytes())?;
-
-    let progress = a.out.join("progress.jsonl");
-    let p = plan(&c, &progress)?;
     // the loader takes a fold_* folder's plans.json and dataset.json from its parent, so those hashed here
     // would not be the ones it runs with
     if a.model_dir.file_name().is_some_and(|n| n.to_string_lossy().starts_with("fold_")) {
@@ -427,6 +433,21 @@ fn run(c: Checked) -> Result<()> {
             );
         }
     }
+
+    // every run that passes the checks above is recorded before the model loads, so one capped or killed after
+    // that still shows it;
+    // every write goes to the resolved output, the path the overlap check passed, since the given one may step
+    // through the CT on its way (`<ct>/0.0.0/../../pred.zarr`)
+    fs::create_dir_all(&out)?;
+    let mut attempts = fs::OpenOptions::new().create(true).append(true).open(out.join("attempts.jsonl"))?;
+    // held until the run ends: two runs on one output, on different --only-columns say, would each rewrite the
+    // chunks their columns share from what they read, losing the other's columns while both record progress
+    lock_output(&attempts, &out)?;
+    let attempt = py_dumps(&json!({"attempt": t_start, "start": t_start}), JsonStyle::DEFAULT);
+    attempts.write_all(format!("{attempt}\n").as_bytes())?;
+
+    let progress = out.join("progress.jsonl");
+    let p = plan(&c, &progress)?;
     let mut e = engine::open(&a.model_dir, c.device, c.precision)?;
     check_column_memory(&c, &p, &e)?;
 
@@ -471,7 +492,7 @@ fn run(c: Checked) -> Result<()> {
     attrs.insert("voxel_size_um".into(), json!(9.362));
     attrs.insert("origin_zyx".into(), json!([p.z0, 0, 0]));
     attrs.insert("inference".into(), Value::Object(prov));
-    let output = Output::open_or_create(&a.out, p.nz, p.ny, p.nx, &attrs)?;
+    let output = Output::open_or_create(&out, p.nz, p.ny, p.nx, &attrs)?;
 
     let feed = start_feed(&c, &p)?;
     if let Some(len) = p.progress_complete {
@@ -498,7 +519,7 @@ fn run(c: Checked) -> Result<()> {
         "attempt": t_start,
         "end": now_unix(),
         "complete": recs.len() == p.cols.cols.len(),
-        "identity": prediction_identity(&a.out)?,
+        "identity": prediction_identity(&out)?,
         "columns_total": p.cols.cols.len(),
         "columns_done": recs.len(),
         "stopped_early": stopped,
@@ -520,7 +541,7 @@ fn run(c: Checked) -> Result<()> {
         summary["mode"] = json!("villa");
     }
     let name = format!("summary-{}.json", t_start as i64);
-    fs::write(a.out.join(name), py_dumps(&summary, JsonStyle::indented(1)))?;
+    fs::write(out.join(name), py_dumps(&summary, JsonStyle::indented(1)))?;
     println!("{}", py_dumps(&summary, JsonStyle::DEFAULT));
     Ok(())
 }
