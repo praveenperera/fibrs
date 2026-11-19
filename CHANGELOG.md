@@ -31,7 +31,9 @@ over a CT volume on an NVIDIA GPU, natively in the `fibrs` binary, with no PyTor
   predictions were decoded 8 planes at a time. On a 512-plane band it is 9.0 GiB, where 0.1.0 peaked at
   8.9–10.8 GiB.
 - **Tracing is faster on dense bands**, with the same `.afv`:
-  - The native predictions are decoded 8 planes at a time instead of a whole chunk at a time.
+  - The native predictions are decoded 8 planes at a time instead of a whole chunk at a time when the array's
+    chunks allow it. If one chunk of such an array still has to be decoded whole, its 8-plane slabs are cached one
+    at a time as they are copied, instead of all being copied before any is cached.
   - Decoded predictions and the direction field's tile buffers are reused from a pool.
   - Each field's bricks are cut from large mappings it owns.
   - The direction field's Gaussian filters sum a whole row of voxels at a time, in the same order as before.
@@ -87,13 +89,18 @@ overlaps. The speedup is the mean of the per-pair ratios:
 | fp32 (default) | 45.37 s | 26.77 s | 1.72× (1.66–1.78×) |
 | bf16 (opt-in) | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) |
 
+On a 512 × 2048 × 2048 box of PHerc0358 (z 2304–2816, y 2176–4224, x 2944–4992) with no all-zero tile, one run
+of each at fp32 on the same GPU took 165.6 s for villa, 85.4 s for fibrs in band mode (1.94×) and 84.8 s with
+`--mode villa` (1.95×). At fp32 the measured speedup is 1.68×–1.95×; the lowest is the single PHerc0826 run in
+band mode behind the end-to-end row under "Why the speed-up varies" (45.4 s and 27.0 s).
+
 fibrs, a pre-release build of 0.2.0 (`e9adcc9`), ran with cuDNN 9.27.0 and cuBLAS 13.4.1.3. villa ran PyTorch
 2.14.1 (CUDA 13.0) with cuDNN 9.24, at `0bddf2757`.
 
 ### Parity
 
 - **fp32 (default)**, `fibrs predict --mode villa` against villa main's `lasagna.qualzz_inference` (`0bddf2757`)
-  on the same crop:
+  on the PHerc0826 crop above:
   - the 99.9th percentile of the probability differences over the foreground is 1 of 255 in each channel;
   - the largest difference is 3 of 255;
   - the most likely class agrees at 99.97% of voxels in `semantic` and 99.973% in `tracing`;
@@ -101,7 +108,7 @@ fibrs, a pre-release build of 0.2.0 (`e9adcc9`), ran with cuDNN 9.27.0 and cuBLA
 
   The outputs aren't identical, as expected from a different implementation. The differences are of the same
   order as two runs of villa itself with `cudnn.benchmark` on (99.9th percentile 1).
-  The timed runs' outputs were scored the same way. At fp32 they meet the bar: each of fibrs's seven runs
+  The PHerc0826 timed runs' outputs were scored the same way. At fp32 they meet the bar: each of fibrs's seven runs
   differs from villa's at 1.16% of voxel positions in `semantic` and 0.99% in `tracing`, by at most 3 of 255,
   with the same counts in every run. At bf16 (opt-in) they differ from villa's fp32 at 10.7% and 11.5% of
   positions, by at most 33 and 20 of 255; the 99.9th percentile over the foreground is 6 and 4, and the most
@@ -111,7 +118,7 @@ fibrs, a pre-release build of 0.2.0 (`e9adcc9`), ran with cuDNN 9.27.0 and cuBLA
   reads a missing chunk as zero.
 - **Libraries:** running the release build with the cuDNN 9.28.1 and cuBLAS 12.9 that `fibrs[predict]` installs,
   instead of a system cuDNN 9.27.0 and cuBLAS 13.4, left its outputs unchanged on three band columns at fp32 and
-  bf16. With the pip cuDNN alone, the villa-mode crop at fp32 was unchanged too.
+  bf16. With the pip cuDNN alone, the villa-mode PHerc0826 crop at fp32 was unchanged too.
 - **bf16 (opt-in)** against fp32: the figures under Precision.
 
 ### Why the speed-up varies
@@ -125,8 +132,9 @@ more than one:
 - **Prediction skips air.** villa main runs every tile; band mode skips tiles whose input is all zero, so on a
   sparse band it runs a fraction of villa's tiles and on a dense one about as many. `--mode villa` doesn't skip
   all-zero tiles, and on the PHerc0826 crop it ran 864 tiles where villa ran 726, since it runs a tile once for
-  each of its columns that the tile's core overlaps. Every prediction time is the whole command's wall time,
-  reading the same CT crop and writing arrays of the same shapes and chunk sizes.
+  each of its columns that the tile's core overlaps. Every measured prediction time is the whole command's wall
+  time, reading the same CT crop and writing arrays of the same shapes and chunk sizes. villa's prediction was not
+  run on the whole PHerc0358 band; its time there is estimated, so that end-to-end ratio is an estimate too.
 - **Tracing varies with the run.** The tracer ratio varies with the run and with the machine's load, so it is
   given as the lowest to highest measured. Pre-release builds of 0.2.0 traced dense data slower than 0.1.0;
   0.2.0 is faster than 0.1.0 there (the last row).
@@ -136,15 +144,22 @@ more than one:
 | Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 11,840 s | 191 s | 62× | CPU | one run each (run 1; fibrs built before 0.1.0) |
 | Tracing | PHerc0826 | z 12032–12544, whole plane | 15.2% | 4,686 s | 172 s | 27× | CPU | one run each (run 2; fibrs 0.1.0) |
 | Tracing | PHerc1545 | z 1280–1792, whole plane | 8.4% | 1,621 s | 73.4 s | 22× | CPU | one run each (run 3; fibrs 0.1.0) |
+| Tracing | PHerc0358 | z 2304–2816, whole plane | 33.2% | 15,632 s | 332 s | 47× | CPU | one run each, not at the same time (fibrs 0.2.0) |
 | Prediction, `--mode villa` | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 45.37 s | 26.77 s | 1.72× (1.66–1.78×) | fp32 | ABBA, 6 pairs: medians, mean ratio with 95% CI |
 | Prediction, `--mode villa` | PHerc0826 | same crop | 100% | 45.35 s | 14.06 s | 3.19× (3.10–3.27×) | bf16 (opt-in) | ABBA, 6 pairs: medians, mean ratio with 95% CI |
+| Prediction, band mode | PHerc0358 | z 2304–2816 / y 2176–4224 / x 2944–4992 | 100% | 165.6 s | 85.4 s | 1.94× | fp32 | one run each; fibrs `e9adcc9` |
+| Prediction, `--mode villa` | PHerc0358 | same box | 100% | 165.6 s | 84.8 s | 1.95× | fp32 | one run each, against the same villa run; fibrs `e9adcc9` |
 | End to end, prediction in band mode | PHerc0826 | z 12032–12544 / y 4096–5120 / x 1536–2560 | 100% | 387.5 s | 41.7 s | 9.3× | fp32 | one run of each stage |
+| End to end, prediction in band mode | PHerc0358 | z 2304–2816, whole plane | 33.2% | 17,863 s, prediction estimated | 739 s | 24×, estimated | fp32 | villa's prediction time extrapolated from the box above; the rest one run of each stage, fibrs `e9adcc9` predicting; both tracers read fibrs's prediction |
 | Tracing, fibrs 0.1.0 → 0.2.0 | PHerc0358 | z 1792–2304 / y 2176–4224 / x 2944–4992 | 100% | 104 s (0.1.0) | 50–52 s (0.2.0) | 2.0–2.1× | CPU | back to back on one machine, `--threads 8`; not in the tracing range |
 
 "Original" is `avf-spline-generator` 0.2.0 for tracing and villa's `lasagna.qualzz_inference` (main `0bddf2757`,
-PyTorch fp32) for prediction; end to end is the two stages added, from a single run of each (prediction 45.4 s and
-27.0 s, `fibrs predict` in band mode, not the ABBA medians). Tracing ran with `--threads 4` for both tools unless
-the row says otherwise.
+PyTorch fp32) for prediction; end to end is the two stages added, on the PHerc0826 crop from a single run of each
+(prediction 45.4 s and 27.0 s, `fibrs predict` in band mode, not the ABBA medians). On the PHerc0358 band villa's
+prediction was not run: its 2,231 s is the box run's 5.4 s outside inference plus its 160.2 s of inference scaled
+from the box's 2,904 tiles to the band's 40,344, as villa main runs every tile. fibrs's prediction (407.2 s) and
+both tracers (15,632 s and 332 s) were measured. Both tracers read the same saved fibrs prediction of the band, and
+each stage was timed in its own run. Tracing ran with `--threads 4` for both tools unless the row says otherwise.
 
 ### Known limitations
 
