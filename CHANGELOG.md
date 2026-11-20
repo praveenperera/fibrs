@@ -16,7 +16,8 @@
   unchanged.
 - **H's centrality runs during V's walk.** When the GPU computes centrality, the H family's centrality and seeds
   now run while the V family walks on the CPU, instead of after it. The run holds H's centrality and seed list
-  while V walks. The `.afv` is unchanged. With centrality on the CPU, the two still run one after the other.
+  while V walks. The `.afv` is unchanged. With centrality on the CPU, or when the GPU fails on H, H's centrality
+  runs after V's walk, so it never takes the walk's CPU threads.
 
 ## [0.3.1] - 2026-11-19
 
