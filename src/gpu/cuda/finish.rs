@@ -31,9 +31,12 @@ const STAGING_BYTES: usize = 64 << 20;
 /// Most device memory the slab cache takes, however much is free: at 256 KiB a slab (8 planes of a 128³ chunk,
 /// both channels) that is 32,768 slabs, far more than a batch of curves reads
 const SLAB_CACHE_MAX: usize = 8 << 30;
-/// Device memory left beside the slab cache for each batch's buffers (tens of megabytes at the run's largest
-/// batches), the driver and other processes; a quarter of what is free beyond it is left too
-const HEADROOM: usize = 1 << 30;
+/// Device bytes a batch's buffers take per raw point, at most: 12 for the point, 12 for its smoothed copy and 1
+/// for its flag; 27 for its share of the fitted room, at most 2.25 points a raw point (9 for a 4-point piece) at
+/// the tracer's step of 0.75; 8 for a curve's first slot and length and 5 for a fitted piece's five words, as a
+/// curve holds a point at least and a fitted piece 4. Twice that covers the spare half `fit` leaves when it grows
+/// a buffer and the smaller buffer it replaces
+const BATCH_BYTES_PER_POINT: usize = 2 * (12 + 12 + 1 + 27 + 8 + 5);
 /// How far, in tracing voxels, a sample of a fitted segment can lie from the raw segments of its piece: fitting
 /// moves a point at most 0.3 voxels, and the Catmull-Rom resampling overshoots the smoothed points by under 0.1 of
 /// the neighbouring segments' lengths (about 0.15 at the tracer's step of 0.75). The kernels flag a read of a slab
@@ -62,9 +65,16 @@ pub struct GpuFinisher {
 
 impl Gpu {
     /// A finisher of family `family` (1 = V, 2 = H) that reads `tracing` and native predictions laid out as
-    /// `layout`; uploads both pooled predictions and sizes the slab cache from the device memory free after them
-    pub fn finisher(&self, tracing: &[Vol<u8>; 2], family: usize, layout: SlabLayout) -> Result<GpuFinisher> {
-        self.finisher_with(tracing, family, layout, SLAB_CACHE_MAX)
+    /// `layout`, for batches of about `batch_points` raw points at most; uploads both pooled predictions and sizes
+    /// the slab cache from the device memory free after them, less what such a batch's buffers take
+    pub fn finisher(
+        &self,
+        tracing: &[Vol<u8>; 2],
+        family: usize,
+        layout: SlabLayout,
+        batch_points: usize,
+    ) -> Result<GpuFinisher> {
+        self.finisher_with(tracing, family, layout, batch_points, SLAB_CACHE_MAX)
     }
 
     /// [`Gpu::finisher`] with a slab cache of at most `cache_bytes`
@@ -73,6 +83,7 @@ impl Gpu {
         tracing: &[Vol<u8>; 2],
         family: usize,
         layout: SlabLayout,
+        batch_points: usize,
         cache_bytes: usize,
     ) -> Result<GpuFinisher> {
         let shape = tracing[0].shape();
@@ -91,7 +102,8 @@ impl Gpu {
         let stream = self.ctx.new_stream()?;
         let mut staging = Staging::new(&stream, layout.slab_bytes())?;
         let tracing = Tracing::upload(&stream, &mut staging, tracing)?;
-        let slabs = SlabCache::new(self, &stream, layout, cache_bytes)?;
+        let reserve = batch_points.saturating_mul(BATCH_BYTES_PER_POINT);
+        let slabs = SlabCache::new(self, &stream, layout, reserve, cache_bytes)?;
         let bufs = Buffers::new(&stream)?;
         let kernels = [self.k.fs_segments.clone(), self.k.fs_fit.clone()];
         Ok(GpuFinisher { kernels, stream, family: family as u32, tracing, slabs, staging, bufs })
@@ -157,6 +169,10 @@ impl GpuFinisher {
         fit(&stream, &mut b.start, curves + 1)?;
         fit(&stream, &mut b.len, curves)?;
         fit(&stream, &mut b.valid, n)?;
+        let mut valid = vec![0u8; n];
+        let mut err = [0u32];
+        // after the host memory the copies read and write, so an early return waits for them before it is freed
+        let pending = Pending(&stream);
         stream.memcpy_htod(&raw.pts, &mut b.pts.slice_mut(..3 * n))?;
         stream.memcpy_htod(&raw.start, &mut b.start.slice_mut(..curves + 1))?;
         stream.memcpy_htod(&raw.len, &mut b.len.slice_mut(..curves))?;
@@ -175,12 +191,10 @@ impl GpuFinisher {
             (&mut b.valid, &mut b.ok, &mut b.err),
         )?;
 
-        let mut valid = vec![0u8; n];
-        let mut err = [0u32];
         stream.memcpy_dtoh(&b.valid.slice(..n), &mut valid)?;
         stream.memcpy_dtoh(&b.err, &mut err[..])?;
         // the pageable sources above are read by then too
-        stream.synchronize().wrap_err("run the finishing kernels")?;
+        pending.wait("run the finishing kernels")?;
         Ok((valid, err[0]))
     }
 
@@ -200,6 +214,10 @@ impl GpuFinisher {
         fit(&stream, &mut b.fitted, 3 * room)?;
         // the kernel clears a piece's flag when one of its segments fails
         let ones = vec![1u32; pieces];
+        let mut out = Fitted { points: vec![0.0; 3 * room], flen: vec![0; pieces], ok: vec![0; pieces], err: 0 };
+        let mut err = [0u32];
+        // after the host memory the copies read and write, so an early return waits for them before it is freed
+        let pending = Pending(&stream);
         stream.memcpy_htod(&plan.pstart, &mut b.pstart.slice_mut(..pieces))?;
         stream.memcpy_htod(&plan.plen, &mut b.plen.slice_mut(..pieces))?;
         stream.memcpy_htod(&plan.fstart, &mut b.fstart.slice_mut(..pieces + 1))?;
@@ -230,24 +248,35 @@ impl GpuFinisher {
             (&mut b.valid, &mut b.ok, &mut b.err),
         )?;
 
-        let mut out = Fitted { points: vec![0.0; 3 * room], flen: vec![0; pieces], ok: vec![0; pieces], err: 0 };
-        let mut err = [0u32];
         stream.memcpy_dtoh(&b.flen.slice(..pieces), &mut out.flen)?;
         stream.memcpy_dtoh(&b.ok.slice(..pieces), &mut out.ok)?;
         stream.memcpy_dtoh(&b.err, &mut err[..])?;
         stream.memcpy_dtoh(&b.fitted.slice(..3 * room), &mut out.points)?;
-        stream.synchronize().wrap_err("run the fitting kernels")?;
+        pending.wait("run the fitting kernels")?;
         out.err = err[0];
         Ok(out)
     }
 }
 
-impl Drop for GpuFinisher {
-    /// Wait for the queued copies before the staging and the host tables they read are freed: cudarc does not
-    /// track the plain slices they were given, and an error can leave a copy queued
+/// Waits, when dropped, for the work queued on a stream, so host memory its copies read or write outlives them
+/// when an error returns early: cudarc does not track plain host slices, and the driver may read pageable memory
+/// after an asynchronous copy returns. Locals drop in reverse order, so it guards the memory declared before it
+struct Pending<'a>(&'a CudaStream);
+
+impl Pending<'_> {
+    /// Wait for the queued work, saying on failure that it was `what`
+    fn wait(self, what: &'static str) -> Result<()> {
+        let stream = self.0;
+        // waited for here, so the drop has nothing left to wait for
+        std::mem::forget(self);
+        stream.synchronize().wrap_err(what)
+    }
+}
+
+impl Drop for Pending<'_> {
     fn drop(&mut self) {
         // a failed sync means the context is broken, and freeing then is all that is left to do
-        let _ = self.stream.synchronize();
+        let _ = self.0.synchronize();
     }
 }
 
@@ -557,6 +586,8 @@ struct Staging {
     /// The copies queued from each half, which must finish before it is written again
     queued: [Option<CudaEvent>; 2],
     next: usize,
+    /// The stream every copy from `buf` is queued on
+    stream: Arc<CudaStream>,
 }
 
 impl Staging {
@@ -565,7 +596,7 @@ impl Staging {
         let half = (STAGING_BYTES / 2).max(most);
         // write-combined, as the host only writes it
         let buf = pinned(stream.context(), 2 * half, sys::CU_MEMHOSTALLOC_WRITECOMBINED)?;
-        Ok(Self { buf, queued: [None, None], next: 0 })
+        Ok(Self { buf, queued: [None, None], next: 0, stream: stream.clone() })
     }
 
     fn half(&self) -> usize {
@@ -586,6 +617,16 @@ impl Staging {
         self.queued[self.next] = Some(stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?);
         self.next ^= 1;
         Ok(())
+    }
+}
+
+impl Drop for Staging {
+    /// Wait for every copy queued from `buf` before it is freed: cudarc does not track the plain slices the copies
+    /// were given, and an error, while the finisher is set up or later, can leave copies queued that no event in
+    /// `queued` covers yet
+    fn drop(&mut self) {
+        // a failed sync means the context is broken, and freeing then is all that is left to do
+        let _ = self.stream.synchronize();
     }
 }
 
@@ -612,16 +653,20 @@ struct SlabCache {
 }
 
 impl SlabCache {
-    /// A cache as large as the device memory free now allows beyond [`HEADROOM`], up to `most` bytes
-    fn new(gpu: &Gpu, stream: &Arc<CudaStream>, layout: SlabLayout, most: usize) -> Result<Self> {
+    /// A cache as [`slab_slots`] sizes it from the device memory free now, leaving `reserve` bytes for a batch's
+    /// buffers and holding at most `most` bytes
+    fn new(gpu: &Gpu, stream: &Arc<CudaStream>, layout: SlabLayout, reserve: usize, most: usize) -> Result<Self> {
         let (free, _) = gpu.ctx.mem_get_info()?;
         let bytes = layout.slab_bytes();
-        let budget = (free.saturating_sub(HEADROOM) / 4 * 3).min(most);
-        let slots = (budget / bytes).min(NO_SLAB as usize - 1);
+        let slots = slab_slots(free, reserve, most, bytes, layout.len());
         ensure!(slots > 0, "{} MiB free on the GPU leave no room for native slabs", free >> 20);
+        // the pool first, so a failed allocation leaves no copy queued
+        let pool = stream.alloc_zeros::<u8>(slots * bytes).wrap_err("allocate GPU memory")?;
         let host = vec![NO_SLAB; layout.len()];
         let table = stream.clone_htod(&host)?;
-        let pool = stream.alloc_zeros::<u8>(slots * bytes).wrap_err("allocate GPU memory")?;
+        // the driver may read pageable memory after the copy returns, and `host` is freed with the cache, which an
+        // error before the first batch's table write can drop
+        stream.synchronize().wrap_err("upload the slab table")?;
         let [_, ncy, ncx] = layout.chunks();
         let (s, e) = (layout.shape, layout.edge);
         let params =
@@ -733,6 +778,14 @@ impl SlabCache {
             args.arg(v);
         }
     }
+}
+
+/// Slots of `bytes` each for the slab cache: three quarters of the device memory `free` beyond `reserve`, the
+/// other quarter left for the driver and other processes, up to `most` bytes and no more slots than the `slabs` the
+/// native predictions hold, which is below [`NO_SLAB`] (checked in [`Gpu::finisher`])
+fn slab_slots(free: usize, reserve: usize, most: usize, bytes: usize, slabs: usize) -> usize {
+    let budget = (free.saturating_sub(reserve) / 4 * 3).min(most);
+    (budget / bytes).min(slabs)
 }
 
 /// The device buffers each batch reuses, grown as batches need
@@ -977,6 +1030,27 @@ mod tests {
         assert!(checked > 1000, "{checked} pieces checked, too few to test");
     }
 
+    /// The slab cache takes no more slots than the native predictions have slabs however much is free, and the
+    /// reserve for a run's batches (of about 2 Mi raw points) leaves slots on a GPU with under 1 GiB free
+    #[test]
+    fn slab_slots_fit_the_predictions_and_the_device() {
+        const GIB: usize = 1 << 30;
+        let reserve = (2 << 20) * BATCH_BYTES_PER_POINT;
+        // a 64³ volume in one 512 KiB slab
+        let small = SlabLayout { shape: [64; 3], edge: [64; 3], planes: 64 };
+        assert_eq!((small.len(), small.slab_bytes()), (1, 512 << 10));
+        assert_eq!(slab_slots(12 * GIB, reserve, SLAB_CACHE_MAX, small.slab_bytes(), small.len()), 1);
+
+        // 128³ chunks in slabs of 8 planes, over a band larger than the cache
+        let band = SlabLayout { shape: [512, 4096, 4096], edge: [128; 3], planes: 8 };
+        let bytes = band.slab_bytes();
+        let low = slab_slots(768 << 20, reserve, SLAB_CACHE_MAX, bytes, band.len());
+        assert!(low * bytes > 256 << 20, "{low} slots in 768 MiB free");
+        let high = slab_slots(24 * GIB, reserve, SLAB_CACHE_MAX, bytes, band.len());
+        assert_eq!(high * bytes, SLAB_CACHE_MAX);
+        assert_eq!(slab_slots(reserve / 2, reserve, SLAB_CACHE_MAX, bytes, band.len()), 0);
+    }
+
     /// Bit patterns of each curve's pieces, so 0.0 and -0.0 differ
     fn bits(pieces: &[Pieces]) -> Vec<Vec<Vec<[u32; 3]>>> {
         pieces.iter().map(|c| c.iter().map(|p| p.iter().map(|q| q.map(f32::to_bits)).collect()).collect()).collect()
@@ -1023,7 +1097,9 @@ mod tests {
                 let pieces = want.iter().map(Vec::len).sum::<usize>();
                 assert!(pieces > batch.len(), "{name} {family}: {pieces} pieces of {} curves", batch.len());
 
-                let mut finisher = gpu.finisher_with(&tracing, family, layout, room * layout.slab_bytes()).unwrap();
+                // the fixture's curves hold 150 points at most
+                let (points, cache_bytes) = (BATCH * 150, room * layout.slab_bytes());
+                let mut finisher = gpu.finisher_with(&tracing, family, layout, points, cache_bytes).unwrap();
                 assert!(finisher.slots() < all, "{name} {family}: the cache holds every slab");
                 for (i, (curves, want)) in batch.chunks(BATCH).zip(want.chunks(BATCH)).enumerate() {
                     match finisher.finish(&workers, &cache, curves).unwrap() {

@@ -722,7 +722,8 @@ const CHUNK_POOL_RETAIN: usize = 128 << 20;
 /// time
 const FINISH_BATCH: usize = 8192;
 /// Raw curve points at which a batch is handed over even with fewer than [`FINISH_BATCH`] curves, so the batches in
-/// flight stay in the tens of megabytes (12 bytes a point) however long the curves are
+/// flight stay in the tens of megabytes (12 bytes a point) however long the curves are; the GPU leaves room for a
+/// batch of this many beside its slab cache
 const FINISH_POINTS: usize = 2 << 20;
 
 fn trace_families(
@@ -1113,7 +1114,7 @@ fn trace_family<D: DirField>(
     let shape = pres.shape();
     let fields = Fields { pres: &pres, cent: &cent, dirs };
     let ctx = FinishCtx { tracing, pres: &pres, family };
-    let mut finisher = BatchFinisher::open(device, tracing, family, cache, label)?;
+    let mut finisher = BatchFinisher::new(device, tracing, family, label);
     // the pool's idle threads trace seeds ahead of the commit point, and it gets every thread: with one fewer, as
     // when one thread traced every seed, a dense crop at --threads 4 traced no faster than that thread did, since
     // finishing kept the pool busy. The committing thread traces the seeds no pool thread has started
@@ -1196,12 +1197,23 @@ fn trace_family<D: DirField>(
 
 /// Where a family's batches of raw curves are finished: on the GPU when the run has one, and on the CPU for each
 /// batch the GPU hands back, or for every batch once the GPU has failed. Both give the same pieces
-struct BatchFinisher {
-    gpu: Option<GpuFinisher>,
+struct BatchFinisher<'a> {
+    gpu: OnGpu<'a>,
     /// Whether a GPU failure ends the run (`--device cuda`) instead of moving finishing to the CPU
     strict: bool,
     label: &'static str,
     counts: FinishCounts,
+}
+
+/// Where a family's finishing stands on the GPU
+enum OnGpu<'a> {
+    /// The run's GPU, set up for the family when its first batch of curves comes, so a family with none never
+    /// needs it
+    Unopened { gpu: &'a Gpu, tracing: &'a [Vol<u8>; 2], family: usize },
+    /// Boxed, so the other states do not take the finisher's size
+    Open(Box<GpuFinisher>),
+    /// The run has no GPU, or setting it up or a batch on it failed
+    Off,
 }
 
 /// What the GPU finished of a family, for the log
@@ -1219,20 +1231,23 @@ struct FinishCounts {
     failed: usize,
 }
 
-impl BatchFinisher {
-    /// Finishing on the run's GPU, if it has one and the family's pooled predictions and a slab cache fit on it,
-    /// else on the CPU; says which
-    fn open(
-        device: &CentralityDevice,
-        tracing: &[Vol<u8>; 2],
-        family: usize,
-        cache: &NativeCache,
-        label: &'static str,
-    ) -> Result<Self> {
-        let mut finisher = Self { gpu: None, strict: device.strict, label, counts: FinishCounts::default() };
-        let Some(gpu) = &device.gpu else { return Ok(finisher) };
-        let layout = cache.layout();
-        match gpu.finisher(tracing, family, layout) {
+impl<'a> BatchFinisher<'a> {
+    /// Finishing on the run's GPU, if it has one, else on the CPU
+    fn new(device: &'a CentralityDevice, tracing: &'a [Vol<u8>; 2], family: usize, label: &'static str) -> Self {
+        let gpu = match &device.gpu {
+            Some(gpu) => OnGpu::Unopened { gpu, tracing, family },
+            None => OnGpu::Off,
+        };
+        Self { gpu, strict: device.strict, label, counts: FinishCounts::default() }
+    }
+
+    /// Set the GPU up for the family, if it is not yet, when the family's pooled predictions and a slab cache fit
+    /// on it, else move finishing to the CPU; says which
+    fn open(&mut self, cache: &NativeCache) -> Result<()> {
+        let OnGpu::Unopened { gpu, tracing, family } = self.gpu else { return Ok(()) };
+        self.gpu = OnGpu::Off;
+        let (label, layout) = (self.label, cache.layout());
+        match gpu.finisher(tracing, family, layout, FINISH_POINTS) {
             Ok(on_gpu) => {
                 let gib = gib(on_gpu.slots() * layout.slab_bytes());
                 log!(
@@ -1240,13 +1255,13 @@ impl BatchFinisher {
                     gpu.name(),
                     on_gpu.slots()
                 );
-                finisher.gpu = Some(on_gpu);
-                finisher.counts.used = true;
+                self.gpu = OnGpu::Open(Box::new(on_gpu));
+                self.counts.used = true;
             }
-            Err(e) if !device.strict => log!("{label} finishing on the CPU: the GPU failed ({e:#})"),
+            Err(e) if !self.strict => log!("{label} finishing on the CPU: the GPU failed ({e:#})"),
             Err(e) => return Err(e),
         }
-        Ok(finisher)
+        Ok(())
     }
 
     /// One batch's pieces, as [`finish_batch`] gives them
@@ -1257,9 +1272,12 @@ impl BatchFinisher {
         cache: &NativeCache,
         batch: &[RawCurve],
     ) -> Result<Vec<Pieces>> {
+        if !batch.is_empty() {
+            self.open(cache)?;
+        }
         let c = &mut self.counts;
         c.batches += c.used as usize;
-        let Some(gpu) = self.gpu.as_mut() else {
+        let OnGpu::Open(gpu) = &mut self.gpu else {
             c.failed += c.used as usize;
             return finish_batch(pool, ctx, cache, batch);
         };
@@ -1273,7 +1291,7 @@ impl BatchFinisher {
                 log!("{} finishing on the CPU from here: the GPU failed ({e:#})", self.label);
                 c.uploaded = gpu.uploaded();
                 c.failed += 1;
-                self.gpu = None;
+                self.gpu = OnGpu::Off;
             }
             Err(e) => return Err(e),
         }
@@ -1286,7 +1304,7 @@ impl BatchFinisher {
         if !c.used {
             return;
         }
-        if let Some(gpu) = &self.gpu {
+        if let OnGpu::Open(gpu) = &self.gpu {
             c.uploaded = gpu.uploaded();
         }
         let reasons = [
