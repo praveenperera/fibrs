@@ -10,9 +10,10 @@ predictions it reads are Qual's; this port changes how fast the tracer runs, not
 PyTorch, writing the probability zarr the tracer reads, as villa's inference writes it (see
 [Predictions](#predictions)).
 
-From CT to `.afv`, fibrs 0.4.0 runs three 512-plane bands of PHerc1545, PHerc0826 and PHerc0358 in 800 s on one
-RTX 5090, with prediction at fp32. villa's public prediction at fp32 followed by the original tracer takes about
-35,000 s on the same machine, with villa's part estimated, so fibrs is about 44× faster (see [Speed](#speed)). A
+From CT to `.afv`, fibrs 0.4.0 runs three 512-plane bands of PHerc1545, PHerc0826 and PHerc0358 in 800 s in total
+on one RTX 5090, with prediction at fp32. villa's public prediction at fp32 followed by the original tracer takes
+about 35,000 s on the same machine, so fibrs is about 44× faster; villa's part and the original's PHerc0358 time are
+estimated, and without villa's write of its accumulators to disk fibrs is about 32× faster (see [Speed](#speed)). A
 whole scroll end to end would take fibrs about 2.6–3 hours and villa with the original tracer roughly 80–140 hours,
 both estimated, at fp32. Tracing runs on the CPU; the direction field, centrality, the seed tests and the finishing
 of traced curves run on an NVIDIA GPU when one is found, and on the CPU otherwise.
@@ -203,7 +204,8 @@ as published, followed by `avf-spline-generator` 0.2.0 on the CPU with `--thread
   over the 2.61 cores its other two runs got. Against the measured time, that band is 47.5× faster.
 - **villa's estimate.** On PHerc1545 villa ran all 37,446 tiles in 4,266 s and was stopped during its final
   accumulator write, estimated at about 800 s from the 790 s write it made mid-band. PHerc0826 (44,376 tiles) and
-  PHerc0358 (about 40,300) are scaled from that rate, 114 ms per tile, plus the same final write.
+  PHerc0358 (about 40,300) are scaled from that rate, 114 ms per tile, plus the same final write. That PHerc1545 run
+  had a one-minute load average of 13–24, which may have slowed it, and it is not corrected for either.
 - Both tracers traced fibrs's predictions of each band. A trace of villa's predictions could take somewhat longer
   or shorter, as the tracer's time depends on what it reads.
 
@@ -215,7 +217,10 @@ villa writes its tile accumulators to disk as float32 arrays as it runs, and on 
 part of its time; its runner has no setting for a smaller accumulator type. Without the write, estimated from villa
 runs on 1,536-tile boxes of the same bands with the accumulators in memory (53–54 ms per tile), the public pipeline
 would take about 3,600 s, 7,000 s and 14,700 s on the three bands, and fibrs 0.4.0 would still be 30.9×, 29.1× and
-33.2× faster (31.6× over all three, fp32).
+33.2× faster (31.6× over all three, fp32). The older villa figures under [Predictions](#predictions) and
+[Why the speed-up varies](#why-the-speed-up-varies) come from a crop and a box small enough to keep the accumulators
+in memory, so they leave this write out; they agree with these figures (2,231 s for villa's PHerc0358 band
+prediction there, about 2,150 s here).
 
 A whole scroll, end to end on one RTX 5090, estimated (not measured), with prediction at fp32:
 
@@ -232,7 +237,8 @@ scroll traced as its 512-plane bands. For villa and the original tracer, villa's
 upper figure including its final write) is multiplied by the scroll's tile count, and the original tracer's time
 per tile with data on the three bands (0.51–0.94 s) by the scroll's tiles with data; the range spans those rates.
 Neither counts the download or joining the bands' outputs into one file, and neither reference tool was run on a
-whole scroll.
+whole scroll. Tracing in overlapping 1024-plane windows instead of single bands would roughly double the tracing for
+both tools, adding about 15–20 minutes for fibrs and about 40–80 hours for the original.
 
 ### Tracer alone, fibrs 0.1.0 to 0.3.1
 
