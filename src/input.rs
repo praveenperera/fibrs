@@ -11,6 +11,7 @@ use std::io::{self, Read};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use color_eyre::eyre::{Result, bail, ensure, eyre};
 use flate2::read::{MultiGzDecoder, ZlibDecoder};
@@ -20,6 +21,9 @@ use serde_json::Value;
 
 const DTYPE_ERROR: &str = "Predictions must be uint8 [0,255] or floating point [0,1]";
 const VALUE_ERROR: &str = "Predictions contain NaN, infinity or values outside [0,1]";
+
+/// The unit NPY input is read in by the native cache, in place of Zarr chunks: the reference's 64³ blocks
+pub const NPY_BLOCK: [usize; 3] = [64, 64, 64];
 
 /// Element kind of a prediction array
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,15 +125,23 @@ enum Store {
     Npy { map: Mmap, offset: usize, fortran: bool },
 }
 
-/// A local two-channel prediction array
+/// A local two-channel prediction array, or a chunk-aligned crop of one ([`Predictions::crop`])
+///
+/// Every coordinate and chunk key a caller passes is local to the crop; reads translate them by the crop's offset,
+/// so a crop reads exactly the values of the whole array at `offset + local`. A whole array is its own crop at
+/// offset zero
 pub struct Predictions {
     /// Resolved input path, as recorded in `run.json`
     pub path: PathBuf,
-    /// Spatial shape, z, y, x
+    /// Spatial shape of the crop, z, y, x
     pub shape: [usize; 3],
     pub dtype: Dtype,
     reverse: bool,
-    store: Store,
+    store: Arc<Store>,
+    /// The crop's first voxel in the stored array, z, y, x; on a chunk edge of every axis
+    offset: [usize; 3],
+    /// Spatial shape of the stored array
+    full: [usize; 3],
 }
 
 impl Predictions {
@@ -151,7 +163,51 @@ impl Predictions {
             bail!("Expected two channels and at least 2 voxels along each spatial axis");
         }
         let shape = [full_shape[1], full_shape[2], full_shape[3]];
-        Ok(Self { path, shape, dtype, reverse: order == "HV", store })
+        let store = Arc::new(store);
+        Ok(Self { path, shape, dtype, reverse: order == "HV", store, offset: [0; 3], full: shape })
+    }
+
+    /// The box `[lo, hi)` of these predictions (local coordinates) as predictions of its own, sharing the store
+    ///
+    /// The box must lie on whole chunks of the stored array (NPY input: [`NPY_BLOCK`]s): its start on a chunk edge
+    /// and its end on one or at the array's end. The crop's chunk grid is then the array's shifted by whole chunks,
+    /// so its chunk keys translate to the array's and whole-chunk, packed and plane reads work unchanged. An
+    /// unaligned box is refused rather than read across the chunk grid
+    pub fn crop(&self, lo: [usize; 3], hi: [usize; 3]) -> Result<Self> {
+        let edge = self.read_unit();
+        for a in 0..3 {
+            ensure!(
+                lo[a] < hi[a] && hi[a] <= self.shape[a],
+                "crop {lo:?}..{hi:?} lies outside predictions of shape {:?}",
+                self.shape
+            );
+            let (start, end) = (self.offset[a] + lo[a], self.offset[a] + hi[a]);
+            ensure!(
+                start.is_multiple_of(edge[a]) && (end.is_multiple_of(edge[a]) || end == self.full[a]),
+                "crop {lo:?}..{hi:?} of {} is not aligned to its {edge:?} chunks",
+                self.path.display()
+            );
+        }
+        Ok(Self {
+            path: self.path.clone(),
+            shape: [0, 1, 2].map(|a| hi[a] - lo[a]),
+            dtype: self.dtype,
+            reverse: self.reverse,
+            store: self.store.clone(),
+            offset: [0, 1, 2].map(|a| self.offset[a] + lo[a]),
+            full: self.full,
+        })
+    }
+
+    /// The box whole reads are made of: the Zarr chunk, or [`NPY_BLOCK`] for NPY input
+    pub fn read_unit(&self) -> [usize; 3] {
+        self.chunk_shape().unwrap_or(NPY_BLOCK)
+    }
+
+    /// A chunk key of the crop as the stored array's key; the crop's offset is whole chunks
+    fn stored_key(&self, key: [usize; 3]) -> Result<[usize; 3]> {
+        let Store::Zarr { chunks, .. } = &*self.store else { bail!("only Zarr arrays have chunk keys") };
+        Ok([0, 1, 2].map(|a| key[a] + self.offset[a] / chunks[a + 1]))
     }
 
     /// Read `(2, hi - lo)` as uint8 in V, H order (`Predictions.read(lo, hi)`)
@@ -196,13 +252,15 @@ impl Predictions {
     /// Raw element bytes of `(2, hi - lo)`, C order, channels already in V, H order
     fn read_raw_in<A: Allocator>(&self, lo: [usize; 3], hi: [usize; 3], alloc: A) -> Result<Vec<u8, A>> {
         let dims = [0, 1, 2].map(|a| hi[a] - lo[a]);
+        // from here on, coordinates are the stored array's
+        let lo = [0, 1, 2].map(|a| lo[a] + self.offset[a]);
         let es = self.dtype.size();
         let plane = dims.iter().product::<usize>() * es;
         let mut out = Vec::with_capacity_in(2 * plane, alloc);
         out.resize(2 * plane, 0u8);
-        match &self.store {
+        match &*self.store {
             Store::Npy { map, offset, fortran } => {
-                let s = self.shape;
+                let s = self.full;
                 // element strides of (c, z, y, x)
                 let strides = match fortran {
                     false => [s[0] * s[1] * s[2], s[1] * s[2], s[2], 1],
@@ -221,7 +279,7 @@ impl Predictions {
             }
             Store::Zarr { chunks, .. } => {
                 let first = [0, 1, 2].map(|a| lo[a] / chunks[a + 1]);
-                let last = [0, 1, 2].map(|a| (hi[a] - 1) / chunks[a + 1]);
+                let last = [0, 1, 2].map(|a| (lo[a] + dims[a] - 1) / chunks[a + 1]);
                 for kc in 0..2usize.div_ceil(chunks[0]) {
                     for kz in first[0]..=last[0] {
                         for ky in first[1]..=last[1] {
@@ -240,15 +298,16 @@ impl Predictions {
         Ok(out)
     }
 
-    /// Copy the part of chunk `key` (channel chunk, z, y, x) that falls in the window at `lo`
+    /// Copy the part of stored chunk `key` (channel chunk, z, y, x) that falls in the window at `lo`, in the stored
+    /// array's coordinates
     fn copy_chunk(&self, key: [usize; 4], lo: [usize; 3], dims: [usize; 3], out: &mut [u8]) -> Result<()> {
-        let Store::Zarr { chunks, .. } = &self.store else { unreachable!("zarr only") };
+        let Store::Zarr { chunks, .. } = &*self.store else { unreachable!("zarr only") };
         let es = self.dtype.size();
         let data = self.chunk_bytes(key)?;
         let cs = [chunks[1], chunks[2], chunks[3]];
         let origin = [0, 1, 2].map(|a| key[a + 1] * cs[a]);
         let a0 = [0, 1, 2].map(|a| lo[a].max(origin[a]));
-        let a1 = [0, 1, 2].map(|a| (lo[a] + dims[a]).min(origin[a] + cs[a]).min(self.shape[a]));
+        let a1 = [0, 1, 2].map(|a| (lo[a] + dims[a]).min(origin[a] + cs[a]).min(self.full[a]));
         let plane = dims.iter().product::<usize>() * es;
         let cplane = cs.iter().product::<usize>() * es;
         let n = (a1[2] - a0[2]) * es;
@@ -267,9 +326,9 @@ impl Predictions {
         Ok(())
     }
 
-    /// Decoded bytes of one chunk in C order, or the fill value when the chunk file is absent
+    /// Decoded bytes of one stored chunk in C order, or the fill value when the chunk file is absent
     fn chunk_bytes(&self, key: [usize; 4]) -> Result<Vec<u8>> {
-        let Store::Zarr { dir, chunks, sep, fill, compressor, fortran } = &self.store else {
+        let Store::Zarr { dir, chunks, sep, fill, compressor, fortran } = &*self.store else {
             unreachable!("zarr only")
         };
         let n = chunks.iter().product::<usize>() * self.dtype.size();
@@ -288,7 +347,7 @@ impl Predictions {
 
     /// Zarr chunk edge along each spatial axis, or `None` for NPY input
     pub fn chunk_shape(&self) -> Option<[usize; 3]> {
-        match &self.store {
+        match &*self.store {
             Store::Zarr { chunks, .. } => Some([chunks[1], chunks[2], chunks[3]]),
             Store::Npy { .. } => None,
         }
@@ -353,15 +412,20 @@ impl Predictions {
     ///
     /// Zarr stores the chunks at the volume's edge at this full extent too, so the same strides address every chunk
     pub fn slab_layout(&self) -> Option<[usize; 3]> {
-        let Store::Zarr { chunks, compressor, fortran, .. } = &self.store else { return None };
+        let Store::Zarr { chunks, compressor, fortran, .. } = &*self.store else { return None };
         let sliced = chunks[0] == 2 && !*fortran && *compressor == Compressor::Blosc && self.dtype.kind == Kind::U8;
         sliced.then_some([chunks[1], chunks[2], chunks[3]])
     }
 
-    /// The still-compressed bytes of chunk `key`, read into a buffer from `alloc`, for an array with a
+    /// The still-compressed bytes of chunk `key` of the crop, read into a buffer from `alloc`, for an array with a
     /// [`Predictions::slab_layout`]
     pub fn packed_chunk_in<A: Allocator>(&self, key: [usize; 3], alloc: A) -> Result<PackedChunk<A>> {
-        let Store::Zarr { dir, sep, fill, .. } = &self.store else { bail!("only Zarr chunks are packed") };
+        self.stored_packed_in(self.stored_key(key)?, alloc)
+    }
+
+    /// [`Predictions::packed_chunk_in`] by the stored array's chunk key
+    fn stored_packed_in<A: Allocator>(&self, key: [usize; 3], alloc: A) -> Result<PackedChunk<A>> {
+        let Store::Zarr { dir, sep, fill, .. } = &*self.store else { bail!("only Zarr chunks are packed") };
         let name = format!("0{sep}{}{sep}{}{sep}{}", key[0], key[1], key[2]);
         let path = dir.join(&name);
         let file = match fs::File::open(&path) {
@@ -449,7 +513,7 @@ impl Predictions {
     pub fn blocks_fit_planes(&self, planes: usize) -> bool {
         let Some(edge) = self.slab_layout() else { return false };
         let run = planes * edge[1] * edge[2];
-        match self.stored_chunk().map(|key| self.packed_chunk_in(key, Global)) {
+        match self.stored_chunk().map(|key| self.stored_packed_in(key, Global)) {
             Some(Ok(PackedChunk::Blosc(bytes))) => blocks_fit(&bytes, run),
             // an array with no chunk stored holds only its fill value, which no decode reads
             None => true,
@@ -467,12 +531,12 @@ impl Predictions {
         }
     }
 
-    /// The key of a chunk the array stores, found by listing its directory, or `None` when it stores none
+    /// The stored array's key of a chunk it stores, found by listing its directory, or `None` when it stores none
     ///
     /// Listing instead of opening keys in grid order finds a chunk however sparse the array is
     fn stored_chunk(&self) -> Option<[usize; 3]> {
-        let Store::Zarr { dir, sep, chunks, .. } = &self.store else { return None };
-        let grid = [0, 1, 2].map(|a| self.shape[a].div_ceil(chunks[a + 1]));
+        let Store::Zarr { dir, sep, chunks, .. } = &*self.store else { return None };
+        let grid = [0, 1, 2].map(|a| self.full[a].div_ceil(chunks[a + 1]));
         let key = |parts: &[&str]| -> Option<[usize; 3]> {
             let [c, z, y, x] = parts else { return None };
             let k = [z.parse().ok()?, y.parse().ok()?, x.parse().ok()?];
@@ -1158,6 +1222,140 @@ mod tests {
         assert!(blosc_getitem(&frame, 0, &mut uninit(block)).is_err());
         let (mut a, mut b) = (uninit(len), uninit(len));
         assert!(frame_channel_ranges(&frame, channel, 0, [&mut a, &mut b]).is_err());
+    }
+
+    /// A crop reads what the whole array holds at the crop's offset: whole and in part, quantized and not, chunk by
+    /// chunk through the native cache's read, and plane by plane from packed chunks where the array has a slab layout
+    fn assert_crop_reads(full: &Predictions, lo: [usize; 3], hi: [usize; 3]) {
+        let crop = full.crop(lo, hi).unwrap();
+        let at = |p: [usize; 3]| [0, 1, 2].map(|a| p[a] + lo[a]);
+        assert_eq!(crop.shape, [0, 1, 2].map(|a| hi[a] - lo[a]));
+        assert_eq!(crop.read_u8([0; 3], crop.shape).unwrap(), full.read_u8(lo, hi).unwrap());
+        assert_eq!(crop.read_f32([0; 3], crop.shape).unwrap(), full.read_f32(lo, hi).unwrap());
+        let (a, b) = ([1, 1, 1], crop.shape.map(|n| n - 1));
+        assert_eq!(crop.read_u8(a, b).unwrap(), full.read_u8(at(a), at(b)).unwrap());
+
+        let pool = BufferPool::new(1 << 20);
+        let edge = crop.read_unit();
+        let grid = [0, 1, 2].map(|a| crop.shape[a].div_ceil(edge[a]));
+        for key in (0..grid[0]).flat_map(|z| (0..grid[1]).flat_map(move |y| (0..grid[2]).map(move |x| [z, y, x]))) {
+            let NativeChunk { lo: clo, dims, data } = crop.read_chunk_in(key, edge, &pool, &pool).unwrap();
+            let chi = [0, 1, 2].map(|a| clo[a] + dims[a]);
+            assert_eq!(&data[..], &full.read_u8(at(clo), at(chi)).unwrap()[..], "chunk {key:?}");
+            let Some(layout) = crop.slab_layout() else { continue };
+            let (mut got, mut want) = (Vec::new(), Vec::new());
+            crop.decode_planes(&crop.packed_chunk_in(key, &pool).unwrap(), 0..layout[0], &mut got).unwrap();
+            let stored = [0, 1, 2].map(|a| key[a] + lo[a] / layout[a]);
+            full.decode_planes(&full.packed_chunk_in(stored, &pool).unwrap(), 0..layout[0], &mut want).unwrap();
+            assert_eq!(got, want, "packed chunk {key:?}");
+        }
+    }
+
+    /// Write a C-order uint8 Zarr v2 array of (2, `shape`) in `chunks` of (channels, z, y, x), Blosc or raw
+    fn write_zarr(dir: &Path, shape: [usize; 3], chunks: [usize; 4], blosc: bool) {
+        let _ = fs::remove_dir_all(dir);
+        fs::create_dir_all(dir).unwrap();
+        let value = |c: usize, z: usize, y: usize, x: usize| (c * 89 + z * 31 + y * 7 + x * 3 + z * y * x / 5) as u8;
+        let grid = [0, 1, 2, 3].map(|a| [2, shape[0], shape[1], shape[2]][a].div_ceil(chunks[a]));
+        for k in (0..grid[0]).flat_map(|c| {
+            (0..grid[1]).flat_map(move |z| (0..grid[2]).flat_map(move |y| (0..grid[3]).map(move |x| [c, z, y, x])))
+        }) {
+            let mut bytes = Vec::new();
+            for c in k[0] * chunks[0]..(k[0] + 1) * chunks[0] {
+                for z in k[1] * chunks[1]..(k[1] + 1) * chunks[1] {
+                    for y in k[2] * chunks[2]..(k[2] + 1) * chunks[2] {
+                        for x in k[3] * chunks[3]..(k[3] + 1) * chunks[3] {
+                            let inside = c < 2 && z < shape[0] && y < shape[1] && x < shape[2];
+                            bytes.push(if inside { value(c, z, y, x) } else { 0 });
+                        }
+                    }
+                }
+            }
+            let bytes = if blosc { blosc_frame(&bytes, 1, 4 * chunks[2] * chunks[3]) } else { bytes };
+            fs::write(dir.join(format!("{}.{}.{}.{}", k[0], k[1], k[2], k[3])), bytes).unwrap();
+        }
+        let compressor = match blosc {
+            true => serde_json::json!({"id": "blosc", "cname": "zstd", "clevel": 3, "shuffle": 1, "blocksize": 0}),
+            false => Value::Null,
+        };
+        let meta = serde_json::json!({
+            "zarr_format": 2, "shape": [2, shape[0], shape[1], shape[2]], "chunks": chunks,
+            "dtype": "|u1", "fill_value": 0, "order": "C", "filters": null, "compressor": compressor,
+        });
+        fs::write(dir.join(".zarray"), meta.to_string()).unwrap();
+    }
+
+    /// Write an NPY file of float32 values in [0, 1], shape (2, `shape`), in Fortran or C order
+    fn write_npy(path: &Path, shape: [usize; 3], fortran: bool) {
+        let dims = [2, shape[0], shape[1], shape[2]];
+        let mut header = format!(
+            "{{'descr': '<f4', 'fortran_order': {}, 'shape': ({}, {}, {}, {}), }}",
+            if fortran { "True" } else { "False" },
+            dims[0],
+            dims[1],
+            dims[2],
+            dims[3]
+        );
+        while (10 + header.len() + 1) % 64 != 0 {
+            header.push(' ');
+        }
+        header.push('\n');
+        let mut bytes = b"\x93NUMPY\x01\x00".to_vec();
+        bytes.extend((header.len() as u16).to_le_bytes());
+        bytes.extend(header.as_bytes());
+        let value = |i: [usize; 4]| ((i[0] * 89 + i[1] * 31 + i[2] * 7 + i[3] * 3) % 256) as f32 / 255.0;
+        let mut index = [0usize; 4];
+        for _ in 0..dims.iter().product::<usize>() {
+            bytes.extend(value(index).to_le_bytes());
+            // the last axis varies fastest in C order, the first in Fortran order
+            let order: [usize; 4] = if fortran { [0, 1, 2, 3] } else { [3, 2, 1, 0] };
+            for a in order {
+                index[a] += 1;
+                if index[a] < dims[a] {
+                    break;
+                }
+                index[a] = 0;
+            }
+        }
+        fs::write(path, bytes).unwrap();
+    }
+
+    /// Crops of Zarr arrays chunked as native predictions are (Blosc chunks holding both channels, read by planes)
+    /// and as tracing ones may be (raw chunks of one channel), and of NPY input in both orders, read the values the
+    /// whole array holds at their offset; a crop off the chunk grid is refused
+    #[test]
+    fn crops_read_the_whole_array_at_their_offset() {
+        let root = std::env::temp_dir().join(format!("fibrs-crop-{}", std::process::id()));
+        let native = root.join("native.zarr");
+        write_zarr(&native, [24, 48, 40], [2, 16, 16, 16], true);
+        let full = Predictions::open(&native, None, "HV").unwrap();
+        assert!(full.slab_layout().is_some());
+        assert_crop_reads(&full, [0, 16, 16], [24, 48, 40]);
+        assert_crop_reads(&full, [16, 0, 32], [24, 32, 40]);
+        // a crop of a crop is a crop of the array
+        let inner = full.crop([0, 16, 0], [24, 48, 40]).unwrap();
+        assert_eq!(inner.crop([0, 16, 16], [24, 32, 32]).unwrap().read_u8([0; 3], [24, 16, 16]).unwrap(), {
+            full.read_u8([0, 32, 16], [24, 48, 32]).unwrap()
+        });
+        assert!(full.crop([0, 8, 0], [24, 48, 40]).is_err());
+        assert!(full.crop([0, 0, 0], [24, 48, 36]).is_err());
+        assert!(full.crop([0, 0, 0], [24, 64, 40]).is_err());
+
+        let tracing = root.join("tracing.zarr");
+        write_zarr(&tracing, [12, 24, 20], [1, 8, 8, 8], false);
+        let full = Predictions::open(&tracing, None, "VH").unwrap();
+        assert!(full.slab_layout().is_none());
+        assert_crop_reads(&full, [0, 8, 16], [12, 24, 20]);
+
+        for fortran in [false, true] {
+            let path = root.join(format!("pred-{fortran}.npy"));
+            write_npy(&path, [4, 130, 70], fortran);
+            let full = Predictions::open(&path, None, "VH").unwrap();
+            assert_crop_reads(&full, [0, 64, 0], [4, 130, 70]);
+            assert_crop_reads(&full, [0, 0, 64], [4, 128, 70]);
+            assert!(full.crop([0, 32, 0], [4, 130, 70]).is_err());
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The `len` bytes a block source stands for, decoded on the CPU as a GPU decoder would: zstd by the zstd
