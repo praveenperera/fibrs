@@ -286,12 +286,13 @@ impl Gpu {
                 && shape.iter().all(|&n| u32::try_from(n).is_ok()),
             "volume of {shape:?} voxels is too large to index seeds"
         );
-        let units = units(&tracing[family - 1], shape, self.unit_tiles()?);
+        let own = &tracing[family - 1];
+        let units = units(own, shape, self.unit_tiles()?);
         // allocating or freeing pinned memory synchronizes the whole device, so a buffer regrown between units
         // would drain the other slot's kernels: each slot's pinned buffers are sized once, here, for the largest
         // of the units it runs (every other one), from each unit's plan
         let rooms: Vec<Room> =
-            units.par_iter().map(|u| Plan::new(u, &vols, shape).map(|p| p.room())).collect::<Result<_>>()?;
+            units.par_iter().map(|u| Plan::new(u, &vols, shape).map(|p| p.room(own))).collect::<Result<_>>()?;
         let room = |s: usize| rooms.iter().skip(s).step_by(2).fold(Room::default(), |a, &b| a.max(b));
         let mut slots = [Slot::new(&self.ctx, room(0))?, Slot::new(&self.ctx, room(1))?];
         let mut cent = Vol::new(shape, 0u16);
@@ -469,8 +470,13 @@ impl<'v> Plan<'v> {
         Ok(Self { meta, desc, pool })
     }
 
-    fn room(&self) -> Room {
-        Room { pool: self.pool.payloads.len(), out: self.meta.bricks.len() }
+    /// The unit's room, given the family's own pooled prediction `own`
+    ///
+    /// Presence is 0 wherever `own` is, and centrality is 0 below presence 64, so only the output bricks where `own`
+    /// has a payload can hold a nonzero value and be packed: a sparse unit pins room for those alone
+    fn room(&self, own: &Vol<u8>) -> Room {
+        let out = self.meta.bricks.iter().filter(|&&b| own.brick_at(b).is_some()).count();
+        Room { pool: self.pool.payloads.len(), out }
     }
 }
 
