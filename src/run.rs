@@ -851,13 +851,14 @@ impl ToLe for u16 {
 /// same fields
 fn release_freed() {
     // mimalloc keeps a freed large block in its arena and purges it only after a delay, on a later allocation or
-    // free; a forced collect purges every arena's free pages now. Small blocks freed on other threads stay in those
-    // threads' pages, but the stages' fields and tile buffers are large blocks
-    // SAFETY: mi_collect only returns free pages to the kernel; it touches no live allocation
+    // free, and a smaller block in a page of the thread that allocated it, which only that thread collects. So each
+    // thread of the pool collects its own pages, and the forced collect purges every arena's free pages now. The
+    // stages call this between stages, when the pool is idle
     #[cfg(feature = "mimalloc")]
-    unsafe {
-        libmimalloc_sys::mi_collect(true);
-    }
+    rayon::broadcast(|_| {
+        // SAFETY: mi_collect only returns free pages to the kernel; it touches no live allocation
+        unsafe { libmimalloc_sys::mi_collect(true) }
+    });
 
     // SAFETY: malloc_trim only returns free pages to the kernel; it touches no live allocation. Without mimalloc
     // it covers every allocation; with it, the ones C libraries such as OpenBLAS make through glibc
