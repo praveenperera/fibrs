@@ -407,7 +407,8 @@ where
         let mut curves = curves.into_iter().fuse();
         let mut next = geometry.next_rows(&mut curves, 1);
         while let Some(Rows { fibers, error }) = next {
-            // the input is not read past its first error
+            // no batch is read after one with an error, though that batch itself was read whole: an invalid curve
+            // is reported only once the rest of its batch has been read, ahead of any error found reading it
             if let Some(e) = error {
                 insert(fibers, &mut s)?;
                 return Err(e);
@@ -560,8 +561,8 @@ mod tests {
         let _ = fs::remove_dir_all(out.parent().unwrap());
     }
 
-    /// An invalid curve in a later batch fails the export with its own error, and an input error after it is not
-    /// reached, as when the curves were written one at a time
+    /// An invalid curve in a later batch fails the export with its own error, ahead of an input error read later in
+    /// its batch: the earliest error in input order is reported, as when the curves were written one at a time
     #[test]
     fn the_first_error_in_input_order_is_reported() {
         let n = EXPORT_BATCH + 10;
