@@ -97,6 +97,8 @@ pub unsafe fn open_library(path: &Path) -> Result<Library, libloading::Error> {
 /// # Safety
 ///
 /// Loading a library runs its initialisers
+// only nvCOMP's fallback loads by name, and it builds where the CUDA code does
+#[cfg(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64"))]
 pub unsafe fn open_named(name: &str) -> Result<Library, libloading::Error> {
     unsafe { Library::new(name) }
 }
