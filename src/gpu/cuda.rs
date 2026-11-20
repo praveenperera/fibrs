@@ -11,6 +11,9 @@
 //! The direction field runs the same way over its own tiles (`axes.rs`)
 
 mod axes;
+// the producer drives the walk; until it does, only the tests reach it
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) mod walk;
 
 use std::sync::Arc;
 
@@ -68,7 +71,7 @@ use Param::{Ptr, U32};
 
 /// Each kernel's PTX params, in the order every launch here and in `axes.rs` passes them; checked against the
 /// embedded PTX when the device opens, so a stale PTX fails there instead of launching with mismatched arguments
-const KERNELS: [(&str, &[Param]); 12] = [
+const KERNELS: [(&str, &[Param]); 22] = [
     ("fb_gather", &[Ptr, Ptr, Ptr, U32, U32, U32, U32, U32, U32, U32, Ptr, Ptr, Ptr]),
     ("fb_centrality", &[Ptr, Ptr, Ptr, Ptr, Ptr, Ptr]),
     ("fb_seeds", &[Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, U32, Ptr, Ptr, Ptr, U32, Ptr]),
@@ -81,6 +84,28 @@ const KERNELS: [(&str, &[Param]); 12] = [
     ("fb_ax_tensor_z", &[Ptr, Ptr, U32, U32, Ptr, Ptr]),
     ("fb_ax_tensor_y", &[Ptr, Ptr, U32, U32, Ptr, Ptr]),
     ("fb_ax_eigen", &[Ptr, Ptr, U32, U32, U32, Ptr, Ptr, Ptr, Ptr, Ptr, U32, Ptr]),
+    (
+        "fb_walk_seeds",
+        &[
+            U32, U32, U32, U32, U32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, U32, U32, Ptr, Ptr, Ptr,
+            Ptr, Ptr, Ptr,
+        ],
+    ),
+    (
+        "fb_walk_trace",
+        &[U32, U32, U32, U32, U32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, U32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr],
+    ),
+    ("fb_walk_spans", &[U32, U32, Ptr, Ptr, U32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr]),
+    ("fb_walk_scan", &[Ptr, Ptr, U32, Ptr]),
+    (
+        "fb_walk_gather",
+        &[U32, U32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, U32, U32, Ptr, Ptr, Ptr, Ptr, Ptr],
+    ),
+    ("fb_walk_mask", &[U32, U32, U32, U32, U32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, Ptr, Ptr, Ptr, Ptr]),
+    ("fb_walk_marks", &[U32, U32, Ptr, U32, U32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr]),
+    ("fb_walk_results", &[U32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, U32, U32, U32, Ptr]),
+    ("fb_walk_cov_bricks", &[Ptr, Ptr, U32]),
+    ("fb_walk_cov_set", &[Ptr, Ptr, U32]),
 ];
 
 /// The params of kernel `name` in `ptx`, in order, read from the PTX text
@@ -119,6 +144,22 @@ struct Kernels {
     ax_tensor_z: CudaFunction,
     ax_tensor_y: CudaFunction,
     ax_eigen: CudaFunction,
+    walk: WalkKernels,
+}
+
+/// The walk's kernels (`walk.rs`)
+#[cfg_attr(not(test), allow(dead_code))]
+struct WalkKernels {
+    seeds: CudaFunction,
+    trace: CudaFunction,
+    spans: CudaFunction,
+    scan: CudaFunction,
+    gather: CudaFunction,
+    mask: CudaFunction,
+    marks: CudaFunction,
+    results: CudaFunction,
+    cov_bricks: CudaFunction,
+    cov_set: CudaFunction,
 }
 
 /// An open CUDA device with the kernels loaded
@@ -217,6 +258,18 @@ impl Gpu {
             ax_tensor_z: function("fb_ax_tensor_z")?,
             ax_tensor_y: function("fb_ax_tensor_y")?,
             ax_eigen: function("fb_ax_eigen")?,
+            walk: WalkKernels {
+                seeds: function("fb_walk_seeds")?,
+                trace: function("fb_walk_trace")?,
+                spans: function("fb_walk_spans")?,
+                scan: function("fb_walk_scan")?,
+                gather: function("fb_walk_gather")?,
+                mask: function("fb_walk_mask")?,
+                marks: function("fb_walk_marks")?,
+                results: function("fb_walk_results")?,
+                cov_bricks: function("fb_walk_cov_bricks")?,
+                cov_set: function("fb_walk_cov_set")?,
+            },
         };
         let table: Vec<f64> = Fused::dir_table().iter().flat_map(|d| [d[0], d[1], d[2], 0.0]).collect();
         let unit: Vec<f32> = (0..=255u8).map(|v| v as f32 / 255.0f32).collect();

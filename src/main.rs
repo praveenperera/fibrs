@@ -16,6 +16,8 @@ mod pyfmt;
 mod run;
 mod stage1;
 mod vol;
+#[cfg(test)]
+mod walk;
 
 use std::ffi::OsString;
 

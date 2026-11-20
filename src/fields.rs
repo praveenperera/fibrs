@@ -29,7 +29,7 @@ impl Seed {
     /// Volumes up to this many voxels have every index fit in 56 bits
     pub(crate) const MAX_VOXELS: usize = 1 << 56;
 
-    fn new(at: Shape, shape: Shape, priority: u8) -> Self {
+    pub(crate) fn new(at: Shape, shape: Shape, priority: u8) -> Self {
         let index = (at[0] * shape[1] + at[1]) * shape[2] + at[2];
         Self((index as u64) << 8 | u64::from(priority))
     }
@@ -85,7 +85,7 @@ impl<'a> Presence<'a> {
 
     /// Presence from an own and an other value
     #[inline(always)]
-    fn combine(own: u8, other: u8) -> u8 {
+    pub(crate) fn combine(own: u8, other: u8) -> u8 {
         if own < other { 0 } else { (own as u16 + other as u16).min(255) as u8 }
     }
 

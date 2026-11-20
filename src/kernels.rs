@@ -12,7 +12,7 @@ use color_eyre::eyre::{Result, bail};
 
 use crate::arena::{OWN_MAPPING_BYTES, Voxel};
 use crate::pyfmt::{py_max, py_min};
-use crate::vol::{Place, Shape, SharedVol, SharedVolWriter, Vol};
+use crate::vol::{BRICK, Place, Shape, SharedVol, SharedVolWriter, Vol};
 
 /// cos(55°): the turn limit used throughout the tracer
 pub const COS55: f64 = 0.5735764363510462;
@@ -129,6 +129,13 @@ pub trait DirField: Grid<u16> {
 
     /// `nx` and `ny` as two volumes for the GPU's centrality, when the field is held that way
     fn split(&self) -> Option<(&Vol<u8>, &Vol<u8>)>;
+
+    /// Whether brick `b` (C order over the 16³ brick grid) holds values; one that does not reads
+    /// `pack_dir(128, 128)` everywhere
+    fn has_brick(&self, b: usize) -> bool;
+
+    /// Brick `b`'s packed values in `vol.rs`'s brick layout
+    fn packed_brick(&self, b: usize, out: &mut [u16; BRICK]);
 }
 
 impl DirField for Vol<u16> {
@@ -146,6 +153,17 @@ impl DirField for Vol<u16> {
 
     fn split(&self) -> Option<(&Vol<u8>, &Vol<u8>)> {
         None
+    }
+
+    fn has_brick(&self, b: usize) -> bool {
+        self.brick_at(b).is_some()
+    }
+
+    fn packed_brick(&self, b: usize, out: &mut [u16; BRICK]) {
+        match self.brick_at(b) {
+            Some(v) => out.copy_from_slice(v),
+            None => out.fill(self.default_value()),
+        }
     }
 }
 
@@ -227,6 +245,18 @@ impl DirField for SplitDirs<'_> {
 
     fn split(&self) -> Option<(&Vol<u8>, &Vol<u8>)> {
         Some((self.nx, self.ny))
+    }
+
+    fn has_brick(&self, b: usize) -> bool {
+        self.nx.brick_at(b).is_some() || self.ny.brick_at(b).is_some()
+    }
+
+    fn packed_brick(&self, b: usize, out: &mut [u16; BRICK]) {
+        let (nx, ny) = (self.nx.brick_at(b), self.ny.brick_at(b));
+        let (dx, dy) = (self.nx.default_value(), self.ny.default_value());
+        for (k, d) in out.iter_mut().enumerate() {
+            *d = pack_dir(nx.map_or(dx, |v| v[k]), ny.map_or(dy, |v| v[k]));
+        }
     }
 }
 
@@ -424,7 +454,7 @@ const RING_U1: [f32; 13] = [0.0, 0.55, 0.0, -0.55, 0.0, 1.15, 0.81317, 0.0, -0.8
 const RING_U2: [f32; 13] = [0.0, 0.0, 0.55, 0.0, -0.55, 0.0, 0.81317, 1.15, 0.81317, 0.0, -0.81317, -1.15, -0.81317];
 
 /// `exp_arr` of `recenter_normal_plane`: exp(-0.5 * r2) in float64 of a float32 r2
-fn ring() -> &'static [f64; 13] {
+pub(crate) fn ring() -> &'static [f64; 13] {
     static RING: OnceLock<[f64; 13]> = OnceLock::new();
     RING.get_or_init(|| {
         std::array::from_fn(|i| {

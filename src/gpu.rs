@@ -10,6 +10,9 @@
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod cuda;
+// the producer drives the walk; until it does, only the tests reach it
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+pub mod walk;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use cuda::Gpu;
@@ -39,7 +42,9 @@ mod unsupported {
 
     use super::{AxesCounts, Stages};
     use crate::axes::Lapack;
-    use crate::fields::FamilyFields;
+    use crate::fields::{Catalogue, FamilyFields};
+    use crate::gpu::walk::{Caps, Walk};
+    use crate::kernels::DirField;
     use crate::vol::Vol;
 
     /// No GPU backend on this platform; [`Gpu::open`] always fails, so no value exists
@@ -69,6 +74,32 @@ mod unsupported {
             _tracing: &[Vol<u8>; 2],
             _lapack: &Lapack,
         ) -> Result<(Vol<u8>, Vol<u8>, AxesCounts)> {
+            match *self {}
+        }
+
+        pub fn walk<D: DirField>(
+            &self,
+            _tracing: &[Vol<u8>; 2],
+            _family: usize,
+            _cent: &Vol<u16>,
+            _dirs: &D,
+            _cat: &Catalogue,
+            _ring: &[f64; 13],
+        ) -> Result<Walk<'_>> {
+            match *self {}
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn walk_with<D: DirField>(
+            &self,
+            _tracing: &[Vol<u8>; 2],
+            _family: usize,
+            _cent: &Vol<u16>,
+            _dirs: &D,
+            _cat: &Catalogue,
+            _ring: &[f64; 13],
+            _caps: Caps,
+        ) -> Result<Walk<'_>> {
             match *self {}
         }
     }
