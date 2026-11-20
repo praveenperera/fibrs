@@ -1161,7 +1161,18 @@ fn trace_family<D: DirField>(
     let producer = Producer::new(&fields, &cov, &cat, spec)?;
     let mut walk = device.walk(tracing, family, &cent, dirs, &cat, label);
     let producer = match walk.as_mut() {
-        Some(walk) => producer.with_device(walk, Pace::default()),
+        Some(walk) => {
+            // experiment knob: FIBRS_EXP_PACE=chunk,depth,reach
+            let pace = match std::env::var("FIBRS_EXP_PACE") {
+                Ok(v) => {
+                    let n: Vec<usize> = v.split(',').map(|x| x.parse().expect("FIBRS_EXP_PACE")).collect();
+                    Pace { chunk: n[0], depth: n[1], reach: n[2] }
+                }
+                Err(_) => Pace::default(),
+            };
+            eprintln!("exp pace {pace:?}");
+            producer.with_device(walk, pace)
+        }
         None => producer,
     };
     let produce = |tx: &SyncSender<Vec<RawCurve>>| -> Result<usize> {

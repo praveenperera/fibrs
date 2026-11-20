@@ -254,7 +254,16 @@ impl Gpu {
         cat: &Catalogue,
         ring: &[f64; 13],
     ) -> Result<Walk<'_>> {
-        self.walk_with(tracing, family, cent, dirs, cat, ring, Caps::default())
+        // experiment knob: FIBRS_EXP_CAPS=survivors,checks,pts,curves
+        let caps = match std::env::var("FIBRS_EXP_CAPS") {
+            Ok(v) => {
+                let n: Vec<u32> = v.split(',').map(|x| x.parse().expect("FIBRS_EXP_CAPS")).collect();
+                Caps { survivors: n[0], checks: n[1], pts: n[2], curves: n[3] }
+            }
+            Err(_) => Caps::default(),
+        };
+        eprintln!("exp caps {caps:?}");
+        self.walk_with(tracing, family, cent, dirs, cat, ring, caps)
     }
 
     /// [`Gpu::walk`] with chunk slots of `caps`
