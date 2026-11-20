@@ -769,10 +769,72 @@ impl Families<'_, '_, '_> {
         debug_dump(self.work, "nx", || dir_bytes(dirs, 8))?;
         debug_dump(self.work, "ny", || dir_bytes(dirs, 0))?;
         debug_mem("direction field", &[("tracing", self.resident), ("directions", dirs.resident_bytes())]);
-        for &family in self.families {
-            let compute = Compute { threads: self.threads, cent: self.cent };
-            trace_family(self.tracing, dirs, self.cache, self.work, family, compute)?;
-            release_freed();
+        // the GPU computes the next family's centrality while a family walks on the CPU; on the CPU the two would
+        // only share the same threads, so they run one after the other. A thread the schedule spawns is outside
+        // the run's pool, so the centrality upload and the catalogue would run their parallel parts on rayon's
+        // global pool, one thread per core: they get a pool of --threads instead
+        // with one family there is nothing to prepare during its walk, so no pool for it
+        let pool = match self.cent.overlaps() && self.families.len() > 1 {
+            true => Some(rayon::ThreadPoolBuilder::new().num_threads(self.threads).build()?),
+            false => None,
+        };
+        let during_walk = |family| match &pool {
+            Some(pool) => pool.install(|| prepare_on_gpu(self.tracing, dirs, self.work, family, self.cent)),
+            None => Ok(None),
+        };
+        Schedule {
+            prepare: |family| prepare_family(self.tracing, dirs, self.work, family, self.cent),
+            during_walk: pool.is_some().then_some(during_walk),
+            walk: |family, prepared| {
+                walk_family(self.tracing, dirs, self.cache, self.work, family, self.threads, self.cent, prepared)
+            },
+            between: release_freed,
+        }
+        .run(self.families)
+    }
+}
+
+/// The order of a run's family stages: each family is prepared, then walked, and `between` runs after each walk
+///
+/// With `during_walk`, the next family is prepared on another thread while a family walks. It gives `None` when
+/// it cannot prepare the family without the CPU, such as when the GPU fails: `prepare` then prepares it after the
+/// walk, when the CPU is free
+struct Schedule<Prepare, DuringWalk, Walk, Between> {
+    prepare: Prepare,
+    during_walk: Option<DuringWalk>,
+    walk: Walk,
+    between: Between,
+}
+
+impl<P, Prepare, DuringWalk, Walk, Between> Schedule<Prepare, DuringWalk, Walk, Between>
+where
+    P: Send,
+    Prepare: Fn(usize) -> Result<P>,
+    DuringWalk: Fn(usize) -> Result<Option<P>> + Sync,
+    Walk: Fn(usize, P) -> Result<()>,
+    Between: Fn(),
+{
+    fn run(&self, families: &[usize]) -> Result<()> {
+        let mut ahead = None;
+        for (k, &family) in families.iter().enumerate() {
+            let prepared = match ahead.take() {
+                Some(prepared) => prepared,
+                None => (self.prepare)(family)?,
+            };
+            let overlapped = self.during_walk.as_ref().zip(families.get(k + 1));
+            ahead = match overlapped {
+                Some((during_walk, &following)) => std::thread::scope(|scope| {
+                    let next = scope.spawn(|| during_walk(following));
+                    let walked = (self.walk)(family, prepared);
+                    let next = next.join().map_err(|_| eyre!("centrality thread panicked"))?;
+                    walked.and(next)
+                })?,
+                None => {
+                    (self.walk)(family, prepared)?;
+                    None
+                }
+            };
+            (self.between)();
         }
         Ok(())
     }
@@ -924,13 +986,6 @@ fn gib(bytes: usize) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
 }
 
-/// Where a family's stages run: tracing and finishing on `threads` CPU threads, centrality as `cent` says
-#[derive(Clone, Copy)]
-struct Compute<'a> {
-    threads: usize,
-    cent: &'a CentralityDevice,
-}
-
 /// Which of the original's devices a run's centrality reproduces: its CPU kernel rounds some multiply-adds twice
 /// where its CUDA kernels round them once (`stage1.rs`). `run.json` records it as `device`, so one run never mixes
 /// the two, while the hardware a resumed run computes it on may change
@@ -1040,6 +1095,12 @@ impl CentralityDevice {
         Ok(chosen)
     }
 
+    /// Whether the next family's centrality runs while a family walks: only when the GPU computes it, since on the
+    /// CPU it would take the walk's threads
+    fn overlaps(&self) -> bool {
+        self.gpu.is_some() && self.rounding == Rounding::Cuda
+    }
+
     /// The form the direction field is written in: split when the GPU computes centrality, which reads `nx` and
     /// `ny` as two volumes, so a field the CPU computes after a GPU failure needs no copy
     fn dir_form(&self) -> DirForm {
@@ -1086,37 +1147,82 @@ impl CentralityDevice {
         pres: &Presence,
         dirs: &D,
     ) -> Result<FamilyFields> {
-        let (gpu, (nx, ny)) = match (self.rounding, &self.gpu, dirs.split()) {
-            (Rounding::Cpu, _, _) => return Ok(centrality::<Separate, _>(pres, dirs)),
-            (Rounding::Cuda, Some(gpu), Some(split)) => (gpu, split),
-            // no GPU, or a packed field, which [`Self::dir_form`] asks for only when there is no GPU
-            (Rounding::Cuda, _, _) => return Ok(centrality::<Fused, _>(pres, dirs)),
+        let cpu = || match self.rounding {
+            Rounding::Cpu => centrality::<Separate, _>(pres, dirs),
+            Rounding::Cuda => centrality::<Fused, _>(pres, dirs),
         };
-        match gpu.centrality(tracing, family, nx, ny) {
-            Ok(fields) => Ok(fields),
-            Err(e) if !self.strict => {
+        match self.on_gpu(tracing, family, dirs) {
+            Some(Ok(fields)) => Ok(fields),
+            Some(Err(e)) if self.strict => Err(e),
+            Some(Err(e)) => {
                 log!("Centrality on the CPU, rounded as on the GPU: the GPU failed ({e:#})");
-                Ok(centrality::<Fused, _>(pres, dirs))
+                Ok(cpu())
             }
-            Err(e) => Err(e),
+            None => Ok(cpu()),
+        }
+    }
+
+    /// One family's centrality and seeds on the GPU: `None` when the run computes them on the CPU
+    fn on_gpu<D: DirField>(&self, tracing: &[Vol<u8>; 2], family: usize, dirs: &D) -> Option<Result<FamilyFields>> {
+        match (self.rounding, &self.gpu, dirs.split()) {
+            (Rounding::Cuda, Some(gpu), Some((nx, ny))) => Some(gpu.centrality(tracing, family, nx, ny)),
+            // CPU rounding, no GPU, or a packed field, which [`Self::dir_form`] asks for only when there is no GPU
+            _ => None,
         }
     }
 }
 
-fn trace_family<D: DirField>(
+/// A family's centrality and seed catalogue, ready to walk
+struct Prepared {
+    cent: Vol<u16>,
+    cat: Catalogue,
+}
+
+fn prepare_family<D: DirField>(
     tracing: &[Vol<u8>; 2],
     dirs: &D,
-    cache: &NativeCache,
     work: &Path,
     family: usize,
-    Compute { threads, cent: device }: Compute,
-) -> Result<()> {
+    device: &CentralityDevice,
+) -> Result<Prepared> {
+    let t = Instant::now();
+    let pres = Presence::new(tracing, family);
+    let fields = device.compute(tracing, family, &pres, dirs)?;
+    with_fields(work, family, &pres, fields, t)
+}
+
+/// As [`prepare_family`], with centrality on the GPU only: `None` when the run computes it on the CPU, or the GPU
+/// failed and the CPU may compute it, for the caller to prepare the family when the CPU is free
+fn prepare_on_gpu<D: DirField>(
+    tracing: &[Vol<u8>; 2],
+    dirs: &D,
+    work: &Path,
+    family: usize,
+    device: &CentralityDevice,
+) -> Result<Option<Prepared>> {
+    let t = Instant::now();
+    let fields = match device.on_gpu(tracing, family, dirs) {
+        Some(Ok(fields)) => fields,
+        Some(Err(e)) if device.strict => return Err(e),
+        // after the walk the GPU is tried again before the CPU, since it may have failed for want of memory the
+        // walk held
+        Some(Err(e)) => {
+            let label = if family == 1 { "V" } else { "H" };
+            log!("{label} centrality waits for the walk before it: the GPU failed ({e:#})");
+            return Ok(None);
+        }
+        None => return Ok(None),
+    };
+    let pres = Presence::new(tracing, family);
+    with_fields(work, family, &pres, fields, t).map(Some)
+}
+
+/// The seed catalogue of a family whose centrality `fields` holds, computed since `t`
+fn with_fields(work: &Path, family: usize, pres: &Presence<'_>, fields: FamilyFields, t: Instant) -> Result<Prepared> {
     let label = if family == 1 { "V" } else { "H" };
     let folder = family_dir(work, family);
     fs::create_dir_all(&folder)?;
-    let t = Instant::now();
-    let pres = Presence::new(tracing, family);
-    let FamilyFields { cent, seeds } = device.compute(tracing, family, &pres, dirs)?;
+    let FamilyFields { cent, seeds } = fields;
     log!("{label} centrality: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem(label, &[("cent", cent.resident_bytes()), ("seeds", seeds.len() * std::mem::size_of::<Seed>())]);
     let t = Instant::now();
@@ -1138,6 +1244,22 @@ fn trace_family<D: DirField>(
     drop(seeds);
     release_freed();
     log!("{label} seeds: {} in {:.1} s", cat.coords.len(), t.elapsed().as_secs_f64());
+    Ok(Prepared { cent, cat })
+}
+
+fn walk_family<D: DirField>(
+    tracing: &[Vol<u8>; 2],
+    dirs: &D,
+    cache: &NativeCache,
+    work: &Path,
+    family: usize,
+    threads: usize,
+    device: &CentralityDevice,
+    Prepared { cent, cat }: Prepared,
+) -> Result<()> {
+    let label = if family == 1 { "V" } else { "H" };
+    let folder = family_dir(work, family);
+    let pres = Presence::new(tracing, family);
     let shape = pres.shape();
     let fields = Fields { pres: &pres, cent: &cent, dirs };
     let ctx = FinishCtx { tracing, pres: &pres, family };
@@ -1367,6 +1489,77 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// Runs a schedule of `families` whose stages log to the returned list; `during_walk` gives the next family's
+    /// preparation, or `None` when it falls to the CPU, and `fail` names a stage that errors
+    fn scheduled(families: &[usize], during_walk: Option<bool>, fail: Option<&str>) -> (Result<()>, Vec<String>) {
+        let log = std::sync::Mutex::new(Vec::new());
+        let note = |event: String| -> Result<()> {
+            let failed = fail == Some(event.as_str());
+            log.lock().unwrap().push(event.clone());
+            if failed { Err(eyre!("{event} failed")) } else { Ok(()) }
+        };
+        // the walk waits for the next family's preparation to start, so a schedule that runs them one after the
+        // other fails here instead of passing
+        let (started, starts) = std::sync::mpsc::channel();
+        let gpu = |family: usize| -> Result<Option<String>> {
+            started.send(family).unwrap();
+            let on_gpu = during_walk.unwrap_or_default();
+            if fail == Some("during") {
+                return Err(eyre!("during {family} failed"));
+            }
+            Ok(on_gpu.then(|| format!("gpu {family}")))
+        };
+        let schedule = Schedule {
+            prepare: |family| note(format!("prepare {family}")).map(|()| format!("cpu {family}")),
+            during_walk: during_walk.map(|_| gpu),
+            walk: |family, prepared: String| {
+                let last = families.last() == Some(&family);
+                if during_walk.is_some() && !last {
+                    starts.recv_timeout(Duration::from_secs(10))?;
+                }
+                note(format!("walk {family} {prepared}"))
+            },
+            between: || log.lock().unwrap().push("between".into()),
+        };
+        let result = schedule.run(families);
+        (result, log.into_inner().unwrap())
+    }
+
+    #[test]
+    fn families_prepare_during_the_walk_before_them_or_after_it() {
+        let (result, log) = scheduled(&[1, 2], Some(true), None);
+        result.unwrap();
+        assert_eq!(log, ["prepare 1", "walk 1 cpu 1", "between", "walk 2 gpu 2", "between"]);
+
+        // the GPU failed: the CPU prepares the family once the walk before it is done
+        let (result, log) = scheduled(&[1, 2], Some(false), None);
+        result.unwrap();
+        assert_eq!(log, ["prepare 1", "walk 1 cpu 1", "between", "prepare 2", "walk 2 cpu 2", "between"]);
+
+        let (result, log) = scheduled(&[1, 2], None, None);
+        result.unwrap();
+        assert_eq!(log, ["prepare 1", "walk 1 cpu 1", "between", "prepare 2", "walk 2 cpu 2", "between"]);
+
+        let (result, log) = scheduled(&[2], Some(true), None);
+        result.unwrap();
+        assert_eq!(log, ["prepare 2", "walk 2 cpu 2", "between"]);
+    }
+
+    #[test]
+    fn a_failed_stage_stops_the_schedule() {
+        let (result, log) = scheduled(&[1, 2], Some(true), Some("walk 1 cpu 1"));
+        assert_eq!(result.unwrap_err().to_string(), "walk 1 cpu 1 failed");
+        assert_eq!(log, ["prepare 1", "walk 1 cpu 1"]);
+
+        let (result, log) = scheduled(&[1, 2], Some(true), Some("during"));
+        assert_eq!(result.unwrap_err().to_string(), "during 2 failed");
+        assert_eq!(log, ["prepare 1", "walk 1 cpu 1"]);
+
+        let (result, log) = scheduled(&[1, 2], None, Some("prepare 2"));
+        assert_eq!(result.unwrap_err().to_string(), "prepare 2 failed");
+        assert_eq!(log, ["prepare 1", "walk 1 cpu 1", "between", "prepare 2"]);
+    }
 
     #[test]
     fn pipeline_returns_a_consumer_error_while_the_producer_still_sends() {
