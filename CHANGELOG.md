@@ -54,6 +54,14 @@
   103 s against 109 and 114 s, with 0.13% of seeds traced again instead of 0.04%. Peak RSS was 23.0–23.4 GiB against
   23.0–23.1 GiB, and the `.afv` is identical.
 
+- **Faster export.** The `.afv` export makes each batch of fibres' rows (annotations with Python's float repr, point
+  blocks, bounds) on the `--threads` pool while the batch before it is inserted, in order, on one thread. SQLite
+  also gets a 256 MiB page cache instead of 32 MiB and holds its lock for the whole export. A batch ends at 4,096
+  fibres, or at the fibre that brings it to about a million points, so only its last fibre can take it further. On
+  the dense PHerc0358 window z02304–02816 the export took 16 s on one thread. About a third of that was formatting
+  rows, and a fifth was SQLite reading evicted pages back from the file of over 1.5 GiB. Fibre numbering, every
+  table and the first error in input order are unchanged.
+
 ## [0.3.1] - 2026-11-19
 
 fibrs 0.3.1 traces dense data faster: threads that finishing leaves idle trace seeds ahead, and the binary

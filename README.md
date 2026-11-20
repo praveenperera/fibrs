@@ -74,7 +74,9 @@ each family the log counts the slabs uploaded and the batches the CPU finished. 
 the one being committed, and one more thread commits the seeds in order, so tracing can run one thread beyond
 `--threads`. On a dense 512 × 2048 × 2048 crop of PHerc0358, tracing kept 4.2–4.5 cores busy at `--threads 4` and
 7.7 at `--threads 8`. A seed traced ahead is traced again if an earlier seed marked the region it read before it was
-committed, so the output is the same at every `--threads`.
+committed, so the output is the same at every `--threads`. The export to `.afv`, including the one a `--resume`
+of a finished run writes, prepares each batch of fibres' rows on the same `--threads` pool while one thread inserts
+the previous batch's rows in order.
 
 To make an environment's `avf-spline-generator` run the port, so scripts that call it need no change:
 
