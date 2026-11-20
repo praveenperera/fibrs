@@ -41,6 +41,7 @@ pub struct RawCheck {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     /// Traced: its result is in the chunk
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
     Done,
     /// Given back, for a reason the CPU's tracer handles itself (a path longer than the device holds, an error
     /// the CPU reports): the CPU traces it

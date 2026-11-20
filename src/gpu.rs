@@ -10,6 +10,8 @@
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod cuda;
+// the walk's sizes and caps are read only by the CUDA walk
+#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
 pub mod walk;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -69,7 +71,7 @@ mod unsupported {
     use crate::axes::Lapack;
     use crate::fields::{Catalogue, FamilyFields};
     use crate::finish::{NativeCache, SlabLayout};
-    use crate::gpu::walk::{Caps, Walk};
+    use crate::gpu::walk::Walk;
     use crate::kernels::{DirField, RawCurve};
     use crate::vol::Vol;
 
@@ -133,20 +135,6 @@ mod unsupported {
             _dirs: &D,
             _cat: &Catalogue,
             _ring: &[f64; 13],
-        ) -> Result<Walk<'_>> {
-            match *self {}
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        pub fn walk_with<D: DirField>(
-            &self,
-            _tracing: &[Vol<u8>; 2],
-            _family: usize,
-            _cent: &Vol<u16>,
-            _dirs: &D,
-            _cat: &Catalogue,
-            _ring: &[f64; 13],
-            _caps: Caps,
         ) -> Result<Walk<'_>> {
             match *self {}
         }

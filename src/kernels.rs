@@ -132,9 +132,11 @@ pub trait DirField: Grid<u16> {
 
     /// Whether brick `b` (C order over the 16³ brick grid) holds values; one that does not reads
     /// `pack_dir(128, 128)` everywhere
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
     fn has_brick(&self, b: usize) -> bool;
 
     /// Brick `b`'s packed values in `vol.rs`'s brick layout
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
     fn packed_brick(&self, b: usize, out: &mut [u16; BRICK]);
 }
 

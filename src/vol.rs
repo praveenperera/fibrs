@@ -334,6 +334,7 @@ impl Place {
 
     /// The voxel's offset in its brick, `vol.rs`'s brick layout
     #[inline(always)]
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
     pub fn offset(self) -> u16 {
         self.offset
     }
