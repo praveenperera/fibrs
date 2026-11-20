@@ -50,7 +50,8 @@ cargo install fibrs --locked  # a build from source
 ```
 
 [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) downloads the prebuilt binary from the GitHub release
-on Linux x86-64 and Apple silicon, and builds from source elsewhere. `cargo install` builds the crate from crates.io,
+on Linux x86-64 and Apple silicon, and elsewhere falls back to building from source, which needs Linux or macOS:
+fibrs does not build on Windows. `cargo install` builds the crate from crates.io,
 with `--locked` at the dependency versions the release was tested with; it needs Rust 1.100 or later (see
 [Build](#build)). Either way only the binary is installed, into `~/.cargo/bin`. Like the CLI archive's, it loads
 numpy's OpenBLAS at run time, so activate the numpy environment or set `FIBRS_LAPACK`, as above.

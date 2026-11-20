@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Renders Cargo.toml's [package.metadata.binstall] for each target a release attaches a CLI archive for, filling in
-# the template as cargo-binstall does, and prints each target's download URL and binary path. Given a directory of
-# the CLI archives package.yml builds (scripts/release-archive.sh), it also checks that each target's archive is
-# there under the rendered name and holds the binary at the rendered path, and that the directory holds no other
-# CLI archive
+# the template as cargo-binstall does, and prints each target's download URL and binary path. Each URL must be the
+# v<version> GitHub release's asset, since package.yml's release-check requires the tag v<version> and the release
+# carries its archives. Given a directory of the CLI archives package.yml builds (scripts/release-archive.sh), it
+# also checks that each target's archive is there under the rendered name and holds the binary at the rendered
+# path, and that the directory holds no other CLI archive. With --download, it downloads each rendered URL instead,
+# as cargo-binstall will, and checks what it gets the same way
 #
-#   scripts/check-binstall.sh [ARCHIVE_DIR]
+#   scripts/check-binstall.sh [ARCHIVE_DIR | --download]
 #
-# Needs cargo, jq and tar
+# Needs cargo, jq and tar, and curl for --download
 set -euo pipefail
 
 # the targets package.yml builds; cargo-binstall falls back to a source build anywhere else
@@ -15,6 +17,12 @@ targets=(x86_64-unknown-linux-gnu aarch64-apple-darwin)
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dir="${1:-}"
+download=false
+if [ "$dir" = --download ]; then
+  download=true
+  dir="$(mktemp -d)"
+  trap 'rm -rf "$dir"' EXIT
+fi
 
 package="$(cargo metadata --no-deps --format-version 1 --locked --manifest-path "$root/Cargo.toml" \
   | jq -c '.packages[] | select(.name == "fibrs")')"
@@ -61,9 +69,17 @@ for target in "${targets[@]}"; do
   path="$(render "$(field "$target" bin-dir)")"
   archive="${url##*/}"
   echo "$target: $url -> $path"
+  if [ "$url" != "$repo/releases/download/v$version/$archive" ]; then
+    echo "$url is not an asset of the v$version release" >&2
+    exit 1
+  fi
   expected+=("$archive")
 
   if [ -z "$dir" ]; then continue; fi
+
+  if $download; then
+    curl -fsSL --retry 3 -o "$dir/$archive" "$url"
+  fi
 
   if ! [ -f "$dir/$archive" ]; then
     echo "$dir has no $archive" >&2
@@ -78,7 +94,9 @@ for target in "${targets[@]}"; do
   fi
 done
 
-if [ -n "$dir" ]; then
+if $download; then
+  echo "every released CLI archive matches the binstall metadata"
+elif [ -n "$dir" ]; then
   found="$(find "$dir" -type f -name '*.tar.gz' -exec basename {} \; | sort)"
   want="$(printf '%s\n' "${expected[@]}" | sort)"
   if [ "$found" != "$want" ]; then

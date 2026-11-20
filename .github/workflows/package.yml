@@ -394,9 +394,10 @@ jobs:
           echo "marking $GITHUB_REF_NAME latest: $latest"
           gh release edit "$GITHUB_REF_NAME" --draft=false --latest="$latest" --repo "$GITHUB_REPOSITORY"
 
-  # after the GitHub release, so a crate version cargo-binstall finds always has its CLI archives to download, and
-  # only when CRATES_IO_PUBLISH is "true"; otherwise the job is skipped and the tag's run still passes. A version
-  # already on crates.io is skipped, so a rerun passes without publishing again
+  # after the GitHub release, and only once the URLs the binstall metadata names serve its CLI archives, so a crate
+  # version cargo-binstall finds always has them to download; a release published by hand skips the upload above.
+  # It runs only when CRATES_IO_PUBLISH is "true"; otherwise the job is skipped and the tag's run still passes. A
+  # version already on crates.io is skipped, so a rerun passes without publishing again
   crates-publish:
     name: Publish to crates.io
     if: vars.CRATES_IO_PUBLISH == 'true'
@@ -433,6 +434,10 @@ jobs:
             404) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
             *) echo "crates.io answered HTTP $status" >&2; exit 1 ;;
           esac
+
+      - name: Check the release serves the CLI archives
+        if: steps.version.outputs.publish == 'true'
+        run: scripts/check-binstall.sh --download
 
       - name: Get a crates.io token
         if: steps.version.outputs.publish == 'true'
