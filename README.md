@@ -29,9 +29,10 @@ x86-64 (glibc 2.28+) and Apple silicon (macOS 11+) are named `fibrs-<version>-<t
 The archive's binary bundles no OpenBLAS: it loads numpy's at run time, from the environment it is installed
 into (`scripts/install-dropin.sh` puts it there) or else from the active one (`$VIRTUAL_ENV`). On macOS that
 environment also needs `scipy-openblas64==0.3.31.188.0` (see [Numerics](#numerics)). Run from anywhere else, it
-stops at start with "cannot find numpy's OpenBLAS"; set `FIBRS_LAPACK` to the library, such as
-`<venv>/lib/python3.12/site-packages/numpy.libs/libscipy_openblas64_*.so`. `pip install fibrs` into the numpy
-environment needs none of this.
+stops with "cannot find numpy's OpenBLAS" once the tracing predictions are loaded, after it has written the work
+directory's `run.json`. Set `FIBRS_LAPACK` to the library's full path (fibrs does not expand a `*` in it), for example
+`export FIBRS_LAPACK=$(ls <venv>/lib/python3.12/site-packages/numpy.libs/libscipy_openblas64_*.so)`, and run the
+same command again with `--resume`. `pip install fibrs` into the numpy environment needs none of this.
 
 ## Use
 

@@ -6,7 +6,8 @@
 
 fibrs 0.3.1 traces dense data faster: threads that finishing leaves idle trace seeds ahead, and the binary
 allocates through mimalloc instead of glibc malloc. The `.afv` is unchanged. On a PHerc1545 and a PHerc0826 band
-it was identical to the original's with `--device cpu` and to 0.3.0's with `--device cuda`.
+it was identical to the original's with `--device cpu` and to 0.3.0's with `--device cuda`, but for the per-run
+uuid. `fibrs predict` gave 0.3.0's predictions voxel for voxel on nine columns of a PHerc0826 band.
 
 ### What's new
 
@@ -26,6 +27,13 @@ it was identical to the original's with `--device cpu` and to 0.3.0's with `--de
   instead of 1,084 s. Peak memory is unchanged: 9.0 GiB on a PHerc0826 band and 5.6 GiB on a PHerc1545 band at
   `--threads 4`. Output is unchanged. `cargo build --release --no-default-features` builds with the system
   allocator.
+
+### Upgrading
+
+- 0.3.1 doesn't resume a tracer work directory that 0.3.0 started, finished or not, so a `--resume` that only
+  writes the `.afv` again needs 0.3.0 too. Finish a run with the binary that started it, or start a new work
+  directory. A `fibrs predict` band output that 0.3.0 started is refused on resume as well, as it is by any other
+  binary; finish it with 0.3.0 or write a new `--out`.
 
 ### Documentation
 
