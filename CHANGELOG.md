@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixes
+
+- **`fibrs --version` prints fibrs' version.** Run as `fibrs` or `python -m fibrs`, `--version` now prints fibrs'
+  own version; it printed `0.2.0`, the version of `avf-spline-generator` it reproduces, on every release. Run as the
+  drop-in `avf-spline-generator`, it still prints `0.2.0`. `fibrs predict --version` is unchanged.
+
 ## [0.4.0] - 2026-11-20
 
 fibrs 0.4.0 does more of a GPU run on the GPU and spends less CPU time around tracing. Traced curves are finished

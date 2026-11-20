@@ -105,7 +105,8 @@ scripts/install-dropin.sh --restore VENV  # put the original back
 BINARY defaults to the `fibrs` in the archive the script came from, then to the one on `PATH`.
 The original entry is kept as `avf-spline-generator.reference`, and `NOTICE` and `licenses/` are copied to
 `VENV/share/fibrs`. Callers that run `Path(sys.executable).parent / "avf-spline-generator"`
-need no other change.
+need no other change. Run as `avf-spline-generator`, `--version` prints `0.2.0`, the release it stands in for; run
+as `fibrs` or `python -m fibrs`, it prints fibrs' own version.
 
 ## Build
 
