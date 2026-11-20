@@ -17,8 +17,8 @@
 
 - **Faster export.** The `.afv` export makes each batch of fibres' rows (annotations with Python's float repr, point
   blocks, bounds) on the `--threads` pool while the batch before it is inserted, in order, on one thread. SQLite
-  also gets a 256 MiB page cache instead of 32 MiB and holds its lock for the whole export. A batch holds at most
-  4,096 fibres or about a million points, so the export's memory does not grow with fibre length. On the dense PHerc0358
+  also gets a 256 MiB page cache instead of 32 MiB and holds its lock for the whole export. A batch ends at 4,096
+  fibres, or at the fibre that brings it to about a million points, so only its last fibre can take it further. On the dense PHerc0358
   window z02304–02816 the export took 16 s on one thread. About a third of that was formatting rows, and a fifth
   was SQLite reading evicted pages back from the file of over 1.5 GiB. Fibre numbering, every table and the
   first error in input order are unchanged.

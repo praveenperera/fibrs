@@ -193,9 +193,9 @@ fn metadata(opt: &ExportOptions) -> Result<Vec<(&'static str, Value)>> {
 /// Curves prepared at a time: the pool makes one batch's rows while the calling thread inserts the batch before
 const EXPORT_BATCH: usize = 4096;
 
-/// Points prepared at a time: a batch ends once it holds this many, even before [`EXPORT_BATCH`] curves, so the two
-/// batches in flight hold under about 100 MiB of input, native points and block bytes, plus one fibre, however
-/// long the fibres are
+/// Points prepared at a time: a batch ends at the fibre that brings it to this many, even before [`EXPORT_BATCH`]
+/// curves. A fibre is held whole, so each of the two batches in flight holds under about 50 MiB of input, native
+/// points and block bytes, plus its last fibre
 const EXPORT_BATCH_POINTS: usize = 1 << 20;
 
 /// SQLite's page cache for the export, in KiB (a negative `cache_size`): with 32 MiB, SQLite read evicted pages
