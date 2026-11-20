@@ -16,7 +16,7 @@ macro_rules! unroll_full {
 #[allow(dead_code)]
 mod shared;
 
-use crate::kernels::{self, Coverage, Grid};
+use crate::kernels::{self, Coverage, Grid, test_support};
 use crate::lookahead::{RawCheck, RawMark};
 use crate::vol::{EDGE, SHIFT};
 use shared::{Curve, Fields, HALF, Ops, Path, Reads};
@@ -108,7 +108,7 @@ impl Reads for HostReads<'_> {
     fn read(&mut self, z: i32, y: i32, x: i32, kind: u8, t: [f64; 3]) -> u16 {
         let (slot, offset) = place(self.dims, z, y, x);
         let at = self.cov.place_at(slot, offset).expect("the core reads in-bounds voxels");
-        let seen = self.cov.get(at);
+        let seen = test_support::get(self.cov, at);
         let same_dir = (kind == shared::SAME_DIR).then_some(t);
         self.checks.push(RawCheck { slot: slot as u32, offset, seen, same_dir });
         seen
@@ -287,8 +287,8 @@ mod tests {
 
     use super::*;
     use crate::fields::{Catalogue, Presence, Seed, catalogue, centrality};
-    use crate::kernels::test_support::{raw_check, raw_mark};
-    use crate::kernels::{ReadSet, Scratch, Traced, encode_dir, pack_dir, trace_seed};
+    use crate::kernels::test_support::{self, raw_check, raw_mark};
+    use crate::kernels::{Scratch, Traced, encode_dir, pack_dir, trace_seed};
     use crate::stage1::Separate;
     use crate::vol::Vol;
 
@@ -317,7 +317,7 @@ mod tests {
 
     /// A tracer that records every coverage read
     fn recording() -> Traced {
-        Traced { reads: ReadSet::recording(), ..Traced::default() }
+        Traced { reads: test_support::recording(), ..Traced::default() }
     }
 
     /// Every field of the core's outcome against `trace_seed`'s, for seed `i`
@@ -328,7 +328,7 @@ mod tests {
         }
         assert_eq!(got.status, Status::Done, "seed {i}: the core sends back a seed the CPU traces");
         let cpu_checks: Vec<RawCheck> =
-            want.reads.checks().expect("a recording read set").iter().map(raw_check).collect();
+            test_support::checks(&want.reads).expect("a recording read set").iter().map(raw_check).collect();
         assert_eq!(checks_bits(&got.checks), checks_bits(&cpu_checks), "seed {i}: coverage reads");
         assert_eq!(got.curves.len(), want.curves.len(), "seed {i}: curve count");
         for (k, (a, b)) in got.curves.iter().zip(&want.curves).enumerate() {

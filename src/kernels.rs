@@ -515,12 +515,6 @@ impl Coverage {
         seen
     }
 
-    /// The value at a place
-    #[inline(always)]
-    pub fn get(&self, at: Place) -> u16 {
-        self.0.get(at)
-    }
-
     /// The place of brick slot `slot`'s voxel `offset`, if both lie in the volume
     pub fn place_at(&self, slot: usize, offset: u16) -> Option<Place> {
         self.0.place_at(slot, offset)
@@ -647,11 +641,6 @@ pub struct ReadSet {
 }
 
 impl ReadSet {
-    /// A read set that also records every read as a [`Check`], for comparing tracers read by read
-    pub fn recording() -> Self {
-        Self { slots: Vec::new(), checks: Some(Vec::new()) }
-    }
-
     #[inline(always)]
     pub(crate) fn push(&mut self, slot: usize) {
         if self.slots.last() != Some(&slot) {
@@ -661,11 +650,6 @@ impl ReadSet {
 
     pub fn slots(&self) -> &[usize] {
         &self.slots
-    }
-
-    /// The reads recorded since the last clear, when recording
-    pub fn checks(&self) -> Option<&[Check]> {
-        self.checks.as_deref()
     }
 
     fn clear(&mut self) {
@@ -726,10 +710,6 @@ impl Mark {
     /// A mark of `at` along encoded direction `dir` by the point whose tangent is `tans[tan]` of its seed
     pub fn new(at: Place, dir: u16, tan: u32) -> Self {
         Self { at, dir, tan }
-    }
-
-    pub fn at(&self) -> Place {
-        self.at
     }
 }
 
@@ -1410,6 +1390,21 @@ pub(crate) mod test_support {
     /// A mark as a device reports it
     pub fn raw_mark(m: &Mark) -> RawMark {
         RawMark { slot: m.at.slot() as u32, offset: m.at.offset(), dir: m.dir, tan: m.tan }
+    }
+
+    /// The value of `cov` at a place
+    pub fn get(cov: &Coverage, at: Place) -> u16 {
+        cov.0.get(at)
+    }
+
+    /// A read set that also records every read as a [`Check`], for comparing tracers read by read
+    pub fn recording() -> ReadSet {
+        ReadSet { slots: Vec::new(), checks: Some(Vec::new()) }
+    }
+
+    /// The reads `reads` recorded since its last clear, when recording
+    pub fn checks(reads: &ReadSet) -> Option<&[Check]> {
+        reads.checks.as_deref()
     }
 }
 

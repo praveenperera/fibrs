@@ -412,8 +412,8 @@ mod tests {
 
     use super::*;
     use crate::fields::{Presence, catalogue, centrality};
-    use crate::kernels::test_support::{copy, raw_check, raw_mark};
-    use crate::kernels::{Change, CoverageWriter, ReadSet, encode_dir, pack_dir};
+    use crate::kernels::test_support::{self, copy, raw_check, raw_mark};
+    use crate::kernels::{Change, CoverageWriter, encode_dir, pack_dir};
     use crate::lookahead::{ChunkOut, SeedOut, Status};
     use crate::stage1::Separate;
     use crate::vol::Vol;
@@ -557,7 +557,7 @@ mod tests {
 
         fn launch(&mut self, seeds: Range<usize>) -> Result<()> {
             let (mut scratch, mut traced) =
-                (Scratch::default(), Traced { reads: ReadSet::recording(), ..Traced::default() });
+                (Scratch::default(), Traced { reads: test_support::recording(), ..Traced::default() });
             let mut out = ChunkOut { seeds: seeds.clone(), ..ChunkOut::default() };
             for i in seeds {
                 let r = (0..self.cat.starts.len() - 1).find(|&r| i < self.cat.starts[r + 1]).expect("a region");
@@ -565,7 +565,7 @@ mod tests {
                 trace_seed(self.fields, self.mirror, &mut scratch, self.cat.coords[i], primary, &mut traced)?;
                 let at = |n: usize| n as u32;
                 let (c0, k0, t0, m0) = (out.checks.len(), out.curves.len(), out.tans.len(), out.marks.len());
-                out.checks.extend(traced.reads.checks().expect("recording").iter().map(raw_check));
+                out.checks.extend(test_support::checks(&traced.reads).expect("recording").iter().map(raw_check));
                 for c in &traced.curves {
                     let p0 = out.pts.len();
                     out.pts.extend_from_slice(&c.pts);
