@@ -188,11 +188,11 @@ impl Ct {
         Ok(chunk)
     }
 
-    /// The box `[lo, hi)`, C order
-    pub fn read(&self, lo: [usize; 3], hi: [usize; 3]) -> Result<Vec<u8>> {
+    /// The box `[lo, hi)`, C order, into `out`, which must be its size; every byte of `out` is written
+    pub fn read_into(&self, lo: [usize; 3], hi: [usize; 3], out: &mut [u8]) -> Result<()> {
         ensure!((0..3).all(|a| lo[a] < hi[a] && hi[a] <= self.shape[a]), "read {lo:?}..{hi:?} outside the CT");
         let dims = [0, 1, 2].map(|a| hi[a] - lo[a]);
-        let mut out = vec![0u8; dims.iter().product()];
+        ensure!(out.len() == dims.iter().product::<usize>(), "{} bytes for a {dims:?} box", out.len());
         let cs = self.chunks;
         for kz in lo[0] / cs[0]..=(hi[0] - 1) / cs[0] {
             for ky in lo[1] / cs[1]..=(hi[1] - 1) / cs[1] {
@@ -213,7 +213,7 @@ impl Ct {
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
 }
 
