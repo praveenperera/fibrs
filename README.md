@@ -74,7 +74,9 @@ each family the log counts the slabs uploaded and the batches the CPU finished. 
 the one being committed, and one more thread commits the seeds in order, so tracing can run one thread beyond
 `--threads`. On a dense 512 × 2048 × 2048 crop of PHerc0358, tracing kept 4.2–4.5 cores busy at `--threads 4` and
 7.7 at `--threads 8`. A seed traced ahead is traced again if an earlier seed marked the region it read before it was
-committed, so the output is the same at every `--threads`.
+committed, so the output is the same at every `--threads`. The export to `.afv`, including the one a `--resume`
+of a finished run writes, prepares each batch of fibres' rows on the same `--threads` pool while one thread inserts
+the previous batch's rows in order.
 
 To make an environment's `avf-spline-generator` run the port, so scripts that call it need no change:
 
@@ -96,8 +98,9 @@ cargo test --release
 ```
 
 It builds on Linux and macOS with Rust 1.100 or later, the first stable release with the allocator API it uses.
-The binary uses mimalloc as its allocator; `cargo build --release --no-default-features` builds it with the
-system allocator instead.
+The tracer allocates through mimalloc. On Linux with glibc and on macOS, `fibrs predict` allocates through the
+system allocator; elsewhere it keeps mimalloc. `cargo build --release --no-default-features` builds a binary that
+uses the system allocator throughout.
 The wheel is built with maturin from
 `pyproject.toml` (`maturin build --release`; the published Linux wheel uses `--zig --compatibility
 manylinux_2_28`, and the macOS wheel `MACOSX_DEPLOYMENT_TARGET=11.0`).
