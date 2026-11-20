@@ -70,7 +70,7 @@ cached, by where they were decoded, and the batches the CPU finished. If the GPU
 
 The slabs are decoded on the GPU by NVIDIA's nvCOMP when fibrs can load it, and on the CPU otherwise, with the same
 output either way. nvCOMP is optional and not part of fibrs: it is NVIDIA's own PyPI package,
-`nvidia-libnvcomp-cu12` (version 6, under NVIDIA's licence), which `pip install "fibrs[gpu]"` installs. fibrs loads
+`nvidia-libnvcomp-cu12` (version 6, under NVIDIA's licence), which `pip install "fibrs[gpu-zstd]"` installs. fibrs loads
 its `libnvcomp.so.6` at run time from `FIBRS_NVCOMP` (the library's full path) when that is set, else from the wheel
 in the environment fibrs is installed into or in the active one (`$VIRTUAL_ENV`), else from the system's library
 path, and logs once which it uses, or why slabs decode on the CPU. A slab whose chunk nvCOMP cannot decode as Blosc

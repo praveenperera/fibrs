@@ -15,7 +15,7 @@
 - **Prediction slabs decoded on the GPU with nvCOMP.** When fibrs can load NVIDIA's nvCOMP 6, the native slabs
   GPU finishing reads go to the GPU still compressed and are decoded there; without it they are decoded on the
   CPU, with the same output. nvCOMP is optional and never bundled: it comes from NVIDIA's own PyPI package,
-  `nvidia-libnvcomp-cu12`, under NVIDIA's licence, which the new `fibrs[gpu]` extra installs. fibrs loads it at run
+  `nvidia-libnvcomp-cu12`, under NVIDIA's licence, which the new `fibrs[gpu-zstd]` extra installs. fibrs loads it at run
   time from `FIBRS_NVCOMP` (the library's full path), else from the Python environment fibrs is installed into or
   the active one, and logs once whether slabs decode on the GPU or why they decode on the CPU. A slab nvCOMP
   cannot decode as Blosc stored it is decoded on the CPU, as are the slabs of arrays decoded a whole chunk at a

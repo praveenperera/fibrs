@@ -38,7 +38,7 @@ predict = [
 ]
 # nvCOMP 6, which GPU trace finishing loads from this environment's site-packages to decode prediction slabs on the
 # GPU; without it they decode on the CPU, with the same output. Linux x86-64 only, like the GPU engine
-gpu = ["nvidia-libnvcomp-cu12>=6,<7; sys_platform == 'linux' and platform_machine == 'x86_64'"]
+gpu-zstd = ["nvidia-libnvcomp-cu12>=6,<7; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
 [project.urls]
 Repository = "https://github.com/praveenperera/fibrs"
