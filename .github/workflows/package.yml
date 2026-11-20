@@ -11,10 +11,12 @@
 #
 # The tag waits for a reviewer of the pypi environment, then publishes the wheels to PyPI, makes a GitHub release
 # with the tag's CHANGELOG.md entry as its notes and the wheels, CLI archives and SHA256SUMS-* files attached, and
-# then publishes the crate to crates.io, where cargo-binstall finds the release's CLI archives through
-# [package.metadata.binstall] in Cargo.toml. PyPI and crates.io trust this workflow and its environments through
-# OIDC, so no token is stored; crates.io's trusted publishing can't create a crate, so its first version (0.4.0) was
-# published by hand. A tag whose version or changelog entry is wrong fails before anything is published, and every
+# then, when the repository variable CRATES_IO_PUBLISH is "true", publishes the crate to crates.io, where
+# cargo-binstall finds the release's CLI archives through [package.metadata.binstall] in Cargo.toml. The variable is
+# unset by default: a crates.io publish can't be undone, and it needs crates.io's trusted publisher for this
+# workflow and its crates-io environment set up first. PyPI and crates.io trust this workflow and its environments
+# through OIDC, so no token is stored; crates.io's trusted publishing can't create a crate, so its first version
+# (0.4.0) was published by hand. The crate jobs gate only the crates.io publish, never PyPI or the GitHub release. A tag whose version or changelog entry is wrong fails before anything is published, and every
 # publish skips what is already uploaded, so "Re-run failed jobs" finishes a partial release. Third-party actions are pinned to commit SHAs, since these jobs
 # build and publish the release files; the trailing comment names the version
 
@@ -281,8 +283,7 @@ jobs:
   pypi-publish:
     name: Publish to PyPI
     if: startsWith(github.ref, 'refs/tags/v')
-    # nothing is published unless the crate and the binstall metadata check out too
-    needs: [release-check, wheels, crate, binstall]
+    needs: [release-check, wheels]
     runs-on: ubuntu-24.04
     environment:
       name: pypi
@@ -393,11 +394,13 @@ jobs:
           echo "marking $GITHUB_REF_NAME latest: $latest"
           gh release edit "$GITHUB_REF_NAME" --draft=false --latest="$latest" --repo "$GITHUB_REPOSITORY"
 
-  # after the GitHub release, so a crate version cargo-binstall finds always has its CLI archives to download. A
-  # version already on crates.io is skipped, so a rerun passes without publishing again
+  # after the GitHub release, so a crate version cargo-binstall finds always has its CLI archives to download, and
+  # only when CRATES_IO_PUBLISH is "true"; otherwise the job is skipped and the tag's run still passes. A version
+  # already on crates.io is skipped, so a rerun passes without publishing again
   crates-publish:
     name: Publish to crates.io
-    needs: github-release
+    if: vars.CRATES_IO_PUBLISH == 'true'
+    needs: [github-release, crate, binstall]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     environment:

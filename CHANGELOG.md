@@ -12,8 +12,8 @@
   into a loop. A `--tiles-yx 1 1` run writes the untiled run's `.afv`. Without `--tiles-yx`, runs, their output and
   their `run.json` are unchanged. See [Tiled tracing](README.md#tiled-tracing).
 - **Install with cargo.** fibrs is on crates.io from 0.4.0: `cargo binstall fibrs` installs the release's prebuilt
-  CLI binary on Linux x86-64 and Apple silicon, and `cargo install fibrs --locked` builds it from source. Each
-  release now also publishes the crate. See [With cargo](README.md#with-cargo).
+  CLI binary on Linux x86-64 and Apple silicon, and `cargo install fibrs --locked` builds it from source. See
+  [With cargo](README.md#with-cargo).
 
 ### Fixes
 
