@@ -18,6 +18,7 @@ use color_eyre::eyre::{Result, bail, ensure, eyre};
 use serde_json::{Map, Value, json};
 
 use super::contract::Col;
+use super::engine::Buffers;
 use crate::pyfmt::{JsonStyle, py_dumps};
 
 /// zarr's metadata layout (`zarr.util.json_dumps`)
@@ -310,7 +311,7 @@ pub struct ColumnWriter {
     thread: Option<JoinHandle<()>>,
     err: Arc<Mutex<Option<color_eyre::Report>>>,
     /// Written columns' output buffers, for the engine to fill again
-    spent: Arc<Mutex<Vec<(Vec<u8>, Vec<u8>)>>>,
+    spent: Arc<Mutex<Vec<Buffers>>>,
 }
 
 /// The band reference's record key order, so the records read the same
@@ -356,7 +357,7 @@ impl ColumnWriter {
     }
 
     /// A written column's output buffers, or empty ones while none is written yet
-    pub fn spare(&self) -> (Vec<u8>, Vec<u8>) {
+    pub fn spare(&self) -> Buffers {
         self.spent.lock().ok().and_then(|mut s| s.pop()).unwrap_or_default()
     }
 
@@ -391,12 +392,7 @@ impl Drop for ColumnWriter {
 }
 
 /// Writes one column and its progress record, and gives back its output buffers
-fn write_column(
-    output: &Output,
-    progress: &Path,
-    job: Finished,
-    bufs: &mut ChunkBufs,
-) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+fn write_column(output: &Output, progress: &Path, job: Finished, bufs: &mut ChunkBufs) -> Result<Option<Buffers>> {
     let [y0, y1, x0, x1] = job.col;
     let (h, w) = (y1 - y0, x1 - x0);
     if let (Some(sem), Some(tra)) = (&job.sem, &job.tra) {
