@@ -403,7 +403,7 @@ fn resolved(path: &Path) -> Result<PathBuf> {
 
 /// Locks the output for this process; the lock goes with the process, so a killed run leaves none behind
 fn lock_output(attempts: &fs::File, out: &Path) -> Result<()> {
-    match attempts.try_lock() {
+    match try_lock(attempts) {
         Ok(()) => Ok(()),
         Err(TryLockError::WouldBlock) => {
             bail!("{} is in use by another fibrs predict run; wait for it to end or use another --out", out.display())
@@ -412,6 +412,40 @@ fn lock_output(attempts: &fs::File, out: &Path) -> Result<()> {
         Err(TryLockError::Error(e)) => {
             bail!("cannot lock {} ({e}); fibrs predict needs an output on a filesystem with file locks", out.display())
         }
+    }
+}
+
+/// An exclusive lock on the whole file: flock(LOCK_EX | LOCK_NB), advisory, so the attempt log stays readable
+#[cfg(not(windows))]
+fn try_lock(file: &fs::File) -> Result<(), TryLockError> {
+    file.try_lock()
+}
+
+/// An exclusive lock on one byte far past any attempt log's end. Windows' locks are mandatory, so the whole-file lock
+/// std takes would keep anyone from reading the log while the run goes on; this byte excludes a second run just as
+/// well, and a whole-file lock overlaps it
+#[cfg(windows)]
+fn try_lock(file: &fs::File) -> Result<(), TryLockError> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx};
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    // the byte at offset 2^62
+    let mut at = OVERLAPPED::default();
+    at.Anonymous.Anonymous.OffsetHigh = 1 << 30;
+    let flags = LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY;
+    // SAFETY: the handle is open for the call, and on a synchronous handle LockFileEx is done with `at` on return
+    if unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut at) } != 0 {
+        return Ok(());
+    }
+
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Err(TryLockError::WouldBlock)
+    } else {
+        Err(TryLockError::Error(e))
     }
 }
 

@@ -39,11 +39,12 @@ pub const REFERENCE_VERSION: &str = "0.2.0";
 
 /// Whether the binary runs as the drop-in `avf-spline-generator`, by the last component of the path it was run by,
 /// taken as `Path::file_name` takes it: trailing separators and `.` components skipped. On Windows `\` separates
-/// components too, and the name matches in any case and with or without `.exe`, as the system finds and runs
-/// `avf-spline-generator.exe` by it. It allocates nothing, since the global allocator asks before `std::env::args`
-/// can be collected
+/// components too, as does the `:` after a drive, and the name matches in any case and with or without `.exe`, as
+/// the system finds and runs `avf-spline-generator.exe` by it. It allocates nothing, since the global allocator asks
+/// before `std::env::args` can be collected
 pub fn dropin(arg0: &[u8]) -> bool {
-    let separator = |b: &u8| *b == b'/' || (cfg!(windows) && *b == b'\\');
+    // a drive-relative name, `C:avf-spline-generator.exe`, ends its drive at the colon
+    let separator = |b: &u8| *b == b'/' || (cfg!(windows) && (*b == b'\\' || *b == b':'));
     let Some(name) = arg0.split(separator).rev().find(|c| !c.is_empty() && *c != b".") else { return false };
     let name = match name.len().checked_sub(4) {
         Some(stem) if cfg!(windows) && name[stem..].eq_ignore_ascii_case(b".exe") => &name[..stem],

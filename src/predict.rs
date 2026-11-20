@@ -63,6 +63,7 @@ mod tests {
                 (r"C:\venv\Scripts\avf-spline-generator.exe", Some("predict"), false),
                 (r"C:\venv\Scripts\AVF-SPLINE-GENERATOR.EXE", Some("predict"), false),
                 ("avf-spline-generator.EXE", Some("predict"), false),
+                ("C:avf-spline-generator.exe", Some("predict"), false),
                 (r"C:\opt\avf-spline-generator\.", Some("predict"), false),
                 ("avf-spline-generator.exe.exe", Some("predict"), true),
             ],

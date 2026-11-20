@@ -51,16 +51,21 @@ def binary() -> str:
 
 
 def _script_dirs() -> list[Path]:
-    """The scripts directories that may hold the wheel's binary: this interpreter's default one, then its per-user
-    one when user site-packages are enabled (never in a venv)"""
-    dirs = [Path(sysconfig.get_path("scripts"))]
-    if site.ENABLE_USER_SITE:
-        # get_preferred_scheme came in 3.10; before it, the user scheme is named after os.name
-        preferred = getattr(sysconfig, "get_preferred_scheme", None)
-        user = preferred("user") if preferred else f"{os.name}_user"
-        if user in sysconfig.get_scheme_names():
-            dirs.append(Path(sysconfig.get_path("scripts", user)))
-    return dirs
+    """The scripts directories that may hold the wheel's binary: this interpreter's default one and, when user
+    site-packages are enabled (never in a venv), its per-user one. The one this package was installed beside comes
+    first, so a ``pip install --user`` over a system-wide install runs its own binary"""
+    default = Path(sysconfig.get_path("scripts"))
+    if not site.ENABLE_USER_SITE:
+        return [default]
+    # get_preferred_scheme came in 3.10; before it, the user scheme is named after os.name
+    preferred = getattr(sysconfig, "get_preferred_scheme", None)
+    scheme = preferred("user") if preferred else f"{os.name}_user"
+    if scheme not in sysconfig.get_scheme_names():
+        return [default]
+    user = Path(sysconfig.get_path("scripts", scheme))
+    package = Path(__file__).resolve()
+    from_user_site = package.is_relative_to(Path(sysconfig.get_path("purelib", scheme)).resolve())
+    return [user, default] if from_user_site else [default, user]
 
 
 def _environment() -> dict[str, str]:
