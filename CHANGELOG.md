@@ -4,6 +4,17 @@
 
 ### What's new
 
+- **Faster seed catalogue.** Each family's seed catalogue (priority split, descending-centrality argsort, sort by
+  1024³ region) is built on the `--threads` pool:
+  - the split and gathers keep their order;
+  - the partitions NumPy's quicksort sets aside are sorted in parallel, which gives its exact order, equal keys
+    included;
+  - the stable sort by region is now a counting sort.
+
+  On the dense PHerc0358 window z02304–02816, the catalogues of its 22 million V and 21 million H seeds took
+  about 10 CPU-s on one thread, most of the 12 s the seed stage took. The tracing order, and so the `.afv`, is
+  unchanged.
+
 - **Less memory work while finishing curves.** Native prediction slabs are decoded straight into their buffers
   instead of into zero-filled ones, and chunk files are read the same way. Compressed chunks get a buffer pool of
   their own. In the one pool they shared with decoded slabs, a chunk read found no buffer to reuse one time in
