@@ -24,13 +24,14 @@ use sha2::{Digest, Sha256};
 use crate::afv::{ExportOptions, MinLength, Summary, export_afv};
 use crate::arena::BufferPool;
 use crate::axes::{Lapack, direction_field, find_lapack};
-use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
+use crate::fields::{Catalogue, FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
+use crate::gpu::walk::Walk;
 use crate::gpu::{AxesCounts, Gpu, Stages};
 use crate::input::Predictions;
-use crate::kernels::{Coverage, DirField, DirForm, Directions, Fields, RawCurve, SplitDirs};
+use crate::kernels::{Coverage, DirField, DirForm, Directions, Fields, RawCurve, SplitDirs, ring};
 use crate::log;
-use crate::lookahead::AheadStats;
+use crate::lookahead::{AheadStats, Pace};
 use crate::produce::{Flow, Producer, Speculation, Stats};
 use crate::stage1::{Fused, Separate};
 use crate::vol::{EDGE, Shape, Vol};
@@ -1048,6 +1049,32 @@ impl CentralityDevice {
         }
     }
 
+    /// The GPU's walk of one family's seeds ahead of the CPU's commit (`lookahead.rs`), when the run has a GPU
+    ///
+    /// The `.afv` is the CPU's either way, so a GPU that cannot hold the family leaves the CPU to trace alone, even
+    /// under `--device cuda`. `FIBRS_DEBUG_GPU_WALK=0` keeps the walk on the CPU, for comparing the two
+    fn walk<'g, D: DirField>(
+        &'g self,
+        tracing: &[Vol<u8>; 2],
+        family: usize,
+        cent: &Vol<u16>,
+        dirs: &D,
+        cat: &Catalogue,
+        label: &str,
+    ) -> Option<Walk<'g>> {
+        let gpu = self.gpu.as_ref()?;
+        if std::env::var_os("FIBRS_DEBUG_GPU_WALK").is_some_and(|v| v == "0") {
+            return None;
+        }
+        match gpu.walk(tracing, family, cent, dirs, cat, ring()) {
+            Ok(walk) => Some(walk),
+            Err(e) => {
+                log!("{label} walk on the CPU only: the GPU cannot trace ahead ({e:#})");
+                None
+            }
+        }
+    }
+
     /// One family's centrality and seeds in the run's rounding
     ///
     /// When the GPU fails, such as out of memory, the CPU computes the same CUDA rounding unless `--device cuda`
@@ -1082,14 +1109,14 @@ fn trace_family<D: DirField>(
     cache: &NativeCache,
     work: &Path,
     family: usize,
-    Compute { threads, cent }: Compute,
+    Compute { threads, cent: device }: Compute,
 ) -> Result<()> {
     let label = if family == 1 { "V" } else { "H" };
     let folder = family_dir(work, family);
     fs::create_dir_all(&folder)?;
     let t = Instant::now();
     let pres = Presence::new(tracing, family);
-    let FamilyFields { cent, seeds } = cent.compute(tracing, family, &pres, dirs)?;
+    let FamilyFields { cent, seeds } = device.compute(tracing, family, &pres, dirs)?;
     log!("{label} centrality: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem(label, &[("cent", cent.resident_bytes()), ("seeds", seeds.len() * std::mem::size_of::<Seed>())]);
     let t = Instant::now();
@@ -1132,6 +1159,11 @@ fn trace_family<D: DirField>(
     let spec = Speculation::from_env()?;
     let cov = Coverage::new(shape);
     let producer = Producer::new(&fields, &cov, &cat, spec)?;
+    let mut walk = device.walk(tracing, family, &cent, dirs, &cat, label);
+    let producer = match walk.as_mut() {
+        Some(walk) => producer.with_device(walk, Pace::default()),
+        None => producer,
+    };
     let produce = |tx: &SyncSender<Vec<RawCurve>>| -> Result<usize> {
         let mut batch: Vec<RawCurve> = Vec::new();
         let mut points = 0;
