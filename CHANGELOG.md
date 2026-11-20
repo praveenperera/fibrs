@@ -6,7 +6,7 @@
 
 - **Less memory work while finishing curves.** Native prediction slabs are decoded straight into their buffers
   instead of into zero-filled ones, and chunk files are read the same way. Compressed chunks get a buffer pool of
-  their own, in 128 KiB size classes. In the one pool they shared with decoded slabs, a chunk read found no
+  their own, with size classes that scale with the chunk. In the one pool they shared with decoded slabs, a chunk read found no
   buffer to reuse one time in five, and freed slabs were dropped instead of being kept for the next decode. On
   the dense PHerc0358 window z02304–02816 at `--threads 8`, the zero-filling took about 34 CPU-s and the page
   faults of fresh buffers about 35 CPU-s, 14% of the finishing threads' time. The `.afv` is unchanged.
