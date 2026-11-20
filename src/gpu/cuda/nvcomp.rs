@@ -511,8 +511,9 @@ mod tests {
         let slab = 8;
         let block = slab * plane;
 
-        let mut want = vec![0u8; 2 * channel];
+        let mut want = Vec::new();
         p.decode_planes(&packed, 0..edge[0], &mut want).unwrap();
+        assert_eq!(want.len(), 2 * channel);
         let PackedChunk::Blosc(bytes) = &packed else { panic!("the chunk is stored") };
         // slab s of channel c lands at c * channel + s * block, as `decode_planes` lays both channels out
         let mut frames = Vec::new();

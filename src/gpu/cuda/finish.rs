@@ -1254,6 +1254,7 @@ mod tests {
 
     use super::*;
     use crate::fields::Presence;
+    use crate::finish::CachePools;
     use crate::finish::test_support::store_with;
     use crate::finish::{FinishCtx, NativeSampler};
     use crate::gpu::Stages;
@@ -1568,8 +1569,8 @@ mod tests {
             let (dir, pred) = store_with(name, native, edge, blocksize, value);
             // a chunk inside the array the writer never stored reads as the fill value
             fs::remove_file(dir.join("0.1.2.2")).unwrap();
-            let buffers = BufferPool::new(1 << 20);
-            let cache = NativeCache::new(&pred, 64 << 20, &buffers);
+            let pools = CachePools::new();
+            let cache = NativeCache::new(&pred, 64 << 20, &pools);
             let layout = cache.layout();
             assert_eq!(layout.planes < edge, name != "finish-whole", "{name}: decoded by slabs");
             if name == "finish-sliced" {
