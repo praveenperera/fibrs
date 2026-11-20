@@ -1380,7 +1380,12 @@ mod tests {
             rng.next();
             // the first chunk is noise zstd cannot shrink, so Blosc stores its blocks as they are
             if z < edge && y < edge && x < edge {
-                return (rng.next() >> 56) as u8;
+                // splitmix64's finaliser over the voxel and channel: xorshift from neighbouring seeds leaves the
+                // high bits correlated enough for zstd to compress
+                let mut h = ((((c * 7919 + z) * 7919 + y) * 7919 + x) as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+                h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                return ((h ^ (h >> 31)) >> 56) as u8;
             }
             let at = |v: usize| (v as f64 - 0.5) / 2.0;
             pair(&mut rng, lead(at(z), at(y), at(x)))[c]
