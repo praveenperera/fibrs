@@ -14,7 +14,6 @@
 - **Install with cargo.** fibrs is on crates.io from 0.4.0: `cargo binstall fibrs` installs the release's prebuilt
   CLI binary on Linux x86-64 and Apple silicon, and `cargo install fibrs --locked` builds it from source. See
   [With cargo](README.md#with-cargo).
-
 - **`fibrs predict` reuses its buffers across a run.** Readers read each tile into a recycled buffer, the engine
   hands batches back already sized for the next one, and the writer keeps one chunk buffer and one compress buffer
   for the whole run, overwriting a chunk a column covers completely instead of zeroing it first. Once a column is
