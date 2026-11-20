@@ -5,8 +5,9 @@
 fibrs 0.4.0 does more of a GPU run on the GPU and spends less CPU time around tracing. Traced curves are finished
 on the GPU, and GPU centrality takes less than half as long on dense data. The seed catalogue and the export's
 rows are built on the `--threads` pool, idle threads trace further ahead, and finishing does less memory work.
-`fibrs predict` allocates through the system allocator again, which brings its speed back to 0.3.0's. None of
-these changes alters the `.afv` or the predictions.
+`fibrs predict` allocates through the system allocator again, which brings its speed back to 0.3.0's. Finishing
+can also decode prediction slabs on the GPU with nvCOMP, off by default and opted into with `FIBRS_NVCOMP`. None
+of these changes alters the `.afv` or the predictions; nvCOMP decoding gives the same output on sound files.
 
 ### What's new
 
@@ -36,6 +37,7 @@ these changes alters the `.afv` or the predictions.
   CPU, and the log counts those batches and the slabs cached, by where they were decoded, at the end of each
   family. If the GPU fails while finishing, `--device auto` finishes the rest of the family on the CPU and
   `--device cuda` stops the run, as in the other GPU stages. `--device cpu` finishes on the CPU as before.
+
 - **Opt-in GPU decoding of prediction slabs with nvCOMP.** With NVIDIA's nvCOMP 6, the native slabs GPU
   finishing reads go to the GPU still compressed and are decoded there, with the same output on sound files. It is
   off by default, so slabs decode on the CPU with c-blosc's checks; opt in with `FIBRS_NVCOMP=on`, which loads
