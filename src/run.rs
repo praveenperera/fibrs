@@ -25,7 +25,7 @@ use crate::afv::{ExportOptions, MinLength, Summary, export_afv};
 use crate::axes::{Lapack, direction_field, find_lapack};
 use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{CachePools, FinishCtx, NativeCache, NativeSampler};
-use crate::gpu::{AxesCounts, CpuReason, Finished, Gpu, GpuFinisher, Pieces, Stages};
+use crate::gpu::{AxesCounts, CpuReason, Finished, Gpu, GpuFinisher, Pieces, SlabLoads, Stages};
 use crate::input::Predictions;
 use crate::kernels::{Coverage, DirField, DirForm, Directions, Fields, RawCurve, SplitDirs};
 use crate::log;
@@ -126,7 +126,11 @@ pub struct Args {
     /// Where the direction field and centrality run (tracing always runs on the CPU): auto uses an NVIDIA GPU when
     /// one is usable and the CPU otherwise, cpu never uses the GPU, and cuda fails without one. A GPU run writes the
     /// original's --device cuda output, whose centrality can differ from its cpu output by a rounding. A resumed
-    /// run keeps the rounding it started with, so one started on the CPU keeps centrality there
+    /// run keeps the rounding it started with, so one started on the CPU keeps centrality there. A GPU run also
+    /// finishes curves there; its prediction slabs decode on the CPU with c-blosc's checks unless GPU decoding
+    /// with nvCOMP is opted in to (FIBRS_NVCOMP=on, with fibrs[gpu-zstd] installed, or FIBRS_NVCOMP set to a
+    /// libnvcomp.so.6 path). On a corrupt chunk nvCOMP's behaviour is undefined: it may give wrong output or a
+    /// CUDA fault
     #[arg(long, value_enum, default_value = "auto")]
     pub device: Device,
     /// Visible CUDA device index for the GPU; without it, the first usable visible GPU
@@ -1217,7 +1221,7 @@ struct FinishCounts {
     /// Whether the GPU took part: the family's batches after it fails count as finished on the CPU
     used: bool,
     batches: usize,
-    uploaded: u64,
+    loaded: SlabLoads,
     /// Batches handed back, by [`CpuReason`], and the batch the GPU failed on and every one after it
     slabs: usize,
     unlisted: usize,
@@ -1284,7 +1288,7 @@ impl<'a> BatchFinisher<'a> {
             Ok(Finished::OnCpu(CpuReason::Decode)) => c.decode += 1,
             Err(e) if !self.strict => {
                 log!("{} finishing on the CPU from here: the GPU failed ({e:#})", self.label);
-                c.uploaded = gpu.uploaded();
+                c.loaded = gpu.loaded();
                 c.failed += 1;
                 self.gpu = OnGpu::Off;
             }
@@ -1293,14 +1297,15 @@ impl<'a> BatchFinisher<'a> {
         finish_batch(pool, ctx, cache, batch)
     }
 
-    /// Log the slabs the GPU uploaded and the batches the CPU finished instead, if the GPU took part
+    /// Log the slabs the GPU cached, by where they were decoded, and the batches the CPU finished instead, if the
+    /// GPU took part
     fn summary(&mut self) {
         let c = &mut self.counts;
         if !c.used {
             return;
         }
         if let OnGpu::Open(gpu) = &self.gpu {
-            c.uploaded = gpu.uploaded();
+            c.loaded = gpu.loaded();
         }
         let reasons = [
             (c.slabs, "read more slabs than the GPU holds"),
@@ -1313,9 +1318,12 @@ impl<'a> BatchFinisher<'a> {
         let why: Vec<String> = reasons.iter().filter(|&&(n, _)| n > 0).map(|(n, why)| format!("{n} {why}")).collect();
         let why = if why.is_empty() { String::new() } else { format!(": {}", why.join(", ")) };
         log!(
-            "{} finishing: {} native slabs uploaded to the GPU, {on_cpu} of {} batches finished on the CPU{why}",
+            "{} finishing: {} native slabs cached on the GPU ({} decoded there, {} on the CPU), {on_cpu} of {} \
+             batches finished on the CPU{why}",
             self.label,
-            c.uploaded,
+            c.loaded.total(),
+            c.loaded.on_gpu,
+            c.loaded.on_cpu,
             c.batches
         );
     }

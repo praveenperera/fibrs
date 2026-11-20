@@ -15,8 +15,9 @@
 
 mod axes;
 mod finish;
+mod nvcomp;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
 use cudarc::driver::{
@@ -28,6 +29,7 @@ use rayon::prelude::*;
 
 pub use finish::GpuFinisher;
 
+use self::nvcomp::NvComp;
 use super::Stages;
 use crate::fields::{FamilyFields, Seed, TILE, TILE_HALO, tiles};
 use crate::stage1::{Arith, Fused};
@@ -166,6 +168,8 @@ pub struct Gpu {
     dirs: CudaSlice<f64>,
     /// Every byte of a pooled prediction as the direction field's float32, `v as f32 / 255.0` as the CPU computes it
     unit: CudaSlice<f32>,
+    /// nvCOMP for finishing's native slabs, loaded when the first finisher opens: `None` when slabs decode on the CPU
+    nvcomp: OnceLock<Option<Arc<NvComp>>>,
 }
 
 impl Gpu {
@@ -265,7 +269,7 @@ impl Gpu {
         stream.synchronize()?;
         let (free, _) = ctx.mem_get_info()?;
         let name = format!("CUDA device {device}, {} (compute capability {major}.{minor})", ctx.name()?);
-        Ok(Self { ctx, name, k, free, dirs, unit })
+        Ok(Self { ctx, name, k, free, dirs, unit, nvcomp: OnceLock::new() })
     }
 
     pub fn name(&self) -> &str {

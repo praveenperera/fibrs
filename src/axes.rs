@@ -18,6 +18,7 @@ use rayon::prelude::*;
 
 use crate::arena::BufferPool;
 use crate::kernels::{DirForm, Directions};
+use crate::pyenv::site_packages;
 use crate::vol::{Shape, Vol};
 
 /// Halo the tensor needs: 4 + 1 + 6
@@ -161,25 +162,10 @@ pub fn find_lapack() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("FIBRS_LAPACK") {
         return Ok(PathBuf::from(p));
     }
-    let mut roots = Vec::new();
-    if let Some(arg0) = std::env::args_os().next() {
-        let arg0 = PathBuf::from(arg0);
-        let arg0 = if arg0.components().count() > 1 { Some(arg0) } else { which(&arg0) };
-        if let Some(bin) = arg0.as_deref().and_then(Path::parent) {
-            roots.push(bin.join(".."));
-        }
-    }
-    if let Some(v) = std::env::var_os("VIRTUAL_ENV") {
-        roots.push(PathBuf::from(v));
-    }
-    for root in roots {
-        let Ok(libs) = std::fs::read_dir(root.join("lib")) else { continue };
-        for py in libs.flatten() {
-            let site = py.path().join("site-packages");
-            for dir in [site.join("numpy.libs"), site.join("scipy_openblas64/lib")] {
-                if let Some(lib) = openblas_in(&dir) {
-                    return Ok(lib);
-                }
+    for site in site_packages() {
+        for dir in [site.join("numpy.libs"), site.join("scipy_openblas64/lib")] {
+            if let Some(lib) = openblas_in(&dir) {
+                return Ok(lib);
             }
         }
     }
@@ -196,10 +182,6 @@ fn openblas_in(dir: &Path) -> Option<PathBuf> {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         name.starts_with("libscipy_openblas64_") && (name.ends_with(".so") || name.ends_with(".dylib"))
     })
-}
-
-fn which(name: &Path) -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
 /// The GPU kernels' certification of a voxel's direction, which the tests hold against dsyevd on the CPU
