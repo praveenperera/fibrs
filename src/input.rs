@@ -298,18 +298,19 @@ impl Predictions {
     /// from `alloc`; returns the chunk's origin and extent too. NPY input is served in blocks of the same size
     ///
     /// A whole uint8 Blosc chunk holding both channels, which is what prediction writers store, is decoded
-    /// straight into the returned buffer, its compressed bytes read into another buffer from `alloc`; anything
+    /// straight into the returned buffer, its compressed bytes read into a buffer from `packed`; anything
     /// else is read through [`Predictions::read_u8`]'s path into a buffer from `alloc`
-    pub fn read_chunk_in<A: Allocator + Copy>(
+    pub fn read_chunk_in<A: Allocator + Copy, P: Allocator>(
         &self,
         key: [usize; 3],
         edge: [usize; 3],
         alloc: A,
+        packed: P,
     ) -> Result<NativeChunk<A>> {
         let lo = [0, 1, 2].map(|a| key[a] * edge[a]);
         let hi = [0, 1, 2].map(|a| (lo[a] + edge[a]).min(self.shape[a]));
         let dims = [0, 1, 2].map(|a| hi[a] - lo[a]);
-        if let Some(data) = self.whole_chunk_in(key, edge, dims, alloc)? {
+        if let Some(data) = self.whole_chunk_in(key, edge, dims, alloc, packed)? {
             return Ok(NativeChunk { lo, dims, data });
         }
         Ok(NativeChunk { lo, dims, data: self.read_u8_in(lo, hi, alloc)? })
@@ -318,18 +319,20 @@ impl Predictions {
     /// The fast path of [`Predictions::read_chunk_in`]: the chunk's decoded bytes are already `(2, dims)` in C order
     /// when its file holds both channels of an unclipped uint8 C-order chunk, so `read_raw`'s copy is the identity;
     /// `None` when the chunk is not of that kind
-    fn whole_chunk_in<A: Allocator + Copy>(
+    fn whole_chunk_in<A: Allocator + Copy, P: Allocator>(
         &self,
         key: [usize; 3],
         edge: [usize; 3],
         dims: [usize; 3],
         alloc: A,
+        packed: P,
     ) -> Result<Option<Vec<u8, A>>> {
         if self.slab_layout() != Some(edge) || dims != edge {
             return Ok(None);
         }
         let n = 2 * dims.iter().product::<usize>();
-        let mut out = match self.packed_chunk_in(key, alloc)? {
+        // the compressed bytes come from `packed`, so they never take the room `alloc` keeps for decoded chunks
+        let mut out = match self.packed_chunk_in(key, packed)? {
             PackedChunk::Fill(fill) => {
                 let mut out = Vec::with_capacity_in(n, alloc);
                 out.resize(n, fill);
@@ -849,11 +852,11 @@ mod tests {
             for z in 0..grid[0] {
                 for y in 0..grid[1] {
                     for x in 0..grid[2] {
-                        let NativeChunk { lo, dims, data } = p.read_chunk_in([z, y, x], edge, &pool).unwrap();
+                        let NativeChunk { lo, dims, data } = p.read_chunk_in([z, y, x], edge, &pool, &pool).unwrap();
                         let hi = [0, 1, 2].map(|a| lo[a] + dims[a]);
                         assert_eq!(&data[..], &p.read_u8(lo, hi).unwrap()[..], "{}", case["name"]);
                         checked += 1;
-                        direct += p.whole_chunk_in([z, y, x], edge, dims, &pool).unwrap().is_some() as usize;
+                        direct += p.whole_chunk_in([z, y, x], edge, dims, &pool, &pool).unwrap().is_some() as usize;
                     }
                 }
             }

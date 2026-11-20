@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use color_eyre::eyre::{Result, eyre};
 
-use crate::arena::BufferPool;
+use crate::arena::{BufferPool, Classes};
 use crate::fields::Presence;
 use crate::input::{NativeChunk, PackedChunk, Predictions};
 use crate::kernels::{evaluate_curve, fit_curve};
@@ -106,9 +106,6 @@ const DECODED_RETAIN: usize = 128 << 20;
 /// eviction frees is seldom of the size class the next read asks for; a kept buffer of the asked class is found
 /// only when the pool holds many of each
 const PACKED_RETAIN: usize = 128 << 20;
-/// Size classes of compressed chunks: in PHerc0358's prediction zarrs those of about 1 MiB spread over 10 classes
-/// 64 KiB apart, and a read found no kept buffer of its class one time in five
-const PACKED_GRANULE: usize = 128 << 10;
 
 /// The buffer pools behind a [`NativeCache`]
 ///
@@ -124,7 +121,11 @@ impl CachePools {
     pub fn new() -> Self {
         Self {
             decoded: BufferPool::new(DECODED_RETAIN),
-            packed: BufferPool::with_granule(PACKED_RETAIN, PACKED_GRANULE),
+            // in PHerc0358's prediction zarrs compressed chunks of about 1 MiB spread over 10 classes 64 KiB apart,
+            // and a read found no kept buffer of its class one time in five. Scaled classes put them in about 4,
+            // and keep the classes of chunks under 256 KiB 64 KiB apart, so the cache's budget holds as many of
+            // those as before; a simulated z02304 run held 6% fewer chunks with classes 128 KiB apart
+            packed: BufferPool::with_classes(PACKED_RETAIN, Classes::Scaled),
         }
     }
 }
@@ -227,7 +228,12 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         let [cz, cy, cx, s] = key;
         if self.planes == self.edge[0] {
             self.counts.lock().expect("cache lock").read += 1;
-            return Ok(Slab::from_chunk(self.pred.read_chunk_in([cz, cy, cx], self.edge, &self.pools.decoded)?));
+            return Ok(Slab::from_chunk(self.pred.read_chunk_in(
+                [cz, cy, cx],
+                self.edge,
+                &self.pools.decoded,
+                &self.pools.packed,
+            )?));
         }
         let packed = self.packed([cz, cy, cx])?;
         if !self.pred.planes_fit(&packed, self.planes) {
