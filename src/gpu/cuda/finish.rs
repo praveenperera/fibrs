@@ -989,6 +989,7 @@ mod tests {
     #[test]
     #[ignore = "needs an NVIDIA GPU; run through the GPU queue"]
     fn gpu_finish_matches_cpu() {
+        const BATCH: usize = 10;
         let gpu = Gpu::open(None, Stages::DirectionField).unwrap();
         let tracing = volumes();
         let native = SHAPE.map(|n| 2 * n);
@@ -1000,7 +1001,9 @@ mod tests {
             let at = |v: usize| (v as f64 - 0.5) / 2.0;
             pair(&mut rng, lead(at(z), at(y), at(x)))[c]
         };
-        let batch = curves(600);
+        // batches of curves that start near each other, as the tracer's are, so each reads a part of the store
+        let mut batch = curves(600);
+        batch.sort_by(|a, b| a.pts[0][0].total_cmp(&b.pts[0][0]));
         let workers = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
         let blocks = [("finish-sliced", 8 * edge * edge), ("finish-whole", 2 * edge * edge * edge)];
         for (name, blocksize) in blocks {
@@ -1008,9 +1011,10 @@ mod tests {
             let buffers = BufferPool::new(1 << 20);
             let cache = NativeCache::new(&pred, 64 << 20, &buffers);
             let layout = cache.layout();
-            let per_batch = batch.chunks(50).map(|b| list_slabs(&layout, b).len()).max().unwrap();
+            let per_batch = batch.chunks(BATCH).map(|b| list_slabs(&layout, b).len()).max().unwrap();
             let all = list_slabs(&layout, &batch).len();
-            assert!(all > 2 * per_batch, "{name}: {all} slabs in all, {per_batch} in a batch; too few to evict");
+            let room = per_batch + per_batch / 4;
+            assert!(all > room, "{name}: {all} slabs in all, {per_batch} in a batch; too few to evict");
             for family in [1, 2] {
                 let pres = Presence::new(&tracing, family);
                 let ctx = FinishCtx { tracing: &tracing, pres: &pres, family };
@@ -1019,10 +1023,9 @@ mod tests {
                 let pieces = want.iter().map(Vec::len).sum::<usize>();
                 assert!(pieces > batch.len(), "{name} {family}: {pieces} pieces of {} curves", batch.len());
 
-                let room = per_batch + per_batch / 2;
                 let mut finisher = gpu.finisher_with(&tracing, family, layout, room * layout.slab_bytes()).unwrap();
                 assert!(finisher.slots() < all, "{name} {family}: the cache holds every slab");
-                for (i, (curves, want)) in batch.chunks(50).zip(want.chunks(50)).enumerate() {
+                for (i, (curves, want)) in batch.chunks(BATCH).zip(want.chunks(BATCH)).enumerate() {
                     match finisher.finish(&workers, &cache, curves).unwrap() {
                         Finished::Pieces(got) => {
                             assert!(bits(&got) == bits(want), "{name} {family}: batch {i} differs")
