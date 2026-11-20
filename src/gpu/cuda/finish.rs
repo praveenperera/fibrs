@@ -1516,7 +1516,7 @@ mod tests {
     /// enough that later batches evict earlier ones' slabs; a batch reading more slabs than the cache holds comes
     /// back for the CPU
     ///
-    /// Slabs decode on the CPU, then, when `FIBRS_NVCOMP` names nvCOMP (for example
+    /// Slabs decode on the CPU, then, when `FIBRS_NVCOMP` is `on` or names nvCOMP (for example
     /// `/build/fibrs-gpu/venv-nvcomp/lib/python3.14/site-packages/nvidia/libnvcomp/lib64/libnvcomp.so.6`), on the GPU
     /// too: every slab of the store in slab-sized blocks, among them a chunk of noise Blosc stores as is and a chunk
     /// never stored; none of the store in whole-chunk blocks; and in the store mixing slab-sized and half-slab blocks,
@@ -1526,10 +1526,14 @@ mod tests {
     fn gpu_finish_matches_cpu() {
         const BATCH: usize = 10;
         let gpu = Gpu::open(None, Stages::DirectionField).unwrap();
-        let nvcomp = std::env::var_os("FIBRS_NVCOMP").map(|_| Arc::new(NvComp::open().unwrap()));
+        // `off` is the loader's way to decode on the CPU, so it runs the CPU-only case as unset does
+        let nvcomp = match std::env::var_os("FIBRS_NVCOMP") {
+            Some(value) if !value.eq_ignore_ascii_case("off") => Some(Arc::new(NvComp::open().unwrap())),
+            _ => None,
+        };
         match &nvcomp {
             Some(nvcomp) => eprintln!("decoding on the GPU too, with {}", nvcomp.name()),
-            None => eprintln!("FIBRS_NVCOMP is not set: decoding on the CPU only"),
+            None => eprintln!("FIBRS_NVCOMP is unset or off: decoding on the CPU only"),
         }
         let tracing = volumes();
         let native = SHAPE.map(|n| 2 * n);
