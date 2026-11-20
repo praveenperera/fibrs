@@ -852,9 +852,10 @@ impl ToLe for u16 {
 fn release_freed() {
     // mimalloc keeps a freed large block in its arena and purges it only after a delay, on a later allocation or
     // free, and a smaller block in a page of the thread that allocated it, which only that thread collects. So each
-    // thread of the pool collects its own pages, which the stages do between stages, when the pool is idle. A
-    // thread skips the arena purge while another holds it, so pages a thread hands back during another's purge
-    // could stay; one more forced collect after them all purges every arena's free pages
+    // thread of the pool collects its own pages, which the stages do between stages, when the pool is idle, and one
+    // more forced collect after them all purges what they handed back. This is best effort: a page freed while
+    // another thread holds mimalloc's purge lock (a pool thread mid-collect, or a finishing pool's thread still
+    // exiting) can stay until mimalloc's own delayed purge, which runs about 1 s later as the next stage allocates
     // SAFETY: mi_collect only returns free pages to the kernel; it touches no live allocation
     #[cfg(feature = "mimalloc")]
     unsafe {
