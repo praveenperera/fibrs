@@ -8,11 +8,11 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{SyncSender, sync_channel};
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 
 use clap::error::ErrorKind;
 use clap::{Arg, ArgAction, Command, CommandFactory, Parser, ValueEnum};
@@ -38,11 +38,18 @@ use crate::vol::{EDGE, Shape, Vol};
 pub const REFERENCE_VERSION: &str = "0.2.0";
 
 /// Whether the binary runs as the drop-in `avf-spline-generator`, by the last component of the path it was run by,
-/// taken as `Path::file_name` takes it: trailing `/` and `.` components skipped. It allocates nothing, since the
-/// global allocator asks before `std::env::args` can be collected
+/// taken as `Path::file_name` takes it: trailing separators and `.` components skipped. On Windows `\` separates
+/// components too, and the name matches in any case and with or without `.exe`, as the system finds and runs
+/// `avf-spline-generator.exe` by it. It allocates nothing, since the global allocator asks before `std::env::args`
+/// can be collected
 pub fn dropin(arg0: &[u8]) -> bool {
-    let name = arg0.split(|&b| b == b'/').rev().find(|c| !c.is_empty() && *c != b".");
-    name == Some(b"avf-spline-generator".as_slice())
+    let separator = |b: &u8| *b == b'/' || (cfg!(windows) && *b == b'\\');
+    let Some(name) = arg0.split(separator).rev().find(|c| !c.is_empty() && *c != b".") else { return false };
+    let name = match name.len().checked_sub(4) {
+        Some(stem) if cfg!(windows) && name[stem..].eq_ignore_ascii_case(b".exe") => &name[..stem],
+        _ => name,
+    };
+    if cfg!(windows) { name.eq_ignore_ascii_case(b"avf-spline-generator") } else { name == b"avf-spline-generator" }
 }
 
 /// What `--version` prints: run as the drop-in, the version of the reference release it stands in for, so callers
@@ -401,7 +408,11 @@ fn file_signature(path: &Path) -> Result<String> {
     }
     for (parts, file) in entries {
         let meta = fs::metadata(&file)?;
-        let mtime_ns = meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128;
+        // Python's st_mtime_ns: nanoseconds from the Unix epoch, negative before it
+        let mtime_ns = match meta.modified()?.duration_since(UNIX_EPOCH) {
+            Ok(after) => after.as_nanos() as i128,
+            Err(before) => -(before.duration().as_nanos() as i128),
+        };
         digest.update(format!("{}\0{}\0{}\n", parts.join("/"), meta.len(), mtime_ns).as_bytes());
     }
     Ok(digest.finalize().iter().map(|b| format!("{b:02x}")).collect())
@@ -442,8 +453,13 @@ struct WorkLock(#[allow(dead_code)] File);
 
 impl WorkLock {
     fn acquire(path: &Path) -> Result<Self> {
-        let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).mode(0o644).open(path)?;
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o644);
+        let f = options.open(path)?;
+        // flock(LOCK_EX | LOCK_NB) on Linux and macOS, LockFileEx on Windows
+        if f.try_lock().is_err() {
             bail!("The file lock '{}' could not be acquired.", path.display());
         }
         Ok(Self(f))
@@ -1020,11 +1036,20 @@ fn debug_mem(stage: &str, parts: &[(&str, usize)]) {
     if std::env::var_os("FIBRS_DEBUG_MEM").is_none() {
         return;
     }
-    let rss =
-        fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok());
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
     let parts: Vec<String> = parts.iter().map(|(k, v)| format!("{k} {:.2}", gib(*v))).collect();
-    log!("mem {stage}: {} GiB; rss {:.2} GiB", parts.join(", "), gib(rss.unwrap_or(0) * page));
+    log!("mem {stage}: {} GiB; rss {:.2} GiB", parts.join(", "), gib(rss_bytes().unwrap_or(0)));
+}
+
+/// The process's resident set, from procfs; other systems have no procfs, and their debug logs show zero
+#[cfg(target_os = "linux")]
+fn rss_bytes() -> Option<usize> {
+    let pages = fs::read_to_string("/proc/self/statm").ok()?.split_whitespace().nth(1)?.parse::<usize>().ok()?;
+    Some(pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rss_bytes() -> Option<usize> {
+    None
 }
 
 fn gib(bytes: usize) -> f64 {

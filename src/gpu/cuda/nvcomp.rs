@@ -22,11 +22,16 @@ use super::Pending;
 use crate::pyenv::site_packages;
 
 /// The library's soname, as the wheel and NVIDIA's other packages install it
+#[cfg(unix)]
 const SONAME: &str = "libnvcomp.so.6";
+
+/// The library's DLL name, as the wheel and NVIDIA's other packages install it
+#[cfg(windows)]
+const SONAME: &str = "nvcomp64_6.dll";
 /// The major version these bindings follow
 const MAJOR: u32 = 6;
 /// Where the wheel puts the library inside `site-packages`
-const WHEEL_DIR: &str = "nvidia/libnvcomp/lib64";
+const WHEEL_DIR: &str = if cfg!(windows) { "nvidia/libnvcomp/bin" } else { "nvidia/libnvcomp/lib64" };
 /// Largest frame and output nvCOMP's zstd decoder takes (`nvcompZstdDecompressionMaxAllowedChunkSize`)
 const MAX_CHUNK: usize = (1 << 31) - 1;
 
@@ -179,7 +184,7 @@ impl NvComp {
     /// Load nvCOMP as `FIBRS_NVCOMP` allows, which keeps it off unless the run opts in. Unset or `off`, in any
     /// case, loads none; `on`, in any case, tries the `nvidia-libnvcomp-cu12` wheel (the `fibrs[gpu-zstd]` extra)
     /// in the venv this executable was started from and in `$VIRTUAL_ENV`, then the dynamic loader's search path;
-    /// any other value is a path to `libnvcomp.so.6`, the only place then tried
+    /// any other value is a path to `libnvcomp.so.6` (`nvcomp64_6.dll` on Windows), the only place then tried
     pub fn open() -> Result<Self> {
         let wheels =
             || site_packages().into_iter().map(|site| site.join(WHEEL_DIR).join(SONAME)).filter(|p| p.is_file());
@@ -198,7 +203,7 @@ impl NvComp {
                 Err(e) => reasons.push(format!("{e:#}")),
             }
         }
-        bail!("cannot load nvCOMP ({}); set FIBRS_NVCOMP to a libnvcomp.so.6 path, or off", reasons.join("; "))
+        bail!("cannot load nvCOMP ({}); set FIBRS_NVCOMP to a {SONAME} path, or off", reasons.join("; "))
     }
 
     /// Load nvCOMP from `path`, a path or a bare soname for the dynamic loader to find, and check it is major 6
@@ -206,7 +211,7 @@ impl NvComp {
         let at = path.display();
         // SAFETY: loading the library runs its initializers, which set up its statically linked CUDA runtime
         // without touching a device; nvCOMP is built to be loaded into any process
-        let lib = unsafe { Library::new(path) }.wrap_err_with(|| format!("load {at}"))?;
+        let lib = unsafe { crate::pyenv::open_library(path) }.wrap_err_with(|| format!("load {at}"))?;
         let missing = |name: &str| format!("{at} has no {name}");
         // SAFETY: each symbol is declared in nvCOMP 6's `nvcomp.h` and `nvcomp/zstd.h` with the signature of its
         // type here; the version is checked before any but `nvcompGetProperties`, which every major has, is called

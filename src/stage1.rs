@@ -28,7 +28,7 @@ pub trait Arith: Send + Sync + 'static {
 pub struct Separate;
 
 /// The reference's CUDA rounding: the product and the sum rounded once, as one `fma`
-#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+#[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
 pub struct Fused;
 
 impl Arith for Separate {

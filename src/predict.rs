@@ -35,7 +35,6 @@ pub fn requested_bytes(arg0: &[u8], arg1: Option<&[u8]>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
     use std::path::Path;
 
     use super::requested_bytes;
@@ -55,8 +54,29 @@ mod tests {
             ("/opt/avf-spline-generator/..", Some("predict"), true),
         ];
 
+        // Windows paths, and the extension the system adds, in any case
+        #[cfg(windows)]
+        let cases = [
+            &cases[..],
+            &[
+                (r"C:\venv\Scripts\fibrs.exe", Some("predict"), true),
+                (r"C:\venv\Scripts\avf-spline-generator.exe", Some("predict"), false),
+                (r"C:\venv\Scripts\AVF-SPLINE-GENERATOR.EXE", Some("predict"), false),
+                ("avf-spline-generator.EXE", Some("predict"), false),
+                (r"C:\opt\avf-spline-generator\.", Some("predict"), false),
+                ("avf-spline-generator.exe.exe", Some("predict"), true),
+            ],
+        ]
+        .concat();
+
         for (arg0, arg1, want) in cases {
-            let dropin = Path::new(arg0).file_name() == Some(OsStr::new("avf-spline-generator"));
+            let name = Path::new(arg0).file_name().map(|n| n.to_string_lossy().into_owned());
+            #[cfg(windows)]
+            let name = name.map(|n| {
+                let n = n.to_ascii_lowercase();
+                n.strip_suffix(".exe").map(str::to_owned).unwrap_or(n)
+            });
+            let dropin = name.as_deref() == Some("avf-spline-generator");
             assert_eq!(!dropin && arg1 == Some("predict"), want, "{arg0} {arg1:?}");
             assert_eq!(requested_bytes(arg0.as_bytes(), arg1.map(str::as_bytes)), want, "{arg0} {arg1:?}");
         }

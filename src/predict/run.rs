@@ -368,7 +368,8 @@ fn check_column_memory(c: &Checked, p: &Plan, e: &Opened) -> Result<()> {
 
 /// `path` made absolute and resolved as the system would open it: the part that exists is canonicalized, links
 /// and `..` included, and the rest, which a run creates, may hold only plain names, so the path given and the path
-/// resolved always name the same place
+/// resolved always name the same place. On Windows, `std::path::absolute` already resolves `..` lexically, as the
+/// system does before it opens a path
 fn resolved(path: &Path) -> Result<PathBuf> {
     let path = std::path::absolute(path)?;
     let parts: Vec<Component> = path.components().filter(|c| *c != Component::CurDir).collect();
