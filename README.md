@@ -76,7 +76,8 @@ the one being committed, and one more thread commits the seeds in order, so trac
 7.7 at `--threads 8`. A seed traced ahead is traced again if an earlier seed marked the region it read before it was
 committed, so the output is the same at every `--threads`. The export to `.afv`, including the one a `--resume`
 of a finished run writes, prepares each batch of fibres' rows on the same `--threads` pool while one thread inserts
-the previous batch's rows in order.
+the previous batch's rows in order. A family traced while another is still to trace is written during that tracing,
+on two more threads, so a run of both families writes V while H traces.
 
 To make an environment's `avf-spline-generator` run the port, so scripts that call it need no change:
 

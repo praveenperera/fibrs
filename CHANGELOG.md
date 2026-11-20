@@ -44,6 +44,12 @@
   rows, and a fifth was SQLite reading evicted pages back from the file of over 1.5 GiB. Fibre numbering, every
   table and the first error in input order are unchanged.
 
+- **Export during tracing.** A run that traces both families writes V's fibres to the `.afv` while H traces, on
+  two threads beside the `--threads` pool, so only H's fibres, the length index and the checks are left once
+  tracing ends. The rows, their order and the checks are the same as before. The unfinished file sits next to the
+  output, as `.afv-*.partial`, from the start of tracing instead of from the start of the export, and is removed if
+  the run fails.
+
 ## [0.3.1] - 2026-11-19
 
 fibrs 0.3.1 traces dense data faster: threads that finishing leaves idle trace seeds ahead, and the binary

@@ -130,28 +130,143 @@ impl Drop for TempGuard {
     }
 }
 
-/// Write `curves` (family 1 = V or 2 = H, tracing-space float32 x, y, z points) to `destination`
+/// An export in progress: the temporary file, open in one transaction, with the fibres appended so far
 ///
-/// Fibres are prepared on the current rayon pool while the calling thread inserts them in order
-pub fn export_afv<I>(curves: I, destination: &Path, opt: &ExportOptions) -> Result<Summary>
-where
-    I: IntoIterator<Item = Result<(usize, Vec<[f32; 3]>)>>,
-    I::IntoIter: Send,
-{
-    if destination.exists() {
-        bail!("Output already exists: {}", destination.display());
+/// Appending the curves in several calls writes the same rows as one call with all of them, so a family can be
+/// written while the next one is still being traced
+pub struct AfvExport {
+    // declared before the guard, so the connection closes before the guard removes an unfinished file
+    db: Connection,
+    temporary: TempGuard,
+    destination: PathBuf,
+    geometry: Geometry,
+    summary: Summary,
+}
+
+impl AfvExport {
+    /// Create the temporary file next to `destination` and write the schema and the first metadata rows
+    pub fn start(destination: &Path, opt: &ExportOptions) -> Result<Self> {
+        if destination.exists() {
+            bail!("Output already exists: {}", destination.display());
+        }
+        let parent = destination.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let parent = if parent.as_os_str().is_empty() { PathBuf::from(".") } else { parent };
+        fs::create_dir_all(&parent)?;
+        let temporary = TempGuard(mkstemp(&parent)?);
+        let db = Connection::open(&temporary.0)?;
+        db.execute_batch("PRAGMA foreign_keys=ON")?;
+        // the file is this run's own temporary until it is complete, so no other connection takes a lock on it
+        db.execute_batch("PRAGMA locking_mode=EXCLUSIVE")?;
+        db.execute_batch(&format!("PRAGMA cache_size=-{EXPORT_CACHE_KIB}"))?;
+        db.execute_batch(SCHEMA)?;
+        // one transaction from here to `finish`; a connection closed before then rolls it back
+        db.execute_batch("BEGIN")?;
+        {
+            let mut meta = db.prepare("INSERT INTO metadata VALUES(?,?)")?;
+            for (k, v) in metadata(opt)? {
+                meta.execute(params![k, py_json(&v)])?;
+            }
+        }
+        let geometry = Geometry {
+            origin: opt.origin_xyz.map(|v| v as f64),
+            limit: [opt.volume_shape[2], opt.volume_shape[1], opt.volume_shape[0]].map(|v| v as f64),
+            voxel_um: opt.voxel_um,
+            minimum_mm: opt.minimum_mm.value(),
+        };
+        let destination = destination.to_path_buf();
+        Ok(Self { db, temporary, destination, geometry, summary: Summary::default() })
     }
-    let parent = destination.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let parent = if parent.as_os_str().is_empty() { PathBuf::from(".") } else { parent };
-    fs::create_dir_all(&parent)?;
-    let temporary = mkstemp(&parent)?;
-    let _guard = TempGuard(temporary.clone());
-    let summary = write_db(curves, &temporary, opt)?;
-    File::open(&temporary)?.sync_all()?;
-    // a hard link publishes the complete file without overwriting a path that another process may
-    // have created while tracing was running
-    fs::hard_link(&temporary, destination).map_err(|e| eyre!("{}: {e}", destination.display()))?;
-    Ok(summary)
+
+    /// Append `curves` (family 1 = V or 2 = H, tracing-space float32 x, y, z points) after the fibres already
+    /// written, numbering on from them
+    ///
+    /// Fibres are prepared on the current rayon pool while the calling thread inserts them in order
+    pub fn append<I>(&mut self, curves: I) -> Result<()>
+    where
+        I: IntoIterator<Item = Result<(usize, Vec<[f32; 3]>)>>,
+        I::IntoIter: Send,
+    {
+        let Self { db, geometry, summary: s, .. } = self;
+        let mut fiber = db.prepare_cached("INSERT INTO fibers VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")?;
+        let mut block = db.prepare_cached("INSERT INTO blocks VALUES(?,?,?,?)")?;
+        let mut bound = db.prepare_cached("INSERT INTO block_bounds VALUES(?,?,?,?,?,?,?)")?;
+        let mut insert = |rows: Vec<FiberRows>, s: &mut Summary| -> Result<()> {
+            for r in rows {
+                s.fiber_count += 1;
+                let count = s.fiber_count;
+                let b = r.bounds;
+                let name = format!("fiber_{count}.json");
+                fiber.execute(params![
+                    count,
+                    name,
+                    r.label,
+                    r.point_count as i64,
+                    r.length,
+                    b[0],
+                    b[1],
+                    b[2],
+                    b[3],
+                    b[4],
+                    b[5],
+                    r.annotation
+                ])?;
+                for (first, bytes, b) in r.blocks {
+                    s.block_count += 1;
+                    block.execute(params![s.block_count, count, first as i64, bytes])?;
+                    bound.execute(params![s.block_count, b[0], b[1], b[2], b[3], b[4], b[5]])?;
+                }
+                s.point_count += r.point_count as i64;
+            }
+            Ok(())
+        };
+        // fused so that, as when the curves were written one by one, the input ends at its first `None`
+        let mut curves = curves.into_iter().fuse();
+        let mut next = geometry.next_rows(&mut curves, s.fiber_count + 1);
+        while let Some(Rows { fibers, error }) = next {
+            // no batch is read after one with an error, though that batch itself was read whole: an invalid curve
+            // is reported only once the rest of its batch has been read, ahead of any error found reading it
+            if let Some(e) = error {
+                insert(fibers, s)?;
+                return Err(e);
+            }
+            let first = s.fiber_count + fibers.len() as i64 + 1;
+            let mut prepared = None;
+            // the pool makes the next batch's rows while this thread inserts this batch's
+            let inserted = rayon::in_place_scope(|scope| {
+                scope.spawn(|_| prepared = Some(geometry.next_rows(&mut curves, first)));
+                insert(fibers, s)
+            });
+            inserted?;
+            next = prepared.expect("the spawned batch has finished");
+        }
+        Ok(())
+    }
+
+    /// Index the fibres, store the totals, commit, check the file and publish it at the destination
+    pub fn finish(self) -> Result<Summary> {
+        let Self { db, temporary, destination, summary: s, .. } = self;
+        db.execute_batch("CREATE INDEX fibers_length ON fibers(length DESC,id)")?;
+        {
+            let mut meta = db.prepare("INSERT OR REPLACE INTO metadata VALUES(?,?)")?;
+            let rows = [
+                ("complete", json!(true)),
+                ("fiber_count", json!(s.fiber_count)),
+                ("point_count", json!(s.point_count)),
+                ("block_count", json!(s.block_count)),
+            ];
+            for (k, v) in rows {
+                meta.execute(params![k, py_json(&v)])?;
+            }
+        }
+        db.execute_batch("COMMIT")?;
+        check(&db)?;
+        db.close().map_err(|(_, e)| e)?;
+        File::open(&temporary.0)?.sync_all()?;
+        // a hard link publishes the complete file without overwriting a path that another process may
+        // have created while tracing was running
+        fs::hard_link(&temporary.0, &destination).map_err(|e| eyre!("{}: {e}", destination.display()))?;
+        Ok(s)
+    }
 }
 
 fn metadata(opt: &ExportOptions) -> Result<Vec<(&'static str, Value)>> {
@@ -345,104 +460,6 @@ fn fiber_rows(count: i64, k: Kept) -> FiberRows {
     FiberRows { label, point_count: q.len(), length, bounds: bounds(&q), annotation: py_json(&annotation), blocks }
 }
 
-fn write_db<I>(curves: I, path: &Path, opt: &ExportOptions) -> Result<Summary>
-where
-    I: IntoIterator<Item = Result<(usize, Vec<[f32; 3]>)>>,
-    I::IntoIter: Send,
-{
-    let mut db = Connection::open(path)?;
-    db.execute_batch("PRAGMA foreign_keys=ON")?;
-    // the file is this run's own temporary until it is complete, so no other connection takes a lock on it
-    db.execute_batch("PRAGMA locking_mode=EXCLUSIVE")?;
-    db.execute_batch(&format!("PRAGMA cache_size=-{EXPORT_CACHE_KIB}"))?;
-    db.execute_batch(SCHEMA)?;
-    let tx = db.transaction()?;
-    {
-        let mut meta = tx.prepare("INSERT INTO metadata VALUES(?,?)")?;
-        for (k, v) in metadata(opt)? {
-            meta.execute(params![k, py_json(&v)])?;
-        }
-    }
-    let geometry = Geometry {
-        origin: opt.origin_xyz.map(|v| v as f64),
-        limit: [opt.volume_shape[2], opt.volume_shape[1], opt.volume_shape[0]].map(|v| v as f64),
-        voxel_um: opt.voxel_um,
-        minimum_mm: opt.minimum_mm.value(),
-    };
-    let mut s = Summary::default();
-    {
-        let mut fiber = tx.prepare("INSERT INTO fibers VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")?;
-        let mut block = tx.prepare("INSERT INTO blocks VALUES(?,?,?,?)")?;
-        let mut bound = tx.prepare("INSERT INTO block_bounds VALUES(?,?,?,?,?,?,?)")?;
-        let mut insert = |rows: Vec<FiberRows>, s: &mut Summary| -> Result<()> {
-            for r in rows {
-                s.fiber_count += 1;
-                let count = s.fiber_count;
-                let b = r.bounds;
-                let name = format!("fiber_{count}.json");
-                fiber.execute(params![
-                    count,
-                    name,
-                    r.label,
-                    r.point_count as i64,
-                    r.length,
-                    b[0],
-                    b[1],
-                    b[2],
-                    b[3],
-                    b[4],
-                    b[5],
-                    r.annotation
-                ])?;
-                for (first, bytes, b) in r.blocks {
-                    s.block_count += 1;
-                    block.execute(params![s.block_count, count, first as i64, bytes])?;
-                    bound.execute(params![s.block_count, b[0], b[1], b[2], b[3], b[4], b[5]])?;
-                }
-                s.point_count += r.point_count as i64;
-            }
-            Ok(())
-        };
-        // fused so that, as when the curves were written one by one, the input ends at its first `None`
-        let mut curves = curves.into_iter().fuse();
-        let mut next = geometry.next_rows(&mut curves, 1);
-        while let Some(Rows { fibers, error }) = next {
-            // no batch is read after one with an error, though that batch itself was read whole: an invalid curve
-            // is reported only once the rest of its batch has been read, ahead of any error found reading it
-            if let Some(e) = error {
-                insert(fibers, &mut s)?;
-                return Err(e);
-            }
-            let first = s.fiber_count + fibers.len() as i64 + 1;
-            let mut prepared = None;
-            // the pool makes the next batch's rows while this thread inserts this batch's
-            let inserted = rayon::in_place_scope(|scope| {
-                scope.spawn(|_| prepared = Some(geometry.next_rows(&mut curves, first)));
-                insert(fibers, &mut s)
-            });
-            inserted?;
-            next = prepared.expect("the spawned batch has finished");
-        }
-    }
-    tx.execute_batch("CREATE INDEX fibers_length ON fibers(length DESC,id)")?;
-    {
-        let mut meta = tx.prepare("INSERT OR REPLACE INTO metadata VALUES(?,?)")?;
-        let rows = [
-            ("complete", json!(true)),
-            ("fiber_count", json!(s.fiber_count)),
-            ("point_count", json!(s.point_count)),
-            ("block_count", json!(s.block_count)),
-        ];
-        for (k, v) in rows {
-            meta.execute(params![k, py_json(&v)])?;
-        }
-    }
-    tx.commit()?;
-    check(&db)?;
-    db.close().map_err(|(_, e)| e)?;
-    Ok(s)
-}
-
 fn check(db: &Connection) -> Result<()> {
     let integrity: Vec<String> =
         db.prepare("PRAGMA integrity_check")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
@@ -462,6 +479,17 @@ fn check(db: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // the whole export in one call, as a run with nothing traced ahead of it writes it
+    fn export_afv<I>(curves: I, destination: &Path, opt: &ExportOptions) -> Result<Summary>
+    where
+        I: IntoIterator<Item = Result<(usize, Vec<[f32; 3]>)>>,
+        I::IntoIter: Send,
+    {
+        let mut export = AfvExport::start(destination, opt)?;
+        export.append(curves)?;
+        export.finish()
+    }
 
     fn options() -> ExportOptions<'static> {
         ExportOptions {
@@ -591,5 +619,62 @@ mod tests {
         let summary = export_afv(curves, &out, &options()).unwrap();
         assert_eq!(summary.fiber_count, 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every row of every table but the per-run uuid, in a stable order
+    fn table_rows(path: &Path) -> Vec<String> {
+        let db = Connection::open(path).unwrap();
+        let queries = [
+            "SELECT key || '=' || value FROM metadata WHERE key != 'uuid' ORDER BY key",
+            "SELECT id || ' ' || name || ' ' || family || ' ' || point_count || ' ' || length || ' ' || min_x || ' ' \
+             || max_x || ' ' || min_y || ' ' || max_y || ' ' || min_z || ' ' || max_z || ' ' || annotation \
+             FROM fibers ORDER BY id",
+            "SELECT id || ' ' || fiber_id || ' ' || first_segment || ' ' || hex(points) FROM blocks ORDER BY id",
+            "SELECT id || ' ' || min_x || ' ' || max_x || ' ' || min_y || ' ' || max_y || ' ' || min_z || ' ' || max_z \
+             FROM block_bounds ORDER BY id",
+            "SELECT CAST(id AS TEXT) FROM fibers ORDER BY length DESC, id",
+        ];
+        let mut out = Vec::new();
+        for q in queries {
+            let mut stmt = db.prepare(q).unwrap();
+            out.extend(stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().map(Result::unwrap));
+            out.push(String::new());
+        }
+        out
+    }
+
+    /// A family appended on one pool while another is still to come, then the next family on another pool, stores
+    /// the rows one export of both writes, with the split falling inside a batch
+    #[test]
+    fn an_export_appended_family_by_family_matches_one_export() {
+        let n = EXPORT_BATCH + 321;
+        let all: Vec<(usize, Vec<[f32; 3]>)> = (0..n).map(curve).collect();
+        let (v, h): (Vec<_>, Vec<_>) = all.into_iter().partition(|(family, _)| *family == 1);
+        let whole: Vec<Result<_>> = v.iter().chain(h.iter()).cloned().map(Ok).collect();
+        let (one, summary) = export(whole, "whole");
+        let summary = summary.unwrap();
+
+        let dir = std::env::temp_dir().join(format!("fibrs-afv-parts-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let out = dir.join("out.afv");
+        let mut parts = AfvExport::start(&out, &options()).unwrap();
+        let early = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        early.install(|| parts.append(v.into_iter().map(Ok))).unwrap();
+        let late = rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap();
+        let parted = late
+            .install(|| {
+                parts.append(h.into_iter().map(Ok))?;
+                parts.finish()
+            })
+            .unwrap();
+
+        assert_eq!(
+            (parted.fiber_count, parted.point_count, parted.block_count),
+            (summary.fiber_count, summary.point_count, summary.block_count)
+        );
+        assert!(summary.fiber_count > EXPORT_BATCH as i64 / 2, "{summary:?}");
+        assert_eq!(table_rows(&out), table_rows(&one));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(one.parent().unwrap());
     }
 }

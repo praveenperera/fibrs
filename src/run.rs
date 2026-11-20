@@ -11,7 +11,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, channel, sync_channel};
 use std::time::Instant;
 
 use clap::error::ErrorKind;
@@ -21,7 +21,7 @@ use rayon::prelude::*;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::afv::{ExportOptions, MinLength, Summary, export_afv};
+use crate::afv::{AfvExport, ExportOptions, MinLength, Summary};
 use crate::axes::{Lapack, direction_field, find_lapack};
 use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{CachePools, FinishCtx, NativeCache, NativeSampler};
@@ -576,13 +576,6 @@ pub fn run(args: Args) -> Result<Summary> {
     }
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads as usize).build()?;
     let pending: Vec<usize> = families.iter().copied().filter(|&f| !family_complete(&work, f)).collect();
-    if !pending.is_empty() {
-        let cache_bytes = (args.native_cache_mib + args.field_cache_mib) as usize * 1024 * 1024;
-        pool.install(|| {
-            trace_families(&native, supplied.as_ref(), &work, &pending, threads as usize, cache_bytes, &cent)
-        })?;
-    }
-    let started = Instant::now();
     let opt = ExportOptions {
         voxel_um: args.voxel_size_um,
         origin_xyz: [args.origin_xyz[0], args.origin_xyz[1], args.origin_xyz[2]],
@@ -590,8 +583,26 @@ pub fn run(args: Args) -> Result<Summary> {
         minimum_mm: min_mm,
         coordinate_space: args.coordinate_space.as_deref(),
     };
-    let curves = families.iter().flat_map(|&f| CurveReader::open(&work, f).unwrap_or_else(CurveReader::failed));
-    let summary = pool.install(|| export_afv(curves, &args.output, &opt))?;
+    let mut export = AfvExport::start(&args.output, &opt)?;
+    let mut written = 0;
+    if !pending.is_empty() {
+        let cache_bytes = (args.native_cache_mib + args.field_cache_mib) as usize * 1024 * 1024;
+        let writer = EarlyExport { work: &work, families: &families };
+        (export, written) = writer.run(export, |on_traced| {
+            pool.install(|| {
+                let trace =
+                    Trace { native: &native, supplied: supplied.as_ref(), work: &work, threads: threads as usize };
+                trace_families(trace, &pending, cache_bytes, &cent, on_traced)
+            })
+        })?;
+    }
+    let started = Instant::now();
+    let rest = &families[written..];
+    let curves = rest.iter().flat_map(|&f| CurveReader::open(&work, f).unwrap_or_else(CurveReader::failed));
+    let summary = pool.install(|| {
+        export.append(curves)?;
+        export.finish()
+    })?;
     log!("Export: {:.1} s", started.elapsed().as_secs_f64());
     log!("Wrote {} fibres ({} points) to {}", summary.fiber_count, summary.point_count, output.display());
     Ok(summary)
@@ -721,15 +732,23 @@ const FINISH_BATCH: usize = 8192;
 /// batch of this many beside its slab cache
 const FINISH_POINTS: usize = 2 << 20;
 
-fn trace_families(
-    native: &Predictions,
-    supplied: Option<&Predictions>,
-    work: &Path,
-    families: &[usize],
+/// The inputs and settings every family's tracing reads
+struct Trace<'a> {
+    native: &'a Predictions,
+    supplied: Option<&'a Predictions>,
+    work: &'a Path,
     threads: usize,
+}
+
+/// Trace `families` in order, calling `on_traced` with each one that finishes while another is still to trace
+fn trace_families(
+    trace: Trace,
+    families: &[usize],
     cache_bytes: usize,
     cent: &CentralityDevice,
+    on_traced: &mut (dyn FnMut(usize) + Send),
 ) -> Result<()> {
+    let Trace { native, supplied, work, threads } = trace;
     let t = Instant::now();
     log!("Preparing tracing predictions");
     let tracing = load_tracing(native, supplied)?;
@@ -742,8 +761,8 @@ fn trace_families(
     let cache = NativeCache::new(native, cache_bytes, &pools);
     let families = Families { tracing: &tracing, resident, cache: &cache, work, families, threads, cent };
     match &dirs {
-        Directions::Packed(packed) => families.trace(packed),
-        Directions::Split { nx, ny } => families.trace(&SplitDirs { nx, ny }),
+        Directions::Packed(packed) => families.trace(packed, on_traced),
+        Directions::Split { nx, ny } => families.trace(&SplitDirs { nx, ny }, on_traced),
     }
 }
 
@@ -759,14 +778,17 @@ struct Families<'a, 'n, 'p> {
 }
 
 impl Families<'_, '_, '_> {
-    fn trace<D: DirField>(&self, dirs: &D) -> Result<()> {
+    fn trace<D: DirField>(&self, dirs: &D, on_traced: &mut (dyn FnMut(usize) + Send)) -> Result<()> {
         debug_dump(self.work, "nx", || dir_bytes(dirs, 8))?;
         debug_dump(self.work, "ny", || dir_bytes(dirs, 0))?;
         debug_mem("direction field", &[("tracing", self.resident), ("directions", dirs.resident_bytes())]);
-        for &family in self.families {
+        for (i, &family) in self.families.iter().enumerate() {
             let compute = Compute { threads: self.threads, cent: self.cent };
             trace_family(self.tracing, dirs, self.cache, self.work, family, compute)?;
             release_freed();
+            if i + 1 < self.families.len() {
+                on_traced(family);
+            }
         }
         Ok(())
     }
@@ -1400,6 +1422,61 @@ impl CurveWriter {
         f.sync_all()?;
         fs::rename(&self.temporary, &self.path)?;
         Ok(())
+    }
+}
+
+/// Writes each traced family to the export on a thread of its own while a later family traces
+///
+/// A family is handed over once it and every family before it in export order are traced, so the rows go in the
+/// order a single export writes them. The writer prepares rows on a pool of its own, two threads beside the
+/// tracing pool, since a job on that pool could stall behind the helpers that trace until the family ends
+struct EarlyExport<'a> {
+    work: &'a Path,
+    families: &'a [usize],
+}
+
+/// Threads of the early writer's pool: one prepares the next batch's rows while the other inserts
+const EARLY_EXPORT_THREADS: usize = 2;
+
+impl EarlyExport<'_> {
+    /// Run `trace` while writing the families it finishes, then return the export and how many of `families`, in
+    /// order, it holds. A tracing error comes before any error from writing
+    fn run<F>(&self, export: AfvExport, trace: F) -> Result<(AfvExport, usize)>
+    where
+        F: FnOnce(&mut (dyn FnMut(usize) + Send)) -> Result<()>,
+    {
+        let (tx, rx) = channel::<usize>();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| self.write(export, rx));
+            let mut sent = 0;
+            let hand_over = |sent: &mut usize| {
+                while *sent < self.families.len() && family_complete(self.work, self.families[*sent]) {
+                    // a writer that failed has dropped its end; its error comes back from the join
+                    let _ = tx.send(self.families[*sent]);
+                    *sent += 1;
+                }
+            };
+            // families finished by an earlier run go first, while the first pending family traces
+            hand_over(&mut sent);
+            let traced = trace(&mut |_family| hand_over(&mut sent));
+            drop(tx);
+            let written = writer.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+            traced?;
+            written
+        })
+    }
+
+    fn write(&self, mut export: AfvExport, families: Receiver<usize>) -> Result<(AfvExport, usize)> {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(EARLY_EXPORT_THREADS).build()?;
+        let mut written = 0;
+        for family in families {
+            let t = Instant::now();
+            let curves = CurveReader::open(self.work, family).unwrap_or_else(CurveReader::failed);
+            pool.install(|| export.append(curves))?;
+            written += 1;
+            log!("Exported family {family} while tracing: {:.1} s", t.elapsed().as_secs_f64());
+        }
+        Ok((export, written))
     }
 }
 
