@@ -22,6 +22,11 @@
   the dense PHerc0358 window z02304–02816 at `--threads 8`, the zero-filling took about 34 CPU-s and the page
   faults of fresh buffers about 35 CPU-s, 14% of the finishing threads' time. The `.afv` is unchanged.
 
+- **Faster tracing on dense data.** Idle threads trace up to 256 seeds ahead of the commit point instead of 64. On
+  the dense PHerc0358 window z02304–02816 at `--threads 8`, two runs of each put both families' tracing at 97 and
+  103 s against 109 and 114 s, with 0.13% of seeds traced again instead of 0.04%. Peak RSS was 23.0–23.4 GiB against
+  23.0–23.1 GiB, and the `.afv` is identical.
+
 ## [0.3.1] - 2026-11-19
 
 fibrs 0.3.1 traces dense data faster: threads that finishing leaves idle trace seeds ahead, and the binary
