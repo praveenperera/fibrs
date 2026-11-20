@@ -709,10 +709,19 @@ impl SlabCache {
         nvcomp: Option<Arc<NvComp>>,
     ) -> Result<Self> {
         let Some(nvcomp) = nvcomp else { return Self::new(gpu, stream, layout, reserve, most, None) };
+        let (free, _) = gpu.ctx.mem_get_info()?;
+        let without = slab_slots(free, reserve, most, layout.slab_bytes(), layout.len());
         // allocated before the slab cache is sized, so the free memory it is sized from leaves this out
         let with_decoder = GpuDecoder::new(stream, nvcomp, layout)
             .and_then(|decoder| Self::new(gpu, stream, layout, reserve, most, Some(decoder)));
         let e = match with_decoder {
+            // a cache the decoder shrank by more than a quarter sends batches to CPU finishing that fit with CPU
+            // slab decoding, which costs more than decoding on the GPU saves
+            Ok(cache) if 4 * cache.held.len() < 3 * without => {
+                let slots = cache.held.len();
+                drop(cache);
+                eyre!("{slots} slab slots with nvCOMP's buffers, {without} without")
+            }
             Ok(cache) => return Ok(cache),
             Err(e) => e,
         };

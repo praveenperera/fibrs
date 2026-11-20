@@ -271,7 +271,10 @@ impl NvComp {
     pub fn workspace(&self, stream: &Arc<CudaStream>, frames: usize, max_out: usize) -> Result<Workspace> {
         ensure!(frames > 0, "an nvCOMP workspace holds at least one frame");
         let total_out = frames.checked_mul(max_out).ok_or_else(|| eyre!("{frames} frames of {max_out} bytes"))?;
-        let temp_bytes = self.temp_bytes(stream, frames, max_out, total_out)?;
+        let needed = self.temp_bytes(stream, frames, max_out, total_out)?;
+        // nvCOMP 5.0-6.0's known issue: frames zstd 1.5.6 compressed at level 18 or above (Blosc's clevel 9) can fail
+        // to decode with the scratch the async query asks for, and NVIDIA's workaround is half as much again
+        let temp_bytes = needed.checked_add(needed / 2).ok_or_else(|| eyre!("nvCOMP asks for {needed} bytes"))?;
         // SAFETY: nvCOMP only uses the scratch space as scratch, so it needs no initial value
         let mut temp = unsafe { stream.alloc::<u8>(temp_bytes.max(1)) }.wrap_err("allocate nvCOMP's scratch space")?;
         let (temp_ptr, temp_guard) = temp.device_ptr_mut(stream);
