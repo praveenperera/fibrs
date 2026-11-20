@@ -821,11 +821,17 @@ fn kernels_index(layout: &SlabLayout) -> bool {
 /// (fibrs-kernels/src/finish.rs) takes the shape and grid as u32 and computes in u32 a voxel's brick index, at most
 /// one below the grid's brick count, and its offset in the brick; the clamped voxel indices stay below the shape,
 /// and the slot's offset in the pool it computes in usize
+///
+/// Each axis is also at most [`POOLED_AXIS_MAX`] voxels: fit's cell clamp rounds `n - 1.001` to float32, which
+/// past that reaches `n - 1` and puts the cell's far corner outside the volume
 fn kernels_index_pooled(shape: Shape, grid: Shape) -> bool {
     let fits = |n: usize| u32::try_from(n).is_ok();
     let bricks = grid.iter().try_fold(1usize, |acc, &n| acc.checked_mul(n));
-    shape.iter().all(|&n| fits(n)) && bricks.is_some_and(|n| n == 0 || fits(n - 1))
+    shape.iter().all(|&n| n <= POOLED_AXIS_MAX) && bricks.is_some_and(|n| n == 0 || fits(n - 1))
 }
+
+/// Longest pooled axis the GPU finishes, 2^15 voxels, four times the longest pooled axis of the scrolls traced so far
+const POOLED_AXIS_MAX: usize = 1 << 15;
 
 /// Slots of `bytes` each for the slab cache: three quarters of the device memory `free` beyond `reserve` and the
 /// slab table, the other quarter left for the driver and other processes, up to `most` bytes and no more slots than
@@ -1129,6 +1135,9 @@ mod tests {
         let grid = |bz: usize| [bz, 2048, 2048];
         let shape = |bz: usize| grid(bz).map(|n| n * EDGE);
         assert!(kernels_index_pooled(shape(1024), grid(1024)));
+        // float32 rounds 32768.999 up to 32769, the last voxel of an axis of 32770
+        assert!(((32770 - 1) as f64 - 0.001) as f32 == 32769.0);
+        assert!(!kernels_index_pooled([16, 16, 32770], [1, 1, 2049]));
         assert!(!kernels_index_pooled(shape(1025), grid(1025)));
         assert!(!kernels_index_pooled([1 << 32, 16, 16], [1 << 28, 1, 1]));
     }
