@@ -7,11 +7,19 @@
 - **Trace finishing on the GPU.** When a run uses the GPU, finishing (cutting each traced curve where the
   predictions disagree, then smoothing, resampling and re-checking each piece) runs there too. It gives the CPU's
   pieces bit for bit, so the `.afv` is unchanged, whatever rounding the run started with. Both pooled predictions
-  and a cache of native prediction slabs, up to 8 GiB, stay on the GPU while a family is finished; the slabs are
-  still decoded on the CPU. A batch of curves the GPU cannot finish, for example one that reads more slabs than
-  its cache holds, is finished on the CPU, and the log counts those batches and the slabs uploaded at the end of
-  each family. If the GPU fails while finishing, `--device auto` finishes the rest of the family on the CPU and
+  and a cache of native prediction slabs, up to 8 GiB, stay on the GPU while a family is finished. A batch of
+  curves the GPU cannot finish, for example one that reads more slabs than its cache holds, is finished on the
+  CPU, and the log counts those batches and the slabs cached, by where they were decoded, at the end of each
+  family. If the GPU fails while finishing, `--device auto` finishes the rest of the family on the CPU and
   `--device cuda` stops the run, as in the other GPU stages. `--device cpu` finishes on the CPU as before.
+- **Prediction slabs decoded on the GPU with nvCOMP.** When fibrs can load NVIDIA's nvCOMP 6, the native slabs
+  GPU finishing reads go to the GPU still compressed and are decoded there; without it they are decoded on the
+  CPU, with the same output. nvCOMP is optional and never bundled: it comes from NVIDIA's own PyPI package,
+  `nvidia-libnvcomp-cu12`, under NVIDIA's licence, which the new `fibrs[gpu]` extra installs. fibrs loads it at run
+  time from `FIBRS_NVCOMP` (the library's full path), else from the Python environment fibrs is installed into or
+  the active one, and logs once whether slabs decode on the GPU or why they decode on the CPU. A slab nvCOMP
+  cannot decode as Blosc stored it is decoded on the CPU, as are the slabs of arrays decoded a whole chunk at a
+  time.
 
 ## [0.3.1] - 2026-11-19
 

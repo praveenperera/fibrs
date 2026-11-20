@@ -63,10 +63,19 @@ for example when it runs out of memory.
 When a run uses the GPU, finishing (cutting each traced curve where the predictions disagree, then smoothing,
 resampling and re-checking each piece) runs there too, with the same result as on the CPU, whatever the rounding the
 run started with. Both pooled predictions and a cache of native prediction slabs, up to 8 GiB, stay on the GPU while
-a family is finished; the slabs are still decoded on the CPU. The GPU finishes the curves in batches, and a batch it
-cannot finish, for example one that reads more slabs than its cache holds, is finished on the CPU. At the end of
-each family the log counts the slabs uploaded and the batches the CPU finished. If the GPU fails while finishing,
+a family is finished. The GPU finishes the curves in batches, and a batch it cannot finish, for example one that
+reads more slabs than its cache holds, is finished on the CPU. At the end of each family the log counts the slabs
+cached, by where they were decoded, and the batches the CPU finished. If the GPU fails while finishing,
 `--device auto` finishes the rest of the family on the CPU and `--device cuda` stops the run.
+
+The slabs are decoded on the GPU by NVIDIA's nvCOMP when fibrs can load it, and on the CPU otherwise, with the same
+output either way. nvCOMP is optional and not part of fibrs: it is NVIDIA's own PyPI package,
+`nvidia-libnvcomp-cu12` (version 6, under NVIDIA's licence), which `pip install "fibrs[gpu]"` installs. fibrs loads
+its `libnvcomp.so.6` at run time from `FIBRS_NVCOMP` (the library's full path) when that is set, else from the wheel
+in the environment fibrs is installed into or in the active one (`$VIRTUAL_ENV`), else from the system's library
+path, and logs once which it uses, or why slabs decode on the CPU. A slab whose chunk nvCOMP cannot decode as Blosc
+stored it (its Blosc blocks are not one slab of one channel each, or a zstd frame fails fibrs's checks) is decoded on
+the CPU, as is every slab of an array decoded a whole chunk at a time.
 
 `fibrs.run([...])` runs it from Python and returns the exit status.
 
@@ -490,4 +499,4 @@ each stage was timed in its own run. Tracing ran with `--threads 4` for both too
 Apache-2.0, like the original; the licence text is `licenses/apache-2.0.txt`. `NOTICE` lists the ported code
 (AVF_SPLINE_GENERATOR, one NumPy sort routine), the statically linked C libraries and what `fibrs predict` takes
 from villa (MIT: its tile rule in villa mode); their licence texts are in `licenses/`. The AFV model and its
-weights are Qual's, and cuDNN and cuBLAS are NVIDIA's; none of them is distributed here.
+weights are Qual's, and cuDNN, cuBLAS and nvCOMP are NVIDIA's; none of them is distributed here.

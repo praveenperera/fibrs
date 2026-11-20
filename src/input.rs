@@ -407,8 +407,8 @@ impl Predictions {
     ///
     /// Each channel's planes must be exactly one Blosc block: a single zstd frame or a block stored as is, with no
     /// shuffle to undo (byte shuffle at one-byte items moves nothing) and no split into streams per item byte
-    // GPU finishing reads its slabs through it once it is wired in; until then only tests do
-    #[cfg_attr(not(test), expect(dead_code))]
+    // only GPU finishing reads slabs this way
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
     pub fn plane_blocks<A: Allocator>(
         &self,
         packed: &PackedChunk<A>,

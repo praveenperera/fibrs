@@ -279,6 +279,19 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         Ok(())
     }
 
+    /// The predictions the cache reads
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn predictions(&self) -> &'a Predictions {
+        self.pred
+    }
+
+    /// Chunk `key`'s compressed bytes through the cache of compressed chunks, for a decoder outside the cache (the
+    /// GPU's); `None` when the cache decodes whole chunks, and so keeps no compressed ones
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn packed_chunk(&self, key: Shape) -> Option<Result<Arc<PackedChunk<&'p BufferPool>>>> {
+        (self.planes != self.edge[0]).then(|| self.packed(key))
+    }
+
     fn slab(&self, key: SlabKey) -> Result<Arc<Slab<'p>>> {
         if let Some(slab) = self.slabs.lock().expect("cache lock").get(&key) {
             return Ok(slab);

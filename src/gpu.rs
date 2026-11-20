@@ -36,6 +36,22 @@ pub struct AxesCounts {
 /// One curve's finished pieces, in order
 pub type Pieces = Vec<Vec<[f32; 3]>>;
 
+/// Native slabs a [`GpuFinisher`] put in its slab cache, counting slabs again after eviction, by where they were
+/// decoded
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SlabLoads {
+    /// Decoded on the GPU by nvCOMP from their compressed chunks, or filled there for a chunk never stored
+    pub on_gpu: u64,
+    /// Decoded on the CPU through the `NativeCache` and uploaded
+    pub on_cpu: u64,
+}
+
+impl SlabLoads {
+    pub fn total(&self) -> u64 {
+        self.on_gpu + self.on_cpu
+    }
+}
+
 /// What [`GpuFinisher::finish`] made of a batch of raw curves
 #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
 pub enum Finished {
@@ -64,7 +80,7 @@ pub enum CpuReason {
 mod unsupported {
     use color_eyre::eyre::{Result, bail};
 
-    use super::{AxesCounts, Finished, Stages};
+    use super::{AxesCounts, Finished, SlabLoads, Stages};
     use crate::axes::Lapack;
     use crate::fields::FamilyFields;
     use crate::finish::{NativeCache, SlabLayout};
@@ -82,7 +98,7 @@ mod unsupported {
             match *self {}
         }
 
-        pub fn uploaded(&self) -> u64 {
+        pub fn loaded(&self) -> SlabLoads {
             match *self {}
         }
 

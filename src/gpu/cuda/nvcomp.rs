@@ -216,6 +216,24 @@ impl NvComp {
         unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned()
     }
 
+    /// Device scratch space in bytes [`NvComp::decompress`] allocates for a batch of `frames` frames, none
+    /// decoding to more than `max_out` bytes and all to at most `total_out`, so a caller can set it aside
+    pub fn temp_bytes(
+        &self,
+        stream: &Arc<CudaStream>,
+        frames: usize,
+        max_out: usize,
+        total_out: usize,
+    ) -> Result<usize> {
+        // nvCOMP's statically linked CUDA runtime works in the context current on the calling thread
+        stream.context().bind_to_thread()?;
+        let mut temp_bytes = 0usize;
+        // SAFETY: the function only computes the size and writes it through the pointer; it enqueues nothing
+        let status = unsafe { (self.temp_size)(frames, max_out, OPTS, &mut temp_bytes, total_out, stream.cu_stream()) };
+        ensure!(status.is_success(), "nvCOMP's zstd temp size query failed: {}", self.status_string(status));
+        Ok(temp_bytes)
+    }
+
     /// Decode a batch of zstd frames held in `input` into `output` on `stream`, waiting for it to finish, and
     /// report each frame's status and decoded size, in the order of `frames`
     ///
@@ -252,12 +270,7 @@ impl NvComp {
         let max_out = frames.iter().map(|f| f.output.len()).max().unwrap_or(0);
         let total_out: usize = frames.iter().map(|f| f.output.len()).sum();
 
-        // nvCOMP's statically linked CUDA runtime works in the context current on the calling thread
-        ctx.bind_to_thread()?;
-        let mut temp_bytes = 0usize;
-        // SAFETY: the function only computes the size and writes it through the pointer; it enqueues nothing
-        let status = unsafe { (self.temp_size)(n, max_out, OPTS, &mut temp_bytes, total_out, stream.cu_stream()) };
-        ensure!(status.is_success(), "nvCOMP's zstd temp size query failed: {}", self.status_string(status));
+        let temp_bytes = self.temp_bytes(stream, n, max_out, total_out)?;
         // SAFETY: nvCOMP only uses the scratch space as scratch, so it needs no initial value
         let mut temp = unsafe { stream.alloc::<u8>(temp_bytes.max(1)) }?;
         let mut statuses = stream.alloc_zeros::<i32>(n)?;
@@ -291,6 +304,8 @@ impl NvComp {
         let word = |k: u64| (table_ptr + k * 8 * n as u64) as *const c_void;
         let (status_ptr, status_guard) = statuses.device_ptr_mut(stream);
         let (sizes_ptr, sizes_guard) = sizes.device_ptr_mut(stream);
+        // nvCOMP's statically linked CUDA runtime works in the context current on the calling thread
+        ctx.bind_to_thread()?;
         // SAFETY: every device array holds `n` entries of the type nvCOMP reads or writes there, and its pointers
         // address ranges `check_frames` held inside the input and the disjoint outputs, aligned as nvCOMP asked;
         // the frames are well formed by the caller's contract. The guards above order these buffers' other work on
