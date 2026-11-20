@@ -23,7 +23,7 @@ use rayon::ThreadPool;
 use rayon::prelude::*;
 
 use super::nvcomp::{Frame, NvComp};
-use super::{BLOCK, Gpu, NO_BRICK, Pending, fit, grid_1d, pinned};
+use super::{BLOCK, Gpu, NO_BRICK, Pending, drain, fit, grid_1d, pinned};
 use crate::arena::BufferPool;
 use crate::finish::{NativeCache, SlabLayout, valid_runs};
 use crate::gpu::{CpuReason, Finished, Pieces, SlabLoads};
@@ -113,13 +113,19 @@ impl Gpu {
         // the kernels' default for bricks without a payload
         ensure!(tracing.iter().all(|v| v.default_value() == 0), "unexpected pooled prediction defaults");
         ensure!(family == 1 || family == 2, "family {family} is neither V (1) nor H (2)");
-        let fits = |n: &usize| u32::try_from(*n).is_ok();
-        ensure!(shape.iter().all(fits), "volume of {shape:?} voxels is too large");
+        let grid = tracing[0].grid();
         ensure!(
-            layout.shape.iter().chain(&layout.edge).all(fits) && layout.len() < NO_SLAB as usize,
-            "native predictions of {:?} voxels in chunks of {:?} are too large for the slab table",
+            kernels_index_pooled(shape, grid),
+            "pooled predictions of {shape:?} voxels in a {grid:?} brick grid are too large for the finishing \
+             kernels' u32 indices"
+        );
+        ensure!(
+            kernels_index(&layout),
+            "native predictions of {:?} voxels in chunks of {:?}, {} planes a slab, are too large for the finishing \
+             kernels' u32 indices",
             layout.shape,
-            layout.edge
+            layout.edge,
+            layout.planes
         );
         let stream = self.ctx.new_stream()?;
         let mut staging = Staging::new(&stream, layout.slab_bytes())?;
@@ -601,7 +607,7 @@ impl Tracing {
         }
         let device_table = stream.clone_htod(&table)?;
         // the driver may read pageable memory after the copy returns, and `table` is freed here
-        stream.synchronize().wrap_err("upload the pooled predictions")?;
+        drain(stream).wrap_err("upload the pooled predictions")?;
         Ok((device_table, pool))
     }
 
@@ -660,8 +666,8 @@ impl Drop for Staging {
     /// were given, and an error, while the finisher is set up or later, can leave copies queued that no event in
     /// `queued` covers yet
     fn drop(&mut self) {
-        // a failed sync means the context is broken, and freeing then is all that is left to do
-        let _ = self.stream.synchronize();
+        // a failed wait means the context is broken, and freeing then is all that is left to do
+        let _ = drain(&self.stream);
     }
 }
 
@@ -694,8 +700,8 @@ struct SlabCache {
 }
 
 impl SlabCache {
-    /// A cache as [`slab_slots`] sizes it from the device memory free now, leaving `reserve` bytes for a batch's
-    /// buffers and what `decoder` allocates for each call, and holding at most `most` bytes
+    /// A cache as [`slab_slots`] sizes it from the device memory free now, leaving room for its table, `reserve`
+    /// bytes for a batch's buffers and what `decoder` allocates for each call, and holding at most `most` bytes
     fn new(
         gpu: &Gpu,
         stream: &Arc<CudaStream>,
@@ -716,7 +722,7 @@ impl SlabCache {
         let table = stream.clone_htod(&host)?;
         // the driver may read pageable memory after the copy returns, and `host` is freed with the cache, which an
         // error before the first batch's table write can drop
-        stream.synchronize().wrap_err("upload the slab table")?;
+        drain(stream).wrap_err("upload the slab table")?;
         let [_, ncy, ncx] = layout.chunks();
         let (s, e) = (layout.shape, layout.edge);
         let params =
@@ -973,7 +979,7 @@ impl SlabCache {
         let Some((lo, hi)) = self.dirty.take() else { return Ok(()) };
         stream.memcpy_htod(&self.host[lo..=hi], &mut self.table.slice_mut(lo..=hi))?;
         // the driver may read pageable memory after the copy returns, and the next batch changes `host`
-        stream.synchronize().wrap_err("upload the native slabs")?;
+        drain(stream).wrap_err("upload the native slabs")?;
         Ok(())
     }
 
@@ -1130,11 +1136,43 @@ fn fill(stream: &Arc<CudaStream>, dst: &mut CudaViewMut<u8>, value: u8) -> Resul
     Ok(())
 }
 
-/// Slots of `bytes` each for the slab cache: three quarters of the device memory `free` beyond `reserve`, the
-/// other quarter left for the driver and other processes, up to `most` bytes and no more slots than the `slabs` the
-/// native predictions hold, which is below [`NO_SLAB`] (checked in [`Gpu::finisher`])
+/// Whether the kernels can index native predictions laid out as `layout`: `Native::value`
+/// (fibrs-kernels/src/finish.rs) takes the shape and chunk edge as u32 and computes in u32 a slab's table index,
+/// which must stay below [`NO_SLAB`], and a slab's bytes per channel, `planes · ey · ex`, which bound a voxel's
+/// offset in it; the slot's offset in the pool it computes in usize
+fn kernels_index(layout: &SlabLayout) -> bool {
+    let fits = |n: usize| u32::try_from(n).is_ok();
+    let [_, ey, ex] = layout.edge;
+    let per_channel = layout.planes.checked_mul(ey).and_then(|n| n.checked_mul(ex));
+    layout.shape.iter().chain(&layout.edge).all(|&n| fits(n))
+        && layout.len() < NO_SLAB as usize
+        && per_channel.is_some_and(fits)
+}
+
+/// Whether the kernels can index pooled predictions of `shape` in a brick grid of `grid`: `Pooled::get`
+/// (fibrs-kernels/src/finish.rs) takes the shape and grid as u32 and computes in u32 a voxel's brick index, at most
+/// one below the grid's brick count, and its offset in the brick; the clamped voxel indices stay below the shape,
+/// and the slot's offset in the pool it computes in usize
+///
+/// Each axis is also at most [`POOLED_AXIS_MAX`] voxels: fit's cell clamp rounds `n - 1.001` to float32, which
+/// past that reaches `n - 1` and puts the cell's far corner outside the volume
+fn kernels_index_pooled(shape: Shape, grid: Shape) -> bool {
+    let fits = |n: usize| u32::try_from(n).is_ok();
+    let bricks = grid.iter().try_fold(1usize, |acc, &n| acc.checked_mul(n));
+    shape.iter().all(|&n| n <= POOLED_AXIS_MAX) && bricks.is_some_and(|n| n == 0 || fits(n - 1))
+}
+
+/// Longest pooled axis the GPU finishes, 2^15 voxels, three times the longest pooled axis of the scrolls traced so far (about 10,500)
+const POOLED_AXIS_MAX: usize = 1 << 15;
+
+/// Slots of `bytes` each for the slab cache: three quarters of the device memory `free` beyond `reserve` and the
+/// slab table, the other quarter left for the driver and other processes, up to `most` bytes and no more slots than
+/// the `slabs` the native predictions hold, which is below [`NO_SLAB`] (checked in [`Gpu::finisher`])
 fn slab_slots(free: usize, reserve: usize, most: usize, bytes: usize, slabs: usize) -> usize {
-    let budget = (free.saturating_sub(reserve) / 4 * 3).min(most);
+    // the table, a u32 per slab, is allocated after the pool, so the pool must leave room for it; on small
+    // chunks it can outgrow the pool
+    let table = slabs.saturating_mul(size_of::<u32>());
+    let budget = (free.saturating_sub(reserve).saturating_sub(table) / 4 * 3).min(most);
     (budget / bytes).min(slabs)
 }
 
@@ -1187,6 +1225,7 @@ mod tests {
     use crate::finish::{FinishCtx, NativeSampler};
     use crate::gpu::Stages;
     use crate::kernels::{evaluate_curve, fit_curve};
+    use crate::vol::EDGE;
 
     /// A small xorshift, so the fixtures need no dependency
     struct Rng(u64);
@@ -1398,6 +1437,40 @@ mod tests {
         let high = slab_slots(24 * GIB, reserve, SLAB_CACHE_MAX, bytes, band.len());
         assert_eq!(high * bytes, SLAB_CACHE_MAX);
         assert_eq!(slab_slots(reserve / 2, reserve, SLAB_CACHE_MAX, bytes, band.len()), 0);
+
+        // 8³ chunks of a 4096³ volume: 128 Mi slabs of 1 KiB, whose 512 MiB table must fit beside the pool
+        let fine = SlabLayout { shape: [4096; 3], edge: [8; 3], planes: 8 };
+        assert_eq!((fine.len(), fine.slab_bytes()), (1 << 27, 1 << 10));
+        let slots = slab_slots(GIB, reserve, SLAB_CACHE_MAX, fine.slab_bytes(), fine.len());
+        assert!(slots > 0);
+        let table = fine.len() * size_of::<u32>();
+        assert!(slots * fine.slab_bytes() + table + reserve <= GIB, "{slots} slots and a {table}-byte table in 1 GiB");
+    }
+
+    /// The kernels index a slab of up to u32::MAX bytes per channel, so a uint8 chunk of 1024 × 2048 × 2048 decoded
+    /// whole, 4 GiB a channel, goes to the CPU, while the same chunk decoded by planes stays on the GPU; and a
+    /// pooled brick grid of up to 2³² bricks, so one plane of bricks more than 1024 × 2048 × 2048 goes to the CPU
+    /// although every axis fits
+    #[test]
+    fn kernels_index_within_u32() {
+        let whole = SlabLayout { shape: [1024, 2048, 2048], edge: [1024, 2048, 2048], planes: 1024 };
+        assert_eq!(whole.slab_bytes(), 8 << 30);
+        assert!(!kernels_index(&whole));
+        assert!(kernels_index(&SlabLayout { planes: 8, ..whole }));
+
+        // 65535 × 65537 is u32::MAX
+        let edge = SlabLayout { shape: [1, 65535, 65537], edge: [1, 65535, 65537], planes: 1 };
+        assert!(kernels_index(&edge));
+        assert!(!kernels_index(&SlabLayout { shape: [1, 65535, 65538], edge: [1, 65535, 65538], ..edge }));
+
+        let grid = |bz: usize| [bz, 2048, 2048];
+        let shape = |bz: usize| grid(bz).map(|n| n * EDGE);
+        assert!(kernels_index_pooled(shape(1024), grid(1024)));
+        // float32 rounds 32768.999 up to 32769, the last voxel of an axis of 32770
+        assert!(((32770 - 1) as f64 - 0.001) as f32 == 32769.0);
+        assert!(!kernels_index_pooled([16, 16, 32770], [1, 1, 2049]));
+        assert!(!kernels_index_pooled(shape(1025), grid(1025)));
+        assert!(!kernels_index_pooled([1 << 32, 16, 16], [1 << 28, 1, 1]));
     }
 
     /// Bit patterns of each curve's pieces, so 0.0 and -0.0 differ

@@ -19,8 +19,8 @@ use std::sync::{Arc, OnceLock};
 
 use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PinnedHostSlice, PushKernelArg,
-    ValidAsZeroBits, sys,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DeviceRepr, DriverError, LaunchConfig, PinnedHostSlice,
+    PushKernelArg, ValidAsZeroBits, result, sys,
 };
 use cudarc::nvrtc::Ptx;
 use rayon::prelude::*;
@@ -434,7 +434,8 @@ fn fit<T: DeviceRepr + ValidAsZeroBits>(stream: &Arc<CudaStream>, buf: &mut Cuda
 
 /// Waits, when dropped, for the work queued on a stream, so host memory its copies read or write outlives them
 /// when an error returns early: cudarc does not track plain host slices, and the driver may read pageable memory
-/// after an asynchronous copy returns. Locals drop in reverse order, so it guards the memory declared before it
+/// after an asynchronous copy returns. Locals drop in reverse order, so it guards the memory declared before it.
+/// It waits through [`drain`], so an error cudarc stored cannot skip the wait
 struct Pending<'a>(&'a CudaStream);
 
 impl Pending<'_> {
@@ -443,15 +444,31 @@ impl Pending<'_> {
         let stream = self.0;
         // waited for here, so the drop has nothing left to wait for
         std::mem::forget(self);
-        stream.synchronize().wrap_err(what)
+        drain(stream).wrap_err(what)
     }
 }
 
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
-        // a failed sync means the context is broken, and freeing then is all that is left to do
-        let _ = self.0.synchronize();
+        // a failed wait means the context is broken, and freeing then is all that is left to do
+        let _ = drain(self.0);
     }
+}
+
+/// Wait for everything queued on `stream`, then return any error cudarc stored before, as
+/// `CudaStream::synchronize` would; every wait that keeps host memory alive for a copy goes through here
+///
+/// `CudaStream::synchronize` returns a stored error, such as a failed record of a copy's tracking event after the
+/// copy was queued, before it reaches the driver, so it could return while that copy still reads memory about to
+/// be freed. This waits through the driver first, whatever is stored
+fn drain(stream: &CudaStream) -> Result<(), DriverError> {
+    let ctx = stream.context();
+    // SAFETY: the context and stream handles are live for as long as `stream` is borrowed, and neither call frees
+    // or changes them; the stream is still waited for when making its context current fails
+    let (bound, waited) =
+        unsafe { (result::ctx::set_current(ctx.cu_ctx()), result::stream::synchronize(stream.cu_stream())) };
+    ctx.check_err()?;
+    bound.and(waited)
 }
 
 /// `n` elements of pinned host memory, zeroed, so the typed slices made over it never cover uninitialized memory
