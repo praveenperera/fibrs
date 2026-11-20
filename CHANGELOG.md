@@ -32,8 +32,8 @@ uuid. `fibrs predict` gave 0.3.0's predictions voxel for voxel on nine columns o
 
 - 0.3.1 doesn't resume a tracer work directory that 0.3.0 started, finished or not, so a `--resume` that only
   writes the `.afv` again needs 0.3.0 too. Finish a run with the binary that started it, or start a new work
-  directory. A `fibrs predict` band output that 0.3.0 started is refused on resume as well, as it is by any other
-  binary; finish it with 0.3.0 or write a new `--out`.
+  directory. A `fibrs predict` output that 0.3.0 started, in band or villa mode, is refused on resume as well, as
+  it is by any other binary; finish it with 0.3.0 or write a new `--out`.
 
 ### Documentation
 
