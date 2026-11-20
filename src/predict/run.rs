@@ -607,7 +607,7 @@ fn columns(
                 Item::ColumnEnd { col: ci, .. } => bail!("tile feed out of order: column {ci} while running {i}"),
             }
         };
-        let mut out = engine.finish(run > 0)?;
+        let mut out = engine.finish(run > 0, writer.spare())?;
         if let (Some(sel), Some(sem), Some(tra)) = (&p.selection, &mut out.semantic, &mut out.tracing) {
             sel.mask_column(*col, sem, tra);
         }
