@@ -462,7 +462,9 @@ fn run(c: Checked) -> Result<()> {
     // every run that passes the checks above is recorded before the model loads, so one capped or killed after
     // that still shows it
     fs::create_dir_all(out)?;
-    let mut attempts = fs::OpenOptions::new().create(true).append(true).open(out.join("attempts.jsonl"))?;
+    // read as well as append: Windows locks a file only through a handle with read or write access, and append
+    // alone is neither
+    let mut attempts = fs::OpenOptions::new().create(true).read(true).append(true).open(out.join("attempts.jsonl"))?;
     // held until the run ends: two runs on one output, on different --only-columns say, would each rewrite the
     // chunks their columns share from what they read, losing the other's columns while both record progress
     lock_output(&attempts, out)?;
