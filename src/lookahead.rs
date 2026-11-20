@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use color_eyre::eyre::Result;
 
-use crate::kernels::{Change, Check, Coverage, Mark, Probe, RawCurve, Traced};
+use crate::kernels::{Change, Check, Coverage, Fields, Grid, Probe, RawCurve, Traced};
 
 /// One coverage read of a seed traced on the device, as the device reports it
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -144,7 +144,17 @@ impl Ahead {
     }
 
     /// Fill `out` with the device's result for seed `i` when it has one whose reads hold on `cov` now
-    pub fn fill(&self, cov: &Coverage, i: usize, out: &mut Traced) -> bool {
+    ///
+    /// The marks come from [`Coverage::mark_list`] over the accepted curves, as [`crate::kernels::trace_seed`]
+    /// makes them: the device returns only the curves, since a seed in fresh territory marks thousands of voxels
+    /// and copying those for every seed of a chunk cost more host memory and time than marking the few used
+    pub fn fill<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
+        &self,
+        f: &Fields<P, C, D>,
+        cov: &Coverage,
+        i: usize,
+        out: &mut Traced,
+    ) -> bool {
         let Some(chunk) = self.chunk_of(i) else { return false };
         let seed = &chunk.results[i - chunk.seeds.start];
         if seed.status == Status::Cpu {
@@ -159,15 +169,16 @@ impl Ahead {
         for c in checks {
             out.reads.push(c.slot as usize);
         }
-        out.tans.extend_from_slice(&chunk.tans[range(&seed.tans)]);
+        // each curve's tangents follow the last's in the seed's range, one per point
+        let mut tans = &chunk.tans[range(&seed.tans)];
         for c in &chunk.curves[range(&seed.curves)] {
-            out.curves.push(RawCurve { pts: chunk.pts[range(c)].to_vec() });
+            let pts = &chunk.pts[range(c)];
+            let (own, rest) = tans.split_at(pts.len());
+            cov.mark_list(f, pts, own, out.tans.len(), &mut out.marks);
+            out.tans.extend_from_slice(own);
+            out.curves.push(RawCurve { pts: pts.to_vec() });
+            tans = rest;
         }
-        let marks = chunk.marks[range(&seed.marks)].iter();
-        out.marks.extend(marks.map(|m| {
-            let at = cov.place_at(m.slot as usize, m.offset).expect("the device marks voxels of the coverage");
-            Mark::new(at, m.dir, m.tan)
-        }));
         self.used.fetch_add(1, Ordering::Relaxed);
         true
     }

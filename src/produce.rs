@@ -242,7 +242,7 @@ impl<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Producer<'_, P, C, D> {
 
     fn trace(&self, i: usize, scratch: &mut Scratch, out: &mut Traced) -> Result<()> {
         if let Some((ahead, ..)) = &self.ahead
-            && ahead.fill(self.cov, i, out)
+            && ahead.fill(self.fields, self.cov, i, out)
         {
             return Ok(());
         }
