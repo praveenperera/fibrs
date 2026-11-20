@@ -301,7 +301,10 @@ fn dry_run(c: &Checked) -> Result<()> {
         let tiles_air = loop {
             match feed.next()? {
                 // the digest of the bytes the GPU would get pins down the reads and their reflection
-                Item::Batch(b) => batches.push(json!({"origins": b.origins, "sha256": hex(&Sha256::digest(&b.data))})),
+                Item::Batch(b) => {
+                    batches.push(json!({"origins": b.origins, "sha256": hex(&Sha256::digest(&b.data))}));
+                    feed.recycle(b.data);
+                }
                 Item::ColumnEnd { air, .. } => break air,
             }
         };
@@ -597,13 +600,18 @@ fn columns(
                     engine.add(&b.data, &b.origins)?;
                     forward += t.elapsed().as_secs_f64();
                     run += b.origins.len();
+                    feed.recycle(b.data);
                 }
                 Item::ColumnEnd { col: ci, air } if ci == *i => break air,
                 Item::Batch(b) => bail!("tile feed out of order: column {} while running {i}", b.col),
                 Item::ColumnEnd { col: ci, .. } => bail!("tile feed out of order: column {ci} while running {i}"),
             }
         };
-        let mut out = engine.finish(run > 0)?;
+        // an all-air column quantizes nothing and the engine drops whatever buffers it is given, so only a
+        // column that ran tiles takes a written column's pair, which the next populated column would otherwise lose
+        let quantize = run > 0;
+        let reuse = if quantize { writer.spare() } else { Default::default() };
+        let mut out = engine.finish(quantize, reuse)?;
         if let (Some(sel), Some(sem), Some(tra)) = (&p.selection, &mut out.semantic, &mut out.tracing) {
             sel.mask_column(*col, sem, tra);
         }

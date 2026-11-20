@@ -6,6 +6,7 @@
 //! [`BrickStore`] owned by the volume, not one heap allocation each
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
 use rayon::prelude::*;
 
@@ -37,6 +38,26 @@ pub const BRICK: usize = EDGE * EDGE * EDGE;
 
 /// A z, y, x shape
 pub type Shape = [usize; 3];
+
+/// The slot of the brick holding voxel `z, y, x` in a brick grid of `grid`
+#[inline(always)]
+fn brick_index(grid: Shape, z: usize, y: usize, x: usize) -> usize {
+    ((z >> SHIFT) * grid[1] + (y >> SHIFT)) * grid[2] + (x >> SHIFT)
+}
+
+/// A voxel's sub-brick within its brick
+#[inline(always)]
+fn sub_index(z: usize, y: usize, x: usize) -> usize {
+    let s = SHIFT - SUB_SHIFT;
+    let m = (1 << s) - 1;
+    ((z >> SUB_SHIFT & m) << (2 * s)) | ((y >> SUB_SHIFT & m) << s) | (x >> SUB_SHIFT & m)
+}
+
+/// A voxel's offset within its sub-brick
+#[inline(always)]
+fn offset(z: usize, y: usize, x: usize) -> usize {
+    ((z & SUB_MASK) << (2 * SUB_SHIFT)) | ((y & SUB_MASK) << SUB_SHIFT) | (x & SUB_MASK)
+}
 
 /// A sparse 3D volume of `T` in z, y, x order
 pub struct Vol<T: Voxel> {
@@ -90,21 +111,17 @@ impl<T: Voxel> Vol<T> {
 
     #[inline(always)]
     fn brick_index(&self, z: usize, y: usize, x: usize) -> usize {
-        ((z >> SHIFT) * self.grid[1] + (y >> SHIFT)) * self.grid[2] + (x >> SHIFT)
+        brick_index(self.grid, z, y, x)
     }
 
-    /// A voxel's sub-brick within its brick
     #[inline(always)]
     fn sub_index(z: usize, y: usize, x: usize) -> usize {
-        let s = SHIFT - SUB_SHIFT;
-        let m = (1 << s) - 1;
-        ((z >> SUB_SHIFT & m) << (2 * s)) | ((y >> SUB_SHIFT & m) << s) | (x >> SUB_SHIFT & m)
+        sub_index(z, y, x)
     }
 
-    /// A voxel's offset within its sub-brick
     #[inline(always)]
     fn offset(z: usize, y: usize, x: usize) -> usize {
-        ((z & SUB_MASK) << (2 * SUB_SHIFT)) | ((y & SUB_MASK) << SUB_SHIFT) | (x & SUB_MASK)
+        offset(z, y, x)
     }
 
     /// The origin of sub-brick `s` within its brick, in voxels
@@ -207,13 +224,13 @@ impl<T: Voxel> Vol<T> {
         (self.sub(id), Self::offset(z, y, x))
     }
 
-    /// The 2 × 2 × 2 values from an in-bounds voxel to the one past it on every axis, which must be in bounds too,
-    /// in z, y, x order: corner `dz * 4 + dy * 2 + dx`
+    /// The values at the eight corners of the cell whose lowest corner is `z, y, x`, in z, y, x order: corner
+    /// `4 * dz + 2 * dy + dx`
     ///
-    /// The tracer's trilinear samples read cells like this, so each sub-brick the cell touches is found once: one
-    /// for 42% of cells, two for another 42%, and at most eight
+    /// The cell must be in bounds. The tracer's trilinear samples read cells like this, so each sub-brick the cell
+    /// touches is found once: one for 42% of cells, two for another 42%, and at most eight
     #[inline(always)]
-    pub fn cell(&self, z: usize, y: usize, x: usize) -> [T; 8] {
+    pub fn corners(&self, z: usize, y: usize, x: usize) -> [T; 8] {
         // the axes on which the cell crosses into the next sub-brick
         let cross = [z, y, x].map(|v| (v & SUB_MASK) == SUB_MASK);
         if cross == [false; 3] {
@@ -233,12 +250,6 @@ impl<T: Voxel> Vol<T> {
             }
         }
         std::array::from_fn(|c| subs[reach(c)][Self::offset(z + (c >> 2), y + (c >> 1 & 1), x + (c & 1))])
-    }
-
-    /// The value at a voxel given as signed coordinates, which must be in bounds
-    #[inline(always)]
-    pub fn at(&self, z: i64, y: i64, x: i64) -> T {
-        self.get(z as usize, y as usize, x as usize)
     }
 
     /// Set one voxel, allocating its brick's table and its sub-brick on first non-default write
@@ -301,6 +312,48 @@ impl<T: Voxel> Vol<T> {
         Self::write_brick(&mut self.bricks[bi], dims, self.default, &mut tables, &mut store, |z, y| {
             &data[(z * EDGE + y) * EDGE..][..dims[2]]
         });
+    }
+
+    /// Fill bricks in parallel, each given as its slot (C order over the brick grid) and its voxels in brick order;
+    /// sub-bricks that would hold only the default are not allocated, as in [`Vol::set_brick`]
+    ///
+    /// Each slot may be filled once and must still read as the default, as in [`Vol::fill_brick_rows`]. A slot given
+    /// twice is a caller error: debug builds panic when both bricks hold a non-default voxel, and an all-default
+    /// brick is skipped before the slot is checked
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    pub fn set_bricks<'a, I>(&mut self, bricks: I)
+    where
+        I: IndexedParallelIterator<Item = (usize, &'a [T; BRICK])>,
+    {
+        let (grid, shape, default) = (self.grid, self.shape, self.default);
+        let (tables, store) = (&self.tables, &self.store);
+        // each writer takes tables and sub-bricks from its own runs of the stores, so the brick slots are the only
+        // shared state, and they are set below on this thread
+        let filled: Vec<(usize, u32)> = bricks
+            .map_init(
+                || (tables.run(), store.run()),
+                |(tables, store), (bi, data)| {
+                    let dims = Self::brick_extent(grid, shape, bi).1;
+                    let mut slot = 0;
+                    Self::write_brick(&mut slot, dims, default, tables, store, |z, y| {
+                        &data[(z * EDGE + y) * EDGE..][..dims[2]]
+                    });
+                    (bi, slot)
+                },
+            )
+            .filter(|&(_, slot)| slot != 0)
+            .collect();
+        for (bi, slot) in filled {
+            debug_assert!(self.bricks[bi] == 0, "brick {bi} is filled a second time");
+            self.bricks[bi] = slot;
+        }
+    }
+
+    /// Whether any voxel of brick `bi` (C order over the brick grid) that lies in an allocated sub-brick satisfies
+    /// `f`; the brick's other voxels read as the default and are not tested
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    pub fn any_allocated_in_brick(&self, bi: usize, f: impl Fn(T) -> bool) -> bool {
+        self.table(bi).iter().filter(|&&id| id != 0).any(|&id| self.sub(id).iter().any(|&v| f(v)))
     }
 
     /// Bytes held by allocated sub-bricks and the tables that name them
@@ -415,6 +468,160 @@ impl<T: Voxel> Vol<T> {
     }
 }
 
+/// A sparse `u16` volume, zero by default, that one writer changes while other threads read it
+///
+/// It is laid out as [`Vol`] is, in 16³ bricks of 4³ sub-bricks, but every brick slot, table entry and voxel is
+/// atomic: the writer publishes a table or sub-brick it allocates with a release store, so a reader that sees its
+/// id sees its zeros, and a reader racing the writer reads either the old or the new value of a voxel, never a torn
+/// one. Readers learn nothing about ordering from a voxel's value; the tracer orders them through its own commit
+/// counter
+pub struct SharedVol {
+    shape: Shape,
+    grid: Shape,
+    /// Each brick's table id in `tables`, 0 while the whole brick reads as zero
+    bricks: Box<[AtomicU32]>,
+    /// The tables, [`SUBS`] sub-brick ids each, 0 for an unallocated sub-brick
+    tables: BrickStore<u32, SUBS>,
+    store: BrickStore<u16, SUB>,
+    /// Whether [`SharedVol::writer`] has been called: a second writer would race the first on allocation
+    has_writer: AtomicBool,
+}
+
+/// Where a voxel of a [`SharedVol`] lives: its brick slot, its sub-brick in the brick and its offset in that
+///
+/// Only [`SharedVol::place`] makes one, so the sub-brick and offset are always in range: reads and writes through
+/// a place index the table and sub-brick without a bounds check
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Place {
+    slot: usize,
+    sub: u8,
+    offset: u8,
+}
+
+impl Place {
+    /// The brick slot, in C order over the brick grid
+    #[inline(always)]
+    pub fn slot(self) -> usize {
+        self.slot
+    }
+}
+
+impl SharedVol {
+    /// An empty volume where every voxel reads as zero
+    pub fn new(shape: Shape) -> Self {
+        let grid = shape.map(|n| n.div_ceil(EDGE));
+        let slots: usize = grid.iter().product();
+        let bricks = (0..slots).map(|_| AtomicU32::new(0)).collect();
+        // each store's id 0 is handed out first and never written: the empty table and the zero sub-brick. Both
+        // stores' bricks start zeroed (fresh mappings), so neither writes them before they are published
+        let mut tables = BrickStore::new(0, slots + 1);
+        tables.alloc();
+        let mut store = BrickStore::new(0, slots * SUBS + 1);
+        store.alloc();
+        Self { shape, grid, bricks, tables, store, has_writer: AtomicBool::new(false) }
+    }
+
+    pub fn shape(&self) -> Shape {
+        self.shape
+    }
+
+    /// The brick slot, sub-brick and offset of an in-bounds voxel
+    #[inline(always)]
+    pub fn place(&self, z: usize, y: usize, x: usize) -> Place {
+        debug_assert!(z < self.shape[0] && y < self.shape[1] && x < self.shape[2]);
+        Place { slot: brick_index(self.grid, z, y, x), sub: sub_index(z, y, x) as u8, offset: offset(z, y, x) as u8 }
+    }
+
+    /// The table entry of a place's sub-brick, in a published table
+    #[inline(always)]
+    fn entry(&self, table: u32, at: Place) -> &AtomicU32 {
+        // SAFETY: a published table holds SUBS ids of `tables`, which lives as long as `self`, and is only ever
+        // accessed atomically once published; `at.sub` is below SUBS
+        unsafe { AtomicU32::from_ptr(self.tables.get(table).as_ptr().add(at.sub as usize)) }
+    }
+
+    /// A place's voxel, in a published sub-brick
+    #[inline(always)]
+    fn voxel(&self, sub: u32, at: Place) -> &AtomicU16 {
+        // SAFETY: a published sub-brick holds SUB voxels of `store`, which lives as long as `self`, and is only
+        // ever accessed atomically once published; `at.offset` is below SUB
+        unsafe { AtomicU16::from_ptr(self.store.get(sub).as_ptr().add(at.offset as usize)) }
+    }
+
+    /// The value at a place
+    #[inline(always)]
+    pub fn get(&self, at: Place) -> u16 {
+        let table = self.bricks[at.slot].load(Ordering::Acquire);
+        if table == 0 {
+            return 0;
+        }
+        let sub = self.entry(table, at).load(Ordering::Acquire);
+        if sub == 0 {
+            return 0;
+        }
+        self.voxel(sub, at).load(Ordering::Relaxed)
+    }
+
+    /// Bytes held by allocated sub-bricks and the tables that name them
+    pub fn resident_bytes(&self) -> usize {
+        let mut tables = 0;
+        let mut subs = 0;
+        for slot in &self.bricks {
+            let table = slot.load(Ordering::Acquire);
+            if table == 0 {
+                continue;
+            }
+            tables += 1;
+            let entry = |sub: usize| self.entry(table, Place { slot: 0, sub: sub as u8, offset: 0 });
+            subs += (0..SUBS).filter(|&sub| entry(sub).load(Ordering::Relaxed) != 0).count();
+        }
+        tables * SUBS * size_of::<u32>() + subs * SUB * size_of::<u16>()
+    }
+
+    /// The volume's one writer
+    ///
+    /// # Panics
+    ///
+    /// When called a second time on the same volume
+    pub fn writer(&self) -> SharedVolWriter<'_> {
+        assert!(!self.has_writer.swap(true, Ordering::Relaxed), "a shared volume has one writer");
+        SharedVolWriter { vol: self, tables: self.tables.run(), store: self.store.run() }
+    }
+}
+
+/// The only handle that changes a [`SharedVol`]
+pub struct SharedVolWriter<'v> {
+    vol: &'v SharedVol,
+    tables: BrickRun<'v, u32, SUBS>,
+    store: BrickRun<'v, u16, SUB>,
+}
+
+impl SharedVolWriter<'_> {
+    /// The value at a place; the writer always sees its own writes
+    #[inline(always)]
+    pub fn get(&self, at: Place) -> u16 {
+        self.vol.get(at)
+    }
+
+    /// Set one voxel, allocating and publishing its brick's table and its sub-brick on the first write to them
+    #[inline]
+    pub fn set(&mut self, at: Place, value: u16) {
+        let slot = &self.vol.bricks[at.slot];
+        let mut table = slot.load(Ordering::Relaxed);
+        if table == 0 {
+            table = self.tables.alloc().0;
+            slot.store(table, Ordering::Release);
+        }
+        let entry = self.vol.entry(table, at);
+        let mut sub = entry.load(Ordering::Relaxed);
+        if sub == 0 {
+            sub = self.store.alloc().0;
+            entry.store(sub, Ordering::Release);
+        }
+        self.vol.voxel(sub, at).store(value, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +638,39 @@ mod tests {
         let block: Vec<u8> = (0..3 * 4 * 5).map(|i| i as u8).collect();
         v.write_block([30, 31, 28], [3, 4, 5], &block);
         assert_eq!(v.read_block([30, 31, 28], [3, 4, 5]), block);
+    }
+
+    /// The parallel install leaves a volume as one `set_brick` per brick would: the values read back, and an
+    /// all-default brick stays unallocated
+    #[test]
+    fn set_bricks_matches_set_brick() {
+        let shape = [40, 70, 33];
+        let data: Vec<[u16; BRICK]> = (0..6u16).map(|k| std::array::from_fn(|i| (i as u16 % 7) * k)).collect();
+        let slots = [0, 5, 17, 23, 31, 44];
+        let mut one = Vol::new(shape, 0u16);
+        for (&bi, d) in slots.iter().zip(&data) {
+            one.set_brick(bi, d);
+        }
+
+        let mut all = Vol::new(shape, 0u16);
+        all.set_bricks(slots.par_iter().copied().zip(&data));
+        assert_eq!(all.read_block([0; 3], shape), one.read_block([0; 3], shape));
+        // brick 0 holds only zeros, so five of the six are allocated
+        assert_eq!(slots.map(|bi| all.has_brick(bi)), [false, true, true, true, true, true]);
+        assert_eq!(all.resident_bytes(), one.resident_bytes());
+    }
+
+    #[test]
+    fn shared_volume_reads_its_writers_values() {
+        let v = SharedVol::new([20, 33, 40]);
+        let at = v.place(19, 32, 39);
+        assert_eq!(v.get(at), 0);
+        let mut w = v.writer();
+        w.set(at, 0x8080);
+        w.set(v.place(19, 32, 38), 1);
+        assert_eq!((v.get(at), w.get(v.place(19, 32, 38)), v.get(v.place(0, 0, 0))), (0x8080, 1, 0));
+        // both voxels share one sub-brick of one brick
+        assert_eq!(v.resident_bytes(), SUBS * 4 + SUB * 2);
     }
 
     #[test]
@@ -479,7 +719,7 @@ mod tests {
             for y in 0..shape[1] - 1 {
                 for x in 0..shape[2] - 1 {
                     let each = std::array::from_fn(|c| value(z + (c >> 2), y + (c >> 1 & 1), x + (c & 1)));
-                    assert_eq!(filled.cell(z, y, x), each);
+                    assert_eq!(filled.corners(z, y, x), each);
                 }
             }
         }

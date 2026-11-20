@@ -22,14 +22,14 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::afv::{ExportOptions, MinLength, Summary, export_afv};
-use crate::arena::BufferPool;
 use crate::axes::{Lapack, direction_field, find_lapack};
 use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
-use crate::finish::{FinishCtx, NativeCache, NativeSampler};
-use crate::gpu::{AxesCounts, Gpu, Stages};
+use crate::finish::{CachePools, FinishCtx, NativeCache, NativeSampler};
+use crate::gpu::{AxesCounts, CpuReason, Finished, Gpu, GpuFinisher, Pieces, SlabLoads, Stages};
 use crate::input::Predictions;
-use crate::kernels::{Coverage, Fields, RawCurve, Scratch, trace_seed};
+use crate::kernels::{Coverage, DirField, DirForm, Directions, Fields, RawCurve, SplitDirs};
 use crate::log;
+use crate::produce::{Flow, Producer, Speculation, Stats};
 use crate::stage1::{Fused, Separate};
 use crate::vol::{EDGE, Shape, Vol};
 
@@ -126,7 +126,11 @@ pub struct Args {
     /// Where the direction field and centrality run (tracing always runs on the CPU): auto uses an NVIDIA GPU when
     /// one is usable and the CPU otherwise, cpu never uses the GPU, and cuda fails without one. A GPU run writes the
     /// original's --device cuda output, whose centrality can differ from its cpu output by a rounding. A resumed
-    /// run keeps the rounding it started with, so one started on the CPU keeps centrality there
+    /// run keeps the rounding it started with, so one started on the CPU keeps centrality there. A GPU run also
+    /// finishes curves there; its prediction slabs decode on the CPU with c-blosc's checks unless GPU decoding
+    /// with nvCOMP is opted in to (FIBRS_NVCOMP=on, with fibrs[gpu-zstd] installed, or FIBRS_NVCOMP set to a
+    /// libnvcomp.so.6 path). On a corrupt chunk nvCOMP's behaviour is undefined: it may give wrong output or a
+    /// CUDA fault
     #[arg(long, value_enum, default_value = "auto")]
     pub device: Device,
     /// Visible CUDA device index for the GPU; without it, the first usable visible GPU
@@ -591,7 +595,7 @@ pub fn run(args: Args) -> Result<Summary> {
         coordinate_space: args.coordinate_space.as_deref(),
     };
     let curves = families.iter().flat_map(|&f| CurveReader::open(&work, f).unwrap_or_else(CurveReader::failed));
-    let summary = export_afv(curves, &args.output, &opt)?;
+    let summary = pool.install(|| export_afv(curves, &args.output, &opt))?;
     log!("Export: {:.1} s", started.elapsed().as_secs_f64());
     log!("Wrote {} fibres ({} points) to {}", summary.fiber_count, summary.point_count, output.display());
     Ok(summary)
@@ -710,18 +714,15 @@ fn pool_block(native: &Predictions, lo: Shape, hi: Shape) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Freed native prediction buffers kept for reuse: each eviction frees one and the decode or read that caused it
-/// takes one, so few wait at a time; this bounds a burst of evictions, at 512 slabs of the usual 2 × 8 × 128²
-const CHUNK_POOL_RETAIN: usize = 128 << 20;
-
-/// Raw curves handed from the tracing thread to the finishing threads at a time
+/// Raw curves handed from the committing thread to the finishing threads at a time
 ///
 /// Each batch is finished in native-chunk order, so a larger batch reads and decodes each chunk for more curves:
 /// on a dense PHerc0358 crop 8192 read 55% fewer chunks and decoded 40% fewer slabs than 2048, for 10% less CPU
 /// time
 const FINISH_BATCH: usize = 8192;
 /// Raw curve points at which a batch is handed over even with fewer than [`FINISH_BATCH`] curves, so the batches in
-/// flight stay in the tens of megabytes (12 bytes a point) however long the curves are
+/// flight stay in the tens of megabytes (12 bytes a point) however long the curves are; the GPU leaves room for a
+/// batch of this many beside its slab cache
 const FINISH_POINTS: usize = 2 << 20;
 
 fn trace_families(
@@ -739,44 +740,71 @@ fn trace_families(
     let resident = tracing.iter().map(Vol::resident_bytes).sum::<usize>();
     log!("Tracing predictions: {:.1} s, {:.2} GiB resident", t.elapsed().as_secs_f64(), gib(resident));
     let lapack = Lapack::init(&find_lapack()?)?;
-    let (nx, ny) = direction_field_on(cent.gpu.as_ref(), cent.strict, &tracing, lapack)?;
+    let dirs = direction_field_on(cent, &tracing, lapack)?;
     release_freed();
-    debug_dump(work, "nx", || nx.read_block([0, 0, 0], nx.shape()))?;
-    debug_dump(work, "ny", || ny.read_block([0, 0, 0], ny.shape()))?;
-    debug_mem("direction field", &[("tracing", resident), ("nx", nx.resident_bytes()), ("ny", ny.resident_bytes())]);
-    let pool = BufferPool::new(CHUNK_POOL_RETAIN);
-    let cache = NativeCache::new(native, cache_bytes, &pool);
-    for &family in families {
-        trace_family(&tracing, &nx, &ny, &cache, work, family, Compute { threads, cent })?;
-        release_freed();
+    let pools = CachePools::new();
+    let cache = NativeCache::new(native, cache_bytes, &pools);
+    let families = Families { tracing: &tracing, resident, cache: &cache, work, families, threads, cent };
+    match &dirs {
+        Directions::Packed(packed) => families.trace(&**packed),
+        Directions::Split { nx, ny } => families.trace(&SplitDirs { nx, ny }),
     }
-    Ok(())
 }
 
-/// The direction field, on `gpu` when there is one
+/// What tracing each pending family needs besides the direction field
+struct Families<'a, 'n, 'p> {
+    tracing: &'a [Vol<u8>; 2],
+    resident: usize,
+    cache: &'a NativeCache<'n, 'p>,
+    work: &'a Path,
+    families: &'a [usize],
+    threads: usize,
+    cent: &'a CentralityDevice,
+}
+
+impl Families<'_, '_, '_> {
+    fn trace<D: DirField>(&self, dirs: &D) -> Result<()> {
+        debug_dump(self.work, "nx", || dir_bytes(dirs, 8))?;
+        debug_dump(self.work, "ny", || dir_bytes(dirs, 0))?;
+        debug_mem("direction field", &[("tracing", self.resident), ("directions", dirs.resident_bytes())]);
+        for &family in self.families {
+            let compute = Compute { threads: self.threads, cent: self.cent };
+            trace_family(self.tracing, dirs, self.cache, self.work, family, compute)?;
+            release_freed();
+        }
+        Ok(())
+    }
+}
+
+/// One direction byte of every voxel as a dense C-order array, `nx` for `shift` 8 and `ny` for 0, read a voxel at a
+/// time so a dump holds one byte a voxel in either form
+fn dir_bytes<D: DirField>(dirs: &D, shift: u32) -> Vec<u8> {
+    let [d, h, w] = dirs.shape().map(|n| n as i64);
+    let mut out = Vec::with_capacity(dirs.shape().iter().product());
+    let voxels = (0..d).flat_map(|z| (0..h).flat_map(move |y| (0..w).map(move |x| [z, y, x])));
+    out.extend(voxels.map(|[z, y, x]| (dirs.at(z, y, x) >> shift) as u8));
+    out
+}
+
+/// The direction field, on the GPU when there is one, in the form the run's centrality reads
 ///
 /// Both devices give the same bytes, so when the GPU fails, such as out of memory, the CPU computes it instead,
-/// unless `strict` (`--device cuda`) asked for the GPU only
-fn direction_field_on(
-    gpu: Option<&Gpu>,
-    strict: bool,
-    tracing: &[Vol<u8>; 2],
-    lapack: &Lapack,
-) -> Result<(Vol<u8>, Vol<u8>)> {
+/// unless `--device cuda` asked for the GPU only
+fn direction_field_on(cent: &CentralityDevice, tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<Directions> {
     let t = Instant::now();
-    let on_cpu = || -> Result<(Vol<u8>, Vol<u8>)> {
-        let field = direction_field(tracing, lapack)?;
+    let on_cpu = || -> Result<Directions> {
+        let field = direction_field(tracing, lapack, cent.dir_form())?;
         log!("Direction field: {:.1} s", t.elapsed().as_secs_f64());
         Ok(field)
     };
-    let Some(gpu) = gpu else { return on_cpu() };
+    let Some(gpu) = &cent.gpu else { return on_cpu() };
     match gpu.direction_field(tracing, lapack) {
         Ok((nx, ny, AxesCounts { present, fallback })) => {
             let secs = t.elapsed().as_secs_f64();
             log!("Direction field: {secs:.1} s, {fallback} of {present} voxels solved on the CPU");
-            Ok((nx, ny))
+            Ok(Directions::Split { nx: Box::new(nx), ny: Box::new(ny) })
         }
-        Err(e) if !strict => {
+        Err(e) if !cent.strict => {
             log!("Direction field on the CPU: the GPU failed ({e:#})");
             on_cpu()
         }
@@ -818,11 +846,25 @@ impl ToLe for u16 {
 /// Each stage frees what the next does not read (the direction field's and centrality's tile results, the seed
 /// field, a finished family's centrality and coverage), but glibc keeps freed memory in the arena of
 /// the thread that freed it and only trims the top of each heap. The next stage allocates from other threads'
-/// arenas (coverage grows on the tracing thread, the next family's fields on the pool's), so without this the
+/// arenas (coverage grows on the committing thread, the next family's fields on the pool's), so without this the
 /// freed bytes stay resident beside the new ones: on a 0826 band the H family peaked 1.7 GiB above V with the
 /// same fields
 fn release_freed() {
-    // SAFETY: malloc_trim only returns free pages to the kernel; it touches no live allocation
+    // mimalloc keeps a freed large block in its arena and purges it only after a delay, on a later allocation or
+    // free, and a smaller block in a page of the thread that allocated it, which only that thread collects. So each
+    // thread of the pool collects its own pages, which the stages do between stages, when the pool is idle, and one
+    // more forced collect after them all purges what they handed back. This is best effort: a page freed while
+    // another thread holds mimalloc's purge lock (a pool thread mid-collect, or a finishing pool's thread still
+    // exiting) can stay until mimalloc's own delayed purge, which runs about 1 s later as the next stage allocates
+    // SAFETY: mi_collect only returns free pages to the kernel; it touches no live allocation
+    #[cfg(feature = "mimalloc")]
+    unsafe {
+        rayon::broadcast(|_| libmimalloc_sys::mi_collect(true));
+        libmimalloc_sys::mi_collect(true);
+    }
+
+    // SAFETY: malloc_trim only returns free pages to the kernel; it touches no live allocation. Without mimalloc
+    // it covers every allocation; with it, the ones C libraries such as OpenBLAS make through glibc
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::malloc_trim(0);
@@ -846,7 +888,7 @@ fn fix_malloc_thresholds() {
     {
         // SAFETY: mallopt only changes how later allocations are served; it touches no live allocation
         unsafe {
-            libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
+            libc::mallopt(libc::M_MMAP_THRESHOLD, crate::arena::OWN_MAPPING_BYTES as libc::c_int);
         }
     }
     // fixing the mmap threshold also fixes the trim threshold at 128 KiB, so each finishing thread's heap gave
@@ -937,7 +979,7 @@ impl CentralityDevice {
     /// it on, opened only when a family still needs centrality
     ///
     /// `auto` takes the GPU when one opens, and otherwise the CPU, saying why. A run started on the CPU keeps
-    /// centrality there, but its direction field, the same bytes on either device, still takes the GPU
+    /// centrality there, but its direction field and finishing, the same bytes on either device, still take the GPU
     fn choose(
         device: Device,
         index: Option<usize>,
@@ -996,49 +1038,57 @@ impl CentralityDevice {
         Ok(chosen)
     }
 
+    /// The form the direction field is written in: split when the GPU computes centrality, which reads `nx` and
+    /// `ny` as two volumes, so a field the CPU computes after a GPU failure needs no copy
+    fn dir_form(&self) -> DirForm {
+        match (self.rounding, &self.gpu) {
+            (Rounding::Cuda, Some(_)) => DirForm::Split,
+            _ => DirForm::Packed,
+        }
+    }
+
     /// One family's centrality and seeds in the run's rounding
     ///
     /// When the GPU fails, such as out of memory, the CPU computes the same CUDA rounding unless `--device cuda`
     /// asked for the GPU only
-    fn compute(
+    fn compute<D: DirField>(
         &self,
         tracing: &[Vol<u8>; 2],
         family: usize,
         pres: &Presence,
-        nx: &Vol<u8>,
-        ny: &Vol<u8>,
+        dirs: &D,
     ) -> Result<FamilyFields> {
-        let gpu = match (self.rounding, &self.gpu) {
-            (Rounding::Cpu, _) => return Ok(centrality::<Separate>(pres, nx, ny)),
-            (Rounding::Cuda, None) => return Ok(centrality::<Fused>(pres, nx, ny)),
-            (Rounding::Cuda, Some(gpu)) => gpu,
+        let (gpu, (nx, ny)) = match (self.rounding, &self.gpu, dirs.split()) {
+            (Rounding::Cpu, _, _) => return Ok(centrality::<Separate, _>(pres, dirs)),
+            (Rounding::Cuda, Some(gpu), Some(split)) => (gpu, split),
+            // no GPU, or a packed field, which [`Self::dir_form`] asks for only when there is no GPU
+            (Rounding::Cuda, _, _) => return Ok(centrality::<Fused, _>(pres, dirs)),
         };
         match gpu.centrality(tracing, family, nx, ny) {
             Ok(fields) => Ok(fields),
             Err(e) if !self.strict => {
                 log!("Centrality on the CPU, rounded as on the GPU: the GPU failed ({e:#})");
-                Ok(centrality::<Fused>(pres, nx, ny))
+                Ok(centrality::<Fused, _>(pres, dirs))
             }
             Err(e) => Err(e),
         }
     }
 }
 
-fn trace_family(
+fn trace_family<D: DirField>(
     tracing: &[Vol<u8>; 2],
-    nx: &Vol<u8>,
-    ny: &Vol<u8>,
+    dirs: &D,
     cache: &NativeCache,
     work: &Path,
     family: usize,
-    Compute { threads, cent }: Compute,
+    Compute { threads, cent: device }: Compute,
 ) -> Result<()> {
     let label = if family == 1 { "V" } else { "H" };
     let folder = family_dir(work, family);
     fs::create_dir_all(&folder)?;
     let t = Instant::now();
     let pres = Presence::new(tracing, family);
-    let FamilyFields { cent, seeds } = cent.compute(tracing, family, &pres, nx, ny)?;
+    let FamilyFields { cent, seeds } = device.compute(tracing, family, &pres, dirs)?;
     log!("{label} centrality: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem(label, &[("cent", cent.resident_bytes()), ("seeds", seeds.len() * std::mem::size_of::<Seed>())]);
     let t = Instant::now();
@@ -1061,9 +1111,13 @@ fn trace_family(
     release_freed();
     log!("{label} seeds: {} in {:.1} s", cat.coords.len(), t.elapsed().as_secs_f64());
     let shape = pres.shape();
-    let fields = Fields { pres: &pres, cent: &cent, nx, ny };
+    let fields = Fields { pres: &pres, cent: &cent, dirs };
     let ctx = FinishCtx { tracing, pres: &pres, family };
-    let finish_pool = rayon::ThreadPoolBuilder::new().num_threads(threads.saturating_sub(1).max(1)).build()?;
+    let mut finisher = BatchFinisher::new(device, tracing, family, label);
+    // the pool's idle threads trace seeds ahead of the commit point, and it gets every thread: with one fewer, as
+    // when one thread traced every seed, a dense crop at --threads 4 traced no faster than that thread did, since
+    // finishing kept the pool busy. The committing thread traces the seeds no pool thread has started
+    let finish_pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
     let path = folder.join("curves.bin");
     let mut writer = CurveWriter::create(&path)?;
     // FIBRS_DEBUG_RAW=1 also keeps the raw curves (family-N/raw.bin, same format) to compare with the
@@ -1075,38 +1129,40 @@ fn trace_family(
     let t = Instant::now();
     let total = cat.coords.len();
     let mut pieces = 0;
+    let spec = Speculation::from_env()?;
+    let cov = Coverage::new(shape);
+    let producer = Producer::new(&fields, &cov, &cat, spec)?;
     let produce = |tx: &SyncSender<Vec<RawCurve>>| -> Result<usize> {
-        let mut cov = Coverage::new(shape);
-        let mut scratch = Scratch::default();
         let mut batch: Vec<RawCurve> = Vec::new();
         let mut points = 0;
         let mut count = 0;
         let mut last_log = Instant::now();
-        for r in 0..cat.starts.len() - 1 {
-            let (start, end) = (cat.starts[r], cat.starts[r + 1]);
-            let primary_end = start + cat.primary[r];
-            for (i, &seed) in cat.coords.iter().enumerate().take(end).skip(start) {
-                let before = batch.len();
-                trace_seed(&fields, &mut cov, &mut scratch, seed, i < primary_end, &mut batch)?;
-                points += batch[before..].iter().map(|c| c.pts.len()).sum::<usize>();
-                if batch.len() >= FINISH_BATCH || points >= FINISH_POINTS {
-                    count += batch.len();
-                    points = 0;
-                    // a closed channel means finishing failed; its error is the one reported
-                    if tx.send(std::mem::take(&mut batch)).is_err() {
-                        return Ok(count);
-                    }
-                }
-                if last_log.elapsed().as_secs_f64() >= 10.0 {
-                    log!("{label} seeds: {}/{total}; {} raw curves", i + 1, count + batch.len());
-                    last_log = Instant::now();
-                }
+        let deliver = |i: usize, curves: &mut Vec<RawCurve>| -> Result<Flow> {
+            points += curves.iter().map(|c| c.pts.len()).sum::<usize>();
+            batch.append(curves);
+            if last_log.elapsed().as_secs_f64() >= 10.0 {
+                log!("{label} seeds: {}/{total}; {} raw curves", i + 1, count + batch.len());
+                last_log = Instant::now();
             }
-        }
+            if batch.len() < FINISH_BATCH && points < FINISH_POINTS {
+                return Ok(Flow::Continue);
+            }
+            count += batch.len();
+            points = 0;
+            // a closed channel means finishing failed; its error is the one reported
+            match tx.send(std::mem::take(&mut batch)) {
+                Ok(()) => Ok(Flow::Continue),
+                Err(_) => Ok(Flow::Stop),
+            }
+        };
+        let stats = producer.run(&finish_pool, deliver)?;
         count += batch.len();
         if !batch.is_empty() {
             let _ = tx.send(batch);
         }
+        let Stats { seeds, window, retraced, committer } = stats;
+        let share = 100.0 * retraced as f64 / seeds.max(1) as f64;
+        log!("{label} window {window}: {retraced} seeds traced again ({share:.3}%), {committer} on the committer");
         debug_mem(label, &[("coverage", cov.resident_bytes()), ("cache", cache.bytes()), ("catalogue", 12 * total)]);
         Ok(count)
     };
@@ -1116,13 +1172,14 @@ fn trace_family(
                 w.push(&curve.pts)?;
             }
         }
-        for curve in finish_batch(&finish_pool, &ctx, cache, &batch)?.iter().flatten() {
+        for curve in finisher.finish(&finish_pool, &ctx, cache, &batch)?.iter().flatten() {
             writer.push(curve)?;
             pieces += 1;
         }
         Ok(())
     };
     let raw = pipeline(2, produce, consume)?;
+    finisher.summary();
     writer.finish()?;
     if let Some(w) = raw_writer {
         w.finish()?;
@@ -1135,6 +1192,141 @@ fn trace_family(
     );
     save_json(&folder.join("progress.json"), &json!({"complete": true, "raw_curves": raw, "curves": pieces}))?;
     Ok(())
+}
+
+/// Where a family's batches of raw curves are finished: on the GPU when the run has one, and on the CPU for each
+/// batch the GPU hands back, or for every batch once the GPU has failed. Both give the same pieces
+struct BatchFinisher<'a> {
+    gpu: OnGpu<'a>,
+    /// Whether a GPU failure ends the run (`--device cuda`) instead of moving finishing to the CPU
+    strict: bool,
+    label: &'static str,
+    counts: FinishCounts,
+}
+
+/// Where a family's finishing stands on the GPU
+enum OnGpu<'a> {
+    /// The run's GPU, set up for the family when its first batch of curves comes, so a family with none never
+    /// needs it
+    Unopened { gpu: &'a Gpu, tracing: &'a [Vol<u8>; 2], family: usize },
+    /// Boxed, so the other states do not take the finisher's size
+    Open(Box<GpuFinisher>),
+    /// The run has no GPU, or setting it up or a batch on it failed
+    Off,
+}
+
+/// What the GPU finished of a family, for the log
+#[derive(Default)]
+struct FinishCounts {
+    /// Whether the GPU took part: the family's batches after it fails count as finished on the CPU
+    used: bool,
+    batches: usize,
+    loaded: SlabLoads,
+    /// Batches handed back, by [`CpuReason`], and the batch the GPU failed on and every one after it
+    slabs: usize,
+    unlisted: usize,
+    capacity: usize,
+    decode: usize,
+    failed: usize,
+}
+
+impl<'a> BatchFinisher<'a> {
+    /// Finishing on the run's GPU, if it has one, else on the CPU
+    fn new(device: &'a CentralityDevice, tracing: &'a [Vol<u8>; 2], family: usize, label: &'static str) -> Self {
+        let gpu = match &device.gpu {
+            Some(gpu) => OnGpu::Unopened { gpu, tracing, family },
+            None => OnGpu::Off,
+        };
+        Self { gpu, strict: device.strict, label, counts: FinishCounts::default() }
+    }
+
+    /// Set the GPU up for the family, if it is not yet, when the family's pooled predictions and a slab cache fit
+    /// on it, else move finishing to the CPU; says which
+    fn open(&mut self, cache: &NativeCache) -> Result<()> {
+        let OnGpu::Unopened { gpu, tracing, family } = self.gpu else { return Ok(()) };
+        self.gpu = OnGpu::Off;
+        let (label, layout) = (self.label, cache.layout());
+        match gpu.finisher(tracing, family, layout, FINISH_POINTS) {
+            Ok(on_gpu) => {
+                let gib = gib(on_gpu.slots() * layout.slab_bytes());
+                log!(
+                    "{label} finishing on {}, {} native slabs cached there ({gib:.2} GiB)",
+                    gpu.name(),
+                    on_gpu.slots()
+                );
+                self.gpu = OnGpu::Open(Box::new(on_gpu));
+                self.counts.used = true;
+            }
+            Err(e) if !self.strict => log!("{label} finishing on the CPU: the GPU failed ({e:#})"),
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    }
+
+    /// One batch's pieces, as [`finish_batch`] gives them
+    fn finish(
+        &mut self,
+        pool: &rayon::ThreadPool,
+        ctx: &FinishCtx,
+        cache: &NativeCache,
+        batch: &[RawCurve],
+    ) -> Result<Vec<Pieces>> {
+        if !batch.is_empty() {
+            self.open(cache)?;
+        }
+        let c = &mut self.counts;
+        c.batches += c.used as usize;
+        let OnGpu::Open(gpu) = &mut self.gpu else {
+            c.failed += c.used as usize;
+            return finish_batch(pool, ctx, cache, batch);
+        };
+        match gpu.finish(pool, cache, batch) {
+            Ok(Finished::Pieces(pieces)) => return Ok(pieces),
+            Ok(Finished::OnCpu(CpuReason::Slabs)) => c.slabs += 1,
+            Ok(Finished::OnCpu(CpuReason::Unlisted)) => c.unlisted += 1,
+            Ok(Finished::OnCpu(CpuReason::Capacity)) => c.capacity += 1,
+            Ok(Finished::OnCpu(CpuReason::Decode)) => c.decode += 1,
+            Err(e) if !self.strict => {
+                log!("{} finishing on the CPU from here: the GPU failed ({e:#})", self.label);
+                c.loaded = gpu.loaded();
+                c.failed += 1;
+                self.gpu = OnGpu::Off;
+            }
+            Err(e) => return Err(e),
+        }
+        finish_batch(pool, ctx, cache, batch)
+    }
+
+    /// Log the slabs the GPU cached, by where they were decoded, and the batches the CPU finished instead, if the
+    /// GPU took part
+    fn summary(&mut self) {
+        let c = &mut self.counts;
+        if !c.used {
+            return;
+        }
+        if let OnGpu::Open(gpu) = &self.gpu {
+            c.loaded = gpu.loaded();
+        }
+        let reasons = [
+            (c.slabs, "read more slabs than the GPU holds"),
+            (c.unlisted, "read a slab not uploaded"),
+            (c.capacity, "fitted a piece beyond its room"),
+            (c.decode, "had a slab that did not decode"),
+            (c.failed, "came at or after a GPU failure"),
+        ];
+        let on_cpu = reasons.iter().map(|&(n, _)| n).sum::<usize>();
+        let why: Vec<String> = reasons.iter().filter(|&&(n, _)| n > 0).map(|(n, why)| format!("{n} {why}")).collect();
+        let why = if why.is_empty() { String::new() } else { format!(": {}", why.join(", ")) };
+        log!(
+            "{} finishing: {} native slabs cached on the GPU ({} decoded there, {} on the CPU), {on_cpu} of {} \
+             batches finished on the CPU{why}",
+            self.label,
+            c.loaded.total(),
+            c.loaded.on_gpu,
+            c.loaded.on_cpu,
+            c.batches
+        );
+    }
 }
 
 /// Run `produce` on its own thread, handing what it sends to `consume` through a channel of `capacity`
@@ -1164,7 +1356,7 @@ fn finish_batch(
     ctx: &FinishCtx,
     cache: &NativeCache,
     batch: &[RawCurve],
-) -> Result<Vec<Vec<Vec<[f32; 3]>>>> {
+) -> Result<Vec<Pieces>> {
     let mut order: Vec<usize> = (0..batch.len()).collect();
     order.sort_by_key(|&i| {
         let p = batch[i].pts[0];

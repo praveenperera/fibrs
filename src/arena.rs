@@ -17,6 +17,10 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Mutex;
 
+/// Blocks of this size or more get their own mapping from glibc (`run::fix_malloc_thresholds`); smaller ones come
+/// from the per-thread heaps
+pub const OWN_MAPPING_BYTES: usize = 1 << 20;
+
 /// Requests below this size go straight to the global allocator: they come from its per-thread caches and never
 /// map memory of their own
 const MIN_POOLED: usize = 64 << 10;

@@ -17,6 +17,8 @@ use libloading::Library;
 use rayon::prelude::*;
 
 use crate::arena::BufferPool;
+use crate::kernels::{DirForm, Directions};
+use crate::pyenv::site_packages;
 use crate::vol::{Shape, Vol};
 
 /// Halo the tensor needs: 4 + 1 + 6
@@ -160,25 +162,10 @@ pub fn find_lapack() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("FIBRS_LAPACK") {
         return Ok(PathBuf::from(p));
     }
-    let mut roots = Vec::new();
-    if let Some(arg0) = std::env::args_os().next() {
-        let arg0 = PathBuf::from(arg0);
-        let arg0 = if arg0.components().count() > 1 { Some(arg0) } else { which(&arg0) };
-        if let Some(bin) = arg0.as_deref().and_then(Path::parent) {
-            roots.push(bin.join(".."));
-        }
-    }
-    if let Some(v) = std::env::var_os("VIRTUAL_ENV") {
-        roots.push(PathBuf::from(v));
-    }
-    for root in roots {
-        let Ok(libs) = std::fs::read_dir(root.join("lib")) else { continue };
-        for py in libs.flatten() {
-            let site = py.path().join("site-packages");
-            for dir in [site.join("numpy.libs"), site.join("scipy_openblas64/lib")] {
-                if let Some(lib) = openblas_in(&dir) {
-                    return Ok(lib);
-                }
+    for site in site_packages() {
+        for dir in [site.join("numpy.libs"), site.join("scipy_openblas64/lib")] {
+            if let Some(lib) = openblas_in(&dir) {
+                return Ok(lib);
             }
         }
     }
@@ -195,10 +182,6 @@ fn openblas_in(dir: &Path) -> Option<PathBuf> {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         name.starts_with("libscipy_openblas64_") && (name.ends_with(".so") || name.ends_with(".dylib"))
     })
-}
-
-fn which(name: &Path) -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
 /// The GPU kernels' certification of a voxel's direction, which the tests hold against dsyevd on the CPU
@@ -363,14 +346,14 @@ fn gradient<A: Allocator + Copy>(b: &Block<A>, axis: usize) -> Block<A> {
 /// One tile's core: origin, extent, nx and ny
 type TileAxes = (Shape, Shape, Vec<u8>, Vec<u8>);
 
-/// Compute nx, ny for the whole tracing volume from the two pooled channels
-pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<(Vol<u8>, Vol<u8>)> {
+/// Compute nx, ny for the whole tracing volume from the two pooled channels, written in `form`
+/// ([`crate::kernels::DirField`])
+pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack, form: DirForm) -> Result<Directions> {
     let shape = tracing[0].shape();
     let grid = shape.map(|n| n.div_ceil(CORE));
     let tiles: Vec<Shape> =
         (0..grid[0]).flat_map(|z| (0..grid[1]).flat_map(move |y| (0..grid[2]).map(move |x| [z, y, x]))).collect();
-    let mut nx = Vol::new(shape, 128u8);
-    let mut ny = Vol::new(shape, 128u8);
+    let mut dirs = Directions::new(shape, form);
     // every tile's smoothed block, gradients and products are a few MiB each and mostly of one size, so they come
     // from a pool instead of a fresh mapping each; a thread's next tile takes the buffers its last one freed, so
     // the pool keeps one tile's buffers per thread, up to TILE_POOL_RETAIN
@@ -385,11 +368,10 @@ pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack) -> Result<(Vol<u
             part.par_iter().map(|&t| tile_axes(tracing, t, lapack, &pool)).collect();
         for r in results {
             let Some((lo, dims, xx, yy)) = r? else { continue };
-            nx.write_block(lo, dims, &xx);
-            ny.write_block(lo, dims, &yy);
+            dirs.write_block(lo, dims, &xx, &yy);
         }
     }
-    Ok((nx, ny))
+    Ok(dirs)
 }
 
 /// Most freed tile buffers the direction field keeps for reuse, the bound the README states: one tile's buffers

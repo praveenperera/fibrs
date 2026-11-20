@@ -10,9 +10,9 @@ use std::sync::OnceLock;
 
 use color_eyre::eyre::{Result, bail};
 
-use crate::arena::Voxel;
+use crate::arena::{OWN_MAPPING_BYTES, Voxel};
 use crate::pyfmt::{py_max, py_min};
-use crate::vol::Vol;
+use crate::vol::{Place, Shape, SharedVol, SharedVolWriter, Vol};
 
 /// cos(55°): the turn limit used throughout the tracer
 pub const COS55: f64 = 0.5735764363510462;
@@ -24,11 +24,14 @@ pub trait Grid<T: Copy>: Sync {
     /// The value at an in-bounds voxel
     fn at(&self, z: i64, y: i64, x: i64) -> T;
 
-    /// The 2 × 2 × 2 values from an in-bounds voxel to the one past it on every axis, which must be in bounds too,
-    /// in z, y, x order: corner `dz * 4 + dy * 2 + dx`
+    /// The values at the eight corners of the cell whose lowest corner is `z, y, x`, which must be in bounds
+    /// with the cell, in z, y, x order: `[z][y][x]` flattened, so index `4 * dz + 2 * dy + dx`
     #[inline(always)]
     fn corners(&self, z: i64, y: i64, x: i64) -> [T; 8] {
-        std::array::from_fn(|c| self.at(z + (c >> 2) as i64, y + (c >> 1 & 1) as i64, x + (c & 1) as i64))
+        std::array::from_fn(|k| {
+            let k = k as i64;
+            self.at(z + (k >> 2), y + (k >> 1 & 1), x + (k & 1))
+        })
     }
 }
 
@@ -45,7 +48,7 @@ impl<T: Voxel> Grid<T> for Vol<T> {
 
     #[inline(always)]
     fn corners(&self, z: i64, y: i64, x: i64) -> [T; 8] {
-        self.cell(z as usize, y as usize, x as usize)
+        Vol::corners(self, z as usize, y as usize, x as usize)
     }
 }
 
@@ -67,24 +70,25 @@ impl<T: Copy + Sync> Grid<T> for Dense<T> {
     }
 }
 
-/// `decode_dir` for every byte pair; the function is pure, so a table gives the same values
-fn dir_table() -> &'static [[f64; 3]] {
-    static TABLE: OnceLock<Vec<[f64; 3]>> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut t = Vec::with_capacity(65536);
-        for nx in 0..=255u8 {
-            for ny in 0..=255u8 {
-                t.push(decode_dir_calc(nx, ny));
-            }
-        }
-        t
-    })
-}
+/// `(b as f32 as f64 - 128.0) / 127.0` for every byte, the per-axis part of `decode_dir`
+///
+/// A table over byte pairs gives the same values but takes 1.5 MiB, and its lookups missed the cache often
+/// enough to cost the single-threaded tracer a fifth of its time; the rest of `decode_dir` is a few float operations
+const AXIS: [f64; 256] = {
+    let mut t = [0.0f64; 256];
+    let mut b = 0;
+    while b < 256 {
+        t[b] = (b as u8 as f32 as f64 - 128.0) / 127.0;
+        b += 1;
+    }
+    t
+};
 
 /// `decode_dir` (core.py:8): all float64 after the float32 conversion of each byte
-fn decode_dir_calc(nx: u8, ny: u8) -> [f64; 3] {
-    let mut dx = (nx as f32 as f64 - 128.0) / 127.0;
-    let mut dy = (ny as f32 as f64 - 128.0) / 127.0;
+#[inline(always)]
+pub fn decode_dir(nx: u8, ny: u8) -> [f64; 3] {
+    let mut dx = AXIS[nx as usize];
+    let mut dy = AXIS[ny as usize];
     let r2 = dx * dx + dy * dy;
     if r2 <= 1.0 {
         return [dx, dy, (1.0f32 as f64 - r2).sqrt()];
@@ -95,9 +99,138 @@ fn decode_dir_calc(nx: u8, ny: u8) -> [f64; 3] {
     [dx, dy, 0.0f32 as f64]
 }
 
+/// The direction bytes `nx`, `ny` of a voxel as one value, `nx << 8 | ny`
 #[inline(always)]
-pub fn decode_dir(nx: u8, ny: u8) -> [f64; 3] {
-    dir_table()[(nx as usize) << 8 | ny as usize]
+pub const fn pack_dir(nx: u8, ny: u8) -> u16 {
+    (nx as u16) << 8 | ny as u16
+}
+
+/// `decode_dir` of packed direction bytes
+#[inline(always)]
+pub fn decode_packed(d: u16) -> [f64; 3] {
+    decode_dir((d >> 8) as u8, d as u8)
+}
+
+/// The direction field as centrality and the tracer read it: each voxel's `nx` and `ny` as one packed value
+/// ([`pack_dir`])
+///
+/// It is held in the form the centrality device reads. On the CPU that is one packed volume, `Vol<u16>`: the tracer
+/// is bound by direction reads, and one volume instead of two halves their brick lookups and cache lines. The GPU
+/// reads `nx` and `ny` as two volumes, which [`SplitDirs`] reads as packed values. A field is written in its final
+/// form ([`Directions`]) and never converted, since converting one into the other would hold both at once
+pub trait DirField: Grid<u16> {
+    fn shape(&self) -> Shape;
+
+    /// Bytes held by allocated bricks
+    fn resident_bytes(&self) -> usize;
+
+    /// A dense C-order block of packed values with origin `lo` and extent `dims`
+    fn packed_block(&self, lo: Shape, dims: Shape) -> Vec<u16>;
+
+    /// `nx` and `ny` as two volumes for the GPU's centrality, when the field is held that way
+    fn split(&self) -> Option<(&Vol<u8>, &Vol<u8>)>;
+}
+
+impl DirField for Vol<u16> {
+    fn shape(&self) -> Shape {
+        Vol::shape(self)
+    }
+
+    fn resident_bytes(&self) -> usize {
+        Vol::resident_bytes(self)
+    }
+
+    fn packed_block(&self, lo: Shape, dims: Shape) -> Vec<u16> {
+        self.read_block(lo, dims)
+    }
+
+    fn split(&self) -> Option<(&Vol<u8>, &Vol<u8>)> {
+        None
+    }
+}
+
+/// The form a direction field is written in: [`DirForm::Split`] when the GPU computes centrality, which reads `nx`
+/// and `ny` as two volumes, and [`DirForm::Packed`] otherwise
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirForm {
+    Packed,
+    Split,
+}
+
+/// An owned direction field in one of its two forms ([`DirField`])
+pub enum Directions {
+    // both forms are boxed: a volume's handle is a few hundred bytes, and the split form holds two
+    Packed(Box<Vol<u16>>),
+    Split { nx: Box<Vol<u8>>, ny: Box<Vol<u8>> },
+}
+
+impl Directions {
+    /// A field of `shape` in `form` where every voxel reads as straight up, `nx = ny = 128`
+    pub fn new(shape: Shape, form: DirForm) -> Self {
+        match form {
+            DirForm::Packed => Directions::Packed(Box::new(Vol::new(shape, pack_dir(128, 128)))),
+            DirForm::Split => {
+                Directions::Split { nx: Box::new(Vol::new(shape, 128)), ny: Box::new(Vol::new(shape, 128)) }
+            }
+        }
+    }
+
+    /// Copy dense C-order blocks of `nx` and `ny` bytes with origin `lo` and extent `dims` into the field
+    pub fn write_block(&mut self, lo: Shape, dims: Shape, nx: &[u8], ny: &[u8]) {
+        match self {
+            Directions::Packed(dirs) => {
+                let packed: Vec<u16> = nx.iter().zip(ny).map(|(&x, &y)| pack_dir(x, y)).collect();
+                dirs.write_block(lo, dims, &packed);
+            }
+            Directions::Split { nx: to_nx, ny: to_ny } => {
+                to_nx.write_block(lo, dims, nx);
+                to_ny.write_block(lo, dims, ny);
+            }
+        }
+    }
+}
+
+/// A direction field the GPU computed: its `nx` and `ny` volumes, read as packed values
+pub struct SplitDirs<'a> {
+    pub nx: &'a Vol<u8>,
+    pub ny: &'a Vol<u8>,
+}
+
+impl Grid<u16> for SplitDirs<'_> {
+    #[inline(always)]
+    fn dims(&self) -> [i64; 3] {
+        self.nx.dims()
+    }
+
+    #[inline(always)]
+    fn at(&self, z: i64, y: i64, x: i64) -> u16 {
+        pack_dir(self.nx.at(z, y, x), self.ny.at(z, y, x))
+    }
+
+    #[inline(always)]
+    fn corners(&self, z: i64, y: i64, x: i64) -> [u16; 8] {
+        let (nx, ny) = (Grid::corners(self.nx, z, y, x), Grid::corners(self.ny, z, y, x));
+        std::array::from_fn(|k| pack_dir(nx[k], ny[k]))
+    }
+}
+
+impl DirField for SplitDirs<'_> {
+    fn shape(&self) -> Shape {
+        self.nx.shape()
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.nx.resident_bytes() + self.ny.resident_bytes()
+    }
+
+    fn packed_block(&self, lo: Shape, dims: Shape) -> Vec<u16> {
+        let (nx, ny) = (self.nx.read_block(lo, dims), self.ny.read_block(lo, dims));
+        nx.iter().zip(&ny).map(|(&x, &y)| pack_dir(x, y)).collect()
+    }
+
+    fn split(&self) -> Option<(&Vol<u8>, &Vol<u8>)> {
+        Some((self.nx, self.ny))
+    }
 }
 
 /// `encode_dir` (core.py:23), with float32 tangents
@@ -145,7 +278,7 @@ fn cell(d: [i64; 3], mut x: f64, mut y: f64, mut z: f64) -> ([i64; 3], [f32; 3])
 pub fn trilin_u8<G: Grid<u8>>(arr: &G, x: f64, y: f64, z: f64) -> f64 {
     let ([iz, iy, ix], [fz, fy, fx]) = cell(arr.dims(), x, y, z);
     let c = arr.corners(iz, iy, ix);
-    let lerp = |i: usize| (1.0 - fx as f64) * c[i] as f64 + (fx * c[i + 1] as f32) as f64;
+    let lerp = |k: usize| (1.0 - fx as f64) * c[k] as f64 + (fx * c[k + 1] as f32) as f64;
     let p00 = lerp(0);
     let p01 = lerp(2);
     let p10 = lerp(4);
@@ -159,8 +292,8 @@ pub fn trilin_u8<G: Grid<u8>>(arr: &G, x: f64, y: f64, z: f64) -> f64 {
 pub fn trilin_u16<G: Grid<u16>>(arr: &G, x: f64, y: f64, z: f64) -> f64 {
     let ([iz, iy, ix], [fz, fy, fx]) = cell(arr.dims(), x, y, z);
     let fx = fx as f64;
-    let c = arr.corners(iz, iy, ix);
-    let lerp = |i: usize| (1.0 - fx) * c[i] as f64 + fx * c[i + 1] as f64;
+    let c = arr.corners(iz, iy, ix).map(f64::from);
+    let lerp = |k: usize| (1.0 - fx) * c[k] + fx * c[k + 1];
     let p00 = lerp(0);
     let p01 = lerp(2);
     let p10 = lerp(4);
@@ -170,17 +303,17 @@ pub fn trilin_u16<G: Grid<u16>>(arr: &G, x: f64, y: f64, z: f64) -> f64 {
 }
 
 /// The read-only fields one family traces over
-pub struct Fields<'a, P, C, N> {
+pub struct Fields<'a, P, C, D> {
     pub pres: &'a P,
     pub cent: &'a C,
-    pub nx: &'a N,
-    pub ny: &'a N,
+    /// Packed direction bytes, [`pack_dir`]
+    pub dirs: &'a D,
 }
 
-impl<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>> Fields<'_, P, C, N> {
+impl<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Fields<'_, P, C, D> {
     #[inline(always)]
     fn dir_at(&self, z: i64, y: i64, x: i64) -> [f64; 3] {
-        decode_dir(self.nx.at(z, y, x), self.ny.at(z, y, x))
+        decode_packed(self.dirs.at(z, y, x))
     }
 
     /// `trilin_dir_aligned` (core.py:92)
@@ -188,16 +321,17 @@ impl<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>> Fields<'_, P, C, N> {
         let ([iz, iy, ix], [fz, fy, fx]) = cell(self.pres.dims(), x, y, z);
         let (fx, fy, fz) = (fx as f64, fy as f64, fz as f64);
         let (mut vx, mut vy, mut vz) = (0.0f64, 0.0f64, 0.0f64);
-        let (pres, nx, ny) = (self.pres.corners(iz, iy, ix), self.nx.corners(iz, iy, ix), self.ny.corners(iz, iy, ix));
+        let pres = self.pres.corners(iz, iy, ix);
+        let dirs = self.dirs.corners(iz, iy, ix);
         for dz_i in 0..2 {
             let wz = if dz_i == 0 { 1.0 - fz } else { fz };
             for dy_i in 0..2 {
                 let wy = wz * (if dy_i == 0 { 1.0 - fy } else { fy });
                 for dx_i in 0..2 {
                     let w = wy * (if dx_i == 0 { 1.0 - fx } else { fx });
-                    let c = (dz_i * 4 + dy_i * 2 + dx_i) as usize;
-                    let pw = w * (pres[c] as f32 as f64 + 10.0);
-                    let [mut ux, mut uy, mut uz] = decode_dir(nx[c], ny[c]);
+                    let k = 4 * dz_i + 2 * dy_i + dx_i;
+                    let pw = w * (pres[k] as f32 as f64 + 10.0);
+                    let [mut ux, mut uy, mut uz] = decode_packed(dirs[k]);
                     if ux * rx + uy * ry + uz * rz < 0.0 {
                         ux = -ux;
                         uy = -uy;
@@ -317,26 +451,37 @@ pub fn ortho_basis(ux: f64, uy: f64, uz: f64) -> [f64; 6] {
     [e1x, e1y, e1z, e2x, e2y, e2z]
 }
 
-/// Mutable coverage of one family: the reference's count (0, 1, 2) and first marking direction, packed in one
-/// `u16` per voxel
+/// Coverage of one family: the reference's count (0, 1, 2) and first marking direction, packed in one `u16` per
+/// voxel
 ///
 /// 0 is a count of 0 and 1 a count of 2, whose direction the reference never reads; a count of 1 stores the
 /// direction as `nx << 8 | ny`, which is at least 256 because `encode_dir` never returns a 0 byte. One volume
-/// instead of three saves a byte per covered voxel
-pub struct Coverage(Vol<u16>);
+/// instead of three saves a byte per covered voxel.
+///
+/// Seeds are traced on several threads against this shared volume while one [`CoverageWriter`] marks the curves
+/// of committed seeds, in seed order. Every read records the brick it touched in a [`ReadSet`], so the writer can
+/// tell whether anything a seed read has changed since it was traced
+pub struct Coverage(SharedVol);
 
 const UNCOVERED: u16 = 0;
 const COVERED_TWICE: u16 = 1;
 
 impl Coverage {
     pub fn new(shape: [usize; 3]) -> Self {
-        Self(Vol::new(shape, UNCOVERED))
+        Self(SharedVol::new(shape))
     }
 
     /// Whether a voxel has been marked at all
     #[inline]
-    pub fn is_covered(&self, z: i64, y: i64, x: i64) -> bool {
-        self.0.at(z, y, x) != UNCOVERED
+    pub fn is_covered(&self, reads: &mut ReadSet, z: i64, y: i64, x: i64) -> bool {
+        self.read(reads, z, y, x) != UNCOVERED
+    }
+
+    #[inline(always)]
+    fn read(&self, reads: &mut ReadSet, z: i64, y: i64, x: i64) -> u16 {
+        let at = self.0.place(z as usize, y as usize, x as usize);
+        reads.push(at.slot());
+        self.0.get(at)
     }
 
     /// Bytes held by allocated bricks
@@ -346,38 +491,48 @@ impl Coverage {
 
     /// `is_covered_same_dir` (core.py:237)
     #[inline]
-    pub fn covered_same_dir(&self, x: f64, y: f64, z: f64, tx: f64, ty: f64, tz: f64) -> bool {
-        let [d, h, w] = self.0.dims();
+    #[allow(clippy::too_many_arguments)]
+    pub fn covered_same_dir(&self, reads: &mut ReadSet, x: f64, y: f64, z: f64, tx: f64, ty: f64, tz: f64) -> bool {
+        let [d, h, w] = self.0.shape().map(|n| n as i64);
         let ix = (x + 0.5) as i64;
         let iy = (y + 0.5) as i64;
         let iz = (z + 0.5) as i64;
         if ix < 0 || ix >= w || iy < 0 || iy >= h || iz < 0 || iz >= d {
             return false;
         }
-        let c = self.0.at(iz, iy, ix);
+        let c = self.read(reads, iz, iy, ix);
         if c == UNCOVERED {
             return false;
         }
         if c == COVERED_TWICE {
             return true;
         }
-        let [ux, uy, uz] = decode_dir((c >> 8) as u8, c as u8);
+        let [ux, uy, uz] = decode_packed(c);
         (ux * tx + uy * ty + uz * tz).abs() > 0.86
     }
 
-    /// `mark_curve_coverage` (core.py:527) with `core_r = 2.05`
-    pub fn mark<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>>(
-        &mut self,
-        f: &Fields<P, C, N>,
+    /// The voxels `mark_curve_coverage` (core.py:527, `core_r = 2.05`) would update for one curve, in its order
+    ///
+    /// Everything that decides whether a voxel near a point is marked reads only the fields, so it is done here,
+    /// on the tracing thread; only the update itself, which reads the voxel's coverage, is left to
+    /// [`CoverageWriter::apply`]. `first` is the index of `tans[0]` in the seed's [`Traced::tans`]
+    pub fn mark_list<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
+        &self,
+        f: &Fields<P, C, D>,
         pts: &[[f32; 3]],
         tans: &[[f32; 3]],
+        first: usize,
+        out: &mut Vec<Mark>,
     ) {
-        let [d, h, w] = self.0.dims();
+        let [d, h, w] = self.0.shape().map(|n| n as i64);
         let core_r2 = (2.05f64 * 2.05) as f32 as f64;
-        for (p, t) in pts.iter().zip(tans) {
+        for (k, (p, t)) in pts.iter().zip(tans).enumerate() {
             let [px, py, pz] = p.map(|v| v as f64);
             let [tx, ty, tz] = t.map(|v| v as f64);
             let (bnx, bny) = encode_dir(t[0], t[1], t[2]);
+            debug_assert!(bnx != 0);
+            let dir = pack_dir(bnx, bny);
+            let tan = u32::try_from(first + k).expect("a seed's curves hold fewer than 2³² points");
             let c0 = trilin_u16(f.cent, px, py, pz);
             let ix0 = (px + 0.5) as i64;
             let iy0 = (py + 0.5) as i64;
@@ -415,27 +570,101 @@ impl Coverage {
                                 trilin_u16(f.cent, 0.35 * px + 0.65 * xf, 0.35 * py + 0.65 * yf, 0.35 * pz + 0.65 * zf);
                             c0 + 2.0 >= cm1 && cm1 + 3.0 >= cm2 && cm2 + 3.0 >= cq
                         };
-                        if !suppress {
-                            continue;
-                        }
-                        let (zu, yu, xu) = (zz as usize, yy as usize, xx as usize);
-                        let c = self.0.get(zu, yu, xu);
-                        if c == UNCOVERED {
-                            debug_assert!(bnx != 0);
-                            self.0.set(zu, yu, xu, (bnx as u16) << 8 | bny as u16);
-                            continue;
-                        }
-                        // a count of 2 stays 2 whichever way the new direction points
-                        if c == COVERED_TWICE {
-                            continue;
-                        }
-                        let [ux0, uy0, uz0] = decode_dir((c >> 8) as u8, c as u8);
-                        if (ux0 * tx + uy0 * ty + uz0 * tz).abs() <= 0.85 {
-                            self.0.set(zu, yu, xu, COVERED_TWICE);
+                        if suppress {
+                            out.push(Mark { at: self.0.place(zz as usize, yy as usize, xx as usize), dir, tan });
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// The coverage's one writer, which commits seeds in order
+    ///
+    /// # Panics
+    ///
+    /// When called a second time on the same coverage
+    pub fn writer(&self) -> CoverageWriter<'_> {
+        CoverageWriter { vol: self.0.writer(), written: vec![0; WRITTEN_SLOTS].into_boxed_slice() }
+    }
+}
+
+/// The brick slots a seed's tracing read from the coverage, in read order
+///
+/// A slot read again right after itself is kept once; steps mostly stay in one brick, so the set stays short
+#[derive(Default)]
+pub struct ReadSet(Vec<usize>);
+
+impl ReadSet {
+    #[inline(always)]
+    fn push(&mut self, slot: usize) {
+        if self.0.last() != Some(&slot) {
+            self.0.push(slot);
+        }
+    }
+
+    pub fn slots(&self) -> &[usize] {
+        &self.0
+    }
+}
+
+/// One voxel update of [`Coverage::mark_list`]: the encoded direction of the marking point and its tangent's
+/// index in [`Traced::tans`]
+#[derive(Clone, Copy)]
+pub struct Mark {
+    at: Place,
+    dir: u16,
+    tan: u32,
+}
+
+/// The `written` table's size, as a power of two
+const WRITTEN_BITS: u32 = 16;
+const WRITTEN_SLOTS: usize = 1 << WRITTEN_BITS;
+
+/// Applies committed seeds' marks to a [`Coverage`] and checks traced seeds' reads against them
+///
+/// `written` maps each brick slot, by a hash, to one more than the newest seed that changed a voxel in it. Only
+/// the last few dozen seeds matter for a check, so a small table that stays in cache replaces one counter per
+/// slot: slots that share an entry can only make a seed look stale, never current, and a stale seed is traced
+/// again
+pub struct CoverageWriter<'c> {
+    vol: SharedVolWriter<'c>,
+    written: Box<[u32]>,
+}
+
+impl CoverageWriter<'_> {
+    #[inline(always)]
+    fn entry(slot: usize) -> usize {
+        // Fibonacci hashing spreads neighbouring slots over the table
+        ((slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - WRITTEN_BITS)) as usize
+    }
+
+    /// Whether a seed that read `reads` while the first `committed` seeds were committed may have read a value a
+    /// later commit changed
+    pub fn stale(&self, reads: &ReadSet, committed: u32) -> bool {
+        reads.slots().iter().any(|&slot| self.written[Self::entry(slot)] > committed)
+    }
+
+    /// Mark seed `seed`'s curves, as `mark_curve_coverage` does curve by curve and point by point
+    pub fn apply(&mut self, seed: u32, traced: &Traced) {
+        let stamp = seed + 1;
+        for m in &traced.marks {
+            let c = self.vol.get(m.at);
+            let value = match c {
+                UNCOVERED => m.dir,
+                // a count of 2 stays 2 whichever way the new direction points
+                COVERED_TWICE => continue,
+                _ => {
+                    let [tx, ty, tz] = traced.tans[m.tan as usize].map(|v| v as f64);
+                    let [ux0, uy0, uz0] = decode_packed(c);
+                    if (ux0 * tx + uy0 * ty + uz0 * tz).abs() > 0.85 {
+                        continue;
+                    }
+                    COVERED_TWICE
+                }
+            };
+            self.vol.set(m.at, value);
+            self.written[Self::entry(m.at.slot())] = stamp;
         }
     }
 }
@@ -467,16 +696,63 @@ impl Default for Scratch {
     }
 }
 
-/// One accepted raw curve; its tangents only matter for coverage, which is marked as it is accepted
+/// One accepted raw curve; its tangents only matter for coverage, which [`Traced::marks`] holds
 pub struct RawCurve {
     pub pts: Vec<[f32; 3]>,
 }
 
+/// What tracing one seed found, before it is committed: the curves it accepted, the coverage updates they make,
+/// and the coverage bricks it read to decide
+///
+/// Kept and cleared between seeds, so a thread's buffers are reused
+#[derive(Default)]
+pub struct Traced {
+    pub curves: Vec<RawCurve>,
+    pub marks: Vec<Mark>,
+    /// The accepted curves' tangents, which [`Mark::tan`] indexes
+    pub tans: Vec<[f32; 3]>,
+    pub reads: ReadSet,
+}
+
+/// Marks a [`Traced`] keeps room for between seeds: as many as fit a page below the size glibc maps on its own,
+/// leaving room for its chunk header
+///
+/// A seed whose curves are accepted makes thousands, and a window of seeds traced ahead each keeping room for the
+/// largest it has held would add hundreds of MiB. Room below that size stays in a thread's heap, where shrinking it
+/// after each seed made glibc delete and map again a 64 MiB heap for nearly every curve traced: on a dense
+/// PHerc0358 crop that was 110,000 `munmap`s, each one stalling every thread's page faults. Room kept below that
+/// size is never freed, and only the rare larger list is mapped and unmapped
+const MARKS_KEPT: usize = (OWN_MAPPING_BYTES - 4096) / size_of::<Mark>();
+
+impl Traced {
+    /// Give back the room for marks beyond [`MARKS_KEPT`]
+    pub fn trim(&mut self) {
+        if self.marks.capacity() > MARKS_KEPT {
+            self.marks.clear();
+            self.marks.shrink_to(MARKS_KEPT);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.curves.clear();
+        self.marks.clear();
+        self.tans.clear();
+        self.reads.0.clear();
+    }
+
+    /// Drop a result that will not be committed, keeping no more room than [`Traced::trim`] does
+    pub fn discard(&mut self) {
+        self.clear();
+        self.trim();
+    }
+}
+
 /// `trace_half_buf` (core.py:322) with `step_size = 0.75`, `max_low_steps = 3`
 #[allow(clippy::too_many_arguments)]
-fn trace_half<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>>(
-    f: &Fields<P, C, N>,
+fn trace_half<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
+    f: &Fields<P, C, D>,
     cov: &Coverage,
+    reads: &mut ReadSet,
     x0: f64,
     y0: f64,
     z0: f64,
@@ -620,7 +896,7 @@ fn trace_half<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>>(
         } else {
             low_pres_run = 0;
         }
-        if cov.covered_same_dir(nx_p, ny_p, nz_p, ntx, nty, ntz) {
+        if cov.covered_same_dir(reads, nx_p, ny_p, nz_p, ntx, nty, ntz) {
             cov_run += 1;
             if cov_run >= 2 {
                 break;
@@ -660,35 +936,39 @@ fn trace_half<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>>(
     n_pts
 }
 
-/// One iteration of `trace_seed_range` (core.py:882-1016) for seed `i`, with `min_raw_len = 7.5`;
-/// accepted curves are marked into `cov` and appended to `out`
+/// One iteration of `trace_seed_range` (core.py:882-1016) for seed `i`, with `min_raw_len = 7.5`, into `out`
+///
+/// The seed reads `cov` but does not mark it: its accepted curves and the marks they make are left in `out` for
+/// [`CoverageWriter::apply`]. Given the same coverage values at the bricks in `out.reads`, the result is the same
 #[allow(clippy::too_many_arguments)]
-pub fn trace_seed<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>>(
-    f: &Fields<P, C, N>,
-    cov: &mut Coverage,
+pub fn trace_seed<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
+    f: &Fields<P, C, D>,
+    cov: &Coverage,
     s: &mut Scratch,
     seed: [i32; 3],
     primary: bool,
-    out: &mut Vec<RawCurve>,
+    out: &mut Traced,
 ) -> Result<()> {
+    out.clear();
+    let reads = &mut out.reads;
     let [sz, sy, sx] = seed.map(|v| v as i64);
-    if !primary && cov.is_covered(sz, sy, sx) {
+    if !primary && cov.is_covered(reads, sz, sy, sx) {
         return Ok(());
     }
     let [ux, uy, uz] = f.dir_at(sz, sy, sx);
     let (sxf, syf, szf) = (sx as f64, sy as f64, sz as f64);
-    if cov.covered_same_dir(sxf, syf, szf, ux, uy, uz) {
+    if cov.covered_same_dir(reads, sxf, syf, szf, ux, uy, uz) {
         return Ok(());
     }
     let [cx, cy, cz] = f.recenter(sx as f32 as f64, sy as f32 as f64, sz as f32 as f64, ux, uy, uz, 1.5, 4);
-    if cov.covered_same_dir(cx, cy, cz, ux, uy, uz) {
+    if cov.covered_same_dir(reads, cx, cy, cz, ux, uy, uz) {
         return Ok(());
     }
     if trilin_u8(f.pres, cx, cy, cz) < 76.5 {
         return Ok(());
     }
     let [ux, uy, uz] = f.dir_aligned(cx, cy, cz, ux, uy, uz);
-    let nf = trace_half(f, cov, cx, cy, cz, ux, uy, uz, &mut s.pts_f, &mut s.tans_f);
+    let nf = trace_half(f, cov, reads, cx, cy, cz, ux, uy, uz, &mut s.pts_f, &mut s.tans_f);
     if nf == HALF {
         bail!("Full-scroll half-path buffer reached; refusing an artificial endpoint");
     }
@@ -711,7 +991,7 @@ pub fn trace_seed<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>>(
             buz /= bn;
         }
     }
-    let nb = trace_half(f, cov, cx, cy, cz, bux, buy, buz, &mut s.pts_b, &mut s.tans_b);
+    let nb = trace_half(f, cov, reads, cx, cy, cz, bux, buy, buz, &mut s.pts_b, &mut s.tans_b);
     if nb == HALF {
         bail!("Full-scroll half-path buffer reached; refusing an artificial endpoint");
     }
@@ -745,8 +1025,10 @@ pub fn trace_seed<P: Grid<u8>, C: Grid<u16>, N: Grid<u8>>(
         if (arc_len as f64) < req_len {
             continue;
         }
-        cov.mark(f, &s.pts_c[a..b], &s.tans_c[a..b]);
-        out.push(RawCurve { pts: s.pts_c[a..b].to_vec() });
+        // a later span's marks follow an earlier one's, as `mark_curve_coverage` marks them curve by curve
+        cov.mark_list(f, &s.pts_c[a..b], &s.tans_c[a..b], out.tans.len(), &mut out.marks);
+        out.tans.extend_from_slice(&s.tans_c[a..b]);
+        out.curves.push(RawCurve { pts: s.pts_c[a..b].to_vec() });
     }
     Ok(())
 }
@@ -869,13 +1151,16 @@ pub fn valid_curve_spans(pts: &[[f32; 3]], seed_index: i64) -> Result<Vec<(usize
     Ok(spans)
 }
 
+/// Fewest points `fit_curve` smooths and resamples; a shorter curve is finished as it was traced
+pub const MIN_FIT_POINTS: usize = 4;
+
 /// `fit_and_resample_splines` (core.py:590) for one curve with `target_step = 0.8`, `smooth_iters = 10`,
 /// `max_dev = 0.3` and `min_final_len = 0`: the smoothed points and the resampled count (0 when the
 /// curve has fewer than 4 points)
 pub fn fit_curve<P: Grid<u8>>(pts: &[[f32; 3]], pres: &P) -> (Vec<[f32; 3]>, usize) {
     const MAX_DEV: f64 = 0.3;
     let m = pts.len();
-    if m < 4 {
+    if m < MIN_FIT_POINTS {
         return (pts.to_vec(), 0);
     }
     let mut buf = pts.to_vec();
@@ -966,6 +1251,45 @@ pub fn evaluate_curve(smoothed: &[[f32; 3]], n_out: usize, shape: [usize; 3]) ->
 mod tests {
     use super::*;
 
+    /// The tracer reads the GPU's two volumes and the CPU's packed volume as the same values, and a packed field
+    /// split for the GPU's centrality gives back the two volumes, including bricks only one of them had written
+    #[test]
+    fn both_direction_forms_read_the_same() {
+        let shape = [20, 33, 17];
+        let (mut nx, mut ny) = (Vol::new(shape, 128u8), Vol::new(shape, 128u8));
+        let mut packed = Vol::new(shape, pack_dir(128, 128));
+        let (mut written_packed, mut written_split) =
+            (Directions::new(shape, DirForm::Packed), Directions::new(shape, DirForm::Split));
+        for ([z, y, x], bx, by) in
+            [([1, 2, 3], 7, 250), ([1, 2, 4], 9, 128), ([18, 30, 16], 1, 128), ([5, 20, 9], 128, 129)]
+        {
+            nx.set(z, y, x, bx);
+            ny.set(z, y, x, by);
+            packed.set(z, y, x, pack_dir(bx, by));
+            for written in [&mut written_packed, &mut written_split] {
+                written.write_block([z, y, x], [1, 1, 1], &[bx], &[by]);
+            }
+        }
+
+        let split = SplitDirs { nx: &nx, ny: &ny };
+        assert_eq!(split.at(1, 2, 3), pack_dir(7, 250));
+        assert_eq!(split.corners(1, 2, 3), packed.corners(1, 2, 3));
+        assert_eq!(split.corners(1, 2, 3)[1], pack_dir(9, 128));
+        assert_eq!(split.packed_block([0; 3], shape), packed.packed_block([0; 3], shape));
+
+        assert!(packed.split().is_none());
+        assert_eq!(
+            split.split().map(|(x, y)| (x.read_block([0; 3], shape), y.read_block([0; 3], shape))),
+            Some((nx.read_block([0; 3], shape), ny.read_block([0; 3], shape)))
+        );
+
+        // the field the CPU writes in either form reads the same values
+        let Directions::Packed(written) = written_packed else { panic!("packed form") };
+        assert_eq!(written.packed_block([0; 3], shape), packed.packed_block([0; 3], shape));
+        let Directions::Split { nx: wx, ny: wy } = written_split else { panic!("split form") };
+        assert_eq!(SplitDirs { nx: &wx, ny: &wy }.packed_block([0; 3], shape), packed.packed_block([0; 3], shape));
+    }
+
     #[test]
     fn decode_matches_reference_formula() {
         // nx = ny = 128 is the straight-up direction; 255, 255 has r2 > 1 and is renormalized flat
@@ -975,6 +1299,36 @@ mod tests {
         assert!(((x * x + y * y).sqrt() - 1.0).abs() < 1e-12);
         assert_eq!(encode_dir(0.0, 0.0, 1.0), (128, 128));
         assert_eq!(encode_dir(1.0, -1.0, -0.5), (1, 255));
+    }
+
+    #[test]
+    fn a_seed_is_stale_once_a_later_commit_changes_a_brick_it_read() {
+        let cov = Coverage::new([40, 70, 70]);
+        let mut reads = ReadSet::default();
+        assert!(!cov.is_covered(&mut reads, 20, 20, 20));
+        assert!(!cov.covered_same_dir(&mut reads, 60.0, 60.0, 30.0, 0.0, 0.0, 1.0));
+        assert_eq!(reads.slots().len(), 2);
+
+        // seed 3 marks a voxel in the first brick read: a seed traced once 4 seeds were committed saw the mark, one
+        // traced when only 3 were did not
+        let mut writer = cov.writer();
+        let mut traced = Traced::default();
+        traced.tans.push([0.0, 0.0, 1.0]);
+        traced.marks.push(Mark { at: cov.0.place(21, 22, 23), dir: pack_dir(128, 128), tan: 0 });
+        assert!(!writer.stale(&reads, 3));
+        writer.apply(3, &traced);
+        assert!(writer.stale(&reads, 3));
+        assert!(!writer.stale(&reads, 4));
+        assert!(cov.is_covered(&mut ReadSet::default(), 21, 22, 23));
+
+        // a count of 1 becomes 2 for a crossing direction and stays 1 for the same one
+        traced.marks[0].dir = pack_dir(255, 128);
+        traced.tans[0] = [0.0, 0.0, 1.0];
+        writer.apply(4, &traced);
+        assert_eq!(cov.0.get(cov.0.place(21, 22, 23)), pack_dir(128, 128));
+        traced.tans[0] = [1.0, 0.0, 0.0];
+        writer.apply(5, &traced);
+        assert_eq!(cov.0.get(cov.0.place(21, 22, 23)), COVERED_TWICE);
     }
 
     #[test]

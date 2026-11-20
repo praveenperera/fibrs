@@ -2,7 +2,7 @@
 
 use rayon::prelude::*;
 
-use crate::kernels::{Dense, Grid};
+use crate::kernels::{Dense, DirField, Grid};
 use crate::pyfmt::argsort_u16;
 use crate::stage1::{Arith, stage1};
 use crate::vol::{Shape, Vol};
@@ -79,7 +79,24 @@ impl<'a> Presence<'a> {
         if a == 0 {
             return 0;
         }
-        presence(a, self.other.locate(z, y, x).0[at])
+        Self::combine(a, self.other.locate(z, y, x).0[at])
+    }
+
+    /// Presence from an own and an other value
+    #[inline(always)]
+    fn combine(own: u8, other: u8) -> u8 {
+        if own < other { 0 } else { (own as u16 + other as u16).min(255) as u8 }
+    }
+
+    /// The values at the eight corners of an in-bounds cell, as [`Vol::corners`]
+    #[inline(always)]
+    pub fn corners(&self, z: usize, y: usize, x: usize) -> [u8; 8] {
+        let own = self.own.corners(z, y, x);
+        if own == [0; 8] {
+            return own;
+        }
+        let other = self.other.corners(z, y, x);
+        std::array::from_fn(|k| Self::combine(own[k], other[k]))
     }
 
     /// A dense C-order block with origin `lo` and extent `dims`
@@ -92,7 +109,7 @@ impl<'a> Presence<'a> {
                 self.own.read_row(lo[0] + z, lo[1] + y, lo[2], row);
                 self.other.read_row(lo[0] + z, lo[1] + y, lo[2], &mut other);
                 for (v, &b) in row.iter_mut().zip(&other) {
-                    *v = presence(*v, b);
+                    *v = Self::combine(*v, b);
                 }
             }
         }
@@ -100,7 +117,7 @@ impl<'a> Presence<'a> {
     }
 
     /// Whether any voxel of the block `[lo, lo + dims)` satisfies `pred`; presence is 0 wherever the family's
-    /// own pooled prediction is, so only its allocated bricks are visited
+    /// own pooled prediction is, so only its allocated sub-bricks are visited
     pub fn any_in(&self, lo: Shape, dims: Shape, pred: impl Fn(u8) -> bool) -> bool {
         self.own.any_allocated_in(lo, dims, |z, y, x| pred(self.get(z, y, x)))
     }
@@ -119,21 +136,8 @@ impl Grid<u8> for Presence<'_> {
 
     #[inline(always)]
     fn corners(&self, z: i64, y: i64, x: i64) -> [u8; 8] {
-        let at = [z, y, x].map(|v| v as usize);
-        let own = self.own.cell(at[0], at[1], at[2]);
-        // presence is 0 wherever the family's own prediction is, as in `get`
-        if own == [0; 8] {
-            return own;
-        }
-        let other = self.other.cell(at[0], at[1], at[2]);
-        std::array::from_fn(|c| presence(own[c], other[c]))
+        Presence::corners(self, z as usize, y as usize, x as usize)
     }
-}
-
-/// Presence from the family's own pooled prediction and the other's
-#[inline(always)]
-fn presence(own: u8, other: u8) -> u8 {
-    if own < other { 0 } else { (own as u16 + other as u16).min(255) as u8 }
 }
 
 /// The reference's `tiles(shape, size)` order: C order over tile origins
@@ -157,7 +161,7 @@ type TileFields = (Shape, Shape, Vec<u16>, Vec<u8>);
 
 /// Centrality and seeds over the reference's 128³ tiles with an 8-voxel halo, tiles in parallel, in the rounding
 /// of the reference's CPU kernel ([`crate::stage1::Separate`]) or its CUDA kernels ([`crate::stage1::Fused`])
-pub fn centrality<A: Arith>(pres: &Presence, nx: &Vol<u8>, ny: &Vol<u8>) -> FamilyFields {
+pub fn centrality<A: Arith, D: DirField>(pres: &Presence, dirs: &D) -> FamilyFields {
     let shape = pres.shape();
     assert!(
         shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d)).is_some_and(|n| n <= Seed::MAX_VOXELS),
@@ -170,7 +174,7 @@ pub fn centrality<A: Arith>(pres: &Presence, nx: &Vol<u8>, ny: &Vol<u8>) -> Fami
     // at once stay small; tile cores are disjoint, so the order they are written in does not matter
     for part in jobs.chunks(4 * rayon::current_num_threads()) {
         let results: Vec<Option<TileFields>> =
-            part.par_iter().map(|&(start, end)| centrality_tile::<A>(pres, nx, ny, start, end)).collect();
+            part.par_iter().map(|&(start, end)| centrality_tile::<A, D>(pres, dirs, start, end)).collect();
         for (start, inner, c, s) in results.into_iter().flatten() {
             cent.write_block(start, inner, &c);
             let mut i = 0;
@@ -194,13 +198,7 @@ pub fn centrality<A: Arith>(pres: &Presence, nx: &Vol<u8>, ny: &Vol<u8>) -> Fami
 }
 
 /// One tile's core centrality and seeds, or None when no voxel of the tile and its halo reaches presence 64
-fn centrality_tile<A: Arith>(
-    pres: &Presence,
-    nx: &Vol<u8>,
-    ny: &Vol<u8>,
-    start: Shape,
-    end: Shape,
-) -> Option<TileFields> {
+fn centrality_tile<A: Arith, D: DirField>(pres: &Presence, dirs: &D, start: Shape, end: Shape) -> Option<TileFields> {
     let shape = pres.shape();
     let lo = start.map(|v| v.saturating_sub(TILE_HALO));
     let hi = [0, 1, 2].map(|a| (end[a] + TILE_HALO).min(shape[a]));
@@ -209,9 +207,8 @@ fn centrality_tile<A: Arith>(
     if !pres.any_in(lo, dims, |p| p >= 64) {
         return None;
     }
-    let block = |v: &Vol<u8>| Dense { dims, data: v.read_block(lo, dims) };
     let pres = Dense { dims, data: pres.read_block(lo, dims) };
-    let (cent, seeds) = stage1::<A>(&pres, &block(nx), &block(ny));
+    let (cent, seeds) = stage1::<A>(&pres, &Dense { dims, data: dirs.packed_block(lo, dims) });
     let inner = [0, 1, 2].map(|a| end[a] - start[a]);
     let off = [0, 1, 2].map(|a| start[a] - lo[a]);
     let mut c = Vec::with_capacity(inner.iter().product());
@@ -237,21 +234,20 @@ pub struct Catalogue {
 
 /// `prepare_seeds` (prepare.py:162): priority 2 then 1, each in descending centrality (reversed
 /// unstable argsort), then a stable sort by region
+///
+/// Each step runs on the pool and gives exactly the serial result: the splits and gathers keep their order,
+/// the argsort sorts disjoint partitions in parallel, and the stable sort by region is a counting sort
 pub fn catalogue(seeds: &[Seed], cent: &Vol<u16>) -> Catalogue {
     let shape = cent.shape();
-    let mut by_priority: [Vec<[i32; 3]>; 2] = [Vec::new(), Vec::new()];
-    for &seed in seeds {
-        let v = seed.priority();
-        if v == 2 || v == 1 {
-            by_priority[(v == 1) as usize].push(seed.coords(shape));
-        }
-    }
+    let of_priority =
+        |p: u8| -> Vec<[i32; 3]> { seeds.par_iter().filter(|s| s.priority() == p).map(|s| s.coords(shape)).collect() };
+    let by_priority = [of_priority(2), of_priority(1)];
     let n_primary = by_priority[0].len();
     let mut ordered = Vec::with_capacity(n_primary + by_priority[1].len());
     for raw in &by_priority {
-        let values: Vec<u16> = raw.iter().map(|c| cent.get(c[0] as usize, c[1] as usize, c[2] as usize)).collect();
+        let values: Vec<u16> = raw.par_iter().map(|c| cent.get(c[0] as usize, c[1] as usize, c[2] as usize)).collect();
         let order = argsort_u16(&values);
-        ordered.extend(order.iter().rev().map(|&i| raw[i]));
+        ordered.par_extend(order.par_iter().rev().map(|&i| raw[i]));
     }
     const REGION: usize = 1024;
     let grid = shape.map(|n| n.div_ceil(REGION));
@@ -259,7 +255,7 @@ pub fn catalogue(seeds: &[Seed], cent: &Vol<u16>) -> Catalogue {
         let r = c.map(|v| v as usize / REGION);
         (r[0] * grid[1] + r[1]) * grid[2] + r[2]
     };
-    let keys: Vec<usize> = ordered.iter().map(key).collect();
+    let keys: Vec<usize> = ordered.par_iter().map(key).collect();
     let n_regions = grid.iter().product();
     let mut counts = vec![0usize; n_regions];
     let mut primary = vec![0usize; n_regions];
@@ -269,12 +265,94 @@ pub fn catalogue(seeds: &[Seed], cent: &Vol<u16>) -> Catalogue {
             primary[k] += 1;
         }
     }
-    let mut idx: Vec<usize> = (0..ordered.len()).collect();
-    idx.sort_by_key(|&i| keys[i]);
-    let coords = idx.iter().map(|&i| ordered[i]).collect();
     let mut starts = vec![0usize; n_regions + 1];
     for r in 0..n_regions {
         starts[r + 1] = starts[r] + counts[r];
     }
+    // a counting sort by region, which keeps each region's seeds in their order as the stable sort did
+    let mut next = starts.clone();
+    let mut coords = vec![[0i32; 3]; ordered.len()];
+    for (c, &k) in ordered.iter().zip(&keys) {
+        coords[next[k]] = *c;
+        next[k] += 1;
+    }
     Catalogue { coords, starts, primary }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pyfmt::tests::serial_argsort_u16;
+
+    /// The catalogue as it was built on one thread, the reference for [`catalogue`]
+    fn serial_catalogue(seeds: &[Seed], cent: &Vol<u16>) -> Catalogue {
+        let shape = cent.shape();
+        let mut by_priority: [Vec<[i32; 3]>; 2] = [Vec::new(), Vec::new()];
+        for &seed in seeds {
+            let v = seed.priority();
+            if v == 2 || v == 1 {
+                by_priority[(v == 1) as usize].push(seed.coords(shape));
+            }
+        }
+        let n_primary = by_priority[0].len();
+        let mut ordered = Vec::with_capacity(n_primary + by_priority[1].len());
+        for raw in &by_priority {
+            let values: Vec<u16> = raw.iter().map(|c| cent.get(c[0] as usize, c[1] as usize, c[2] as usize)).collect();
+            let order = serial_argsort_u16(&values);
+            ordered.extend(order.iter().rev().map(|&i| raw[i]));
+        }
+        const REGION: usize = 1024;
+        let grid = shape.map(|n| n.div_ceil(REGION));
+        let key = |c: &[i32; 3]| {
+            let r = c.map(|v| v as usize / REGION);
+            (r[0] * grid[1] + r[1]) * grid[2] + r[2]
+        };
+        let keys: Vec<usize> = ordered.iter().map(key).collect();
+        let n_regions = grid.iter().product();
+        let mut counts = vec![0usize; n_regions];
+        let mut primary = vec![0usize; n_regions];
+        for (i, &k) in keys.iter().enumerate() {
+            counts[k] += 1;
+            if i < n_primary {
+                primary[k] += 1;
+            }
+        }
+        let mut idx: Vec<usize> = (0..ordered.len()).collect();
+        idx.sort_by_key(|&i| keys[i]);
+        let coords = idx.iter().map(|&i| ordered[i]).collect();
+        let mut starts = vec![0usize; n_regions + 1];
+        for r in 0..n_regions {
+            starts[r + 1] = starts[r] + counts[r];
+        }
+        Catalogue { coords, starts, primary }
+    }
+
+    /// The pooled catalogue is the serial one: the same seeds in the same order, regions and primary counts,
+    /// with many equal centralities and seeds in every region of a 2 × 2 grid
+    #[test]
+    fn pooled_catalogue_is_the_serial_one() {
+        let shape = [8, 1500, 1100];
+        let mut cent = Vol::new(shape, 0u16);
+        let mut state = 11u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let voxels = shape.iter().product::<usize>();
+        let seeds: Vec<Seed> = (0..300_000)
+            .map(|_| {
+                let index = next() % voxels;
+                let [z, y, x] = [index / (shape[1] * shape[2]), index / shape[2] % shape[1], index % shape[2]];
+                cent.set(z, y, x, (next() % 50) as u16);
+                Seed::from_raw(((index as u64) << 8) | (next() % 3) as u64)
+            })
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let pooled = pool.install(|| catalogue(&seeds, &cent));
+        let serial = serial_catalogue(&seeds, &cent);
+        assert!(pooled.coords == serial.coords);
+        assert_eq!(pooled.starts, serial.starts);
+        assert_eq!(pooled.primary, serial.primary);
+        assert!(pooled.starts.windows(2).all(|w| w[1] > w[0]), "every region should hold seeds: {:?}", pooled.starts);
+    }
 }

@@ -104,7 +104,9 @@ jobs:
       # the wheel on the oldest and a current CPython, then the drop-in into a venv with the original installed from
       # its tagged source, so VENV/bin/avf-spline-generator runs the binary. The synthetic fixture is traced through
       # the drop-in and through python -m fibrs, and both must write what the original wrote for it
-      # (tests/fixtures/synthetic/reference.afv); --restore must leave the wheel's fibrs in place
+      # (tests/fixtures/synthetic/reference.afv). So must the drop-in tracing no seed ahead of the commit point
+      # (FIBRS_DEBUG_WINDOW=1), and tracing every seed traced ahead again (FIBRS_DEBUG_RETRACE=1); --restore must
+      # leave the wheel's fibrs in place
       - name: Install the wheel and the drop-in, and trace the fixture
         shell: bash
         working-directory: ${{ runner.temp }}
@@ -150,7 +152,9 @@ jobs:
           test -e venv-ref/bin/avf-spline-generator.reference
           test "$(venv-ref/bin/avf-spline-generator --version)" = 0.2.0
           fixture="$GITHUB_WORKSPACE/tests/fixtures/synthetic"
-          for entry in "venv-ref/bin/avf-spline-generator" "venv-ref/bin/python -m fibrs"; do
+          for entry in "venv-ref/bin/avf-spline-generator" "venv-ref/bin/python -m fibrs" \
+            "env FIBRS_DEBUG_WINDOW=1 venv-ref/bin/avf-spline-generator" \
+            "env FIBRS_DEBUG_RETRACE=1 venv-ref/bin/avf-spline-generator"; do
             rm -rf trace
             # the macOS runners have 3 cores, and --threads can't exceed the core count; the output doesn't
             # depend on it

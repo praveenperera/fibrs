@@ -7,7 +7,9 @@
 
 use std::alloc::{Allocator, Global};
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
+use std::mem::MaybeUninit;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Result, bail, ensure, eyre};
@@ -296,18 +298,19 @@ impl Predictions {
     /// from `alloc`; returns the chunk's origin and extent too. NPY input is served in blocks of the same size
     ///
     /// A whole uint8 Blosc chunk holding both channels, which is what prediction writers store, is decoded
-    /// straight into the returned buffer, its compressed bytes read into another buffer from `alloc`; anything
+    /// straight into the returned buffer, its compressed bytes read into a buffer from `packed`; anything
     /// else is read through [`Predictions::read_u8`]'s path into a buffer from `alloc`
-    pub fn read_chunk_in<A: Allocator + Copy>(
+    pub fn read_chunk_in<A: Allocator + Copy, P: Allocator>(
         &self,
         key: [usize; 3],
         edge: [usize; 3],
         alloc: A,
+        packed: P,
     ) -> Result<NativeChunk<A>> {
         let lo = [0, 1, 2].map(|a| key[a] * edge[a]);
         let hi = [0, 1, 2].map(|a| (lo[a] + edge[a]).min(self.shape[a]));
         let dims = [0, 1, 2].map(|a| hi[a] - lo[a]);
-        if let Some(data) = self.whole_chunk_in(key, edge, dims, alloc)? {
+        if let Some(data) = self.whole_chunk_in(key, edge, dims, alloc, packed)? {
             return Ok(NativeChunk { lo, dims, data });
         }
         Ok(NativeChunk { lo, dims, data: self.read_u8_in(lo, hi, alloc)? })
@@ -316,18 +319,20 @@ impl Predictions {
     /// The fast path of [`Predictions::read_chunk_in`]: the chunk's decoded bytes are already `(2, dims)` in C order
     /// when its file holds both channels of an unclipped uint8 C-order chunk, so `read_raw`'s copy is the identity;
     /// `None` when the chunk is not of that kind
-    fn whole_chunk_in<A: Allocator + Copy>(
+    fn whole_chunk_in<A: Allocator + Copy, P: Allocator>(
         &self,
         key: [usize; 3],
         edge: [usize; 3],
         dims: [usize; 3],
         alloc: A,
+        packed: P,
     ) -> Result<Option<Vec<u8, A>>> {
         if self.slab_layout() != Some(edge) || dims != edge {
             return Ok(None);
         }
         let n = 2 * dims.iter().product::<usize>();
-        let mut out = match self.packed_chunk_in(key, alloc)? {
+        // the compressed bytes come from `packed`, so they never take the room `alloc` keeps for decoded chunks
+        let mut out = match self.packed_chunk_in(key, packed)? {
             PackedChunk::Fill(fill) => {
                 let mut out = Vec::with_capacity_in(n, alloc);
                 out.resize(n, fill);
@@ -359,7 +364,7 @@ impl Predictions {
         let Store::Zarr { dir, sep, fill, .. } = &self.store else { bail!("only Zarr chunks are packed") };
         let name = format!("0{sep}{}{sep}{}{sep}{}", key[0], key[1], key[2]);
         let path = dir.join(&name);
-        let mut file = match fs::File::open(&path) {
+        let file = match fs::File::open(&path) {
             Ok(f) => f,
             // a uint8 fill value is one byte, the same in both channels, so channel order does not matter
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(PackedChunk::Fill(fill[0])),
@@ -367,38 +372,72 @@ impl Predictions {
         };
         let size = file.metadata().map_err(|e| eyre!("{}: {e}", path.display()))?.len() as usize;
         let mut bytes = Vec::with_capacity_in(size, alloc);
-        bytes.resize(size, 0);
-        file.read_exact(&mut bytes).map_err(|e| eyre!("{}: {e}", path.display()))?;
+        read_exact_uninit(&file, &mut bytes.spare_capacity_mut()[..size])
+            .map_err(|e| eyre!("{}: {e}", path.display()))?;
+        // SAFETY: the read filled all `size` bytes
+        unsafe { bytes.set_len(size) };
         Ok(PackedChunk::Blosc(bytes))
     }
 
-    /// Decode z planes `planes` of both channels of a packed chunk into `out`, V then H, each `(planes, cy, cx)`
-    /// at the stored extent of [`Predictions::slab_layout`]
+    /// Decode z planes `planes` of both channels of a packed chunk into `out`, which must be empty, V then H, each
+    /// `(planes, cy, cx)` at the stored extent of [`Predictions::slab_layout`]
     ///
     /// Blosc compresses a chunk in independent blocks (128 KiB, 8 planes of 128 × 128, in prediction zarrs), and
-    /// only the blocks the planes fall in are decoded
-    pub fn decode_planes<A: Allocator>(
+    /// only the blocks the planes fall in are decoded. They are decoded into `out`'s spare capacity, which is
+    /// reserved as needed: zeroing a buffer that the decode overwrites whole took longer than reading the slab's
+    /// compressed bytes
+    pub fn decode_planes<A: Allocator, B: Allocator>(
         &self,
         packed: &PackedChunk<A>,
         planes: std::ops::Range<usize>,
-        out: &mut [u8],
+        out: &mut Vec<u8, B>,
     ) -> Result<()> {
         let edge = self.slab_layout().ok_or_else(|| eyre!("the array's chunks cannot be decoded by planes"))?;
         let plane = edge[1] * edge[2];
         let channel = edge[0] * plane;
         let len = planes.len() * plane;
-        ensure!(planes.end <= edge[0] && out.len() == 2 * len, "planes {planes:?} do not fit a {edge:?} chunk");
-        let bytes = match packed {
-            PackedChunk::Fill(fill) => {
-                out.fill(*fill);
-                return Ok(());
+        ensure!(planes.end <= edge[0] && out.is_empty(), "planes {planes:?} do not fit a {edge:?} chunk");
+        out.reserve_exact(2 * len);
+        let spare = &mut out.spare_capacity_mut()[..2 * len];
+        match packed {
+            PackedChunk::Fill(fill) => spare.fill(MaybeUninit::new(*fill)),
+            PackedChunk::Blosc(bytes) => {
+                let (v, h) = spare.split_at_mut(len);
+                // stored channel order is V, H, or H, V when `reverse`
+                let parts = if self.reverse { [h, v] } else { [v, h] };
+                frame_channel_ranges(bytes, channel, planes.start * plane, parts)?;
             }
+        }
+        // SAFETY: both channels' `len` bytes were written, by the fill or by a decode that returned success
+        unsafe { out.set_len(2 * len) };
+        Ok(())
+    }
+
+    /// Where planes `planes` of both channels of a packed chunk are, V then H, for a decoder outside c-blosc (the
+    /// GPU's zstd), when each channel's planes are one block it can reproduce on its own; `None` when they are not,
+    /// and [`Predictions::decode_planes`] decodes them instead
+    ///
+    /// Each channel's planes must be exactly one Blosc block: a single zstd frame or a block stored as is, with no
+    /// shuffle to undo (byte shuffle at one-byte items moves nothing) and no split into streams per item byte
+    // only GPU finishing reads slabs this way
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    pub fn plane_blocks<A: Allocator>(
+        &self,
+        packed: &PackedChunk<A>,
+        planes: std::ops::Range<usize>,
+    ) -> Option<[BlockSource; 2]> {
+        let edge = self.slab_layout()?;
+        let plane = edge[1] * edge[2];
+        if planes.is_empty() || planes.end > edge[0] {
+            return None;
+        }
+        let bytes = match packed {
+            PackedChunk::Fill(fill) => return Some([BlockSource::Fill(*fill), BlockSource::Fill(*fill)]),
             PackedChunk::Blosc(bytes) => bytes,
         };
-        let (v, h) = out.split_at_mut(len);
+        let [first, second] = frame_channel_blocks(bytes, edge[0] * plane, planes.start * plane, planes.len() * plane)?;
         // stored channel order is V, H, or H, V when `reverse`
-        let parts = if self.reverse { [h, v] } else { [v, h] };
-        frame_channel_ranges(bytes, channel, planes.start * plane, parts)
+        Some(if self.reverse { [second, first] } else { [first, second] })
     }
 
     /// Whether the array's Blosc blocks each fall within runs of `planes` planes, so decoding those planes decodes
@@ -465,6 +504,17 @@ pub enum PackedChunk<A: Allocator> {
     /// The chunk's Blosc frame
     Blosc(Vec<u8, A>),
     /// A chunk the writer never stored: every voxel holds the fill value
+    Fill(u8),
+}
+
+/// Where one channel's run of planes is in a packed chunk, as [`Predictions::plane_blocks`] finds it
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockSource {
+    /// One zstd frame of the chunk's bytes that decodes to the run, its header checked by [`zstd_frame_fits`]
+    Zstd(std::ops::Range<usize>),
+    /// The run's bytes as stored: a block zstd could not shrink, or a chunk Blosc stored uncompressed
+    Raw(std::ops::Range<usize>),
+    /// A chunk the writer never stored: every byte of the run is this value
     Fill(u8),
 }
 
@@ -581,20 +631,31 @@ struct FrameInfo {
     blocksize: usize,
 }
 
+/// c-blosc's `BLOSC_MAX_BLOCKSIZE`: the largest block it decodes, so its scratch of three blocks and a size per
+/// item byte fits an `int`
+const BLOSC_MAX_BLOCKSIZE: usize = (i32::MAX as usize - 255 * 4) / 3;
+
 /// Validate a Blosc 1 frame and read its header: version, version, flags, typesize, then nbytes, blocksize and
 /// cbytes as little-endian u32
+///
+/// Refuses the block and item sizes c-blosc's decoders refuse, so a frame they would not decode gives no block
+/// sources for a decoder outside c-blosc either
 fn blosc_frame_info(src: &[u8]) -> Result<FrameInfo> {
     let mut nbytes = 0usize;
     // SAFETY: c-blosc reads at most `src.len()` bytes of the header to validate it
     let valid = unsafe { blosc_src::blosc_cbuffer_validate(src.as_ptr().cast(), src.len(), &mut nbytes) };
     ensure!(valid == 0 && src.len() >= 16, "not a valid Blosc frame");
     let blocksize = u32::from_le_bytes(src[8..12].try_into().expect("4 bytes")) as usize;
-    Ok(FrameInfo { nbytes, typesize: src[3] as usize, blocksize })
+    let typesize = src[3] as usize;
+    // c-blosc decodes an empty frame without reading its block size, which it writes as 0
+    let sized = blocksize > 0 && blocksize <= nbytes.min(BLOSC_MAX_BLOCKSIZE) && typesize > 0;
+    ensure!(nbytes == 0 || sized, "Blosc frame has {blocksize}-byte blocks of {typesize}-byte items");
+    Ok(FrameInfo { nbytes, typesize, blocksize })
 }
 
 /// Decode the same byte range of both channels of a frame holding two channels of `channel` bytes each: bytes
 /// `start..` of each channel into the matching part, decoding only the blocks they fall in where it can
-fn frame_channel_ranges(bytes: &[u8], channel: usize, start: usize, parts: [&mut [u8]; 2]) -> Result<()> {
+fn frame_channel_ranges(bytes: &[u8], channel: usize, start: usize, parts: [&mut [MaybeUninit<u8>]; 2]) -> Result<()> {
     // a frame of another size would put one channel's bytes where the other's are read
     let frame = blosc_frame_info(bytes)?;
     ensure!(frame.nbytes == 2 * channel, "chunk frame holds {} bytes, expected {}", frame.nbytes, 2 * channel);
@@ -615,7 +676,7 @@ fn frame_channel_ranges(bytes: &[u8], channel: usize, start: usize, parts: [&mut
     // than the range: reading each channel's range would decode a block holding both twice
     let all = blosc_decompress(bytes)?;
     for (at, part) in starts.into_iter().zip(parts) {
-        part.copy_from_slice(&all[at..at + len]);
+        part.write_copy_of_slice(&all[at..at + len]);
     }
     Ok(())
 }
@@ -637,8 +698,9 @@ fn item_ranges_decode_whole_blocks(frame: &FrameInfo) -> bool {
     frame.typesize > 0 && frame.blocksize > 0 && frame.blocksize.is_multiple_of(frame.typesize)
 }
 
-/// Decode bytes `start..start + out.len()` of one Blosc 1 frame into `out`, decoding only the blocks they fall in
-fn blosc_getitem(src: &[u8], start: usize, out: &mut [u8]) -> Result<()> {
+/// Decode bytes `start..start + out.len()` of one Blosc 1 frame into `out`, decoding only the blocks they fall in;
+/// on success every byte of `out` is written
+fn blosc_getitem(src: &[u8], start: usize, out: &mut [MaybeUninit<u8>]) -> Result<()> {
     let frame = blosc_frame_info(src)?;
     let FrameInfo { nbytes, typesize, blocksize } = frame;
     ensure!(
@@ -653,6 +715,116 @@ fn blosc_getitem(src: &[u8], start: usize, out: &mut [u8]) -> Result<()> {
     // `out.len()` bytes; it decodes with a context of its own, so rayon threads may call it at once
     let n = unsafe { blosc_src::blosc_getitem(src.as_ptr().cast(), first, items, out.as_mut_ptr().cast()) };
     ensure!(n >= 0 && n as usize == out.len(), "Blosc frame failed to decode bytes {start}.. ({n})");
+    Ok(())
+}
+
+/// Blosc 1 header flags (c-blosc's `blosc.h`, and `blosc_d` in `blosc.c` for how decoding reads them)
+const BLOSC_SHUFFLE: u8 = 0x01;
+const BLOSC_MEMCPYED: u8 = 0x02;
+const BLOSC_BITSHUFFLE: u8 = 0x04;
+/// Unused by Blosc 1, which refuses a frame that sets it (Blosc 2 marks delta coding with it)
+const BLOSC_FUTURE: u8 = 0x08;
+const BLOSC_DONT_SPLIT: u8 = 0x10;
+/// The compressor format in the flags' top three bits
+const BLOSC_ZSTD_FORMAT: u8 = 4;
+/// c-blosc's `BLOSC_ZSTD_VERSION_FORMAT`, the one zstd codec version it decodes
+const BLOSC_ZSTD_VERSION_FORMAT: u8 = 1;
+
+/// Where bytes `start..start + len` of both channels of a frame holding two channels of `channel` bytes each are,
+/// in stored order, when each is a whole block a zstd decoder or a copy reproduces with nothing left to undo
+///
+/// Mirrors c-blosc's `blosc_d`: a block is split into one stream per item byte unless the frame says not to or
+/// its items are too large or too few, and a stream whose compressed size equals its decoded size is stored as
+/// is. `None` for anything else: a frame c-blosc would refuse, another codec, bit shuffle, byte shuffle of wider
+/// items, split blocks, a range that is not one block per channel, or a zstd frame [`zstd_frame_fits`] refuses
+fn frame_channel_blocks(bytes: &[u8], channel: usize, start: usize, len: usize) -> Option<[BlockSource; 2]> {
+    // the header checks c-blosc makes, so a frame [`Predictions::decode_planes`] refuses, such as one with bytes
+    // past its recorded length or a block size it does not decode, is refused here too, and the header's
+    // compressed size is the frame's length
+    let FrameInfo { nbytes, typesize, blocksize } = blosc_frame_info(bytes).ok()?;
+    let (version, flags, cbytes) = (bytes[0], bytes[2], bytes.len());
+    let shuffled = flags & BLOSC_SHUFFLE != 0 && typesize > 1;
+    if version != 2 || flags & (BLOSC_FUTURE | BLOSC_BITSHUFFLE) != 0 || shuffled {
+        return None;
+    }
+    // a frame of another size would put one channel's bytes where the other's are read
+    if nbytes != 2 * channel || len == 0 || start + len > channel {
+        return None;
+    }
+    let frame = bytes;
+    let starts = [start, channel + start];
+    if flags & BLOSC_MEMCPYED != 0 {
+        // the decoded bytes follow the header as they are
+        return (cbytes == nbytes + 16).then(|| starts.map(|at| BlockSource::Raw(16 + at..16 + at + len)));
+    }
+
+    // one block per channel, so the channels' blocks are blocks `start / len` and `(channel + start) / len`, and
+    // the last block is never a short one
+    // c-blosc's `blosc_d` refuses a zstd frame of another codec version (byte 1) before decoding a block
+    let zstd = flags >> 5 == BLOSC_ZSTD_FORMAT && bytes[1] == BLOSC_ZSTD_VERSION_FORMAT;
+    if !zstd || blocksize != len || !start.is_multiple_of(len) || !channel.is_multiple_of(len) {
+        return None;
+    }
+    let split = flags & BLOSC_DONT_SPLIT == 0 && typesize <= 16 && blocksize / typesize >= 128;
+    if split && typesize > 1 {
+        return None;
+    }
+    let nblocks = nbytes / blocksize;
+    let word = |at: usize| Some(i32::from_le_bytes(frame.get(at..at + 4)?.try_into().ok()?));
+    let block = |at: usize| -> Option<BlockSource> {
+        let begin = usize::try_from(word(16 + 4 * (at / blocksize))?).ok()?;
+        let csize = usize::try_from(word(begin)?).ok()?;
+        let range = begin + 4..(begin + 4).checked_add(csize).filter(|&end| end <= cbytes)?;
+        if csize == blocksize {
+            return Some(BlockSource::Raw(range));
+        }
+        zstd_frame_fits(&frame[range.clone()], blocksize).then_some(BlockSource::Zstd(range))
+    };
+    // the block offsets table must lie inside the frame, as c-blosc checks before decoding
+    if 16 + 4 * nblocks > cbytes {
+        return None;
+    }
+    Some([block(starts[0])?, block(starts[1])?])
+}
+
+/// Whether `frame` is exactly one zstd frame that decodes to `size` bytes without a dictionary, as far as its
+/// header and block headers tell: the zstd magic, a content size of `size` when the header records one, no
+/// dictionary id, and blocks that end where `frame` does
+///
+/// nvCOMP treats a malformed frame as undefined behaviour, so these are checked on the CPU before a frame goes
+/// to the GPU; the decoded size and status are still checked after
+pub fn zstd_frame_fits(frame: &[u8], size: usize) -> bool {
+    const MAGIC: u32 = 0xFD2F_B528;
+    let Some((magic, rest)) = frame.split_first_chunk::<4>() else { return false };
+    let Some(&descriptor) = rest.first() else { return false };
+    // the descriptor's dictionary id flag (bits 0-1) and reserved bit (3)
+    if u32::from_le_bytes(*magic) != MAGIC || descriptor & 0x0b != 0 {
+        return false;
+    }
+    let content = zstd::zstd_safe::get_frame_content_size(frame);
+    let sized = matches!(content, Ok(Some(n)) if n == size as u64) || matches!(content, Ok(None));
+    sized && zstd::zstd_safe::find_frame_compressed_size(frame) == Ok(frame.len())
+}
+
+/// `Read::read_exact` of `file` from its start into `buf` without initialising `buf` first; on success every byte is
+/// written
+fn read_exact_uninit(file: &fs::File, buf: &mut [MaybeUninit<u8>]) -> io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        let rest = &mut buf[done..];
+        // SAFETY: `rest` is valid for writes of `rest.len()` bytes, and pread writes at most that many
+        let n = unsafe { libc::pread(file.as_raw_fd(), rest.as_mut_ptr().cast(), rest.len(), done as libc::off_t) };
+        match n {
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            n if n > 0 => done += n as usize,
+            _ => {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -744,11 +916,15 @@ fn fill_value(v: &Value) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::mem::MaybeUninit;
     use std::path::Path;
 
     use serde_json::Value;
 
-    use super::{NativeChunk, Predictions, blocks_fit, blosc_getitem, frame_channel_ranges};
+    use super::{
+        BlockSource, NativeChunk, PackedChunk, Predictions, blocks_fit, blosc_decompress, blosc_getitem,
+        frame_channel_blocks, frame_channel_ranges, zstd_frame_fits,
+    };
     use crate::arena::BufferPool;
 
     /// Every case in `tests/fixtures/readers` (the expected values were written by the reference's own
@@ -816,11 +992,11 @@ mod tests {
             for z in 0..grid[0] {
                 for y in 0..grid[1] {
                     for x in 0..grid[2] {
-                        let NativeChunk { lo, dims, data } = p.read_chunk_in([z, y, x], edge, &pool).unwrap();
+                        let NativeChunk { lo, dims, data } = p.read_chunk_in([z, y, x], edge, &pool, &pool).unwrap();
                         let hi = [0, 1, 2].map(|a| lo[a] + dims[a]);
                         assert_eq!(&data[..], &p.read_u8(lo, hi).unwrap()[..], "{}", case["name"]);
                         checked += 1;
-                        direct += p.whole_chunk_in([z, y, x], edge, dims, &pool).unwrap().is_some() as usize;
+                        direct += p.whole_chunk_in([z, y, x], edge, dims, &pool, &pool).unwrap().is_some() as usize;
                     }
                 }
             }
@@ -837,7 +1013,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(root.join("manifest.json")).expect("manifest"))
                 .expect("manifest json");
         let pool = BufferPool::new(1 << 20);
-        let (mut checked, mut reversed) = (0, 0);
+        let (mut checked, mut reversed, mut sourced) = (0, 0, 0);
         for case in manifest.iter().filter(|c| c["error"].is_null()) {
             let order = case["order"].as_str().unwrap();
             let p = Predictions::open(&root.join(case["path"].as_str().unwrap()), case["key"].as_str(), order).unwrap();
@@ -856,8 +1032,18 @@ mod tests {
                             continue;
                         }
                         let len = planes.len() * edge[1] * edge[2];
-                        let mut out = vec![0u8; 2 * len];
+                        let mut out = Vec::new();
                         p.decode_planes(&packed, planes.clone(), &mut out).unwrap();
+                        assert_eq!(out.len(), 2 * len);
+                        if let Some(sources) = p.plane_blocks(&packed, planes.clone()) {
+                            let bytes = match &packed {
+                                PackedChunk::Blosc(bytes) => &bytes[..],
+                                PackedChunk::Fill(_) => &[],
+                            };
+                            let got: Vec<u8> = sources.iter().flat_map(|s| decode_source(bytes, s, len)).collect();
+                            assert!(got == out, "{} chunk {key:?} planes {planes:?}: block sources", case["name"]);
+                            sourced += 1;
+                        }
                         let hi = [0, 1, 2].map(|a| (lo[a] + [planes.len(), edge[1], edge[2]][a]).min(p.shape[a]));
                         let dims = [0, 1, 2].map(|a| hi[a] - lo[a]);
                         let window = p.read_u8(lo, hi).unwrap();
@@ -879,8 +1065,8 @@ mod tests {
                 }
             }
         }
-        assert!(checked > 30, "too few plane runs checked: {checked}");
-        println!("{checked} plane runs checked, {reversed} in H, V order");
+        assert!(checked > 30 && sourced > 10, "too few plane runs checked: {checked}, {sourced} by block sources");
+        println!("{checked} plane runs checked, {reversed} in H, V order, {sourced} by block sources");
     }
 
     /// Compress `data` as one Blosc 1 frame with zstd and shuffle, as zarr writes prediction chunks
@@ -889,12 +1075,25 @@ mod tests {
     }
 
     fn blosc_frame_with(name: &std::ffi::CStr, data: &[u8], typesize: usize, blocksize: usize) -> Vec<u8> {
+        blosc_compress(3, 1, name, data, typesize, blocksize)
+    }
+
+    /// Compress `data` as one Blosc 1 frame at level `clevel` (0 stores it uncompressed) with shuffle mode `shuffle`
+    /// (0 none, 1 byte, 2 bit)
+    fn blosc_compress(
+        clevel: i32,
+        shuffle: i32,
+        name: &std::ffi::CStr,
+        data: &[u8],
+        typesize: usize,
+        blocksize: usize,
+    ) -> Vec<u8> {
         let mut out = vec![0u8; data.len() + 64];
         // SAFETY: `out` has room for the frame and its 16-byte header; the context call keeps no global state
         let n = unsafe {
             blosc_src::blosc_compress_ctx(
-                3,
-                1,
+                clevel,
+                shuffle,
                 typesize,
                 data.len(),
                 data.as_ptr().cast(),
@@ -910,6 +1109,10 @@ mod tests {
         out
     }
 
+    fn uninit(n: usize) -> Vec<MaybeUninit<u8>> {
+        vec![MaybeUninit::uninit(); n]
+    }
+
     /// Ranges of both channels decode to the stored bytes whatever the frame's item size and block size, and a
     /// frame of the wrong size is refused rather than read across channels
     #[test]
@@ -923,14 +1126,16 @@ mod tests {
             let frame = blosc_frame(&data, typesize, blocksize);
             assert_eq!(blocks_fit(&frame, run), fits, "typesize {typesize} blocksize {blocksize}");
             for start in [0, run, channel - run] {
-                let (mut a, mut b) = (vec![0u8; run], vec![0u8; run]);
+                let (mut a, mut b) = (uninit(run), uninit(run));
                 frame_channel_ranges(&frame, channel, start, [&mut a, &mut b]).unwrap();
-                assert_eq!(a, data[start..start + run], "typesize {typesize} start {start}");
-                assert_eq!(b, data[channel + start..channel + start + run], "typesize {typesize} start {start}");
+                // SAFETY: a successful decode writes every byte of both parts
+                let (a, b) = unsafe { (a.assume_init_ref(), b.assume_init_ref()) };
+                assert_eq!(a, &data[start..start + run], "typesize {typesize} start {start}");
+                assert_eq!(b, &data[channel + start..channel + start + run], "typesize {typesize} start {start}");
             }
         }
         let frame = blosc_frame(&data[..channel], 1, run);
-        let (mut a, mut b) = (vec![0u8; run], vec![0u8; run]);
+        let (mut a, mut b) = (uninit(run), uninit(run));
         assert!(frame_channel_ranges(&frame, channel / 2 + 1, 0, [&mut a, &mut b]).is_err());
     }
 
@@ -950,9 +1155,194 @@ mod tests {
         frame[8..12].copy_from_slice(&(block as u32 + 1).to_le_bytes());
         let len = 2 * block;
         assert!(!blocks_fit(&frame, len));
-        assert!(blosc_getitem(&frame, 0, &mut vec![0u8; block]).is_err());
-        let (mut a, mut b) = (vec![0u8; len], vec![0u8; len]);
+        assert!(blosc_getitem(&frame, 0, &mut uninit(block)).is_err());
+        let (mut a, mut b) = (uninit(len), uninit(len));
         assert!(frame_channel_ranges(&frame, channel, 0, [&mut a, &mut b]).is_err());
+    }
+
+    /// The `len` bytes a block source stands for, decoded on the CPU as a GPU decoder would: zstd by the zstd
+    /// crate, raw bytes copied
+    fn decode_source(bytes: &[u8], source: &BlockSource, len: usize) -> Vec<u8> {
+        match source {
+            BlockSource::Zstd(range) => {
+                let out = zstd::bulk::decompress(&bytes[range.clone()], len).unwrap();
+                assert_eq!(out.len(), len, "a zstd block decodes to {} bytes", out.len());
+                out
+            }
+            BlockSource::Raw(range) => bytes[range.clone()].to_vec(),
+            BlockSource::Fill(fill) => vec![*fill; len],
+        }
+    }
+
+    /// Two channels of `blocks` blocks of `block` bytes, compressible except the first block of the second
+    /// channel, which is noise zstd cannot shrink, so Blosc stores it as is
+    fn two_channels(block: usize, blocks: usize) -> Vec<u8> {
+        let channel = block * blocks;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        (0..2 * channel)
+            .map(|i| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                if (channel..channel + block).contains(&i) { (state >> 56) as u8 } else { (i / 97 % 7 * 31) as u8 }
+            })
+            .collect()
+    }
+
+    /// Every block's source, zstd or stored as is, decodes on its own to the bytes c-blosc decodes for that run of
+    /// both channels, from a frame written as zarr writes prediction chunks
+    #[test]
+    fn block_sources_reproduce_channel_ranges() {
+        let (block, blocks) = (8 * 32 * 32, 4);
+        let channel = block * blocks;
+        let data = two_channels(block, blocks);
+        let frame = blosc_frame(&data, 1, block);
+        assert_eq!(frame[2], 0x91, "shuffle, don't split, zstd, as prediction chunks are written");
+        let (mut zstd, mut raw) = (0, 0);
+        for s in 0..blocks {
+            let start = s * block;
+            let sources = frame_channel_blocks(&frame, channel, start, block).expect("one zstd block per channel");
+            let (mut a, mut b) = (uninit(block), uninit(block));
+            frame_channel_ranges(&frame, channel, start, [&mut a, &mut b]).unwrap();
+            // SAFETY: a successful decode writes every byte of both parts
+            let (a, b) = unsafe { (a.assume_init_ref(), b.assume_init_ref()) };
+            assert_eq!(decode_source(&frame, &sources[0], block), a, "block {s} of the first channel");
+            assert_eq!(decode_source(&frame, &sources[1], block), b, "block {s} of the second channel");
+            for source in &sources {
+                zstd += matches!(source, BlockSource::Zstd(_)) as usize;
+                raw += matches!(source, BlockSource::Raw(_)) as usize;
+            }
+        }
+        assert_eq!((zstd, raw), (2 * blocks - 1, 1), "the noise block is stored as is, the rest as zstd");
+        assert!(frame_channel_blocks(&frame, channel, channel, block).is_none());
+    }
+
+    /// A frame Blosc stored uncompressed gives each channel's run as a slice of the frame, at any run of planes
+    #[test]
+    fn a_stored_frame_gives_raw_ranges() {
+        let (block, blocks) = (8 * 32 * 32, 4);
+        let channel = block * blocks;
+        let data = two_channels(block, blocks);
+        let frame = blosc_compress(0, 1, c"zstd", &data, 1, block);
+        assert_ne!(frame[2] & 0x02, 0, "level 0 stores the frame as is");
+        for (start, len) in [(0, block), (block, 3 * block), (5, 77)] {
+            let sources = frame_channel_blocks(&frame, channel, start, len).unwrap();
+            assert!(sources.iter().all(|s| matches!(s, BlockSource::Raw(_))));
+            assert_eq!(decode_source(&frame, &sources[0], len), data[start..start + len]);
+            assert_eq!(decode_source(&frame, &sources[1], len), data[channel + start..channel + start + len]);
+        }
+    }
+
+    /// Frames a lone zstd decoder or a copy cannot reproduce block by block are left to c-blosc: other codecs, bit
+    /// shuffle, byte shuffle of wider items, blocks split per item byte, runs that are not one block, a frame of
+    /// the wrong size, and a zstd frame whose header names a dictionary
+    #[test]
+    fn frames_a_zstd_decoder_cannot_reproduce_are_refused() {
+        let (block, blocks) = (8 * 32 * 32, 4);
+        let channel = block * blocks;
+        let data = two_channels(block, blocks);
+        let refused =
+            |frame: &[u8], start: usize, len: usize| frame_channel_blocks(frame, channel, start, len).is_none();
+        assert!(refused(&blosc_frame_with(c"lz4", &data, 1, block), 0, block));
+        assert!(refused(&blosc_compress(3, 2, c"zstd", &data, 1, block), 0, block));
+        assert!(refused(&blosc_frame(&data, 2, block), 0, block));
+        assert!(refused(&blosc_frame(&data, 1, 2 * block), 0, block));
+        assert!(refused(&blosc_frame(&data, 1, block), 0, 2 * block));
+        assert!(refused(&blosc_frame(&data, 1, block), block / 2, block));
+        assert!(frame_channel_blocks(&blosc_frame(&data, 1, block), channel / 2, 0, block).is_none());
+
+        // without shuffle a wider item is fine, but clearing "don't split" makes c-blosc read one stream per item
+        // byte; at one-byte items there is one stream either way
+        let mut wide = blosc_compress(3, 0, c"zstd", &data, 2, block);
+        assert!(!refused(&wide, 0, block));
+        wide[2] &= !0x10;
+        assert!(refused(&wide, 0, block));
+        let mut narrow = blosc_frame(&data, 1, block);
+        narrow[2] &= !0x10;
+        assert!(!refused(&narrow, 0, block));
+
+        let mut dictionary = blosc_frame(&data, 1, block);
+        let Some([BlockSource::Zstd(range), _]) = frame_channel_blocks(&dictionary, channel, 0, block) else {
+            panic!("a zstd block")
+        };
+        dictionary[range.start + 4] |= 0x01;
+        assert!(refused(&dictionary, 0, block));
+    }
+
+    /// A chunk file with a byte past its Blosc frame, or a stored frame whose header claims a block size c-blosc
+    /// does not decode, is refused by both decoders: c-blosc's header checks refuse it for the CPU, and the GPU's
+    /// block sources check the same header, so neither decodes a file the other refuses
+    #[test]
+    fn a_frame_with_trailing_bytes_is_refused_by_both_decoders() {
+        let edge = 16;
+        let data = two_channels(8 * edge * edge, 2);
+        let frame = blosc_frame(&data, 1, 8 * edge * edge);
+        let stored = blosc_compress(0, 1, c"zstd", &data, 1, 8 * edge * edge);
+        assert_ne!(stored[2] & 0x02, 0, "level 0 stores the frame as is");
+        let with_blocksize = |blocksize: u32| {
+            let mut bad = stored.clone();
+            bad[8..12].copy_from_slice(&blocksize.to_le_bytes());
+            bad
+        };
+        // c-blosc itself refuses these, not only the header check this crate makes before it
+        for blocksize in [0, data.len() as u32 + 1] {
+            assert!(blosc_decompress(&with_blocksize(blocksize)).is_err(), "c-blosc decodes {blocksize}-byte blocks");
+        }
+        let dir = std::env::temp_dir().join(format!("fibrs-trailing-byte-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("0.0.0.0"), &frame).unwrap();
+        fs::write(dir.join("0.0.0.1"), [&frame[..], &[0]].concat()).unwrap();
+        fs::write(dir.join("0.0.0.2"), &stored).unwrap();
+        fs::write(dir.join("0.0.0.3"), with_blocksize(0)).unwrap();
+        fs::write(dir.join("0.0.0.4"), with_blocksize(data.len() as u32 + 1)).unwrap();
+        let mut codec = frame.clone();
+        codec[1] = 2;
+        fs::write(dir.join("0.0.0.5"), &codec).unwrap();
+        let meta = serde_json::json!({
+            "zarr_format": 2, "shape": [2, edge, edge, 6 * edge], "chunks": [2, edge, edge, edge],
+            "dtype": "|u1", "fill_value": 0, "order": "C", "filters": null, "dimension_separator": ".",
+            "compressor": {"id": "blosc", "cname": "zstd", "clevel": 3, "shuffle": 1, "blocksize": 0},
+        });
+        fs::write(dir.join(".zarray"), meta.to_string()).unwrap();
+        let p = Predictions::open(&dir, None, "VH").unwrap();
+        let pool = BufferPool::new(1 << 20);
+
+        let whole = p.packed_chunk_in([0, 0, 0], &pool).unwrap();
+        p.decode_planes(&whole, 0..8, &mut Vec::new()).unwrap();
+        assert!(p.plane_blocks(&whole, 0..8).is_some(), "the frame as Blosc wrote it gives block sources");
+
+        let as_stored = p.packed_chunk_in([0, 0, 2], &pool).unwrap();
+        p.decode_planes(&as_stored, 0..8, &mut Vec::new()).unwrap();
+        assert!(p.plane_blocks(&as_stored, 0..8).is_some(), "the stored frame as Blosc wrote it gives block sources");
+
+        for (x, what) in [
+            (1, "trailing byte"),
+            (3, "0-byte blocks"),
+            (4, "blocks larger than the frame"),
+            (5, "zstd codec version 2"),
+        ] {
+            let bad = p.packed_chunk_in([0, 0, x], &pool).unwrap();
+            assert!(p.decode_planes(&bad, 0..8, &mut Vec::new()).is_err(), "the CPU decodes a frame with {what}");
+            assert!(p.plane_blocks(&bad, 0..8).is_none(), "the GPU accepts a frame with {what} the CPU refuses");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The header check takes exactly one dictionary-free frame of the expected size, and nothing shorter or longer
+    #[test]
+    fn zstd_frames_are_checked_before_the_gpu_sees_them() {
+        let data: Vec<u8> = (0..4096u32).map(|i| (i / 13) as u8).collect();
+        let frame = zstd::bulk::compress(&data, 3).unwrap();
+        assert!(zstd_frame_fits(&frame, data.len()));
+        assert!(!zstd_frame_fits(&frame, data.len() + 1));
+        assert!(!zstd_frame_fits(&frame[..frame.len() - 1], data.len()));
+        assert!(!zstd_frame_fits(&[&frame[..], &[0]].concat(), data.len()));
+        assert!(!zstd_frame_fits(&[&frame[..], &frame[..]].concat(), data.len()));
+        assert!(!zstd_frame_fits(&frame[..3], data.len()));
+        let mut magic = frame.clone();
+        magic[0] ^= 1;
+        assert!(!zstd_frame_fits(&magic, data.len()));
     }
 
     /// The probe judges an array by a chunk it stores even when every chunk before it in grid order is missing,

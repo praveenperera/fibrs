@@ -2,10 +2,144 @@
 
 ## [Unreleased]
 
+### What's new
+
 - The tracer stores its fields in 4³ sub-bricks within each 16³ brick, allocating only the sub-bricks that hold
   data, so dense windows need less memory and write the same `.afv`. On PHerc0358's densest 1,024-plane window
   with `--threads 8`, the peak fell from 21.6 GiB to 15.4 GiB with `--field-cache-mib 4096`, and from 17.7 GiB to
   11.1 GiB with the default of 1024. No option or default changed.
+
+## [0.4.0] - 2026-11-20
+
+fibrs 0.4.0 does more of a GPU run on the GPU and spends less CPU time around tracing. Traced curves are finished
+on the GPU, and GPU centrality takes less than half as long on dense data. The seed catalogue and the export's
+rows are built on the `--threads` pool, idle threads trace further ahead, and finishing does less memory work.
+`fibrs predict` allocates through the system allocator again, which brings its speed back to 0.3.0's. Finishing
+can also decode prediction slabs on the GPU with nvCOMP, off by default and opted into with `FIBRS_NVCOMP`. None
+of these changes alters the `.afv` or the predictions; nvCOMP decoding gives the same output on sound files.
+
+### What's new
+
+- **Fewer GPU stalls in centrality.** The GPU waits less on the host between units of tiles:
+  - each stream's page-locked buffers are sized once per family, for the largest unit it runs, instead of being
+    regrown mid-stage, which made the GPU finish the other stream's work first. A sparse or faint unit pins room
+    only for the output bricks where its family's predictions are strong enough to give centrality;
+  - each unit's seeds come back as a list of their own, joined once at the end, instead of being appended to one
+    list that kept growing;
+  - a unit's inputs are built while the GPU still runs the units before it, and its centrality is installed on
+    the `--threads` pool once the next unit on its stream is queued.
+
+  The centrality and seeds are unchanged. On a dense PHerc0358 window on an RTX 5090, V and H centrality take
+  19.1 s together instead of 20.9 s (mean of two runs each), about 1% of the whole run.
+
+- **Faster GPU centrality and seed tests.** Before the float64 work, the GPU now lists the voxels that need it:
+  those with presence enough for centrality, then those that pass the seed test's cheap checks. The float64 work
+  then runs on full warps instead of mostly idle ones. The centrality and seeds are unchanged. On a dense PHerc0358
+  window on an RTX 5090, the V centrality kernels take 1.3 s instead of 8.3 s, and V and H centrality take 7.0 s
+  together instead of 15.7 s (mean of two runs each).
+
+- **Trace finishing on the GPU.** When a run uses the GPU, finishing (cutting each traced curve where the
+  predictions disagree, then smoothing, resampling and re-checking each piece) runs there too. It gives the CPU's
+  pieces bit for bit, so the `.afv` is unchanged, whatever rounding the run started with. Both pooled predictions
+  and a cache of native prediction slabs, up to 8 GiB, stay on the GPU while a family is finished. A batch of
+  curves the GPU cannot finish, for example one that reads more slabs than its cache holds, is finished on the
+  CPU, and the log counts those batches and the slabs cached, by where they were decoded, at the end of each
+  family. If the GPU fails while finishing, `--device auto` finishes the rest of the family on the CPU and
+  `--device cuda` stops the run, as in the other GPU stages. `--device cpu` finishes on the CPU as before.
+
+- **Opt-in GPU decoding of prediction slabs with nvCOMP.** With NVIDIA's nvCOMP 6, the native slabs GPU
+  finishing reads go to the GPU still compressed and are decoded there, with the same output on sound files. It is
+  off by default, so slabs decode on the CPU with c-blosc's checks; opt in with `FIBRS_NVCOMP=on`, which loads
+  the nvCOMP the new `fibrs[gpu-zstd]` extra installs (or the system's), or with `FIBRS_NVCOMP` set to a
+  `libnvcomp.so.6` path. GPU slab decoding trusts the prediction files: on a corrupt chunk nvCOMP's behaviour is
+  undefined, so it may give wrong output or a CUDA fault where the CPU decoder would report the corruption.
+  Installing the extra alone does not turn it on. nvCOMP is never bundled: it is NVIDIA's own PyPI
+  package, `nvidia-libnvcomp-cu12`, under NVIDIA's licence, and the log says once whether slabs decode on the GPU
+  or why they decode on the CPU. A slab nvCOMP cannot decode as Blosc stored it is decoded on the CPU, as are the
+  slabs of arrays decoded a whole chunk at a time, and when the decoder's buffers leave too little GPU memory for
+  the slab cache, finishing stays on the GPU and decodes slabs on the CPU.
+
+- **Faster seed catalogue.** Each family's seed catalogue (priority split, descending-centrality argsort, sort by
+  1024³ region) is built on the `--threads` pool:
+  - the split and gathers keep their order;
+  - the partitions NumPy's quicksort sets aside are sorted in parallel, which gives its exact order, equal keys
+    included;
+  - the stable sort by region is now a counting sort.
+
+  On the dense PHerc0358 window z02304–02816, the catalogues of its 22 million V and 21 million H seeds took
+  about 10 CPU-s on one thread, most of the 12 s the seed stage took. The tracing order, and so the `.afv`, is
+  unchanged.
+
+- **`fibrs predict` allocates through the system allocator again.** Under mimalloc, which 0.3.1 made the
+  allocator, the predictor zeroed the large buffers it reused, copied growing vectors that glibc malloc remaps, and
+  faulted fresh pages in. That doubled its kernel time, and on nine columns of a PHerc0826 band a run took 42–43 s
+  instead of 0.3.0's 37–39 s, with the same forward pass. With the system allocator the same run takes 37.1–37.2 s
+  again. The tracer keeps mimalloc. The predictions are unchanged.
+
+- **Less memory work while finishing curves.** Native prediction slabs are decoded straight into their buffers
+  instead of into zero-filled ones, and chunk files are read the same way. Compressed chunks get a buffer pool of
+  their own. In the one pool they shared with decoded slabs, a chunk read found no buffer to reuse one time in
+  five, and freed slabs were dropped instead of being kept for the next decode. On
+  the dense PHerc0358 window z02304–02816 at `--threads 8`, the zero-filling took about 34 CPU-s and the page
+  faults of fresh buffers about 35 CPU-s, 14% of the finishing threads' time. The `.afv` is unchanged.
+
+- **Faster tracing on dense data.** Idle threads trace up to 256 seeds ahead of the commit point instead of 64. On
+  the dense PHerc0358 window z02304–02816 at `--threads 8`, two runs of each put both families' tracing at 97 and
+  103 s against 109 and 114 s, with 0.13% of seeds traced again instead of 0.04%. Peak RSS was 23.0–23.4 GiB against
+  23.0–23.1 GiB, and the `.afv` is identical.
+
+- **Faster export.** The `.afv` export makes each batch of fibres' rows (annotations with Python's float repr, point
+  blocks, bounds) on the `--threads` pool while the batch before it is inserted, in order, on one thread. SQLite
+  also gets a 256 MiB page cache instead of 32 MiB and holds its lock for the whole export. A batch ends at 4,096
+  fibres, or at the fibre that brings it to about a million points, so only its last fibre can take it further. On
+  the dense PHerc0358 window z02304–02816 the export took 16 s on one thread. About a third of that was formatting
+  rows, and a fifth was SQLite reading evicted pages back from the file of over 1.5 GiB. Fibre numbering, every
+  table and the first error in input order are unchanged.
+
+### Upgrading
+
+- 0.4.0 doesn't resume a tracer work directory that 0.3.1 started, finished or not, so a `--resume` that only
+  writes the `.afv` again needs 0.3.1 too. Finish a run with the binary that started it, or start a new work
+  directory. A `fibrs predict` output that 0.3.1 started, in band or villa mode, is refused on resume as well, as
+  it is by any other binary; finish it with 0.3.1 or write a new `--out`.
+
+## [0.3.1] - 2026-11-19
+
+fibrs 0.3.1 traces dense data faster: threads that finishing leaves idle trace seeds ahead, and the binary
+allocates through mimalloc instead of glibc malloc. The `.afv` is unchanged. On a PHerc1545 and a PHerc0826 band
+it was identical to the original's with `--device cpu` and to 0.3.0's with `--device cuda`, but for the per-run
+uuid. `fibrs predict` gave 0.3.0's predictions voxel for voxel on nine columns of a PHerc0826 band.
+
+### What's new
+
+- **Faster tracing on dense data.** Threads that finishing leaves idle now trace seeds ahead of the one being
+  committed. A seed traced ahead is traced again if an earlier seed marked the region it read before it was
+  committed, so the `.afv` is the same as before at every `--threads`. Measured with glibc malloc, before mimalloc
+  became the allocator: on a dense 512 × 2048 × 2048 crop of PHerc0358 at `--threads 8`, a run took 41–43 s instead of 47–55 s, with the same 2.6 GiB peak.
+  On whole bands, also with glibc malloc, PHerc1545 took 58 s at `--threads 4` and 43 s at `--threads 8` instead of 0.3.0's 77 s and 46 s,
+  and PHerc0826 took 153 s and 106 s instead of 174 s and 119 s, with peaks at most 0.3 GiB higher.
+- **Tracing can run one thread beyond `--threads`.** One more thread commits the seeds in order. On that crop,
+  tracing kept 4.2–4.5 cores busy at `--threads 4` and 7.7 at `--threads 8`, where 0.3.0 kept 2.9 and 4.0 busy.
+  Size the cores you give a run with that in mind.
+- **mimalloc is the allocator.** The binary now allocates through mimalloc 3.3.2 instead of the system allocator.
+  On dense windows, glibc malloc maps and unmaps large blocks while holding the kernel's `mmap_lock`, which stalls
+  the page faults of every tracing thread. On the dense PHerc0358 window z02304–02816 at `--threads 8`, 0.3.0 traced
+  both families in 682 s with glibc malloc and in 200 s and 274 s with mimalloc, and the whole run took 500–640 s
+  instead of 1,084 s. Peak memory is unchanged: 9.0 GiB on a PHerc0826 band and 5.6 GiB on a PHerc1545 band at
+  `--threads 4`. Output is unchanged. `cargo build --release --no-default-features` builds with the system
+  allocator.
+
+### Upgrading
+
+- 0.3.1 doesn't resume a tracer work directory that 0.3.0 started, finished or not, so a `--resume` that only
+  writes the `.afv` again needs 0.3.0 too. Finish a run with the binary that started it, or start a new work
+  directory. A `fibrs predict` output that 0.3.0 started, in band or villa mode, is refused on resume as well, as
+  it is by any other binary; finish it with 0.3.0 or write a new `--out`.
+
+### Documentation
+
+- **Running the CLI archive's binary.** The README's Install section says how the archive's binary finds numpy's
+  OpenBLAS, and how to point it there with `FIBRS_LAPACK` when it runs outside a numpy environment.
 
 ## [0.3.0] - 2026-11-19
 
@@ -265,6 +399,8 @@ The first release.
   Python module, and a CLI archive for each with `scripts/install-dropin.sh`
 - `--version` prints `0.2.0`, the original's version, as a drop-in has to
 
+[0.4.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.0
+[0.3.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.3.1
 [0.3.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.3.0
 [0.2.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.2.0
 [0.1.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.1.1

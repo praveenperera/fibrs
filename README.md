@@ -8,7 +8,8 @@ predictions it reads are Qual's; this port changes how fast the tracer runs, not
 
 With `--threads 4` for both tools, it traces 22×–47× faster across three uninterrupted runs on 512-plane bands of
 PHerc0826, PHerc1545 and PHerc0358 (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU;
-the direction field and centrality run on an NVIDIA GPU when one is found, and on the CPU otherwise.
+the direction field, centrality and the finishing of traced curves run on an NVIDIA GPU when one is found, and on
+the CPU otherwise.
 
 `fibrs predict` runs the step before: Qual's AFV fibre model V2 over a CT volume on an NVIDIA GPU, without
 PyTorch, writing the probability zarr the tracer reads, as villa's inference writes it (see
@@ -26,6 +27,18 @@ x86-64; `pip install "fibrs[predict]"` adds the cuDNN and cuBLAS it needs when t
 [Predictions](#predictions)). Prebuilt CLI archives for Linux
 x86-64 (glibc 2.28+) and Apple silicon (macOS 11+) are named `fibrs-<version>-<target>.tar.gz`.
 
+The archive's binary bundles no OpenBLAS: it loads numpy's at run time, from the environment it is installed
+into (`scripts/install-dropin.sh` puts it there) or else from the active one (`$VIRTUAL_ENV`). On macOS that
+environment also needs `scipy-openblas64==0.3.31.188.0` (see [Numerics](#numerics)). Run from anywhere else, it
+stops with "cannot find numpy's OpenBLAS" once the tracing predictions are loaded, after it has written the work
+directory's `run.json`. Activate the numpy environment, or set `FIBRS_LAPACK` to the library's full path (on
+Linux, the `libscipy_openblas64_*.so` file in its `site-packages/numpy.libs`; fibrs does not expand a `*`), and run
+the same command again with `--resume`, through the same binary: an activated environment's `fibrs` can come first
+on `PATH`, and a run resumes only with the version that started it. `pip install fibrs` into an environment
+that holds its own numpy wheel needs none of this. fibrs looks only inside that environment, so one that inherits
+numpy (`--system-site-packages`) or has a distribution's numpy, such as Debian's `python3-numpy`, needs
+`scipy-openblas64==0.3.31.188.0` installed into it, as on macOS.
+
 ## Use
 
 ```sh
@@ -42,12 +55,45 @@ the log says why. `--device cpu` keeps them on the CPU, `--device cuda` fails in
 the GPU certifies each voxel's eigenvector against an error bound, and any voxels it cannot certify, usually few, are
 solved on the CPU with the same `dsyevd` (the log line counts them). Centrality rounds some steps differently on the
 GPU (see "Differences from the original"), and a resumed run keeps the rounding it started with: one started on the
-CPU computes centrality there, and with `--device auto` only its direction field takes the GPU (`--device cuda`
-refuses to resume it). A run started on the GPU can resume without one: the CPU then computes centrality as the GPU
+CPU computes centrality there, and with `--device auto` only its direction field and finishing (below) take the GPU
+(`--device cuda` refuses to resume it). A run started on the GPU can resume without one: the CPU then computes centrality as the GPU
 does, more slowly. `--device auto` also moves the direction field or centrality to the CPU if the GPU fails mid-run,
 for example when it runs out of memory.
 
+When a run uses the GPU, finishing (cutting each traced curve where the predictions disagree, then smoothing,
+resampling and re-checking each piece) runs there too, with the same result as on the CPU, whatever the rounding the
+run started with. Both pooled predictions and a cache of native prediction slabs, up to 8 GiB, stay on the GPU while
+a family is finished. The GPU finishes the curves in batches, and a batch it cannot finish, for example one that
+reads more slabs than its cache holds, is finished on the CPU. At the end of each family the log counts the slabs
+cached, by where they were decoded, and the batches the CPU finished. If the GPU fails while finishing,
+`--device auto` finishes the rest of the family on the CPU and `--device cuda` stops the run.
+
+By default the slabs are decoded on the CPU, with c-blosc's checks. Decoding them on the GPU with NVIDIA's nvCOMP is
+opt-in, with the same output on sound files: run `pip install "fibrs[gpu-zstd]"` and set `FIBRS_NVCOMP=on`, or
+set `FIBRS_NVCOMP` to the path of a `libnvcomp.so.6`. GPU slab decoding trusts the prediction files: on a corrupt
+chunk nvCOMP's behaviour is undefined, so it may give wrong output or a CUDA fault where the CPU decoder would
+report the corruption.
+
+nvCOMP is not part of fibrs: it is NVIDIA's own PyPI package, `nvidia-libnvcomp-cu12` (version 6, under NVIDIA's
+licence), which the `gpu-zstd` extra installs. With `FIBRS_NVCOMP=on` (in any case), fibrs loads that wheel from
+the environment fibrs is installed into or the active one (`$VIRTUAL_ENV`), then tries the system's library path.
+Run from Python (`python -m fibrs` or `fibrs.run`), it loads only the wheel in that Python's environment, venv or
+not, when there is one, so a wheel whose library fails to load leaves slabs on the CPU. Unset or `off`,
+nvCOMP is never loaded, whether or not the wheel is installed. The log says once whether slabs decode on the GPU, or
+why they decode on the CPU. Even with nvCOMP, a slab whose chunk it cannot decode as Blosc stored it (its Blosc
+blocks are not one slab of one channel each, or a zstd frame fails fibrs's checks) is decoded on the CPU, as is
+every slab of an array decoded a whole chunk at a time, and when nvCOMP's buffers would leave too little GPU memory
+for the slab cache, the family's slabs are decoded on the CPU and the log says so.
+
 `fibrs.run([...])` runs it from Python and returns the exit status.
+
+`--threads N` sets the threads that trace and finish curves. Threads that finishing leaves idle trace seeds ahead of
+the one being committed, and one more thread commits the seeds in order, so tracing can run one thread beyond
+`--threads`. On a dense 512 × 2048 × 2048 crop of PHerc0358, tracing kept 4.2–4.5 cores busy at `--threads 4` and
+7.7 at `--threads 8`. A seed traced ahead is traced again if an earlier seed marked the region it read before it was
+committed, so the output is the same at every `--threads`. The export to `.afv`, including the one a `--resume`
+of a finished run writes, prepares each batch of fibres' rows on the same `--threads` pool while one thread inserts
+the previous batch's rows in order.
 
 To make an environment's `avf-spline-generator` run the port, so scripts that call it need no change:
 
@@ -69,6 +115,9 @@ cargo test --release
 ```
 
 It builds on Linux and macOS with Rust 1.100 or later, the first stable release with the allocator API it uses.
+The tracer allocates through mimalloc. On Linux with glibc and on macOS, `fibrs predict` allocates through the
+system allocator; elsewhere it keeps mimalloc. `cargo build --release --no-default-features` builds a binary that
+uses the system allocator throughout.
 The wheel is built with maturin from
 `pyproject.toml` (`maturin build --release`; the published Linux wheel uses `--zig --compatibility
 manylinux_2_28`, and the macOS wheel `MACOSX_DEPLOYMENT_TARGET=11.0`).
@@ -113,7 +162,9 @@ these bands both roundings give the same `.afv`.
 
 CI traces a small synthetic input (`tests/fixtures/synthetic`) with every build's wheel on Linux and macOS,
 through the drop-in and through `python -m fibrs`. Both must write what the original wrote for it, compared by
-`scripts/compare_afv.py`: every metadata value except the per-run uuid, the schema and every table row.
+`scripts/compare_afv.py`: every metadata value except the per-run uuid, the schema and every table row. The drop-in
+must also write it with no seed traced ahead of the one being committed (`FIBRS_DEBUG_WINDOW=1`) and with every seed
+traced ahead traced again (`FIBRS_DEBUG_RETRACE=1`).
 
 ## Speed
 
@@ -165,6 +216,15 @@ On dense bands, fibrs's speed also depends on how it reads the predictions and a
 0.2.0 that decodes the predictions 8 planes at a time took 50–52 s with a 2.6 GiB peak and wrote the same `.afv` as
 0.1.0, which took 104 s with a 3.5 GiB peak. One that decoded whole chunks took 69–72 s, and one that also gave
 each decoded chunk its own mapping spent 40% of its CPU time in the kernel.
+
+Tracing seeds ahead on idle threads (0.3.1, measured with glibc malloc, before mimalloc became the allocator) takes
+that crop at `--threads 8` from 0.2.0's 47–55 s to 41–43 s, in two pairs of runs pinned to the same eight cores on a busy machine: tracing V from 12.0–15.4 s to 8.5–9.9 s and H
+from 8.7–10.2 s to 6.2–6.4 s. The `.afv` is the same, and the peak is 2.6 GiB for both.
+
+On whole bands with `--device cpu` and glibc malloc, each pair of builds run back to back on the same busy machine, it took
+PHerc1545 from 0.3.0's 77 s to 58 s at `--threads 4` and from 46 s to 43 s at `--threads 8`, and PHerc0826 from
+174 s to 153 s and from 119 s to 106 s. The `.afv` is the same, and the peak is at most 0.3 GiB higher (5.6 GiB
+for PHerc1545, 9.1–9.2 GiB for PHerc0826).
 
 ### Centrality on the GPU
 
@@ -453,4 +513,4 @@ each stage was timed in its own run. Tracing ran with `--threads 4` for both too
 Apache-2.0, like the original; the licence text is `licenses/apache-2.0.txt`. `NOTICE` lists the ported code
 (AVF_SPLINE_GENERATOR, one NumPy sort routine), the statically linked C libraries and what `fibrs predict` takes
 from villa (MIT: its tile rule in villa mode); their licence texts are in `licenses/`. The AFV model and its
-weights are Qual's, and cuDNN and cuBLAS are NVIDIA's; none of them is distributed here.
+weights are Qual's, and cuDNN, cuBLAS and nvCOMP are NVIDIA's; none of them is distributed here.

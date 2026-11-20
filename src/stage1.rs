@@ -74,9 +74,10 @@ fn decode_dir<A: Arith>(nx: u8, ny: u8) -> [f64; 3] {
     [dx, dy, 0.0f32 as f64]
 }
 
+/// The direction of a voxel from its packed bytes ([`crate::kernels::pack_dir`]), which index the table
 #[inline(always)]
-fn dir<A: Arith>(nx: u8, ny: u8) -> [f64; 3] {
-    A::dir_table()[(nx as usize) << 8 | ny as usize]
+fn dir<A: Arith>(packed: u16) -> [f64; 3] {
+    A::dir_table()[packed as usize]
 }
 
 /// The clamp and cell split shared by the trilinear helpers (core.py:36-53, cuda.py:26-44)
@@ -166,14 +167,7 @@ fn ring_dir<A: Arith>(b: &[f64; 6], k: usize) -> [f64; 3] {
 
 /// The centrality of the voxel at `z, y, x`, or None below presence 64
 #[inline]
-pub fn centrality_at<A: Arith>(
-    pres: &Dense<u8>,
-    nx: &Dense<u8>,
-    ny: &Dense<u8>,
-    z: i64,
-    y: i64,
-    x: i64,
-) -> Option<u16> {
+pub fn centrality_at<A: Arith>(pres: &Dense<u8>, dirs: &Dense<u16>, z: i64, y: i64, x: i64) -> Option<u16> {
     let p0 = pres.at(z, y, x) as f32;
     if p0 < 64.0 {
         return None;
@@ -181,7 +175,7 @@ pub fn centrality_at<A: Arith>(
     let [d, h, w] = pres.dims();
     let (df, hf, wf) = (d as f64, h as f64, w as f64);
     let (xf, yf, zf) = (x as f64, y as f64, z as f64);
-    let [ux, uy, uz] = dir::<A>(nx.at(z, y, x), ny.at(z, y, x));
+    let [ux, uy, uz] = dir::<A>(dirs.at(z, y, x));
     let p_p = trilin_u8::<A>(pres, xf + ux, yf + uy, zf + uz);
     let p_m = trilin_u8::<A>(pres, xf - ux, yf - uy, zf - uz);
     let p_par = A::mad(p_m, 0.25, A::mad(p0 as f64, 0.5, p_p * 0.25));
@@ -195,7 +189,7 @@ pub fn centrality_at<A: Arith>(
             let zz = py_min(py_max(A::mad(dz, r, zf), 0.0), df - 1.001);
             let pr = trilin_u8::<A>(pres, xx, yy, zz);
             let (iz, iy, ix) = ((zz + 0.5) as i64, (yy + 0.5) as i64, (xx + 0.5) as i64);
-            let [ux2, uy2, uz2] = dir::<A>(nx.at(iz, iy, ix), ny.at(iz, iy, ix));
+            let [ux2, uy2, uz2] = dir::<A>(dirs.at(iz, iy, ix));
             let dr = A::mad(uz, uz2, A::mad(uy, uy2, ux * ux2)).abs();
             if dr > 0.85 {
                 c_sum = A::mad(wr * 0.125 * pr, (dr - 0.85) / 0.15, c_sum);
@@ -207,22 +201,14 @@ pub fn centrality_at<A: Arith>(
 
 /// The seed priority (0, 1 or 2) of an interior voxel at `z, y, x` with stride-2 parity
 #[inline]
-pub fn seed_at<A: Arith>(
-    pres: &Dense<u8>,
-    nx: &Dense<u8>,
-    ny: &Dense<u8>,
-    cent: &Dense<u16>,
-    z: i64,
-    y: i64,
-    x: i64,
-) -> u8 {
+pub fn seed_at<A: Arith>(pres: &Dense<u8>, dirs: &Dense<u16>, cent: &Dense<u16>, z: i64, y: i64, x: i64) -> u8 {
     if pres.at(z, y, x) < 79 || (x + y + z) & 1 != 0 {
         return 0;
     }
     let c0 = cent.at(z, y, x) as f32 * 0.01f32;
     let c0d = c0 as f64;
     let (xf, yf, zf) = (x as f64, y as f64, z as f64);
-    let [ux, uy, uz] = dir::<A>(nx.at(z, y, x), ny.at(z, y, x));
+    let [ux, uy, uz] = dir::<A>(dirs.at(z, y, x));
     let basis = ortho_basis::<A>(ux, uy, uz);
     let mut n_max = 0;
     for k in 0..4 {
@@ -250,14 +236,14 @@ pub fn seed_at<A: Arith>(
 
 /// Centrality and ridge seeds of one tile (seed stride 2); every coordinate and clamp is local to the tile, as
 /// in the reference
-pub fn stage1<A: Arith>(pres: &Dense<u8>, nx: &Dense<u8>, ny: &Dense<u8>) -> (Vec<u16>, Vec<u8>) {
+pub fn stage1<A: Arith>(pres: &Dense<u8>, dirs: &Dense<u16>) -> (Vec<u16>, Vec<u8>) {
     let [d, h, w] = pres.dims();
     let n = pres.data.len();
     let mut cent = Dense { dims: pres.dims, data: vec![0u16; n] };
     for z in 0..d {
         for y in 0..h {
             for x in 0..w {
-                if let Some(c) = centrality_at::<A>(pres, nx, ny, z, y, x) {
+                if let Some(c) = centrality_at::<A>(pres, dirs, z, y, x) {
                     cent.data[((z * h + y) * w + x) as usize] = c;
                 }
             }
@@ -267,7 +253,7 @@ pub fn stage1<A: Arith>(pres: &Dense<u8>, nx: &Dense<u8>, ny: &Dense<u8>) -> (Ve
     for z in 1..d - 1 {
         for y in 1..h - 1 {
             for x in 1..w - 1 {
-                seeds[((z * h + y) * w + x) as usize] = seed_at::<A>(pres, nx, ny, &cent, z, y, x);
+                seeds[((z * h + y) * w + x) as usize] = seed_at::<A>(pres, dirs, &cent, z, y, x);
             }
         }
     }
