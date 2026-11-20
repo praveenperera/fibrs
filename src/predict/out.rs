@@ -151,10 +151,13 @@ fn blosc_decompress_into(src: &[u8], out: &mut [u8]) -> Result<()> {
 
 /// numcodecs' `Blosc(cname="zstd", clevel=3, shuffle=SHUFFLE)` encode of uint8 data, into `out`'s storage
 fn blosc_compress_into<'a>(src: &[u8], out: &'a mut Vec<u8>) -> Result<&'a [u8]> {
+    // c-blosc's output depends on the destination size it is given (a frame that does not fit is stored whole), so
+    // give it exactly numcodecs' size rather than `out`'s capacity, which a larger earlier chunk may have grown
+    let dest = src.len() + blosc_src::BLOSC_MAX_OVERHEAD as usize;
     out.clear();
-    out.reserve(src.len() + blosc_src::BLOSC_MAX_OVERHEAD as usize);
-    // SAFETY: `out` has room for `src.len()` plus Blosc's maximum overhead, the most c-blosc writes; the context
-    // call keeps no global state
+    out.reserve(dest);
+    // SAFETY: `out` has room for `dest`, `src.len()` plus Blosc's maximum overhead, the most c-blosc writes; the
+    // context call keeps no global state
     let n = unsafe {
         blosc_src::blosc_compress_ctx(
             3,
@@ -163,7 +166,7 @@ fn blosc_compress_into<'a>(src: &[u8], out: &'a mut Vec<u8>) -> Result<&'a [u8]>
             src.len(),
             src.as_ptr().cast(),
             out.as_mut_ptr().cast(),
-            out.capacity(),
+            dest,
             c"zstd".as_ptr(),
             0,
             1,
