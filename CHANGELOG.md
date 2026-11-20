@@ -15,7 +15,7 @@ uuid. `fibrs predict` gave 0.3.0's predictions voxel for voxel on nine columns o
   committed. A seed traced ahead is traced again if an earlier seed marked the region it read before it was
   committed, so the `.afv` is the same as before at every `--threads`. Measured with glibc malloc, before mimalloc
   became the allocator: on a dense 512 × 2048 × 2048 crop of PHerc0358 at `--threads 8`, a run took 41–43 s instead of 47–55 s, with the same 2.6 GiB peak.
-  On whole bands, PHerc1545 took 58 s at `--threads 4` and 43 s at `--threads 8` instead of 0.3.0's 77 s and 46 s,
+  On whole bands, also with glibc malloc, PHerc1545 took 58 s at `--threads 4` and 43 s at `--threads 8` instead of 0.3.0's 77 s and 46 s,
   and PHerc0826 took 153 s and 106 s instead of 174 s and 119 s, with peaks at most 0.3 GiB higher.
 - **Tracing can run one thread beyond `--threads`.** One more thread commits the seeds in order. On that crop,
   tracing kept 4.2–4.5 cores busy at `--threads 4` and 7.7 at `--threads 8`, where 0.3.0 kept 2.9 and 4.0 busy.

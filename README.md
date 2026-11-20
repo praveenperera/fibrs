@@ -190,7 +190,7 @@ Tracing seeds ahead on idle threads (0.3.1, measured with glibc malloc, before m
 that crop at `--threads 8` from 0.2.0's 47–55 s to 41–43 s, in two pairs of runs pinned to the same eight cores on a busy machine: tracing V from 12.0–15.4 s to 8.5–9.9 s and H
 from 8.7–10.2 s to 6.2–6.4 s. The `.afv` is the same, and the peak is 2.6 GiB for both.
 
-On whole bands with `--device cpu`, each pair of builds run back to back on the same busy machine, it took
+On whole bands with `--device cpu` and glibc malloc, each pair of builds run back to back on the same busy machine, it took
 PHerc1545 from 0.3.0's 77 s to 58 s at `--threads 4` and from 46 s to 43 s at `--threads 8`, and PHerc0826 from
 174 s to 153 s and from 119 s to 106 s. The `.afv` is the same, and the peak is at most 0.3 GiB higher (5.6 GiB
 for PHerc1545, 9.1–9.2 GiB for PHerc0826).
