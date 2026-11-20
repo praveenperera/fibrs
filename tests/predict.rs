@@ -305,8 +305,9 @@ fn an_output_in_use_by_another_run_is_refused() {
     let run = predict(&[&args[..], &["--out", out.to_str().unwrap()]].concat());
     assert_eq!(run.status.code(), Some(1));
     assert!(text(&run).contains("is in use by another fibrs predict run"), "{}", text(&run));
-    assert_eq!(fs::read_to_string(out.join("attempts.jsonl")).unwrap(), "");
+    // Windows locks are mandatory, so the file is read once the lock is released
     drop(held);
+    assert_eq!(fs::read_to_string(out.join("attempts.jsonl")).unwrap(), "");
 }
 
 #[test]
