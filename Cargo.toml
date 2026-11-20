@@ -2,15 +2,37 @@
 name = "fibrs"
 version = "0.4.0"
 edition = "2024"
-publish = false
 license = "Apache-2.0"
 description = "Native drop-in for Qual's AVF_SPLINE_GENERATOR 0.2.0: traces AFV V/H fibre predictions into the same .afv"
 repository = "https://github.com/praveenperera/fibrs"
 readme = "README.md"
+keywords = ["vesuvius", "fibre", "tracing", "zarr", "cuda"]
+categories = ["science", "command-line-utilities"]
+# what a build reads: the sources, build.rs and the PTX src/gpu/cuda.rs embeds, so the crate needs no CUDA
+# toolkit. ptx/ also holds the toolchain record and source hashes the kernel's provenance cites. The tests, their
+# fixtures and the Python package stay in the repository
+include = [
+    "/src/**",
+    "/build.rs",
+    "/ptx/**",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/licenses/**",
+]
 
 [[bin]]
 name = "fibrs"
 path = "src/main.rs"
+
+# cargo-binstall's download of the CLI archive a release attaches: fibrs-<version>-<target>.tar.gz holding
+# fibrs-<version>-<target>/fibrs, for x86_64-unknown-linux-gnu and aarch64-apple-darwin. Any other target falls back
+# to a source build. scripts/check-binstall.sh renders these against the archives package.yml builds
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ name }-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
 
 [dependencies]
 # the c-blosc release numcodecs 0.15 bundles (1.21.6), so every Blosc chunk the reference reads decodes here
