@@ -1111,7 +1111,11 @@ fn trace_family<D: DirField>(
     // the pool's idle threads trace seeds ahead of the commit point, and it gets every thread: with one fewer, as
     // when one thread traced every seed, a dense crop at --threads 4 traced no faster than that thread did, since
     // finishing kept the pool busy. The committing thread traces the seeds no pool thread has started
-    let finish_pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
+    let spec = Speculation::from_env()?;
+    if spec.reserved >= threads {
+        bail!("FIBRS_DEBUG_TRACE_THREADS={} leaves no thread of {threads} to finish curves", spec.reserved);
+    }
+    let finish_pool = rayon::ThreadPoolBuilder::new().num_threads(threads - spec.reserved).build()?;
     let path = folder.join("curves.bin");
     let mut writer = CurveWriter::create(&path)?;
     // FIBRS_DEBUG_RAW=1 also keeps the raw curves (family-N/raw.bin, same format) to compare with the
@@ -1123,7 +1127,6 @@ fn trace_family<D: DirField>(
     let t = Instant::now();
     let total = cat.coords.len();
     let mut pieces = 0;
-    let spec = Speculation::from_env()?;
     let cov = Coverage::new(shape);
     let producer = Producer::new(&fields, &cov, &cat, spec)?;
     let produce = |tx: &SyncSender<Vec<RawCurve>>| -> Result<usize> {

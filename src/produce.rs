@@ -10,15 +10,16 @@
 //! traced again by the committer, which is then the serial tracer itself. Either way every committed result is
 //! the serial one, and the `.afv` is the same
 //!
-//! `FIBRS_DEBUG_WINDOW=N` sets the window (1 traces only the seed at the commit point) and `FIBRS_DEBUG_RETRACE=1`
-//! makes the committer trace every seed traced ahead again; both are for testing
+//! `FIBRS_DEBUG_WINDOW=N` sets the window (1 traces only the seed at the commit point), `FIBRS_DEBUG_RETRACE=1`
+//! makes the committer trace every seed traced ahead again, and `FIBRS_DEBUG_TRACE_THREADS=K` takes K of the
+//! threads from finishing to trace ahead only; all are for testing
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::Thread;
 
-use color_eyre::eyre::{Result, bail};
+use color_eyre::eyre::{Result, bail, eyre};
 
 use crate::fields::Catalogue;
 use crate::kernels::{Coverage, Fields, Grid, RawCurve, Scratch, Traced, trace_seed};
@@ -38,6 +39,8 @@ pub struct Speculation {
     pub window: usize,
     /// Trace every seed traced ahead again on the committer, as if each had read a changed brick
     pub retrace_all: bool,
+    /// Threads that only trace ahead, taken from the finishing pool
+    pub reserved: usize,
 }
 
 impl Speculation {
@@ -51,7 +54,13 @@ impl Speculation {
             Err(_) => WINDOW,
         };
         let retrace_all = std::env::var_os("FIBRS_DEBUG_RETRACE").is_some_and(|v| v != "0");
-        Ok(Self { window, retrace_all })
+        let reserved = match std::env::var("FIBRS_DEBUG_TRACE_THREADS") {
+            Ok(v) => {
+                v.parse::<usize>().map_err(|_| eyre!("FIBRS_DEBUG_TRACE_THREADS must be a whole number, not {v:?}"))?
+            }
+            Err(_) => 0,
+        };
+        Ok(Self { window, retrace_all, reserved })
     }
 }
 
@@ -95,6 +104,9 @@ impl<'a, P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Producer<'a, P, C, D> {
             cat,
             window,
             retrace_all: spec.retrace_all,
+            reserved: spec.reserved,
+            idle: AtomicUsize::new(0),
+            tracers: OnceLock::new(),
             slots: (0..window).map(|_| Slot::default()).collect(),
             next: AtomicUsize::new(0),
             committed: AtomicUsize::new(0),
@@ -120,15 +132,21 @@ impl<'a, P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Producer<'a, P, C, D> {
             bail!("a producer runs once");
         }
         let max_helpers = pool.current_num_threads();
-        pool.in_place_scope(|scope| {
-            let result = self.commit_all(&mut deliver, || {
-                if self.helpers.load(Ordering::Relaxed) < max_helpers && self.claimable() {
-                    self.helpers.fetch_add(1, Ordering::Relaxed);
-                    scope.spawn(|_| self.help());
-                }
+        std::thread::scope(|threads| {
+            let tracers: Vec<_> = (0..self.reserved).map(|_| threads.spawn(|| self.trace_only())).collect();
+            let _ = self.tracers.set(tracers.iter().map(|t| t.thread().clone()).collect());
+            let result = pool.in_place_scope(|scope| {
+                let result = self.commit_all(&mut deliver, || {
+                    if self.helpers.load(Ordering::Relaxed) < max_helpers && self.claimable() {
+                        self.helpers.fetch_add(1, Ordering::Relaxed);
+                        scope.spawn(|_| self.help());
+                    }
+                });
+                // helpers still tracing ahead finish their seed and see no more to claim
+                self.stop.store(true, Ordering::SeqCst);
+                result
             });
-            // helpers still tracing ahead finish their seed and see no more to claim
-            self.stop.store(true, Ordering::Relaxed);
+            self.wake_tracers();
             result
         })
     }
@@ -158,6 +176,11 @@ pub struct Producer<'a, P, C, D> {
     committer: OnceLock<Thread>,
     /// Tracing buffers of helpers that have returned, a few MiB each, for the next helpers
     scratch: Mutex<Vec<Scratch>>,
+    /// Threads that only trace ahead ([`Producer::trace_only`]), parked while the window is full
+    reserved: usize,
+    /// Reserved tracers parked or about to park
+    idle: AtomicUsize,
+    tracers: OnceLock<Vec<Thread>>,
 }
 
 /// One seed traced ahead
@@ -268,6 +291,48 @@ impl<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Producer<'_, P, C, D> {
         self.helpers.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// A reserved tracer: trace seeds ahead until every seed is claimed, parking while the window is full
+    fn trace_only(&self) {
+        let mut scratch = Scratch::default();
+        loop {
+            if let Some(i) = self.claim() {
+                self.trace_ahead(i, &mut scratch);
+                continue;
+            }
+            if self.stop.load(Ordering::SeqCst) || self.next.load(Ordering::Relaxed) >= self.cat.coords.len() {
+                return;
+            }
+            if (0..SPINS).any(|_| {
+                std::hint::spin_loop();
+                self.claimable()
+            }) {
+                continue;
+            }
+            // sequentially consistent with the committer's commit and `idle` load, so either it sees this
+            // tracer idle and wakes it or this tracer sees the commit
+            self.idle.fetch_add(1, Ordering::SeqCst);
+            if !self.claimable_now() && !self.stop.load(Ordering::SeqCst) {
+                std::thread::park();
+            }
+            self.idle.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// [`Producer::claimable`] ordered after this thread's `idle` store
+    fn claimable_now(&self) -> bool {
+        let next = self.next.load(Ordering::SeqCst);
+        next < self.cat.coords.len() && next < self.committed.load(Ordering::SeqCst) + self.window
+    }
+
+    fn wake_tracers(&self) {
+        if self.idle.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        for t in self.tracers.get().into_iter().flatten() {
+            t.unpark();
+        }
+    }
+
     fn trace_ahead(&self, i: usize, scratch: &mut Scratch) {
         let committer = self.committer.get().expect("helpers start once the committer runs");
         let _guard = PanicGuard(&self.panicked, committer);
@@ -357,6 +422,11 @@ impl<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Producer<'_, P, C, D> {
             traced.trim();
             // release: publishes the marks just applied and hands the slot back
             self.committed.store(i + 1, Ordering::Release);
+            if self.reserved > 0 {
+                // orders the commit before the `idle` load, against a tracer's `idle` store and window check
+                std::sync::atomic::fence(Ordering::SeqCst);
+                self.wake_tracers();
+            }
             if let Flow::Stop = flow {
                 return Ok(stats);
             }
@@ -466,25 +536,32 @@ mod tests {
 
         // the first window is traced before any commit, so the seeds in it that read a brick an earlier seed marks
         // are stale whenever the pool's threads run
-        let (curves, stats) = speculative(&fields, &cat, Speculation { window: WINDOW, retrace_all: false });
+        let (curves, stats) =
+            speculative(&fields, &cat, Speculation { window: WINDOW, retrace_all: false, reserved: 0 });
         assert!(curves == expected, "window {WINDOW}: {} curves, {} expected", curves.len(), expected.len());
         assert_eq!(stats.seeds, seeds);
         // the fibres are close enough that some seeds traced ahead read a brick an earlier commit then marked
         assert!(stats.retraced > 0, "no seed was traced again, so nothing was checked: {stats:?}");
 
         // a window of one only ever traces the seed at the commit point, so nothing is ever stale
-        let (curves, stats) = speculative(&fields, &cat, Speculation { window: 1, retrace_all: false });
+        let (curves, stats) = speculative(&fields, &cat, Speculation { window: 1, retrace_all: false, reserved: 0 });
         assert!(curves == expected, "window 1: {} curves, {} expected", curves.len(), expected.len());
         assert_eq!(stats.retraced, 0);
 
         // every seed traced ahead is traced again on the committer, so every seed is traced serially
-        let (curves, stats) = speculative(&fields, &cat, Speculation { window: WINDOW, retrace_all: true });
+        let (curves, stats) =
+            speculative(&fields, &cat, Speculation { window: WINDOW, retrace_all: true, reserved: 0 });
         assert!(curves == expected, "all retraced: {} curves, {} expected", curves.len(), expected.len());
         assert_eq!(stats.retraced + stats.committer, seeds);
 
         // a window far wider than the catalogue is cut to it rather than allocating a slot for each
-        let (curves, stats) = speculative(&fields, &cat, Speculation { window: usize::MAX, retrace_all: false });
+        let (curves, stats) =
+            speculative(&fields, &cat, Speculation { window: usize::MAX, retrace_all: false, reserved: 0 });
         assert!(curves == expected, "window usize::MAX: {} curves, {} expected", curves.len(), expected.len());
         assert_eq!(stats.window, seeds);
+
+        // threads that only trace ahead commit the same curves
+        let (curves, _) = speculative(&fields, &cat, Speculation { window: WINDOW, retrace_all: false, reserved: 2 });
+        assert!(curves == expected, "2 reserved tracers: {} curves, {} expected", curves.len(), expected.len());
     }
 }
