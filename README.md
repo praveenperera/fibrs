@@ -34,8 +34,9 @@ directory's `run.json`. Activate the numpy environment, or set `FIBRS_LAPACK` to
 Linux, the `libscipy_openblas64_*.so` file in its `site-packages/numpy.libs`; fibrs does not expand a `*`), and run
 the same command again with `--resume`, through the same binary: an activated environment's `fibrs` can come first
 on `PATH`, and a run resumes only with the version that started it. `pip install fibrs` into an environment
-whose numpy is the PyPI wheel needs none of this; a distribution's numpy, such as Debian's `python3-numpy` in a
-`--system-site-packages` environment, bundles none, so install `scipy-openblas64==0.3.31.188.0` there as on macOS.
+that holds its own numpy wheel needs none of this. fibrs looks only inside that environment, so one that inherits
+numpy (`--system-site-packages`) or has a distribution's numpy, such as Debian's `python3-numpy`, needs
+`scipy-openblas64==0.3.31.188.0` installed into it, as on macOS.
 
 ## Use
 
