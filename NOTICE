@@ -22,6 +22,8 @@ vendor. Their full licence texts are in licenses/:
   2014 Kiyoshi Masui, licenses/c-blosc-bitshuffle.txt)
 - LZ4 1.10.0 (lz4-sys): BSD-2-Clause, Copyright (c) 2011-2020 Yann Collet
   (licenses/lz4.txt)
+- mimalloc 3.3.2 (libmimalloc-sys 0.1.49), the binary's allocator: MIT, Copyright (c) 2018-2025
+  Microsoft Corporation, Daan Leijen (licenses/mimalloc.txt)
 - Zstandard 1.5.7 (zstd-sys): BSD-3-Clause, Copyright (c) Meta Platforms, Inc. and
   affiliates (licenses/zstd.txt)
 - zlib (libz-sys, static): zlib licence, Copyright (C) Jean-loup Gailly and Mark Adler
@@ -37,6 +39,13 @@ fibrs predict runs Qual's AFV fibre model V2
 (https://huggingface.co/Qualzz20/afv_fiber_9um_v2). The model and its weights are Qual's:
 fibrs ships neither and reads the snapshot you point it at. At run time it loads NVIDIA's
 cuDNN and cuBLAS from the system or from NVIDIA's pip packages; they are not distributed here.
+
+When a run opts in (FIBRS_NVCOMP=on or a path), GPU trace finishing loads NVIDIA's nvCOMP 6
+(libnvcomp.so.6) at run time, from NVIDIA's own PyPI package nvidia-libnvcomp-cu12
+(installed by the gpu-zstd extra), the system's library path or a path given in
+FIBRS_NVCOMP, to decode prediction slabs on the GPU.
+nvCOMP is proprietary, licensed by NVIDIA under its own SDK licence agreement, and is not
+distributed here; without it fibrs decodes on the CPU.
 
 Its tiling, padding, blend, quantisation, tracing downsample and, in --mode villa, its choice
 of tiles and output chunks follow villa's lasagna.qualzz_inference and

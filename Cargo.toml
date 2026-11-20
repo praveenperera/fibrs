@@ -1,6 +1,6 @@
 [package]
 name = "fibrs"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
@@ -25,9 +25,15 @@ libc = "0.2"
 libloading = "0.9"
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode"] }
 memmap2 = "0.9"
+# the global allocator (the default `mimalloc` feature): glibc malloc maps and unmaps large blocks while holding
+# mmap_lock, which stalls every tracing thread's page faults on dense windows
+mimalloc = { version = "0.1.52", optional = true }
+# mi_collect, to hand the pages a stage freed back to the system (glibc's malloc_trim cannot reach mimalloc's)
+libmimalloc-sys = { version = "0.1.49", optional = true, features = ["extended"] }
 rayon = "1.12"
 rusqlite = { version = "0.40", features = ["bundled"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+# float_roundtrip parses each JSON number to the f64 Python reads, so a value written and read back compares equal
+serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
 sha2 = "0.10"
 zstd = "0.13"
 
@@ -37,7 +43,12 @@ zstd = "0.13"
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 volkit = "0.1"
 # the free device memory for the column check, from the cudarc volkit already brings into the tree
-cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12040"] }
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12040"] }
+
+[features]
+# `--no-default-features` builds with the system allocator
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [profile.release]
 debug = 1

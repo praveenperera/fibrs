@@ -35,6 +35,13 @@ fn text(out: &Output) -> String {
 
 /// `--dry-run`'s per-column lines, without its closing totals
 fn dry_run(ct: &Path, case: &Value, out: &Path) -> Vec<Value> {
+    let args = dry_run_args(ct, case, out);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    column_lines(predict(&args))
+}
+
+/// The `fibrs predict` arguments of a dry run of an `expected.json` case
+fn dry_run_args(ct: &Path, case: &Value, out: &Path) -> Vec<String> {
     let s = |k: &str| case[k].to_string();
     let mut args = vec![
         "--dry-run".to_string(),
@@ -58,8 +65,11 @@ fn dry_run(ct: &Path, case: &Value, out: &Path) -> Vec<Value> {
         let list: Vec<String> = only.iter().map(Value::to_string).collect();
         args.extend(["--only-columns".into(), list.join(",")]);
     }
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let run = predict(&args);
+    args
+}
+
+/// A finished dry run's per-column lines, without its closing totals
+fn column_lines(run: Output) -> Vec<Value> {
     assert!(run.status.success(), "{}", text(&run));
     let mut lines: Vec<Value> =
         String::from_utf8(run.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
@@ -80,6 +90,104 @@ fn dry_run_feeds_what_the_python_reference_feeds() {
         // a dry run writes nothing
         assert_eq!(fs::read_dir(&out).unwrap().count(), 0, "{name}");
     }
+}
+
+/// A `current.zarr`-style `--ct` link repointed to another store while a run reads: every tile still comes from
+/// the store the link named when the arguments were checked, in both modes
+#[cfg(unix)]
+#[test]
+fn a_ct_link_repointed_during_a_run_is_not_followed() {
+    use std::io::Write;
+    use std::os::unix::fs::symlink;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let expected: Value = serde_json::from_slice(&fs::read(fixtures().join("expected.json")).unwrap()).unwrap();
+    // the held chunk is one the run reads early, after startup. Its villa neighbours are stored too, so villa's
+    // selection, which counts only regular files as stored chunks, is the same while it is a FIFO
+    for (name, held) in [("band:band:0-40:c96:b4", "0/0/0"), ("villa:villa:0-150:c192:b1", "2.2.2")] {
+        let case = &expected[name];
+        let dir = scratch(&format!("relink-{}", case["mode"].as_str().unwrap()));
+        let first = dir.join("first.zarr");
+        copy_tree(&fixtures().join(case["ct"].as_str().unwrap()), &first);
+        // the store the link moves to has the same metadata and no chunks, so any tile read from it is fill
+        let next = dir.join("next.zarr");
+        fs::create_dir(&next).unwrap();
+        fs::copy(first.join(".zarray"), next.join(".zarray")).unwrap();
+        let current = dir.join("current.zarr");
+        symlink(&first, &current).unwrap();
+
+        // the held chunk becomes a FIFO, so the run waits at its read until the link has moved
+        let fifo = first.join(held);
+        let bytes = fs::read(&fifo).unwrap();
+        fs::remove_file(&fifo).unwrap();
+        mkfifo(&fifo);
+
+        let out = dir.join("out");
+        fs::create_dir(&out).unwrap();
+        let mut args = dry_run_args(&current, case, &out);
+        // one reader reads the tiles in order, so every tile after the held one is read after the link moves
+        args.extend(["--readers".into(), "1".into()]);
+        let mut run = Command::new(env!("CARGO_BIN_EXE_fibrs"))
+            .arg("predict")
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        // opening the FIFO to write returns once the run has opened it to read
+        let (tx, rx) = mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || tx.send(fs::OpenOptions::new().write(true).open(path)));
+        let Ok(writer) = rx.recv_timeout(Duration::from_secs(120)) else {
+            let _ = run.kill();
+            panic!("{name}: the run never read {held}: {}", text(&run.wait_with_output().unwrap()));
+        };
+        let mut writer = writer.unwrap();
+
+        // moved the way a current.zarr link is updated: a new link renamed over the old one
+        let moved = dir.join("current.zarr.new");
+        symlink(&next, &moved).unwrap();
+        fs::rename(&moved, &current).unwrap();
+        // the chunk is a regular file again before the held read is answered, so a later read of it (a villa
+        // chunk serves several tiles) finds it instead of a FIFO nothing will write to again
+        let restored = dir.join("held.chunk");
+        fs::write(&restored, &bytes).unwrap();
+        fs::rename(&restored, &fifo).unwrap();
+        writer.write_all(&bytes).unwrap();
+        drop(writer);
+
+        assert_eq!(Value::Array(column_lines(run.wait_with_output().unwrap())), case["columns"], "{name}");
+    }
+}
+
+/// Copies the directory `from` to `to`, recursively
+#[cfg(unix)]
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &dest);
+        } else {
+            fs::copy(entry.path(), &dest).unwrap();
+        }
+    }
+}
+
+/// Makes a FIFO at `path`
+#[cfg(unix)]
+fn mkfifo(path: &Path) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c` is a NUL-terminated path that lives through the call
+    let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo {}: {}", path.display(), std::io::Error::last_os_error());
 }
 
 #[test]
@@ -115,6 +223,8 @@ fn bad_arguments_are_refused_with_the_reference_messages() {
         (&["--mode", "villa", "--batch", "4"], 2, "villa mode runs batches of 1; leave --batch out or pass 1"),
         (&["--z0", "0", "--z1", "8", "--precision", "fp16"], 2, "fp32 (the reference contract, the default) or bf16"),
         (&["--z0", "0", "--z1", "8", "--device", "cpu"], 2, "runs on a CUDA device (cuda, cuda:N), not \"cpu\""),
+        (&["--z0", "0", "--z1", "8", "--voxel-size-um", "0"], 2, "--voxel-size-um must be a positive number"),
+        (&["--z0", "0", "--z1", "8", "--voxel-size-um", "nan"], 2, "--voxel-size-um must be a positive number"),
         (&["--z0", "0", "--z1", "8", "--batch", "0"], 1, "--batch and --readers must be at least 1"),
         (&["--z0", "0", "--z1", "8", "--batch", "17"], 1, "--batch is at most 16"),
         (&["--z0", "0", "--z1", "7", "--dry-run"], 1, "band height must be even"),
