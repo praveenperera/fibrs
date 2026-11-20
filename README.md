@@ -8,7 +8,8 @@ predictions it reads are Qual's; this port changes how fast the tracer runs, not
 
 With `--threads 4` for both tools, it traces 22×–47× faster across three uninterrupted runs on 512-plane bands of
 PHerc0826, PHerc1545 and PHerc0358 (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU;
-the direction field and centrality run on an NVIDIA GPU when one is found, and on the CPU otherwise.
+the direction field, centrality and the finishing of traced curves run on an NVIDIA GPU when one is found, and on
+the CPU otherwise.
 
 `fibrs predict` runs the step before: Qual's AFV fibre model V2 over a CT volume on an NVIDIA GPU, without
 PyTorch, writing the probability zarr the tracer reads, as villa's inference writes it (see
@@ -54,10 +55,18 @@ the log says why. `--device cpu` keeps them on the CPU, `--device cuda` fails in
 the GPU certifies each voxel's eigenvector against an error bound, and any voxels it cannot certify, usually few, are
 solved on the CPU with the same `dsyevd` (the log line counts them). Centrality rounds some steps differently on the
 GPU (see "Differences from the original"), and a resumed run keeps the rounding it started with: one started on the
-CPU computes centrality there, and with `--device auto` only its direction field takes the GPU (`--device cuda`
-refuses to resume it). A run started on the GPU can resume without one: the CPU then computes centrality as the GPU
+CPU computes centrality there, and with `--device auto` only its direction field and finishing (below) take the GPU
+(`--device cuda` refuses to resume it). A run started on the GPU can resume without one: the CPU then computes centrality as the GPU
 does, more slowly. `--device auto` also moves the direction field or centrality to the CPU if the GPU fails mid-run,
 for example when it runs out of memory.
+
+When a run uses the GPU, finishing (cutting each traced curve where the predictions disagree, then smoothing,
+resampling and re-checking each piece) runs there too, with the same result as on the CPU, whatever the rounding the
+run started with. Both pooled predictions and a cache of native prediction slabs, up to 8 GiB, stay on the GPU while
+a family is finished; the slabs are still decoded on the CPU. The GPU finishes the curves in batches, and a batch it
+cannot finish, for example one that reads more slabs than its cache holds, is finished on the CPU. At the end of
+each family the log counts the slabs uploaded and the batches the CPU finished. If the GPU fails while finishing,
+`--device auto` finishes the rest of the family on the CPU and `--device cuda` stops the run.
 
 `fibrs.run([...])` runs it from Python and returns the exit status.
 
