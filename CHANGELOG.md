@@ -4,6 +4,16 @@
 
 ### What's new
 
+- **Fewer GPU stalls in centrality.** The GPU no longer waits on the host between units of tiles:
+  - each stream's page-locked buffers are sized once per family, for the largest unit it runs, instead of being
+    regrown mid-stage, which made the GPU finish the other stream's work first;
+  - each unit's seeds come back as a list of their own, joined once at the end, instead of being appended to one
+    list that kept growing;
+  - a unit's inputs are built while the GPU still runs the units before it, and its centrality is installed on
+    the `--threads` pool once the next unit on its stream is queued.
+
+  The centrality and seeds are unchanged. Timing on the dense PHerc0358 window is pending.
+
 - **Trace finishing on the GPU.** When a run uses the GPU, finishing (cutting each traced curve where the
   predictions disagree, then smoothing, resampling and re-checking each piece) runs there too. It gives the CPU's
   pieces bit for bit, so the `.afv` is unchanged, whatever rounding the run started with. Both pooled predictions
