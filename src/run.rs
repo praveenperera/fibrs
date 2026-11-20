@@ -771,7 +771,8 @@ impl Families<'_, '_, '_> {
         // only share the same threads, so they run one after the other. A thread the schedule spawns is outside
         // the run's pool, so the centrality upload and the catalogue would run their parallel parts on rayon's
         // global pool, one thread per core: they get a pool of --threads instead
-        let pool = match self.cent.overlaps() {
+        // with one family there is nothing to prepare during its walk, so no pool for it
+        let pool = match self.cent.overlaps() && self.families.len() > 1 {
             true => Some(rayon::ThreadPoolBuilder::new().num_threads(self.threads).build()?),
             false => None,
         };
@@ -1175,6 +1176,8 @@ fn prepare_on_gpu<D: DirField>(
     let fields = match device.on_gpu(tracing, family, dirs) {
         Some(Ok(fields)) => fields,
         Some(Err(e)) if device.strict => return Err(e),
+        // after the walk the GPU is tried again before the CPU, since it may have failed for want of memory the
+        // walk held
         Some(Err(e)) => {
             let label = if family == 1 { "V" } else { "H" };
             log!("{label} centrality waits for the walk before it: the GPU failed ({e:#})");
