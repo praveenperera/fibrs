@@ -18,6 +18,7 @@ use color_eyre::eyre::{Result, WrapErr, bail, ensure};
 use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut, sys};
 use libloading::Library;
 
+use super::Pending;
 use crate::pyenv::site_packages;
 
 /// The library's soname, as the wheel and NVIDIA's other packages install it
@@ -299,6 +300,11 @@ impl NvComp {
         table.extend(frames.iter().map(|f| out_base + f.output.start as u64));
         table.extend(frames.iter().map(|f| f.input.len() as u64));
         table.extend(frames.iter().map(|f| f.output.len() as u64));
+        let mut status_host = vec![0i32; n];
+        let mut size_host = vec![0usize; n];
+        // after the host memory the copies read and write and the device buffers the decode uses, so an early
+        // return waits for them before any is freed
+        let pending = Pending(stream);
         let table = stream.clone_htod(&table)?;
         let (table_ptr, table_guard) = table.device_ptr(stream);
         let word = |k: u64| (table_ptr + k * 8 * n as u64) as *const c_void;
@@ -309,7 +315,7 @@ impl NvComp {
         // SAFETY: every device array holds `n` entries of the type nvCOMP reads or writes there, and its pointers
         // address ranges `check_frames` held inside the input and the disjoint outputs, aligned as nvCOMP asked;
         // the frames are well formed by the caller's contract. The guards above order these buffers' other work on
-        // `stream` around the decode, and the stream is synchronized below before any of them can be freed
+        // `stream` around the decode, and `pending` waits for the stream before any of them can be freed
         let status = unsafe {
             (self.decompress)(
                 word(0).cast(),
@@ -326,15 +332,16 @@ impl NvComp {
             )
         };
         drop((in_guard, out_guard, temp_guard, table_guard, status_guard, sizes_guard));
-        if !status.is_success() {
-            // an early return frees the buffers on the stream, after whatever the call managed to enqueue
-            stream.synchronize()?;
-            bail!("nvCOMP's zstd decoder failed to launch: {}", self.status_string(status));
-        }
-        let statuses = stream.clone_dtoh(&statuses)?;
-        let sizes = stream.clone_dtoh(&sizes)?;
-        stream.synchronize()?;
-        Ok(statuses.into_iter().zip(sizes).map(|(status, size)| Decoded { status: Status(status), size }).collect())
+        // `pending` waits, on this early return, for whatever the call managed to enqueue
+        ensure!(status.is_success(), "nvCOMP's zstd decoder failed to launch: {}", self.status_string(status));
+        stream.memcpy_dtoh(&statuses, &mut status_host)?;
+        stream.memcpy_dtoh(&sizes, &mut size_host)?;
+        pending.wait("decode with nvCOMP")?;
+        Ok(status_host
+            .into_iter()
+            .zip(size_host)
+            .map(|(status, size)| Decoded { status: Status(status), size })
+            .collect())
     }
 }
 

@@ -139,7 +139,13 @@ mod unsupported {
             match *self {}
         }
 
-        pub fn finisher(&self, _tracing: &[Vol<u8>; 2], _family: usize, _layout: SlabLayout) -> Result<GpuFinisher> {
+        pub fn finisher(
+            &self,
+            _tracing: &[Vol<u8>; 2],
+            _family: usize,
+            _layout: SlabLayout,
+            _batch_points: usize,
+        ) -> Result<GpuFinisher> {
             match *self {}
         }
     }

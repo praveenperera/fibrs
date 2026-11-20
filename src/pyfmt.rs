@@ -29,90 +29,102 @@ pub fn argsort_u16(values: &[u16]) -> Vec<usize> {
 // numpy 2.4.6 npysort_common.h
 const SMALL_QUICKSORT: usize = 15;
 
+/// Partitions at least this long that the quicksort sets aside are sorted on the pool
+const PARALLEL_PARTITION: usize = 1 << 15;
+
+/// NumPy's `aquicksort_` with the partitions it pushes on its stack sorted on the pool
+///
+/// A pushed partition is sorted the same way whenever it is popped: it depends only on its own elements and the
+/// depth limit pushed with it, and partitions are disjoint. So sorting the larger ones on other threads gives
+/// NumPy's order exactly, equal keys included
 fn aquicksort(v: &[u16], tosort: &mut [usize]) {
     let num = tosort.len();
     if num < 2 {
         return;
     }
-    let less = |a: usize, b: usize| v[a] < v[b];
-    // indices into `tosort`; pr is inclusive, as in npysort/quicksort.cpp
-    let mut pl: usize = 0;
-    let mut pr: usize = num - 1;
-    let mut stack: Vec<(usize, usize, i64)> = Vec::new();
-    let mut cdepth: i64 = 2 * msb(num) as i64;
-    loop {
-        let mut heap = false;
+    let cdepth = 2 * msb(num) as i64;
+    rayon::in_place_scope(|scope| sort_popped(v, tosort, cdepth, scope));
+}
+
+/// One range as NumPy's loop takes it off the stack: heapsort past the depth limit, otherwise partition and keep
+/// the smaller side until it is small, then insertion sort
+fn sort_popped<'a>(v: &'a [u16], part: &'a mut [usize], cdepth: i64, scope: &rayon::Scope<'a>) {
+    let mut stack: Vec<(&'a mut [usize], i64)> = vec![(part, cdepth)];
+    while let Some((part, mut cdepth)) = stack.pop() {
         if cdepth < 0 {
-            aheapsort(v, &mut tosort[pl..=pr]);
-            heap = true;
-        } else {
-            while pr - pl > SMALL_QUICKSORT {
-                let pm = pl + ((pr - pl) >> 1);
-                if less(tosort[pm], tosort[pl]) {
-                    tosort.swap(pm, pl);
-                }
-                if less(tosort[pr], tosort[pm]) {
-                    tosort.swap(pr, pm);
-                }
-                if less(tosort[pm], tosort[pl]) {
-                    tosort.swap(pm, pl);
-                }
-                let vp = v[tosort[pm]];
-                let mut pi = pl;
-                let mut pj = pr - 1;
-                tosort.swap(pm, pj);
-                loop {
-                    loop {
-                        pi += 1;
-                        if v[tosort[pi]] >= vp {
-                            break;
-                        }
-                    }
-                    loop {
-                        pj -= 1;
-                        if vp >= v[tosort[pj]] {
-                            break;
-                        }
-                    }
-                    if pi >= pj {
-                        break;
-                    }
-                    tosort.swap(pi, pj);
-                }
-                let pk = pr - 1;
-                tosort.swap(pi, pk);
-                // push the larger partition, keep sorting the smaller one
-                if pi - pl < pr - pi {
-                    cdepth -= 1;
-                    stack.push((pi + 1, pr, cdepth));
-                    pr = pi - 1;
-                } else {
-                    cdepth -= 1;
-                    stack.push((pl, pi - 1, cdepth));
-                    pl = pi + 1;
-                }
+            aheapsort(v, part);
+            continue;
+        }
+        let mut part = part;
+        while part.len() - 1 > SMALL_QUICKSORT {
+            let pi = partition(v, part);
+            cdepth -= 1;
+            let (left, rest) = std::mem::take(&mut part).split_at_mut(pi);
+            let right = &mut rest[1..];
+            // push the larger partition, keep sorting the smaller one
+            let (kept, pushed) = if left.len() < right.len() { (left, right) } else { (right, left) };
+            part = kept;
+            if pushed.len() >= PARALLEL_PARTITION {
+                scope.spawn(move |scope| sort_popped(v, pushed, cdepth, scope));
+            } else {
+                stack.push((pushed, cdepth));
             }
         }
-        if !heap {
-            for i in pl + 1..=pr {
-                let vi = tosort[i];
-                let vp = v[vi];
-                let mut j = i;
-                while j > pl && vp < v[tosort[j - 1]] {
-                    tosort[j] = tosort[j - 1];
-                    j -= 1;
-                }
-                tosort[j] = vi;
+        insertion_sort(v, part);
+    }
+}
+
+/// Median-of-three partition of `part` as `aquicksort_` does it (pl = 0, pr = the last index); returns the pivot's
+/// final index
+fn partition(v: &[u16], tosort: &mut [usize]) -> usize {
+    let less = |a: usize, b: usize| v[a] < v[b];
+    let (pl, pr) = (0, tosort.len() - 1);
+    let pm = pl + ((pr - pl) >> 1);
+    if less(tosort[pm], tosort[pl]) {
+        tosort.swap(pm, pl);
+    }
+    if less(tosort[pr], tosort[pm]) {
+        tosort.swap(pr, pm);
+    }
+    if less(tosort[pm], tosort[pl]) {
+        tosort.swap(pm, pl);
+    }
+    let vp = v[tosort[pm]];
+    let mut pi = pl;
+    let mut pj = pr - 1;
+    tosort.swap(pm, pj);
+    loop {
+        loop {
+            pi += 1;
+            if v[tosort[pi]] >= vp {
+                break;
             }
         }
-        match stack.pop() {
-            Some((l, r, d)) => {
-                pl = l;
-                pr = r;
-                cdepth = d;
+        loop {
+            pj -= 1;
+            if vp >= v[tosort[pj]] {
+                break;
             }
-            None => break,
         }
+        if pi >= pj {
+            break;
+        }
+        tosort.swap(pi, pj);
+    }
+    tosort.swap(pi, pr - 1);
+    pi
+}
+
+fn insertion_sort(v: &[u16], tosort: &mut [usize]) {
+    for i in 1..tosort.len() {
+        let vi = tosort[i];
+        let vp = v[vi];
+        let mut j = i;
+        while j > 0 && vp < v[tosort[j - 1]] {
+            tosort[j] = tosort[j - 1];
+            j -= 1;
+        }
+        tosort[j] = vi;
     }
 }
 
@@ -370,7 +382,101 @@ fn write_str(s: &str, out: &mut String) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    /// NumPy's `aquicksort_` as it was ported, on one thread: the reference for the pooled [`argsort_u16`]
+    pub(crate) fn serial_argsort_u16(values: &[u16]) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..values.len()).collect();
+        serial_aquicksort(values, &mut idx);
+        idx
+    }
+
+    fn serial_aquicksort(v: &[u16], tosort: &mut [usize]) {
+        let num = tosort.len();
+        if num < 2 {
+            return;
+        }
+        let less = |a: usize, b: usize| v[a] < v[b];
+        // indices into `tosort`; pr is inclusive, as in npysort/quicksort.cpp
+        let mut pl: usize = 0;
+        let mut pr: usize = num - 1;
+        let mut stack: Vec<(usize, usize, i64)> = Vec::new();
+        let mut cdepth: i64 = 2 * msb(num) as i64;
+        loop {
+            let mut heap = false;
+            if cdepth < 0 {
+                aheapsort(v, &mut tosort[pl..=pr]);
+                heap = true;
+            } else {
+                while pr - pl > SMALL_QUICKSORT {
+                    let pm = pl + ((pr - pl) >> 1);
+                    if less(tosort[pm], tosort[pl]) {
+                        tosort.swap(pm, pl);
+                    }
+                    if less(tosort[pr], tosort[pm]) {
+                        tosort.swap(pr, pm);
+                    }
+                    if less(tosort[pm], tosort[pl]) {
+                        tosort.swap(pm, pl);
+                    }
+                    let vp = v[tosort[pm]];
+                    let mut pi = pl;
+                    let mut pj = pr - 1;
+                    tosort.swap(pm, pj);
+                    loop {
+                        loop {
+                            pi += 1;
+                            if v[tosort[pi]] >= vp {
+                                break;
+                            }
+                        }
+                        loop {
+                            pj -= 1;
+                            if vp >= v[tosort[pj]] {
+                                break;
+                            }
+                        }
+                        if pi >= pj {
+                            break;
+                        }
+                        tosort.swap(pi, pj);
+                    }
+                    let pk = pr - 1;
+                    tosort.swap(pi, pk);
+                    // push the larger partition, keep sorting the smaller one
+                    if pi - pl < pr - pi {
+                        cdepth -= 1;
+                        stack.push((pi + 1, pr, cdepth));
+                        pr = pi - 1;
+                    } else {
+                        cdepth -= 1;
+                        stack.push((pl, pi - 1, cdepth));
+                        pl = pi + 1;
+                    }
+                }
+            }
+            if !heap {
+                for i in pl + 1..=pr {
+                    let vi = tosort[i];
+                    let vp = v[vi];
+                    let mut j = i;
+                    while j > pl && vp < v[tosort[j - 1]] {
+                        tosort[j] = tosort[j - 1];
+                        j -= 1;
+                    }
+                    tosort[j] = vi;
+                }
+            }
+            match stack.pop() {
+                Some((l, r, d)) => {
+                    pl = l;
+                    pr = r;
+                    cdepth = d;
+                }
+                None => break,
+            }
+        }
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -436,6 +542,20 @@ mod tests {
         let mut seen = order.clone();
         seen.sort_unstable();
         assert_eq!(seen, (0..values.len()).collect::<Vec<_>>());
+    }
+
+    /// Sorting the larger partitions on the pool gives NumPy's order exactly, among equal keys too
+    #[test]
+    fn pooled_argsort_is_the_serial_order() {
+        let mut state = 7u64;
+        let values: Vec<u16> = (0..1_500_000)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((state >> 33) % 40) as u16
+            })
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        assert!(pool.install(|| argsort_u16(&values)) == serial_argsort_u16(&values));
     }
 
     #[test]

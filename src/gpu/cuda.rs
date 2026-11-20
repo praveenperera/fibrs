@@ -432,6 +432,28 @@ fn fit<T: DeviceRepr + ValidAsZeroBits>(stream: &Arc<CudaStream>, buf: &mut Cuda
     Ok(())
 }
 
+/// Waits, when dropped, for the work queued on a stream, so host memory its copies read or write outlives them
+/// when an error returns early: cudarc does not track plain host slices, and the driver may read pageable memory
+/// after an asynchronous copy returns. Locals drop in reverse order, so it guards the memory declared before it
+struct Pending<'a>(&'a CudaStream);
+
+impl Pending<'_> {
+    /// Wait for the queued work, saying on failure that it was `what`
+    fn wait(self, what: &'static str) -> Result<()> {
+        let stream = self.0;
+        // waited for here, so the drop has nothing left to wait for
+        std::mem::forget(self);
+        stream.synchronize().wrap_err(what)
+    }
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        // a failed sync means the context is broken, and freeing then is all that is left to do
+        let _ = self.0.synchronize();
+    }
+}
+
 /// `n` elements of pinned host memory, zeroed, so the typed slices made over it never cover uninitialized memory
 fn pinned<T: DeviceRepr + ValidAsZeroBits>(ctx: &Arc<CudaContext>, n: usize, flags: u32) -> Result<PinnedHostSlice<T>> {
     // SAFETY: the allocation is zeroed below, before any slice is made over it
