@@ -27,6 +27,19 @@
 //! certify back to the host's `dsyevd`. Each filter runs over the whole box with the CPU's edge rules, and every
 //! float32 and float64 operation is an explicit round-to-nearest instruction in the CPU's order, so the bytes
 //! equal the CPU's
+//!
+//! The `fb_walk_*` kernels trace chunks of a family's seeds ahead of the host's commit point (`src/gpu/cuda/walk.rs`
+//! drives them, `src/lookahead.rs` uses the results). The per-seed tracer is [`walk`], generic over its arithmetic
+//! and its reads, and the host includes the same source (`src/walk.rs`), where the tests hold it equal to
+//! `kernels::trace_seed` seed by seed. Per chunk, [`walk_dev::fb_walk_seeds`] runs each seed's start and lists the
+//! survivors, [`walk_dev::fb_walk_trace`] traces both halves of each survivor up to a step cap,
+//! [`walk_dev::fb_walk_spans`] cuts the joined path into accepted curves, three [`walk_dev::fb_walk_scan`] runs lay
+//! the chunk's checks, points and curves out in seed order for [`walk_dev::fb_walk_gather`], and
+//! [`walk_dev::fb_walk_mask`], a scan and [`walk_dev::fb_walk_marks`] list each accepted point's coverage marks in
+//! `mark_list`'s order. [`walk_dev::fb_walk_results`] gives each seed its ranges, or hands it back to the CPU when a
+//! half reached the cap, its spans failed or a buffer ran out. Every coverage read is recorded with the value it
+//! saw, so the host can check a result against the coverage it has committed since. Float64 and float32
+//! operations carry explicit rounding modes, as the CPU tracer's plain Rust arithmetic never contracts
 
 #![no_std]
 #![allow(clippy::missing_safety_doc)]
@@ -37,6 +50,18 @@ use cuda_device::kernel;
 use cuda_device::thread::{__unroll_config, blockDim_x, blockIdx_x, blockIdx_y, threadIdx_x};
 
 pub mod eigen;
+
+/// Full unrolling of the loop whose body it starts, for the walk core shared with the host (which defines it as
+/// nothing)
+macro_rules! unroll_full {
+    () => {
+        cuda_device::thread::__unroll_config::<0>()
+    };
+}
+
+pub mod walk;
+mod walk_dev;
+pub mod walk_layout;
 
 use eigen::{Ops, certify};
 

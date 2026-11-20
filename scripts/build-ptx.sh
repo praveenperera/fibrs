@@ -117,6 +117,15 @@ if grep -qE '^\s*(mul|add|sub|fma|mad)\.f64' "$ptx"; then
   grep -nE '^\s*(mul|add|sub|fma|mad)\.f64' "$ptx" | head >&2
   exit 1
 fi
+# the walk's kernels hold to the CPU tracer's float32 rounding too (its float32 path lengths and point steps), so
+# none of their float32 multiplies or adds may be left for ptxas to fuse
+walk_f32="$(awk '/\.entry fb_walk_/ { entry = $3; sub(/\(.*/, "", entry) } /^}/ { entry = "" }
+  entry != "" && /^[ \t]*(mul|add|sub|fma|mad)(\.ftz)?(\.sat)?\.f32/ { print entry ": " $0 }' "$ptx")"
+if [[ -n "$walk_f32" ]]; then
+  echo "sm_$arch walk kernels have float32 arithmetic without a rounding mode, which ptxas may contract:" >&2
+  head <<< "$walk_f32" >&2
+  exit 1
+fi
 # libdevice: these kernels link none, so THIRD_PARTY notices need no NVIDIA libdevice section
 if grep -q '__nv_' "$ptx"; then
   echo "sm_$arch PTX links libdevice functions; add their notice before shipping:" >&2
