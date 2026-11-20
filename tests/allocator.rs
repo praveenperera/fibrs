@@ -10,7 +10,17 @@ use std::process::{Command, Output};
 /// A run of `exe` with `args` and `MIMALLOC_SHOW_STATS` set, so mimalloc, if it started, prints its statistics, the
 /// memory it reserved among them, to stderr at exit
 fn run(exe: &Path, args: &[&str]) -> Output {
-    Command::new(exe).args(args).env("MIMALLOC_SHOW_STATS", "1").output().unwrap()
+    let mut command = Command::new(exe);
+
+    // other mimalloc settings from the caller's environment, such as one that skips the exit report, would change
+    // what the run prints
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("MIMALLOC_") {
+            command.env_remove(name);
+        }
+    }
+
+    command.args(args).env("MIMALLOC_SHOW_STATS", "1").output().unwrap()
 }
 
 fn mimalloc_started(out: &Output) -> bool {
