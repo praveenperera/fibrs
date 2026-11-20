@@ -14,6 +14,11 @@
   On the dense PHerc0358 window z02304–02816, the catalogues of its 22 million V and 21 million H seeds took
   about 10 CPU-s on one thread, most of the 12 s the seed stage took. The tracing order, and so the `.afv`, is
   unchanged.
+- **`fibrs predict` allocates through the system allocator again.** Under mimalloc, which 0.3.1 made the
+  allocator, the predictor zeroed the large buffers it reused, copied growing vectors that glibc malloc remaps, and
+  faulted fresh pages in. That doubled its kernel time, and on nine columns of a PHerc0826 band a run took 42–43 s
+  instead of 0.3.0's 37–39 s, with the same forward pass. With the system allocator the same run takes 37.1–37.2 s
+  again. The tracer keeps mimalloc. The predictions are unchanged.
 
 ## [0.3.1] - 2026-11-19
 
