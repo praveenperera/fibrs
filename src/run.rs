@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use crate::afv::{ExportOptions, MinLength, Summary, export_afv};
 use crate::arena::BufferPool;
 use crate::axes::{Lapack, direction_field, find_lapack};
-use crate::fields::{FamilyFields, Presence, Seed, catalogue, centrality};
+use crate::fields::{Catalogue, FamilyFields, Presence, Seed, catalogue, centrality};
 use crate::finish::{FinishCtx, NativeCache, NativeSampler};
 use crate::gpu::{AxesCounts, Gpu, Stages};
 use crate::input::Predictions;
@@ -767,9 +767,31 @@ impl Families<'_, '_, '_> {
         debug_dump(self.work, "nx", || dir_bytes(dirs, 8))?;
         debug_dump(self.work, "ny", || dir_bytes(dirs, 0))?;
         debug_mem("direction field", &[("tracing", self.resident), ("directions", dirs.resident_bytes())]);
-        for &family in self.families {
-            let compute = Compute { threads: self.threads, cent: self.cent };
-            trace_family(self.tracing, dirs, self.cache, self.work, family, compute)?;
+        let prepare = |family| prepare_family(self.tracing, dirs, self.work, family, self.cent);
+        let Some((&first, rest)) = self.families.split_first() else { return Ok(()) };
+        let mut prepared = prepare(first)?;
+        let mut families = std::iter::once(first).chain(rest.iter().copied()).peekable();
+        while let Some(family) = families.next() {
+            let walk =
+                |prepared| walk_family(self.tracing, dirs, self.cache, self.work, family, self.threads, prepared);
+            let Some(&following) = families.peek() else {
+                walk(prepared)?;
+                break;
+            };
+            // the GPU computes the next family's centrality while this one walks on the CPU; on the CPU the two
+            // would only share the same threads, so they run one after the other
+            prepared = if self.cent.overlaps() {
+                std::thread::scope(|scope| {
+                    let next = scope.spawn(|| prepare(following));
+                    let walked = walk(prepared);
+                    let next = next.join().map_err(|_| eyre!("centrality thread panicked"))?;
+                    walked.and(next)
+                })?
+            } else {
+                walk(prepared)?;
+                release_freed();
+                prepare(following)?
+            };
             release_freed();
         }
         Ok(())
@@ -922,13 +944,6 @@ fn gib(bytes: usize) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
 }
 
-/// Where a family's stages run: tracing and finishing on `threads` CPU threads, centrality as `cent` says
-#[derive(Clone, Copy)]
-struct Compute<'a> {
-    threads: usize,
-    cent: &'a CentralityDevice,
-}
-
 /// Which of the original's devices a run's centrality reproduces: its CPU kernel rounds some multiply-adds twice
 /// where its CUDA kernels round them once (`stage1.rs`). `run.json` records it as `device`, so one run never mixes
 /// the two, while the hardware a resumed run computes it on may change
@@ -1038,6 +1053,12 @@ impl CentralityDevice {
         Ok(chosen)
     }
 
+    /// Whether the next family's centrality runs while a family walks: only when the GPU computes it, since on the
+    /// CPU it would take the walk's threads
+    fn overlaps(&self) -> bool {
+        self.gpu.is_some() && self.rounding == Rounding::Cuda
+    }
+
     /// The form the direction field is written in: split when the GPU computes centrality, which reads `nx` and
     /// `ny` as two volumes, so a field the CPU computes after a GPU failure needs no copy
     fn dir_form(&self) -> DirForm {
@@ -1075,20 +1096,25 @@ impl CentralityDevice {
     }
 }
 
-fn trace_family<D: DirField>(
+/// A family's centrality and seed catalogue, ready to walk
+struct Prepared {
+    cent: Vol<u16>,
+    cat: Catalogue,
+}
+
+fn prepare_family<D: DirField>(
     tracing: &[Vol<u8>; 2],
     dirs: &D,
-    cache: &NativeCache,
     work: &Path,
     family: usize,
-    Compute { threads, cent }: Compute,
-) -> Result<()> {
+    device: &CentralityDevice,
+) -> Result<Prepared> {
     let label = if family == 1 { "V" } else { "H" };
     let folder = family_dir(work, family);
     fs::create_dir_all(&folder)?;
     let t = Instant::now();
     let pres = Presence::new(tracing, family);
-    let FamilyFields { cent, seeds } = cent.compute(tracing, family, &pres, dirs)?;
+    let FamilyFields { cent, seeds } = device.compute(tracing, family, &pres, dirs)?;
     log!("{label} centrality: {:.1} s", t.elapsed().as_secs_f64());
     debug_mem(label, &[("cent", cent.resident_bytes()), ("seeds", seeds.len() * std::mem::size_of::<Seed>())]);
     let t = Instant::now();
@@ -1110,6 +1136,21 @@ fn trace_family<D: DirField>(
     drop(seeds);
     release_freed();
     log!("{label} seeds: {} in {:.1} s", cat.coords.len(), t.elapsed().as_secs_f64());
+    Ok(Prepared { cent, cat })
+}
+
+fn walk_family<D: DirField>(
+    tracing: &[Vol<u8>; 2],
+    dirs: &D,
+    cache: &NativeCache,
+    work: &Path,
+    family: usize,
+    threads: usize,
+    Prepared { cent, cat }: Prepared,
+) -> Result<()> {
+    let label = if family == 1 { "V" } else { "H" };
+    let folder = family_dir(work, family);
+    let pres = Presence::new(tracing, family);
     let shape = pres.shape();
     let fields = Fields { pres: &pres, cent: &cent, dirs };
     let ctx = FinishCtx { tracing, pres: &pres, family };
