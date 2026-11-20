@@ -24,9 +24,9 @@ pub const OWN_MAPPING_BYTES: usize = 1 << 20;
 /// Requests below this size go straight to the global allocator: they come from its per-thread caches and never
 /// map memory of their own
 const MIN_POOLED: usize = 64 << 10;
-/// Pooled buffers are kept in size classes this far apart, so buffers of nearly equal size (compressed chunks,
-/// clipped tiles) share a class
-const GRANULE: usize = 64 << 10;
+/// Pooled buffers are kept in size classes this far apart unless the pool is made with another granule
+/// ([`BufferPool::with_granule`]), so buffers of nearly equal size (clipped tiles) share a class
+pub const GRANULE: usize = 64 << 10;
 /// Alignment of every pooled buffer; larger alignments go to the global allocator
 const POOL_ALIGN: usize = 64;
 
@@ -41,6 +41,7 @@ const POOL_ALIGN: usize = 64;
 pub struct BufferPool {
     free: Mutex<FreeLists>,
     retain: usize,
+    granule: usize,
 }
 
 #[derive(Default)]
@@ -72,25 +73,41 @@ struct Block(NonNull<u8>);
 unsafe impl Send for Block {}
 
 impl BufferPool {
-    /// A pool that keeps at most `retain` bytes of freed buffers
+    /// A pool that keeps at most `retain` bytes of freed buffers, in size classes [`GRANULE`] apart
     pub fn new(retain: usize) -> Self {
-        Self { free: Mutex::default(), retain }
+        Self::with_granule(retain, GRANULE)
+    }
+
+    /// A pool that keeps at most `retain` bytes of freed buffers, in size classes `granule` bytes apart: a coarser
+    /// granule wastes more of each buffer and finds a kept buffer of the class asked for more often
+    pub fn with_granule(retain: usize, granule: usize) -> Self {
+        assert!(granule > 0, "a size class granule of 0 bytes");
+        Self { free: Mutex::default(), retain, granule }
     }
 
     /// The bytes a buffer of `bytes` occupies while it is in use: its size class when the pool serves it
-    pub fn footprint(bytes: usize) -> usize {
-        Layout::from_size_align(bytes, 1).ok().and_then(Self::class).unwrap_or(bytes)
+    pub fn footprint(&self, bytes: usize) -> usize {
+        Self::footprint_at(bytes, self.granule)
+    }
+
+    /// [`BufferPool::footprint`] in a pool of size classes `granule` apart, before the pool is made
+    pub fn footprint_at(bytes: usize, granule: usize) -> usize {
+        Layout::from_size_align(bytes, 1).ok().and_then(|l| Self::class_at(l, granule)).unwrap_or(bytes)
     }
 
     /// The size class of a pooled request, or `None` for one the global allocator serves directly
-    fn class(layout: Layout) -> Option<usize> {
+    fn class(&self, layout: Layout) -> Option<usize> {
+        Self::class_at(layout, self.granule)
+    }
+
+    fn class_at(layout: Layout, granule: usize) -> Option<usize> {
         if layout.size() < MIN_POOLED || layout.align() > POOL_ALIGN {
             return None;
         }
 
         // a request just under `isize::MAX` would round up past the largest valid layout; the global allocator
         // refuses such a request itself, where an allocator may not panic
-        let class = layout.size().next_multiple_of(GRANULE);
+        let class = layout.size().checked_next_multiple_of(granule)?;
         (class <= isize::MAX as usize).then_some(class)
     }
 
@@ -104,7 +121,7 @@ impl BufferPool {
 // layout (the pool returns exactly the requested length), which maps to the same class
 unsafe impl Allocator for BufferPool {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let Some(class) = Self::class(layout) else { return Global.allocate(layout) };
+        let Some(class) = self.class(layout) else { return Global.allocate(layout) };
         let (reused, stale) = {
             let mut free = self.free.lock().expect("pool lock");
             match free.by_class.get_mut(&class).and_then(Vec::pop) {
@@ -129,7 +146,7 @@ unsafe impl Allocator for BufferPool {
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        let Some(class) = Self::class(layout) else {
+        let Some(class) = self.class(layout) else {
             // SAFETY: requests outside the pool's classes were served by `Global` with this layout
             return unsafe { Global.deallocate(ptr, layout) };
         };
