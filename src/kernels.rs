@@ -1369,7 +1369,7 @@ pub fn evaluate_curve(smoothed: &[[f32; 3]], n_out: usize, shape: [usize; 3]) ->
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
-    use crate::lookahead::{RawCheck, RawMark};
+    use crate::lookahead::RawCheck;
 
     /// Set each voxel `changes` names, as the committer of another coverage did, keeping `writer`'s a copy of it
     pub fn copy(writer: &mut CoverageWriter, changes: &[Change]) {
@@ -1385,11 +1385,6 @@ pub(crate) mod test_support {
             Probe::SameDir(t) => Some(t),
         };
         RawCheck { slot: c.at.slot() as u32, offset: c.at.offset(), seen: c.seen, same_dir }
-    }
-
-    /// A mark as a device reports it
-    pub fn raw_mark(m: &Mark) -> RawMark {
-        RawMark { slot: m.at.slot() as u32, offset: m.at.offset(), dir: m.dir, tan: m.tan }
     }
 
     /// The value of `cov` at a place

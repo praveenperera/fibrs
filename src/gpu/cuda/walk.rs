@@ -688,8 +688,6 @@ impl Walk<'_> {
                 checks: r[1]..r[2],
                 curves: r[3]..r[4],
                 tans: r[5]..r[6],
-                // the host marks the coverage from the points when it uses a result
-                marks: 0..0,
             })
             .collect();
         let checks = slot.host_checks.as_slice()?[..n_checks * CHECK_WORDS]
@@ -708,7 +706,7 @@ impl Walk<'_> {
         let tans = xyz(&slot.host_tans.as_slice()?[..n_pts * 3]);
         let curves =
             slot.host_curves.as_slice()?[..n_curves * 2].as_chunks::<2>().0.iter().map(|r| r[0]..r[1]).collect();
-        Ok(ChunkOut { seeds, results, checks, pts, tans, curves, marks: Vec::new() })
+        Ok(ChunkOut { seeds, results, checks, pts, tans, curves })
     }
 }
 

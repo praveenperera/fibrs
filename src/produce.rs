@@ -412,7 +412,7 @@ mod tests {
 
     use super::*;
     use crate::fields::{Presence, catalogue, centrality};
-    use crate::kernels::test_support::{self, copy, raw_check, raw_mark};
+    use crate::kernels::test_support::{self, copy, raw_check};
     use crate::kernels::{Change, CoverageWriter, encode_dir, pack_dir};
     use crate::lookahead::{ChunkOut, SeedOut, Status};
     use crate::stage1::Separate;
@@ -564,7 +564,7 @@ mod tests {
                 let primary = i < self.cat.starts[r] + self.cat.primary[r];
                 trace_seed(self.fields, self.mirror, &mut scratch, self.cat.coords[i], primary, &mut traced)?;
                 let at = |n: usize| n as u32;
-                let (c0, k0, t0, m0) = (out.checks.len(), out.curves.len(), out.tans.len(), out.marks.len());
+                let (c0, k0, t0) = (out.checks.len(), out.curves.len(), out.tans.len());
                 out.checks.extend(test_support::checks(&traced.reads).expect("recording").iter().map(raw_check));
                 for c in &traced.curves {
                     let p0 = out.pts.len();
@@ -572,13 +572,11 @@ mod tests {
                     out.curves.push(at(p0)..at(out.pts.len()));
                 }
                 out.tans.extend_from_slice(&traced.tans);
-                out.marks.extend(traced.marks.iter().map(raw_mark));
                 out.results.push(SeedOut {
                     status: Status::Done,
                     checks: at(c0)..at(out.checks.len()),
                     curves: at(k0)..at(out.curves.len()),
                     tans: at(t0)..at(out.tans.len()),
-                    marks: at(m0)..at(out.marks.len()),
                 });
             }
             self.done.push_back(out);

@@ -37,15 +37,6 @@ pub struct RawCheck {
     pub same_dir: Option<[f64; 3]>,
 }
 
-/// One coverage update of a seed's accepted curves, as [`crate::kernels::Mark`]: `tan` indexes the seed's tangents
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RawMark {
-    pub slot: u32,
-    pub offset: u16,
-    pub dir: u16,
-    pub tan: u32,
-}
-
 /// How the device left a seed
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -65,7 +56,6 @@ pub struct SeedOut {
     pub curves: Range<u32>,
     /// The tangents of the accepted curves' points, in curve order, as [`Traced::tans`]
     pub tans: Range<u32>,
-    pub marks: Range<u32>,
 }
 
 /// A chunk of consecutive seeds traced on the device
@@ -79,7 +69,6 @@ pub struct ChunkOut {
     pub tans: Vec<[f32; 3]>,
     /// Each accepted curve's points, a range of `pts`
     pub curves: Vec<Range<u32>>,
-    pub marks: Vec<RawMark>,
 }
 
 /// A device that traces chunks of a family's seeds against its own copy of the coverage
