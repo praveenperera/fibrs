@@ -6,8 +6,8 @@
 
 - **Faster tracing on dense data.** Idle threads trace up to 256 seeds ahead of the commit point instead of 64. On
   the dense PHerc0358 window z02304–02816 at `--threads 8`, two runs of each put both families' tracing at 97 and
-  103 s against 109 and 114 s, with 0.13% of seeds traced again instead of 0.04%. Peak memory is unchanged and the
-  `.afv` is identical.
+  103 s against 109 and 114 s, with 0.13% of seeds traced again instead of 0.04%. Peak RSS was 23.0–23.4 GiB against
+  23.0–23.1 GiB, and the `.afv` is identical.
 
 ## [0.3.1] - 2026-11-19
 
