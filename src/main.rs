@@ -11,6 +11,7 @@ mod input;
 mod kernels;
 mod predict;
 mod produce;
+mod pyenv;
 mod pyfmt;
 mod run;
 mod stage1;

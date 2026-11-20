@@ -13,6 +13,9 @@
 
 mod axes;
 mod finish;
+// GPU finishing decodes its prediction slabs through it once it is wired in; until then only its tests use it
+#[cfg_attr(not(test), expect(dead_code))]
+mod nvcomp;
 
 use std::sync::Arc;
 
