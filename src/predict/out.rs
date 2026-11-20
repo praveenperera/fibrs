@@ -18,7 +18,7 @@ use color_eyre::eyre::{Result, bail, ensure, eyre};
 use serde_json::{Map, Value, json};
 
 use super::contract::Col;
-use crate::input::blosc_decompress;
+use super::engine::Buffers;
 use crate::pyfmt::{JsonStyle, py_dumps};
 
 /// zarr's metadata layout (`zarr.util.json_dumps`)
@@ -62,8 +62,9 @@ impl OutArray {
         })
     }
 
-    /// Writes `data`, `(2, dims)` C order, at spatial offset `lo`, as zarr's `array[:, region] = data`
-    pub fn write(&self, lo: [usize; 3], dims: [usize; 3], data: &[u8]) -> Result<()> {
+    /// Writes `data`, `(2, dims)` C order, at spatial offset `lo`, as zarr's `array[:, region] = data`, through
+    /// `bufs`
+    pub fn write(&self, lo: [usize; 3], dims: [usize; 3], data: &[u8], bufs: &mut ChunkBufs) -> Result<()> {
         let plane: usize = dims.iter().product();
         ensure!(data.len() == 2 * plane, "{} bytes for a (2, {dims:?}) region", data.len());
         ensure!((0..3).all(|a| lo[a] + dims[a] <= self.shape[a]), "region past the array's end");
@@ -86,22 +87,18 @@ impl OutArray {
                     // a chunk the region covers whole is replaced; a part-covered one is read, updated and
                     // rewritten (`Array._chunk_setitem_nosync`)
                     let whole = (0..3).all(|a| a0[a] == origin[a] && a1[a] == origin[a] + cs[a]);
-                    let mut chunk = match (whole, fs::read(&path)) {
-                        (true, _) => vec![0u8; 2 * cplane],
+                    // whatever the last chunk left in the buffer
+                    bufs.chunk.resize(2 * cplane, 0);
+                    let chunk = bufs.chunk.as_mut_slice();
+                    match (whole, fs::read(&path)) {
+                        // the copy below overwrites every byte
+                        (true, _) => {}
                         (false, Ok(bytes)) => {
-                            let c = blosc_decompress(&bytes).map_err(|e| eyre!("{}: {e}", path.display()))?;
-                            ensure!(
-                                c.len() == 2 * cplane,
-                                "{}: {} bytes, expected {}",
-                                path.display(),
-                                c.len(),
-                                2 * cplane
-                            );
-                            c
+                            blosc_decompress_into(&bytes, chunk).map_err(|e| eyre!("{}: {e}", path.display()))?
                         }
-                        (false, Err(e)) if e.kind() == ErrorKind::NotFound => vec![0u8; 2 * cplane],
+                        (false, Err(e)) if e.kind() == ErrorKind::NotFound => chunk.fill(0),
                         (false, Err(e)) => bail!("{}: {e}", path.display()),
-                    };
+                    }
                     let w = a1[2] - a0[2];
                     for c in 0..2 {
                         for z in a0[0]..a1[0] {
@@ -121,7 +118,7 @@ impl OutArray {
                             _ => {}
                         }
                     } else {
-                        write_atomic(&path, &blosc_compress(&chunk)?)?;
+                        write_atomic(&path, blosc_compress_into(chunk, &mut bufs.packed)?)?;
                     }
                 }
             }
@@ -130,11 +127,37 @@ impl OutArray {
     }
 }
 
-/// numcodecs' `Blosc(cname="zstd", clevel=3, shuffle=SHUFFLE)` encode of uint8 data
-fn blosc_compress(src: &[u8]) -> Result<Vec<u8>> {
-    let mut out = vec![0u8; src.len() + blosc_src::BLOSC_MAX_OVERHEAD as usize];
-    // SAFETY: `out` holds `src.len()` plus Blosc's maximum overhead, the most c-blosc writes; the context call
-    // keeps no global state
+/// The writer's chunk buffers, kept across chunks and columns: a fresh 4 MiB buffer per chunk meant zeroing it
+/// and faulting its pages in, hundreds of times a column
+#[derive(Default)]
+pub struct ChunkBufs {
+    chunk: Vec<u8>,
+    packed: Vec<u8>,
+}
+
+/// Decodes one Blosc frame into `out`, which must be exactly its decoded size
+fn blosc_decompress_into(src: &[u8], out: &mut [u8]) -> Result<()> {
+    let mut nbytes = 0usize;
+    // SAFETY: c-blosc reads at most `src.len()` bytes of the header to validate it
+    let valid = unsafe { blosc_src::blosc_cbuffer_validate(src.as_ptr().cast(), src.len(), &mut nbytes) };
+    ensure!(valid == 0, "not a valid Blosc frame");
+    ensure!(nbytes == out.len(), "{nbytes} bytes, expected {}", out.len());
+    // SAFETY: the frame was validated against `src.len()`, and c-blosc writes at most `nbytes` bytes, the length of
+    // `out`; the context call keeps no global state
+    let n = unsafe { blosc_src::blosc_decompress_ctx(src.as_ptr().cast(), out.as_mut_ptr().cast(), nbytes, 1) };
+    ensure!(n >= 0 && n as usize == nbytes, "Blosc frame failed to decode ({n})");
+    Ok(())
+}
+
+/// numcodecs' `Blosc(cname="zstd", clevel=3, shuffle=SHUFFLE)` encode of uint8 data, into `out`'s storage
+fn blosc_compress_into<'a>(src: &[u8], out: &'a mut Vec<u8>) -> Result<&'a [u8]> {
+    // c-blosc's output depends on the destination size it is given (a frame that does not fit is stored whole), so
+    // give it exactly numcodecs' size rather than `out`'s capacity, which a larger earlier chunk may have grown
+    let dest = src.len() + blosc_src::BLOSC_MAX_OVERHEAD as usize;
+    out.clear();
+    out.reserve(dest);
+    // SAFETY: `out` has room for `dest`, `src.len()` plus Blosc's maximum overhead, the most c-blosc writes; the
+    // context call keeps no global state
     let n = unsafe {
         blosc_src::blosc_compress_ctx(
             3,
@@ -143,14 +166,15 @@ fn blosc_compress(src: &[u8]) -> Result<Vec<u8>> {
             src.len(),
             src.as_ptr().cast(),
             out.as_mut_ptr().cast(),
-            out.len(),
+            dest,
             c"zstd".as_ptr(),
             0,
             1,
         )
     };
     ensure!(n > 0, "Blosc failed to compress a chunk ({n})");
-    out.truncate(n as usize);
+    // SAFETY: c-blosc reported writing `n` bytes
+    unsafe { out.set_len(n as usize) };
     Ok(out)
 }
 
@@ -289,6 +313,8 @@ pub struct ColumnWriter {
     tx: Option<SyncSender<Finished>>,
     thread: Option<JoinHandle<()>>,
     err: Arc<Mutex<Option<color_eyre::Report>>>,
+    /// Written columns' output buffers, for the engine to fill again
+    spent: Arc<Mutex<Vec<Buffers>>>,
 }
 
 /// The band reference's record key order, so the records read the same
@@ -304,22 +330,38 @@ impl ColumnWriter {
         let (tx, rx) = sync_channel::<Finished>(2);
         let err = Arc::new(Mutex::new(None));
         let slot = err.clone();
+        let spent = Arc::new(Mutex::new(Vec::new()));
+        let give = spent.clone();
         let thread = std::thread::Builder::new().name("fibrs-predict-writer".into()).spawn(move || {
             let mut failed = false;
+            let mut bufs = ChunkBufs::default();
             for job in rx {
                 // after a failure the rest is discarded; the main thread raises it
                 if failed {
                     continue;
                 }
-                if let Err(e) = write_column(&output, &progress, job) {
-                    failed = true;
-                    if let Ok(mut s) = slot.lock() {
-                        *s = Some(e);
+                match write_column(&output, &progress, job, &mut bufs) {
+                    Ok(Some(done)) => {
+                        if let Ok(mut spent) = give.lock() {
+                            spent.push(done);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        failed = true;
+                        if let Ok(mut s) = slot.lock() {
+                            *s = Some(e);
+                        }
                     }
                 }
             }
         })?;
-        Ok(Self { tx: Some(tx), thread: Some(thread), err })
+        Ok(Self { tx: Some(tx), thread: Some(thread), err, spent })
+    }
+
+    /// A written column's output buffers, or empty ones while none is written yet
+    pub fn spare(&self) -> Buffers {
+        self.spent.lock().ok().and_then(|mut s| s.pop()).unwrap_or_default()
     }
 
     fn raise(&self) -> Result<()> {
@@ -352,12 +394,13 @@ impl Drop for ColumnWriter {
     }
 }
 
-fn write_column(output: &Output, progress: &Path, job: Finished) -> Result<()> {
+/// Writes one column and its progress record, and gives back its output buffers
+fn write_column(output: &Output, progress: &Path, job: Finished, bufs: &mut ChunkBufs) -> Result<Option<Buffers>> {
     let [y0, y1, x0, x1] = job.col;
     let (h, w) = (y1 - y0, x1 - x0);
     if let (Some(sem), Some(tra)) = (&job.sem, &job.tra) {
-        output.semantic.write([0, y0, x0], [job.nz, h, w], sem)?;
-        output.tracing.write([0, y0 / 2, x0 / 2], [job.nz / 2, h / 2, w / 2], tra)?;
+        output.semantic.write([0, y0, x0], [job.nz, h, w], sem, bufs)?;
+        output.tracing.write([0, y0 / 2, x0 / 2], [job.nz / 2, h / 2, w / 2], tra, bufs)?;
     }
 
     let mut rec = job.record;
@@ -369,7 +412,7 @@ fn write_column(output: &Output, progress: &Path, job: Finished) -> Result<()> {
     let mut f = fs::OpenOptions::new().create(true).append(true).open(progress)?;
     f.write_all(format!("{line}\n").as_bytes())?;
     println!("{line}");
-    Ok(())
+    Ok(job.sem.zip(job.tra))
 }
 
 #[cfg(test)]
@@ -379,7 +422,7 @@ mod tests {
 
     use serde_json::{Map, Value, json};
 
-    use super::{OutArray, Output};
+    use super::{ChunkBufs, OutArray, Output};
     use crate::input::blosc_decompress;
 
     fn attrs() -> Map<String, Value> {
@@ -413,8 +456,10 @@ mod tests {
         let dir = out.join("semantic");
         // two 4-wide chunks along x; the columns meet inside the first, as 480-wide columns meet in 128 chunks
         let array = OutArray::create(&dir, [4, 4, 8], 4).unwrap();
-        array.write([0, 0, 0], [4, 4, 3], &region([4, 4, 3], [1, 2])).unwrap();
-        array.write([0, 0, 3], [4, 4, 5], &region([4, 4, 5], [3, 4])).unwrap();
+        // one set of buffers throughout, as the writer thread keeps it, so each chunk starts from the last one's bytes
+        let mut bufs = ChunkBufs::default();
+        array.write([0, 0, 0], [4, 4, 3], &region([4, 4, 3], [1, 2]), &mut bufs).unwrap();
+        array.write([0, 0, 3], [4, 4, 5], &region([4, 4, 5], [3, 4]), &mut bufs).unwrap();
 
         let first = chunk(&dir, "0.0.0.0").unwrap();
         assert_eq!(first.len(), 2 * 64);
@@ -425,13 +470,13 @@ mod tests {
         assert_eq!(chunk(&dir, "0.0.0.1").unwrap(), region([4, 4, 4], [3, 4]));
 
         // clearing the second column keeps the first column's voxels and drops the chunk it covered whole
-        array.write([0, 0, 3], [4, 4, 5], &region([4, 4, 5], [0, 0])).unwrap();
+        array.write([0, 0, 3], [4, 4, 5], &region([4, 4, 5], [0, 0]), &mut bufs).unwrap();
         assert!(chunk(&dir, "0.0.0.1").is_none());
         let first = chunk(&dir, "0.0.0.0").unwrap();
         for (c, v) in [1, 2].into_iter().enumerate() {
             assert!(first[c * 64..(c + 1) * 64].chunks(4).all(|row| row == [v, v, v, 0]), "channel {c}");
         }
-        array.write([0, 0, 0], [4, 4, 3], &region([4, 4, 3], [0, 0])).unwrap();
+        array.write([0, 0, 0], [4, 4, 3], &region([4, 4, 3], [0, 0]), &mut bufs).unwrap();
         assert!(chunk(&dir, "0.0.0.0").is_none());
         fs::remove_dir_all(out).unwrap();
     }
