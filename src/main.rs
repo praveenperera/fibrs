@@ -2,6 +2,8 @@
 //! (Qualzz/AVF_SPLINE_GENERATOR @ bee798f7, Apache-2.0) that writes the same `.afv`
 
 mod afv;
+#[cfg(feature = "mimalloc")]
+mod alloc;
 mod arena;
 mod axes;
 mod fields;
@@ -20,10 +22,11 @@ use std::ffi::OsString;
 
 use clap::{CommandFactory, Parser};
 
-/// mimalloc in place of the system allocator, unless built with `--no-default-features`
+/// mimalloc in place of the system allocator for the tracer, unless built with `--no-default-features`; `fibrs
+/// predict` keeps the system allocator (`alloc`)
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: alloc::Dispatch = alloc::Dispatch;
 
 /// Print one log line as the reference's `logging` setup does: `HH:MM:SS message` on stderr
 #[macro_export]
