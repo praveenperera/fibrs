@@ -73,11 +73,13 @@ output either way. nvCOMP is optional and not part of fibrs: it is NVIDIA's own 
 `nvidia-libnvcomp-cu12` (version 6, under NVIDIA's licence), which `pip install "fibrs[gpu-zstd]"` installs. fibrs loads
 its `libnvcomp.so.6` at run time from `FIBRS_NVCOMP` (the library's full path) when that is set, else from the wheel
 in the environment fibrs is installed into or in the active one (`$VIRTUAL_ENV`), else from the system's library
-path, and logs once which it uses, or why slabs decode on the CPU. A slab whose chunk nvCOMP cannot decode as Blosc
+path, and logs once which it uses, or why slabs decode on the CPU. Run from Python (`python -m fibrs` or
+`fibrs.run`), fibrs sets an unset `FIBRS_NVCOMP` to the wheel in that Python's environment, venv or not. A slab whose chunk nvCOMP cannot decode as Blosc
 stored it (its Blosc blocks are not one slab of one channel each, or a zstd frame fails fibrs's checks) is decoded on
-the CPU, as is every slab of an array decoded a whole chunk at a time. nvCOMP trusts the prediction files: a corrupt
-chunk that is still well formed may give wrong output instead of an error. `FIBRS_NVCOMP=off` (in any case) turns
-nvCOMP off, so every slab is decoded on the CPU, and the log gives that as the reason. When nvCOMP's buffers would
+the CPU, as is every slab of an array decoded a whole chunk at a time. GPU slab decoding trusts the prediction files:
+on a corrupt but well-formed chunk, which the CPU decoder would report, nvCOMP's behaviour is undefined (wrong output
+or a CUDA error). `FIBRS_NVCOMP=off` (in any case) turns nvCOMP off, so every slab is decoded on the CPU with
+c-blosc's checks, and the log gives that as the reason. When nvCOMP's buffers would
 leave too little GPU memory for the slab cache, the family's slabs are decoded on the CPU instead, and the log says so.
 
 `fibrs.run([...])` runs it from Python and returns the exit status.
