@@ -1,15 +1,15 @@
 //! zstd decoding on the GPU with NVIDIA's nvCOMP, loaded at run time
 //!
 //! nvCOMP is under NVIDIA's own licence, so fibrs neither links nor ships it: [`NvComp::open`] loads the copy in
-//! NVIDIA's `nvidia-libnvcomp-cu12` wheel, which links the CUDA runtime statically and needs only the driver, and a
-//! caller that cannot open it decodes on the CPU. Bound against nvCOMP 6's C API (`nvcomp/zstd.h`), whose
+//! NVIDIA's `nvidia-libnvcomp-cu12` wheel, which links the CUDA runtime statically and needs only the driver, when
+//! the run opts in to it (see [`NvComp::open`]), and a caller that cannot open it decodes on the CPU. Bound against nvCOMP 6's C API (`nvcomp/zstd.h`), whose
 //! decompression options and argument order differ from earlier majors, so only a major 6 library is accepted
 //!
 //! nvCOMP treats a malformed frame as undefined behaviour, so frames reach [`NvComp::decompress`] only after
 //! [`zstd_frame_fits`](crate::input::zstd_frame_fits) passed their headers on the CPU, and every frame's status and
 //! decoded size are checked after
 
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, OsStr, c_char, c_void};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -143,29 +143,66 @@ pub struct NvComp {
     decompress: DecompressAsync,
 }
 
-impl NvComp {
-    /// Load nvCOMP from the first place that has it: `FIBRS_NVCOMP` (a path to `libnvcomp.so.6`, and then the only
-    /// place tried), the `nvidia-libnvcomp-cu12` wheel in the venv this executable was started from, the one in
-    /// `$VIRTUAL_ENV`, then the dynamic loader's search path. `FIBRS_NVCOMP=off`, in any case, loads none
-    pub fn open() -> Result<Self> {
-        if let Some(path) = std::env::var_os("FIBRS_NVCOMP") {
-            // nvCOMP trusts its input, so this is how a run that doubts its prediction files decodes them on the CPU
-            ensure!(!path.eq_ignore_ascii_case("off"), "FIBRS_NVCOMP is off");
-            return Self::load(Path::new(&path));
+/// Where `FIBRS_NVCOMP` lets [`NvComp::open`] look for nvCOMP
+///
+/// GPU decoding is opt-in because nvCOMP's behaviour on a corrupt but well-formed frame is undefined, where the
+/// CPU decoder reports it: installing the `fibrs[gpu-zstd]` extra, or setting the variable, is the opt-in, and a
+/// system copy of nvCOMP alone never turns it on
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Choice {
+    /// Unset: only the `nvidia-libnvcomp-cu12` wheel in this executable's venv or `$VIRTUAL_ENV`
+    Wheel,
+    /// `on`, in any case: the wheel, then the dynamic loader's search path
+    On,
+    /// `off`, in any case: never load nvCOMP, so every slab keeps c-blosc's checks
+    Off,
+    /// Any other value: that library only
+    Path(PathBuf),
+}
+
+impl Choice {
+    /// The choice a `FIBRS_NVCOMP` value (`None` when unset) makes
+    fn parse(value: Option<&OsStr>) -> Self {
+        let Some(value) = value else { return Self::Wheel };
+        if value.eq_ignore_ascii_case("on") {
+            return Self::On;
         }
-        let wheels = site_packages().into_iter().map(|site| site.join(WHEEL_DIR).join(SONAME));
+        if value.eq_ignore_ascii_case("off") {
+            return Self::Off;
+        }
+        Self::Path(PathBuf::from(value))
+    }
+}
+
+impl NvComp {
+    /// Load nvCOMP as `FIBRS_NVCOMP` allows, which keeps it off unless the run opts in. Unset, only the
+    /// `nvidia-libnvcomp-cu12` wheel (the `fibrs[gpu-zstd]` extra) in the venv this executable was started from or
+    /// in `$VIRTUAL_ENV` is tried; `on`, in any case, tries those wheels and then the dynamic loader's search path;
+    /// `off`, in any case, loads none; any other value is a path to `libnvcomp.so.6`, the only place then tried
+    pub fn open() -> Result<Self> {
+        let wheels =
+            || site_packages().into_iter().map(|site| site.join(WHEEL_DIR).join(SONAME)).filter(|p| p.is_file());
+        let paths: Vec<PathBuf> = match Choice::parse(std::env::var_os("FIBRS_NVCOMP").as_deref()) {
+            // nvCOMP trusts its input, so this is how a run that doubts its prediction files decodes them on the CPU
+            Choice::Off => bail!("FIBRS_NVCOMP is off"),
+            Choice::Path(path) => return Self::load(&path),
+            Choice::On => wheels().chain([PathBuf::from(SONAME)]).collect(),
+            Choice::Wheel => wheels().collect(),
+        };
+        // the default run without the extra: GPU decoding was never asked for, so say how to ask
+        ensure!(
+            !paths.is_empty(),
+            "GPU slab decoding with nvCOMP is opt-in; install fibrs[gpu-zstd], or set FIBRS_NVCOMP=on or to a \
+             libnvcomp.so.6 path"
+        );
         let mut reasons = Vec::new();
-        for path in wheels.filter(|p| p.is_file()).chain([PathBuf::from(SONAME)]) {
+        for path in paths {
             match Self::load(&path) {
                 Ok(nvcomp) => return Ok(nvcomp),
                 Err(e) => reasons.push(format!("{e:#}")),
             }
         }
-        bail!(
-            "cannot load nvCOMP ({}); install the nvidia-libnvcomp-cu12 wheel into this executable's venv or set \
-             FIBRS_NVCOMP",
-            reasons.join("; ")
-        )
+        bail!("cannot load nvCOMP ({}); set FIBRS_NVCOMP to a libnvcomp.so.6 path, or off", reasons.join("; "))
     }
 
     /// Load nvCOMP from `path`, a path or a bare soname for the dynamic loader to find, and check it is major 6
@@ -411,8 +448,24 @@ fn check_frames(frames: &[Frame], input: usize, output: usize) -> Result<()> {
 mod tests {
     use cudarc::driver::CudaContext;
 
-    use super::{Alignments, Frame, NvComp, Status, check_frames};
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    use super::{Alignments, Choice, Frame, NvComp, Status, check_frames};
     use crate::input::{BlockSource, PackedChunk, Predictions, zstd_frame_fits};
+
+    #[test]
+    fn fibrs_nvcomp_values_parse() {
+        let parse = |value: &str| Choice::parse(Some(OsStr::new(value)));
+        assert_eq!(Choice::parse(None), Choice::Wheel);
+        assert_eq!(parse("on"), Choice::On);
+        assert_eq!(parse("ON"), Choice::On);
+        assert_eq!(parse("Off"), Choice::Off);
+        assert_eq!(parse("OFF"), Choice::Off);
+        let lib = "/venv/lib/python3.14/site-packages/nvidia/libnvcomp/lib64/libnvcomp.so.6";
+        assert_eq!(parse(lib), Choice::Path(PathBuf::from(lib)));
+        assert_eq!(parse("onn"), Choice::Path(PathBuf::from("onn")));
+    }
 
     #[test]
     fn frame_ranges_are_checked() {

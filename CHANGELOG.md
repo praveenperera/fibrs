@@ -12,18 +12,17 @@
   CPU, and the log counts those batches and the slabs cached, by where they were decoded, at the end of each
   family. If the GPU fails while finishing, `--device auto` finishes the rest of the family on the CPU and
   `--device cuda` stops the run, as in the other GPU stages. `--device cpu` finishes on the CPU as before.
-- **Prediction slabs decoded on the GPU with nvCOMP.** When fibrs can load NVIDIA's nvCOMP 6, the native slabs
-  GPU finishing reads go to the GPU still compressed and are decoded there; without it they are decoded on the
-  CPU, with the same output. nvCOMP is optional and never bundled: it comes from NVIDIA's own PyPI package,
-  `nvidia-libnvcomp-cu12`, under NVIDIA's licence, which the new `fibrs[gpu-zstd]` extra installs. fibrs loads it at run
-  time from `FIBRS_NVCOMP` (the library's full path), else from the Python environment fibrs is installed into or
-  the active one (from Python, the wheel in that Python's environment), and logs once whether slabs decode on the
-  GPU or why they decode on the CPU. A slab nvCOMP
-  cannot decode as Blosc stored it is decoded on the CPU, as are the slabs of arrays decoded a whole chunk at a
-  time. GPU slab decoding trusts the prediction files: on a corrupt but well-formed chunk, which the CPU decoder
-  would report, nvCOMP's behaviour is undefined (wrong output or a CUDA error); `FIBRS_NVCOMP=off` decodes every
-  slab on the CPU with c-blosc's checks. When the decoder's buffers leave too little GPU memory
-  for the slab cache, finishing stays on the GPU and decodes slabs on the CPU.
+- **Opt-in GPU decoding of prediction slabs with nvCOMP.** With NVIDIA's nvCOMP 6, the native slabs GPU
+  finishing reads go to the GPU still compressed and are decoded there, with the same output on sound files. It is
+  off by default, so slabs decode on the CPU with c-blosc's checks; opt in by installing the new
+  `fibrs[gpu-zstd]` extra, or by setting `FIBRS_NVCOMP=on` (which also tries the system's library path) or to a
+  `libnvcomp.so.6` path. GPU slab decoding trusts the prediction files: on a corrupt chunk nvCOMP's behaviour is
+  undefined, so it may give wrong output or a CUDA fault where the CPU decoder would report the corruption.
+  `FIBRS_NVCOMP=off` turns it off even with the extra installed. nvCOMP is never bundled: it is NVIDIA's own PyPI
+  package, `nvidia-libnvcomp-cu12`, under NVIDIA's licence, and the log says once whether slabs decode on the GPU
+  or why they decode on the CPU. A slab nvCOMP cannot decode as Blosc stored it is decoded on the CPU, as are the
+  slabs of arrays decoded a whole chunk at a time, and when the decoder's buffers leave too little GPU memory for
+  the slab cache, finishing stays on the GPU and decodes slabs on the CPU.
 
 - **Faster seed catalogue.** Each family's seed catalogue (priority split, descending-centrality argsort, sort by
   1024³ region) is built on the `--threads` pool:

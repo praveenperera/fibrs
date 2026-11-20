@@ -40,11 +40,12 @@ fibrs predict runs Qual's AFV fibre model V2
 fibrs ships neither and reads the snapshot you point it at. At run time it loads NVIDIA's
 cuDNN and cuBLAS from the system or from NVIDIA's pip packages; they are not distributed here.
 
-GPU trace finishing can load NVIDIA's nvCOMP 6 (libnvcomp.so.6) at run time, from NVIDIA's
-own PyPI package nvidia-libnvcomp-cu12 (installed by the gpu-zstd extra) or a path given in
-FIBRS_NVCOMP, to decode prediction slabs on the GPU. nvCOMP is proprietary, licensed by NVIDIA
-under its own SDK licence agreement, and is not distributed here; without it fibrs decodes
-on the CPU.
+When a run opts in (the gpu-zstd extra, or FIBRS_NVCOMP=on or a path), GPU trace finishing
+loads NVIDIA's nvCOMP 6 (libnvcomp.so.6) at run time, from NVIDIA's own PyPI package
+nvidia-libnvcomp-cu12 (installed by the gpu-zstd extra), the system's library path
+(FIBRS_NVCOMP=on) or a path given in FIBRS_NVCOMP, to decode prediction slabs on the GPU.
+nvCOMP is proprietary, licensed by NVIDIA under its own SDK licence agreement, and is not
+distributed here; without it fibrs decodes on the CPU.
 
 Its tiling, padding, blend, quantisation, tracing downsample and, in --mode villa, its choice
 of tiles and output chunks follow villa's lasagna.qualzz_inference and
