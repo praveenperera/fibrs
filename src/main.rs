@@ -22,8 +22,8 @@ use std::ffi::OsString;
 
 use clap::{CommandFactory, Parser};
 
-/// mimalloc in place of the system allocator for the tracer, unless built with `--no-default-features`; `fibrs
-/// predict` keeps the system allocator (`alloc`)
+/// mimalloc for small blocks and the system allocator for large ones (`alloc`), unless built with
+/// `--no-default-features`
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: alloc::Dispatch = alloc::Dispatch;

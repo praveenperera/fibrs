@@ -1,144 +1,68 @@
-//! The global allocator: mimalloc for the tracer, the system allocator for `fibrs predict`
+//! The global allocator: the system allocator for large blocks, mimalloc for the rest
 //!
-//! mimalloc keeps the tracer's dense windows off the kernel's `mmap_lock`, which glibc malloc holds while it maps
-//! and unmaps large blocks. The predictor allocates large buffers per batch and column instead, and there mimalloc
-//! zeroes reused blocks, copies a growing vector where glibc remaps it, and faults fresh pages in: on a PHerc0826
-//! band it doubled the predictor's kernel time and took 12% longer end to end, with the forward pass unchanged
+//! mimalloc keeps the tracer's many small allocations fast across threads. Large buffers, which the predictor
+//! allocates per batch and column, go to the system allocator, which glibc serves with fresh mappings and grows in
+//! place with `mremap`, where mimalloc zeroes reused blocks, copies a growing vector and faults fresh pages in
 //!
-//! The choice is made at the first allocation, from the command line, and never changes, so every block is freed
-//! by the allocator that made it. Where the command line cannot be read without allocating, the binary keeps
-//! mimalloc
+//! Which allocator owns a block follows from its size alone, and a block is always freed with the layout it was
+//! allocated or last resized with, so every block is resized and freed by the allocator that made it
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::ptr;
 
 use mimalloc::MiMalloc;
 
-const UNDECIDED: u8 = 0;
-const MIMALLOC: u8 = 1;
-const SYSTEM: u8 = 2;
+/// Blocks of at least this many bytes go to the system allocator
+const LARGE: usize = 1 << 20;
 
-/// Which allocator this process uses, once decided
-static CHOICE: AtomicU8 = AtomicU8::new(UNDECIDED);
-
-/// mimalloc, or the system allocator in `fibrs predict`
+/// mimalloc for blocks under `LARGE` bytes, the system allocator for the rest
 pub struct Dispatch;
 
-impl Dispatch {
-    #[inline]
-    fn system() -> bool {
-        match CHOICE.load(Ordering::Relaxed) {
-            UNDECIDED => decide(),
-            choice => choice == SYSTEM,
-        }
-    }
+#[inline]
+fn large(size: usize) -> bool {
+    size >= LARGE
 }
 
-/// Settles the choice; a thread that loses the race takes the winner's, so all agree
-#[cold]
-fn decide() -> bool {
-    let choice = if args::predict() { SYSTEM } else { MIMALLOC };
-    let settled = match CHOICE.compare_exchange(UNDECIDED, choice, Ordering::Relaxed, Ordering::Relaxed) {
-        Ok(_) => choice,
-        Err(winner) => winner,
-    };
-    settled == SYSTEM
-}
-
-// SAFETY: each call forwards to one allocator, the same one for every call in the process, so a block is resized
-// and freed by the allocator that made it
+// SAFETY: a block's owner follows from its size, and GlobalAlloc requires a block be freed or resized with the
+// layout it was made with, so every call reaches the allocator that made the block; a resize that crosses `LARGE`
+// moves the block to the other allocator
 unsafe impl GlobalAlloc for Dispatch {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { if Self::system() { System.alloc(layout) } else { MiMalloc.alloc(layout) } }
+        unsafe { if large(layout.size()) { System.alloc(layout) } else { MiMalloc.alloc(layout) } }
     }
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        unsafe { if Self::system() { System.alloc_zeroed(layout) } else { MiMalloc.alloc_zeroed(layout) } }
+        unsafe { if large(layout.size()) { System.alloc_zeroed(layout) } else { MiMalloc.alloc_zeroed(layout) } }
     }
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { if Self::system() { System.dealloc(ptr, layout) } else { MiMalloc.dealloc(ptr, layout) } }
+        unsafe { if large(layout.size()) { System.dealloc(ptr, layout) } else { MiMalloc.dealloc(ptr, layout) } }
     }
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let (was, will) = (large(layout.size()), large(new_size));
+        if was == will {
+            return unsafe {
+                if will { System.realloc(ptr, layout, new_size) } else { MiMalloc.realloc(ptr, layout, new_size) }
+            };
+        }
+
+        // SAFETY: the caller guarantees new_size, rounded up to the alignment, does not overflow isize
+        let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+        let moved = unsafe { self.alloc(new_layout) };
+        if moved.is_null() {
+            return moved;
+        }
+
+        // SAFETY: both blocks are live and hold at least the smaller size; the old one goes back to its owner
         unsafe {
-            if Self::system() { System.realloc(ptr, layout, new_size) } else { MiMalloc.realloc(ptr, layout, new_size) }
+            ptr::copy_nonoverlapping(ptr, moved, layout.size().min(new_size));
+            self.dealloc(ptr, layout);
         }
-    }
-}
-
-/// The process's command line, read without allocating
-mod args {
-    use std::ffi::{CStr, c_char};
-
-    use crate::predict;
-
-    /// Whether the command line asks for `fibrs predict`, as `predict::requested` decides it
-    pub fn predict() -> bool {
-        let Some((argc, argv)) = argc_argv() else { return false };
-        if argc < 2 || argv.is_null() {
-            return false;
-        }
-
-        // SAFETY: argv holds argc pointers to NUL-terminated strings that live, unmodified, for the whole process
-        let (arg0, arg1) = unsafe { (*argv, *argv.add(1)) };
-        if arg0.is_null() || arg1.is_null() {
-            return false;
-        }
-
-        // SAFETY: as above
-        let (arg0, arg1) = unsafe { (CStr::from_ptr(arg0), CStr::from_ptr(arg1)) };
-        predict::requested_bytes(arg0.to_bytes(), Some(arg1.to_bytes()))
-    }
-
-    // glibc passes argc and argv to `.init_array` functions, which run before any Rust code; std reads its
-    // `env::args` the same way
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    mod capture {
-        use std::ffi::{c_char, c_int};
-        use std::ptr;
-        use std::sync::atomic::{AtomicIsize, AtomicPtr, Ordering};
-
-        static ARGC: AtomicIsize = AtomicIsize::new(0);
-        static ARGV: AtomicPtr<*const c_char> = AtomicPtr::new(ptr::null_mut());
-
-        #[used]
-        #[unsafe(link_section = ".init_array.00099")]
-        static CAPTURE: extern "C" fn(c_int, *const *const c_char, *const *const c_char) = capture;
-
-        extern "C" fn capture(argc: c_int, argv: *const *const c_char, _envp: *const *const c_char) {
-            ARGC.store(argc as isize, Ordering::Relaxed);
-            ARGV.store(argv.cast_mut(), Ordering::Relaxed);
-        }
-
-        pub fn get() -> Option<(isize, *const *const c_char)> {
-            let argv = ARGV.load(Ordering::Relaxed);
-            (!argv.is_null()).then(|| (ARGC.load(Ordering::Relaxed), argv.cast_const()))
-        }
-    }
-
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    fn argc_argv() -> Option<(isize, *const *const c_char)> {
-        capture::get()
-    }
-
-    #[cfg(target_vendor = "apple")]
-    fn argc_argv() -> Option<(isize, *const *const c_char)> {
-        unsafe extern "C" {
-            fn _NSGetArgc() -> *mut std::ffi::c_int;
-            fn _NSGetArgv() -> *mut *mut *mut c_char;
-        }
-
-        // SAFETY: dyld sets both before any code of the executable runs, and they stay valid for the process
-        unsafe { Some((*_NSGetArgc() as isize, (*_NSGetArgv()).cast_const().cast())) }
-    }
-
-    #[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_vendor = "apple")))]
-    fn argc_argv() -> Option<(isize, *const *const c_char)> {
-        None
+        moved
     }
 }
