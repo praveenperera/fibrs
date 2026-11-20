@@ -63,10 +63,27 @@ for example when it runs out of memory.
 When a run uses the GPU, finishing (cutting each traced curve where the predictions disagree, then smoothing,
 resampling and re-checking each piece) runs there too, with the same result as on the CPU, whatever the rounding the
 run started with. Both pooled predictions and a cache of native prediction slabs, up to 8 GiB, stay on the GPU while
-a family is finished; the slabs are still decoded on the CPU. The GPU finishes the curves in batches, and a batch it
-cannot finish, for example one that reads more slabs than its cache holds, is finished on the CPU. At the end of
-each family the log counts the slabs uploaded and the batches the CPU finished. If the GPU fails while finishing,
+a family is finished. The GPU finishes the curves in batches, and a batch it cannot finish, for example one that
+reads more slabs than its cache holds, is finished on the CPU. At the end of each family the log counts the slabs
+cached, by where they were decoded, and the batches the CPU finished. If the GPU fails while finishing,
 `--device auto` finishes the rest of the family on the CPU and `--device cuda` stops the run.
+
+By default the slabs are decoded on the CPU, with c-blosc's checks. Decoding them on the GPU with NVIDIA's nvCOMP is
+opt-in, with the same output on sound files: run `pip install "fibrs[gpu-zstd]"` and set `FIBRS_NVCOMP=on`, or
+set `FIBRS_NVCOMP` to the path of a `libnvcomp.so.6`. GPU slab decoding trusts the prediction files: on a corrupt
+chunk nvCOMP's behaviour is undefined, so it may give wrong output or a CUDA fault where the CPU decoder would
+report the corruption.
+
+nvCOMP is not part of fibrs: it is NVIDIA's own PyPI package, `nvidia-libnvcomp-cu12` (version 6, under NVIDIA's
+licence), which the `gpu-zstd` extra installs. With `FIBRS_NVCOMP=on` (in any case), fibrs loads that wheel from
+the environment fibrs is installed into or the active one (`$VIRTUAL_ENV`), then tries the system's library path.
+Run from Python (`python -m fibrs` or `fibrs.run`), it loads only the wheel in that Python's environment, venv or
+not, when there is one, so a wheel whose library fails to load leaves slabs on the CPU. Unset or `off`,
+nvCOMP is never loaded, whether or not the wheel is installed. The log says once whether slabs decode on the GPU, or
+why they decode on the CPU. Even with nvCOMP, a slab whose chunk it cannot decode as Blosc stored it (its Blosc
+blocks are not one slab of one channel each, or a zstd frame fails fibrs's checks) is decoded on the CPU, as is
+every slab of an array decoded a whole chunk at a time, and when nvCOMP's buffers would leave too little GPU memory
+for the slab cache, the family's slabs are decoded on the CPU and the log says so.
 
 `fibrs.run([...])` runs it from Python and returns the exit status.
 
@@ -493,4 +510,4 @@ each stage was timed in its own run. Tracing ran with `--threads 4` for both too
 Apache-2.0, like the original; the licence text is `licenses/apache-2.0.txt`. `NOTICE` lists the ported code
 (AVF_SPLINE_GENERATOR, one NumPy sort routine), the statically linked C libraries and what `fibrs predict` takes
 from villa (MIT: its tile rule in villa mode); their licence texts are in `licenses/`. The AFV model and its
-weights are Qual's, and cuDNN and cuBLAS are NVIDIA's; none of them is distributed here.
+weights are Qual's, and cuDNN, cuBLAS and nvCOMP are NVIDIA's; none of them is distributed here.

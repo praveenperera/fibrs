@@ -2,27 +2,34 @@
 //!
 //! Both pooled predictions go up once per family, a table and a pool of bricks each. The native predictions go up
 //! slab by slab into a slab cache sized from the device memory free then. Each batch lists every slab a sample of
-//! its curves can read, decodes the ones the cache lacks on the CPU through the `NativeCache`, in parallel on the
-//! finishing pool, and uploads them in place of the least recently used. `fs_segments` then flags each raw segment,
-//! the host cuts the curves into pieces as `finish` does, `fs_fit` smooths and resamples each piece of at least
-//! [`MIN_FIT_POINTS`] points, and `fs_segments` tests each fitted piece whole. A batch the kernels flag, or one that
-//! reads more slabs than the cache holds, comes back as [`Finished::OnCpu`] for the CPU to finish, so the output is
-//! the CPU's either way
+//! its curves can read and puts the ones the cache lacks in place of the least recently used. With nvCOMP loaded,
+//! each chunk those slabs lie in goes up still compressed, once a batch, and nvCOMP decodes their zstd frames
+//! straight into their slots in one call; a slab it cannot decode, and every slab without nvCOMP, is decoded on the
+//! CPU through the `NativeCache`, in parallel on the finishing pool, and uploaded. `fs_segments` then flags each raw
+//! segment, the host cuts the curves into pieces as `finish` does, `fs_fit` smooths and resamples each piece of at
+//! least [`MIN_FIT_POINTS`] points, and `fs_segments` tests each fitted piece whole. A batch the kernels flag, or
+//! one that reads more slabs than the cache holds, comes back as [`Finished::OnCpu`] for the CPU to finish, so the
+//! output is the CPU's either way
 
-use std::ops::RangeInclusive;
+use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
 use color_eyre::eyre::{Result, WrapErr, ensure, eyre};
 use cudarc::driver::{
-    CudaEvent, CudaFunction, CudaSlice, CudaStream, LaunchArgs, LaunchConfig, PinnedHostSlice, PushKernelArg, sys,
+    CudaEvent, CudaFunction, CudaSlice, CudaStream, CudaViewMut, DevicePtrMut, LaunchArgs, LaunchConfig,
+    PinnedHostSlice, PushKernelArg, result, sys,
 };
 use rayon::ThreadPool;
 use rayon::prelude::*;
 
+use super::nvcomp::{Frame, NvComp, Workspace};
 use super::{BLOCK, Gpu, NO_BRICK, Pending, drain, fit, grid_1d, pinned};
+use crate::arena::BufferPool;
 use crate::finish::{NativeCache, SlabLayout, valid_runs};
-use crate::gpu::{CpuReason, Finished, Pieces};
+use crate::gpu::{CpuReason, Finished, Pieces, SlabLoads};
+use crate::input::{BlockSource, PackedChunk};
 use crate::kernels::{MIN_FIT_POINTS, RawCurve};
+use crate::log;
 use crate::vol::{BRICK, Shape, Vol};
 
 /// Pinned staging for uploads, in two halves so one fills while the other's copies run; host memory, not copy
@@ -48,6 +55,12 @@ const NO_SLAB: u32 = u32::MAX;
 const ERR_SLAB: u32 = 1;
 /// `err` bit `fs_fit` sets when a fitted piece outgrows its room in `fitted`
 const ERR_CAPACITY: u32 = 2;
+/// Device memory for the compressed chunks one nvCOMP call decodes from: over a hundred compressed 128³ chunks of
+/// about 1 MiB, more than most batches miss; a batch that misses more makes more calls, and a chunk larger than it
+/// is decoded on the CPU
+const PACKED_BYTES: usize = 128 << 20;
+/// Most zstd frames, two a slab, one nvCOMP call decodes, which bounds the workspace set aside for it
+const MAX_FRAMES: usize = 4096;
 
 /// Finishes batches of one family's raw curves on the GPU: the pooled predictions and the native slab cache on
 /// the device, and the buffers each batch reuses
@@ -66,7 +79,11 @@ pub struct GpuFinisher {
 impl Gpu {
     /// A finisher of family `family` (1 = V, 2 = H) that reads `tracing` and native predictions laid out as
     /// `layout`, for batches of about `batch_points` raw points at most; uploads both pooled predictions and sizes
-    /// the slab cache from the device memory free after them, less what such a batch's buffers take
+    /// the slab cache from the device memory free after them, less what such a batch's buffers and nvCOMP's decodes
+    /// take, or decodes slabs on the CPU when those leave no room for a cache
+    ///
+    /// The first finisher loads nvCOMP and logs whether native slabs decode on the GPU or on the CPU; a run reads
+    /// one native array, so every later finisher's layout is the first's and shares that choice
     pub fn finisher(
         &self,
         tracing: &[Vol<u8>; 2],
@@ -74,10 +91,11 @@ impl Gpu {
         layout: SlabLayout,
         batch_points: usize,
     ) -> Result<GpuFinisher> {
-        self.finisher_with(tracing, family, layout, batch_points, SLAB_CACHE_MAX)
+        let nvcomp = self.nvcomp.get_or_init(|| load_nvcomp(layout)).clone();
+        self.finisher_with(tracing, family, layout, batch_points, SLAB_CACHE_MAX, nvcomp)
     }
 
-    /// [`Gpu::finisher`] with a slab cache of at most `cache_bytes`
+    /// [`Gpu::finisher`] with a slab cache of at most `cache_bytes`, decoding slabs with `nvcomp` when given
     fn finisher_with(
         &self,
         tracing: &[Vol<u8>; 2],
@@ -85,6 +103,7 @@ impl Gpu {
         layout: SlabLayout,
         batch_points: usize,
         cache_bytes: usize,
+        nvcomp: Option<Arc<NvComp>>,
     ) -> Result<GpuFinisher> {
         let shape = tracing[0].shape();
         ensure!(tracing[1].shape() == shape, "the pooled predictions differ in shape");
@@ -109,7 +128,7 @@ impl Gpu {
         let mut staging = Staging::new(&stream, layout.slab_bytes())?;
         let tracing = Tracing::upload(&stream, &mut staging, tracing)?;
         let reserve = batch_points.saturating_mul(BATCH_BYTES_PER_POINT);
-        let slabs = SlabCache::new(self, &stream, layout, reserve, cache_bytes)?;
+        let slabs = SlabCache::open(self, &stream, layout, reserve, cache_bytes, nvcomp)?;
         let bufs = Buffers::new(&stream)?;
         let kernels = [self.k.fs_segments.clone(), self.k.fs_fit.clone()];
         Ok(GpuFinisher { kernels, stream, family: family as u32, tracing, slabs, staging, bufs })
@@ -122,13 +141,14 @@ impl GpuFinisher {
         self.slabs.held.len()
     }
 
-    /// Slabs uploaded so far, counting uploads again after eviction
-    pub fn uploaded(&self) -> u64 {
-        self.slabs.uploaded
+    /// Slabs put in the cache so far, by where they were decoded, counting slabs again after eviction
+    pub fn loaded(&self) -> SlabLoads {
+        self.slabs.loads
     }
 
     /// Finish `batch`, each curve's pieces equal to `FinishCtx::finish`'s, in batch order; or say why the CPU
-    /// must finish it instead. Decoding runs on `pool`, through `cache`, which must lie as the finisher's layout
+    /// must finish it instead. Slabs are read, and decoded on the CPU when nvCOMP does not decode them, on `pool`
+    /// through `cache`, which must lie as the finisher's layout
     ///
     /// An error is a CUDA error, after which the finisher should not be used again
     pub fn finish(&mut self, pool: &ThreadPool, cache: &NativeCache, batch: &[RawCurve]) -> Result<Finished> {
@@ -261,6 +281,37 @@ impl GpuFinisher {
         pending.wait("run the fitting kernels")?;
         out.err = err[0];
         Ok(out)
+    }
+}
+
+/// nvCOMP for decoding native slabs laid out as `layout`, or `None` when they decode on the CPU; logs which, and why
+fn load_nvcomp(layout: SlabLayout) -> Option<Arc<NvComp>> {
+    if layout.planes == layout.edge[0] {
+        log!("Native slabs for finishing decode on the CPU: the predictions decode a whole chunk at a time");
+        return None;
+    }
+    let nvcomp = NvComp::open().and_then(|nvcomp| {
+        let align = nvcomp.alignments();
+        // each frame starts where Blosc put it, and each output at a channel's half of a slab slot
+        let half = layout.slab_bytes() / 2;
+        ensure!(
+            align.input <= 1 && half.is_multiple_of(align.output.max(1)),
+            "{} wants zstd frames aligned to {} bytes and outputs to {}",
+            nvcomp.name(),
+            align.input,
+            align.output
+        );
+        Ok(nvcomp)
+    });
+    match nvcomp {
+        Ok(nvcomp) => {
+            log!("Native slabs for finishing decode on the GPU with {}", nvcomp.name());
+            Some(Arc::new(nvcomp))
+        }
+        Err(e) => {
+            log!("Native slabs for finishing decode on the CPU: {e:#}");
+            None
+        }
     }
 }
 
@@ -587,7 +638,8 @@ impl Staging {
         self.buf.len() / 2
     }
 
-    /// The next half to fill, once the copies queued from it before have finished
+    /// The next half to fill, once the copies queued from it before have finished; the same half again until
+    /// [`Staging::queued`] moves on
     fn take(&mut self) -> Result<&mut [u8]> {
         if let Some(done) = self.queued[self.next].take() {
             done.synchronize()?;
@@ -618,6 +670,11 @@ impl Drop for Staging {
 /// `NativeCache::copy_slab`'s layout, and a table from each slab of the layout to its slot, or [`NO_SLAB`]
 ///
 /// Slots are reused least recently read first across batches; a batch's own slabs are never evicted for it
+///
+/// With a [`GpuDecoder`], a missing slab is decoded on the device from its chunk's compressed bytes when
+/// [`Predictions::plane_blocks`](crate::input::Predictions::plane_blocks) finds each channel's planes in one block
+/// nvCOMP or a copy reproduces, and nvCOMP reports the frames decoded whole; every other missing slab is decoded on
+/// the CPU through the `NativeCache` and uploaded, as without one
 struct SlabCache {
     layout: SlabLayout,
     /// The native shape, the chunk edge, planes per slab, the chunk grid's y and x, and slabs per chunk
@@ -633,15 +690,61 @@ struct SlabCache {
     batch: u64,
     /// The span of `host` changed since `table` was last written
     dirty: Option<(usize, usize)>,
-    uploaded: u64,
+    decoder: Option<GpuDecoder>,
+    loads: SlabLoads,
 }
 
 impl SlabCache {
+    /// A cache as [`SlabCache::new`] makes it, decoding with `nvcomp` when given and its decoder and a cache both
+    /// fit, else decoding on the CPU; logs why when it falls back
+    ///
+    /// The decoder is optional, so its buffers must not cost a cache that fits without them: with about a GiB free
+    /// after the pooled predictions, they can leave too little for one, which would move finishing off the GPU
+    fn open(
+        gpu: &Gpu,
+        stream: &Arc<CudaStream>,
+        layout: SlabLayout,
+        reserve: usize,
+        most: usize,
+        nvcomp: Option<Arc<NvComp>>,
+    ) -> Result<Self> {
+        let Some(nvcomp) = nvcomp else { return Self::new(gpu, stream, layout, reserve, most, None) };
+        let (free, _) = gpu.ctx.mem_get_info()?;
+        let without = slab_slots(free, reserve, most, layout.slab_bytes(), layout.len());
+        // allocated before the slab cache is sized, so the free memory it is sized from leaves this out
+        let with_decoder = GpuDecoder::new(stream, nvcomp, layout)
+            .and_then(|decoder| Self::new(gpu, stream, layout, reserve, most, Some(decoder)));
+        let e = match with_decoder {
+            // a cache the decoder shrank by more than a quarter sends batches to CPU finishing that fit with CPU
+            // slab decoding, which costs more than decoding on the GPU saves
+            Ok(cache) if 4 * cache.held.len() < 3 * without => {
+                let slots = cache.held.len();
+                drop(cache);
+                eyre!("{slots} slab slots with nvCOMP's buffers, {without} without")
+            }
+            Ok(cache) => return Ok(cache),
+            Err(e) => e,
+        };
+        log!("Native slabs for finishing decode on the CPU: nvCOMP's buffers and a slab cache do not fit ({e:#})");
+        // the decoder's buffers are freed on the stream, and return to the free memory the cache is sized from
+        // only once it is drained
+        drain(stream).wrap_err("free nvCOMP's buffers")?;
+        Self::new(gpu, stream, layout, reserve, most, None)
+    }
+
     /// A cache as [`slab_slots`] sizes it from the device memory free now, leaving room for its table and
     /// `reserve` bytes for a batch's buffers, and holding at most `most` bytes
-    fn new(gpu: &Gpu, stream: &Arc<CudaStream>, layout: SlabLayout, reserve: usize, most: usize) -> Result<Self> {
+    fn new(
+        gpu: &Gpu,
+        stream: &Arc<CudaStream>,
+        layout: SlabLayout,
+        reserve: usize,
+        most: usize,
+        decoder: Option<GpuDecoder>,
+    ) -> Result<Self> {
         let (free, _) = gpu.ctx.mem_get_info()?;
         let bytes = layout.slab_bytes();
+        // the decoder's buffers are already allocated, so `free` leaves them out
         let slots = slab_slots(free, reserve, most, bytes, layout.len());
         ensure!(slots > 0, "{} MiB free on the GPU leave no room for native slabs", free >> 20);
         // the pool first, so a failed allocation leaves no copy queued
@@ -665,12 +768,13 @@ impl SlabCache {
             used: vec![0; slots],
             batch: 0,
             dirty: None,
-            uploaded: 0,
+            decoder,
+            loads: SlabLoads::default(),
         })
     }
 
     /// Make every slab of `needed` (sorted unique table indices, no more than the slots) resident, decoding the
-    /// missing ones through `cache` on `pool` and uploading them; false when one fails to decode
+    /// missing ones on the device or through `cache` on `pool`; false when one fails to decode on the CPU
     fn load(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -698,35 +802,192 @@ impl SlabCache {
                 self.set(old as usize, NO_SLAB);
             }
         }
-        let bytes = self.layout.slab_bytes();
-        let per_half = staging.half() / bytes;
-        let layout = self.layout;
-        let mut decoded = true;
-        for (keys, slots) in missing.chunks(per_half).zip(slots.chunks(per_half)) {
-            let host = &mut staging.take()?[..keys.len() * bytes];
-            let copied = pool.install(|| {
-                host.par_chunks_mut(bytes)
-                    .zip(keys)
-                    .try_for_each(|(out, &i)| cache.copy_slab(layout.key(i as usize), out))
-            });
-            // the CPU finishes the batch, reading only the slabs it needs, and reports the error if one is this
-            if copied.is_err() {
-                decoded = false;
-                break;
-            }
-            for ((&i, &slot), data) in keys.iter().zip(slots).zip(host.chunks_exact(bytes)) {
-                let at = slot as usize * bytes;
-                stream.memcpy_htod(data, &mut self.pool.slice_mut(at..at + bytes))?;
-                self.held[slot as usize] = i;
-                self.used[slot as usize] = self.batch;
-                self.set(i as usize, slot);
-            }
-            staging.queued(stream)?;
-            self.uploaded += keys.len() as u64;
-        }
+        let todo: Vec<(u32, u32)> = missing.into_iter().zip(slots).collect();
+        let on_cpu = match self.decoder {
+            Some(_) => self.decode_on_gpu(stream, staging, pool, cache, &todo)?,
+            None => todo,
+        };
+        let decoded = self.decode_on_cpu(stream, staging, pool, cache, &on_cpu)?;
         // the evictions reach the device even when a decode failed, so no entry names a slot that changed
         self.write_table(stream)?;
         Ok(decoded)
+    }
+
+    /// Decode slabs `todo` (table index, slot) on the CPU through `cache` on `pool` and upload them into their
+    /// slots; false when one fails to decode
+    fn decode_on_cpu(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        staging: &mut Staging,
+        pool: &ThreadPool,
+        cache: &NativeCache,
+        todo: &[(u32, u32)],
+    ) -> Result<bool> {
+        let bytes = self.layout.slab_bytes();
+        let per_half = staging.half() / bytes;
+        let layout = self.layout;
+        for part in todo.chunks(per_half) {
+            let host = &mut staging.take()?[..part.len() * bytes];
+            let copied = pool.install(|| {
+                host.par_chunks_mut(bytes)
+                    .zip(part)
+                    .try_for_each(|(out, &(i, _))| cache.copy_slab(layout.key(i as usize), out))
+            });
+            // the CPU finishes the batch, reading only the slabs it needs, and reports the error if one is this
+            if copied.is_err() {
+                return Ok(false);
+            }
+            for (&(i, slot), data) in part.iter().zip(host.chunks_exact(bytes)) {
+                let at = slot as usize * bytes;
+                stream.memcpy_htod(data, &mut self.pool.slice_mut(at..at + bytes))?;
+                self.hold(i, slot);
+            }
+            staging.queued(stream)?;
+            self.loads.on_cpu += part.len() as u64;
+        }
+        Ok(true)
+    }
+
+    /// Decode slabs `todo` (table index, slot, in table order) into their slots with nvCOMP, reading and uploading
+    /// each chunk they lie in once; returns the slabs left for the CPU
+    fn decode_on_gpu(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        staging: &mut Staging,
+        pool: &ThreadPool,
+        cache: &NativeCache,
+        todo: &[(u32, u32)],
+    ) -> Result<Vec<(u32, u32)>> {
+        let layout = self.layout;
+        let spc = layout.per_chunk() as u32;
+        // a chunk's slabs are adjacent in table order
+        let chunks: Vec<&[(u32, u32)]> = todo.chunk_by(|a, b| a.0 / spc == b.0 / spc).collect();
+        let mut round = Round::default();
+        let mut cpu = Vec::new();
+        // as many chunks are read at once as the pool has threads, so no more compressed chunks are held outside
+        // the cache than the CPU's decoding holds
+        for group in chunks.chunks(pool.current_num_threads().max(1)) {
+            let plans: Vec<ChunkPlan> =
+                pool.install(|| group.par_iter().map(|slabs| ChunkPlan::read(cache, &layout, slabs)).collect());
+            for plan in plans {
+                self.stage_chunk(stream, staging, &mut round, plan, &mut cpu)?;
+            }
+        }
+        self.decode_round(stream, staging, &mut round, &mut cpu)?;
+        Ok(cpu)
+    }
+
+    /// Queue the upload of one chunk's compressed bytes and add the frames, copies and fills of its slabs the GPU
+    /// can decode to `round`, decoding the round first when the chunk does not fit beside it; the chunk's other
+    /// slabs go to `cpu`
+    fn stage_chunk(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        staging: &mut Staging,
+        round: &mut Round,
+        plan: ChunkPlan,
+        cpu: &mut Vec<(u32, u32)>,
+    ) -> Result<()> {
+        let ChunkPlan { packed, slabs, sources } = plan;
+        let mut on_gpu = Vec::with_capacity(slabs.len());
+        for (&slab, sources) in slabs.iter().zip(sources) {
+            match sources {
+                Some(sources) => on_gpu.push((slab, sources)),
+                None => cpu.push(slab),
+            }
+        }
+        let bytes = match packed.as_deref() {
+            Some(PackedChunk::Blosc(bytes)) => &bytes[..],
+            _ => &[],
+        };
+        let blocks = || on_gpu.iter().flat_map(|(_, sources)| sources);
+        let frames = blocks().filter(|b| matches!(b, BlockSource::Zstd(_))).count();
+        let read = blocks().any(|b| !matches!(b, BlockSource::Fill(_)));
+        let room = self.decoder.as_ref().expect("GPU decoding has a decoder").packed.len();
+        if on_gpu.is_empty() || bytes.len() > room || frames > MAX_FRAMES {
+            cpu.extend(on_gpu.iter().map(|&(slab, _)| slab));
+            return Ok(());
+        }
+        if (read && round.used + bytes.len() > room) || round.frames.len() + frames > MAX_FRAMES {
+            self.decode_round(stream, staging, round, cpu)?;
+        }
+
+        let at = round.used;
+        if read {
+            let packed_dev = &mut self.decoder.as_mut().expect("GPU decoding has a decoder").packed;
+            round.gather.put(stream, staging, packed_dev, at, bytes)?;
+            round.used += bytes.len();
+        }
+        let slab_bytes = self.layout.slab_bytes();
+        let half = slab_bytes / 2;
+        for ((i, slot), sources) in on_gpu {
+            let owner = round.slabs.len();
+            round.slabs.push((i, slot));
+            // V then H, each in its half of the slot, as `NativeCache::copy_slab` lays a slab out
+            for (c, source) in sources.into_iter().enumerate() {
+                let out = slot as usize * slab_bytes + c * half;
+                let out = out..out + half;
+                match source {
+                    BlockSource::Zstd(r) => {
+                        round.frames.push(Frame { input: at + r.start..at + r.end, output: out });
+                        round.owner.push(owner);
+                    }
+                    BlockSource::Raw(r) => round.copies.push((at + r.start..at + r.end, out)),
+                    BlockSource::Fill(value) => round.fills.push((out, value)),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Finish the round's uploads, copies and fills and decode its frames in one nvCOMP call, holding each slab
+    /// whose frames decoded whole and sending the others to `cpu`
+    fn decode_round(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        staging: &mut Staging,
+        round: &mut Round,
+        cpu: &mut Vec<(u32, u32)>,
+    ) -> Result<()> {
+        if round.slabs.is_empty() {
+            return Ok(());
+        }
+        let decoder = self.decoder.as_mut().expect("GPU decoding has a decoder");
+        round.gather.flush(stream, staging, &mut decoder.packed)?;
+        for (from, to) in round.copies.drain(..) {
+            stream.memcpy_dtod(&decoder.packed.slice(from), &mut self.pool.slice_mut(to))?;
+        }
+        for (to, value) in round.fills.drain(..) {
+            fill(stream, &mut self.pool.slice_mut(to), value)?;
+        }
+        // SAFETY: each frame's input is a zstd frame `plane_blocks` passed through `zstd_frame_fits` for its
+        // output's length, uploaded unchanged with its chunk above, and the outputs are the distinct channel halves
+        // of distinct slots
+        let decoded = unsafe {
+            decoder.nvcomp.decompress(stream, &mut decoder.workspace, &decoder.packed, &mut self.pool, &round.frames)
+        }?;
+
+        let mut failed = vec![false; round.slabs.len()];
+        for ((frame, d), &owner) in round.frames.iter().zip(&decoded).zip(&round.owner) {
+            failed[owner] |= !d.status.is_success() || d.size != frame.output.len();
+        }
+        for (&(i, slot), failed) in round.slabs.iter().zip(failed) {
+            if failed {
+                cpu.push((i, slot));
+                continue;
+            }
+            self.hold(i, slot);
+            self.loads.on_gpu += 1;
+        }
+        round.clear();
+        Ok(())
+    }
+
+    /// Slab `i` now lies in `slot`, read by this batch
+    fn hold(&mut self, i: u32, slot: u32) {
+        self.held[slot as usize] = i;
+        self.used[slot as usize] = self.batch;
+        self.set(i as usize, slot);
     }
 
     /// `n` slots for new slabs: empty ones first, then the least recently read, never one this batch reads
@@ -762,6 +1023,150 @@ impl SlabCache {
             args.arg(v);
         }
     }
+}
+
+/// nvCOMP and the device memory its decodes use, all allocated before the slab cache is sized: a buffer for one
+/// call's compressed chunks, and the workspace every call reuses, so no call allocates
+struct GpuDecoder {
+    nvcomp: Arc<NvComp>,
+    /// The compressed chunks of one call, back to back
+    packed: CudaSlice<u8>,
+    workspace: Workspace,
+}
+
+impl GpuDecoder {
+    fn new(stream: &Arc<CudaStream>, nvcomp: Arc<NvComp>, layout: SlabLayout) -> Result<Self> {
+        // `SlabCache::stage_chunk` decodes a round before it passes `MAX_FRAMES` frames, and each frame is one
+        // channel of a slab, decoded into its half of the slot
+        let workspace = nvcomp.workspace(stream, MAX_FRAMES, layout.slab_bytes() / 2)?;
+        let packed = stream.alloc_zeros::<u8>(PACKED_BYTES).wrap_err("allocate GPU memory")?;
+        Ok(Self { nvcomp, packed, workspace })
+    }
+}
+
+/// One chunk's missing slabs and where each one's channels lie in its compressed bytes, read on the finishing pool
+struct ChunkPlan<'s, 'p> {
+    /// The chunk's compressed bytes, or `None` when they could not be read
+    packed: Option<Arc<PackedChunk<&'p BufferPool>>>,
+    /// Each slab's table index and slot
+    slabs: &'s [(u32, u32)],
+    /// Each slab's V and H sources, or `None` where the CPU decodes it
+    sources: Vec<Option<[BlockSource; 2]>>,
+}
+
+impl<'s, 'p> ChunkPlan<'s, 'p> {
+    /// Read the chunk of `slabs`, all slabs of one chunk, through `cache` and find each slab's sources in it
+    fn read(cache: &NativeCache<'_, 'p>, layout: &SlabLayout, slabs: &'s [(u32, u32)]) -> Self {
+        let [cz, cy, cx, _] = layout.key(slabs[0].0 as usize);
+        // a chunk that cannot be read is left to the CPU, which reports the error if a curve needs it
+        let packed = cache.packed_chunk([cz, cy, cx]).and_then(Result::ok);
+        let pred = cache.predictions();
+        let half = layout.slab_bytes() / 2;
+        let sources = slabs
+            .iter()
+            .map(|&(i, _)| {
+                let s = layout.key(i as usize)[3];
+                let blocks = pred.plane_blocks(packed.as_deref()?, s * layout.planes..(s + 1) * layout.planes)?;
+                // a stored run is copied as it is into its channel's half of the slot, so it must fill it exactly
+                let fits = blocks.iter().all(|b| !matches!(b, BlockSource::Raw(r) if r.len() != half));
+                fits.then_some(blocks)
+            })
+            .collect();
+        Self { packed, slabs, sources }
+    }
+}
+
+/// One nvCOMP call's work: the slabs it fills and, for their channels, the frames it decodes, the stored runs
+/// copied as they are and the runs of chunks never stored, filled
+#[derive(Default)]
+struct Round {
+    /// Each slab's table index and slot
+    slabs: Vec<(u32, u32)>,
+    frames: Vec<Frame>,
+    /// The index in `slabs` of each frame's slab
+    owner: Vec<usize>,
+    /// Ranges of the compressed buffer copied to ranges of the slab pool
+    copies: Vec<(Range<usize>, Range<usize>)>,
+    /// Ranges of the slab pool set to a value
+    fills: Vec<(Range<usize>, u8)>,
+    /// Bytes of the compressed buffer the round's chunks take
+    used: usize,
+    gather: Gather,
+}
+
+impl Round {
+    /// Empty the round for the next call; the gather was flushed when it was decoded
+    fn clear(&mut self) {
+        self.slabs.clear();
+        self.frames.clear();
+        self.owner.clear();
+        self.copies.clear();
+        self.fills.clear();
+        self.used = 0;
+    }
+}
+
+/// Bytes bound for increasing offsets of one device buffer, gathered in the open staging half and copied up when it
+/// fills or is flushed, so one half carries many compressed chunks, a few hundred kilobytes to a few megabytes each
+#[derive(Default)]
+struct Gather {
+    /// The device offset of the open half's first byte
+    start: usize,
+    /// Bytes of the open half written
+    filled: usize,
+}
+
+impl Gather {
+    /// Copy `bytes` to `dst` at `at`, past every byte put before
+    fn put(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        staging: &mut Staging,
+        dst: &mut CudaSlice<u8>,
+        mut at: usize,
+        mut bytes: &[u8],
+    ) -> Result<()> {
+        let half = staging.half();
+        while !bytes.is_empty() {
+            if self.filled == 0 {
+                self.start = at;
+            }
+            let offset = at - self.start;
+            if offset >= half {
+                self.flush(stream, staging, dst)?;
+                continue;
+            }
+            let n = bytes.len().min(half - offset);
+            staging.take()?[offset..offset + n].copy_from_slice(&bytes[..n]);
+            self.filled = offset + n;
+            (at, bytes) = (at + n, &bytes[n..]);
+        }
+        Ok(())
+    }
+
+    /// Queue the copy of the open half to `dst`
+    fn flush(&mut self, stream: &Arc<CudaStream>, staging: &mut Staging, dst: &mut CudaSlice<u8>) -> Result<()> {
+        if self.filled == 0 {
+            return Ok(());
+        }
+        let (start, end) = (self.start, self.start + self.filled);
+        let host = &staging.take()?[..self.filled];
+        stream.memcpy_htod(host, &mut dst.slice_mut(start..end))?;
+        staging.queued(stream)?;
+        self.filled = 0;
+        Ok(())
+    }
+}
+
+/// Set every byte of `dst` to `value`, on `stream`
+fn fill(stream: &Arc<CudaStream>, dst: &mut CudaViewMut<u8>, value: u8) -> Result<()> {
+    stream.context().bind_to_thread()?;
+    let n = dst.len();
+    let (ptr, _record) = dst.device_ptr_mut(stream);
+    // SAFETY: the pointer addresses the view's `n` bytes, which the memset alone writes, and `_record` orders it
+    // after the view's earlier work and before its later work on other streams
+    unsafe { result::memset_d8_async(ptr, value, n, stream.cu_stream()) }?;
+    Ok(())
 }
 
 /// Whether the kernels can index native predictions laid out as `layout`: `Native::value`
@@ -1111,11 +1516,26 @@ mod tests {
     /// by slabs and by whole chunks (whose chunks at the array's edge are clipped), through a slab cache small
     /// enough that later batches evict earlier ones' slabs; a batch reading more slabs than the cache holds comes
     /// back for the CPU
+    ///
+    /// Slabs decode on the CPU, then, when `FIBRS_NVCOMP` is `on` or names nvCOMP (for example
+    /// `/build/fibrs-gpu/venv-nvcomp/lib/python3.14/site-packages/nvidia/libnvcomp/lib64/libnvcomp.so.6`), on the GPU
+    /// too: every slab of the store in slab-sized blocks, among them a chunk of noise Blosc stores as is and a chunk
+    /// never stored; none of the store in whole-chunk blocks; and in the store mixing slab-sized and half-slab blocks,
+    /// only the chunks of slab-sized blocks, the others on the CPU
     #[test]
-    #[ignore = "needs an NVIDIA GPU; run through the GPU queue"]
+    #[ignore = "needs an NVIDIA GPU, and nvCOMP (FIBRS_NVCOMP) for its GPU decoding; run through the GPU queue"]
     fn gpu_finish_matches_cpu() {
         const BATCH: usize = 10;
         let gpu = Gpu::open(None, Stages::DirectionField).unwrap();
+        // `off` is the loader's way to decode on the CPU, so it runs the CPU-only case as unset does
+        let nvcomp = match std::env::var_os("FIBRS_NVCOMP") {
+            Some(value) if !value.eq_ignore_ascii_case("off") => Some(Arc::new(NvComp::open().unwrap())),
+            _ => None,
+        };
+        match &nvcomp {
+            Some(nvcomp) => eprintln!("decoding on the GPU too, with {}", nvcomp.name()),
+            None => eprintln!("FIBRS_NVCOMP is unset or off: decoding on the CPU only"),
+        }
         let tracing = volumes();
         let native = SHAPE.map(|n| 2 * n);
         let edge = 32;
@@ -1123,6 +1543,15 @@ mod tests {
             // a hash of the voxel for noise, so V and H disagree near the bands' edges
             let mut rng = Rng(((z * 7919 + y) * 104_729 + x) as u64 * 2 + 1);
             rng.next();
+            // the first chunk is noise zstd cannot shrink, so Blosc stores its blocks as they are
+            if z < edge && y < edge && x < edge {
+                // splitmix64's finaliser over the voxel and channel: xorshift from neighbouring seeds leaves the
+                // high bits correlated enough for zstd to compress
+                let mut h = ((((c * 7919 + z) * 7919 + y) * 7919 + x) as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+                h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                return ((h ^ (h >> 31)) >> 56) as u8;
+            }
             let at = |v: usize| (v as f64 - 0.5) / 2.0;
             pair(&mut rng, lead(at(z), at(y), at(x)))[c]
         };
@@ -1130,12 +1559,25 @@ mod tests {
         let mut batch = curves(600);
         batch.sort_by(|a, b| a.pts[0][0].total_cmp(&b.pts[0][0]));
         let workers = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
-        let blocks = [("finish-sliced", 8 * edge * edge), ("finish-whole", 2 * edge * edge * edge)];
+        let slab = 8 * edge * edge;
+        let blocks: [(&str, &dyn Fn(Shape) -> usize); 3] = [
+            ("finish-sliced", &|_| slab),
+            ("finish-mixed", &|[_, _, cx]| if cx % 2 == 0 { slab } else { slab / 2 }),
+            ("finish-whole", &|_| 2 * edge * edge * edge),
+        ];
         for (name, blocksize) in blocks {
-            let (dir, pred) = store_with(name, native, edge, |_| blocksize, value);
+            let (dir, pred) = store_with(name, native, edge, blocksize, value);
+            // a chunk inside the array the writer never stored reads as the fill value
+            fs::remove_file(dir.join("0.1.2.2")).unwrap();
             let pools = CachePools::new();
             let cache = NativeCache::new(&pred, 64 << 20, &pools);
             let layout = cache.layout();
+            assert_eq!(layout.planes < edge, name != "finish-whole", "{name}: decoded by slabs");
+            if name == "finish-sliced" {
+                let noise = pred.packed_chunk_in([0, 0, 0], std::alloc::Global).unwrap();
+                let sources = pred.plane_blocks(&noise, 0..layout.planes).expect("one block a channel");
+                assert!(sources.iter().all(|b| matches!(b, BlockSource::Raw(_))), "{name}: noise {sources:?}");
+            }
             let per_batch = batch.chunks(BATCH).map(|b| list_slabs(&layout, b).len()).max().unwrap();
             let all = list_slabs(&layout, &batch).len();
             let room = per_batch + per_batch / 4;
@@ -1150,21 +1592,35 @@ mod tests {
 
                 // the fixture's curves hold 150 points at most
                 let (points, cache_bytes) = (BATCH * 150, room * layout.slab_bytes());
-                let mut finisher = gpu.finisher_with(&tracing, family, layout, points, cache_bytes).unwrap();
-                assert!(finisher.slots() < all, "{name} {family}: the cache holds every slab");
-                for (i, (curves, want)) in batch.chunks(BATCH).zip(want.chunks(BATCH)).enumerate() {
-                    match finisher.finish(&workers, &cache, curves).unwrap() {
-                        Finished::Pieces(got) => {
-                            assert!(bits(&got) == bits(want), "{name} {family}: batch {i} differs")
+                for decoder in [None, nvcomp.clone()] {
+                    let on = if decoder.is_some() { "nvCOMP" } else { "CPU" };
+                    let mut finisher =
+                        gpu.finisher_with(&tracing, family, layout, points, cache_bytes, decoder).unwrap();
+                    assert!(finisher.slots() < all, "{name} {family}: the cache holds every slab");
+                    for (i, (curves, want)) in batch.chunks(BATCH).zip(want.chunks(BATCH)).enumerate() {
+                        match finisher.finish(&workers, &cache, curves).unwrap() {
+                            Finished::Pieces(got) => {
+                                assert!(bits(&got) == bits(want), "{name} {family} {on}: batch {i} differs")
+                            }
+                            Finished::OnCpu(why) => {
+                                panic!("{name} {family} {on}: batch {i} came back for the CPU ({why:?})")
+                            }
                         }
-                        Finished::OnCpu(why) => panic!("{name} {family}: batch {i} came back for the CPU ({why:?})"),
                     }
+
+                    let loads = finisher.loaded();
+                    eprintln!("{name} {family} {on}: {loads:?}");
+                    assert!(loads.total() > finisher.slots() as u64, "{name} {family} {on}: no slab was evicted");
+                    match (on, name) {
+                        ("CPU", _) | (_, "finish-whole") => assert_eq!(loads.on_gpu, 0, "{name} {family} {on}"),
+                        (_, "finish-sliced") => assert_eq!(loads.on_cpu, 0, "{name} {family} {on}"),
+                        _ => assert!(loads.on_gpu > 0 && loads.on_cpu > 0, "{name} {family} {on}: {loads:?}"),
+                    }
+                    assert!(matches!(
+                        finisher.finish(&workers, &cache, &batch).unwrap(),
+                        Finished::OnCpu(CpuReason::Slabs)
+                    ));
                 }
-                assert!(finisher.uploaded() > finisher.slots() as u64, "{name} {family}: no slab was evicted");
-                assert!(matches!(
-                    finisher.finish(&workers, &cache, &batch).unwrap(),
-                    Finished::OnCpu(CpuReason::Slabs)
-                ));
             }
             let _ = fs::remove_dir_all(&dir);
         }

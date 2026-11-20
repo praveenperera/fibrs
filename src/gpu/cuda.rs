@@ -4,17 +4,20 @@
 //! The family's tiles (the reference's 128³ tiles in its order, with their 8-voxel halo) are grouped into units:
 //! runs of up to [`UNIT_TILES`] adjacent tiles along x sharing their z and y tile rows. A unit uploads the bricks
 //! of its box of the brick grid from the four volumes the kernels read (both pooled predictions, nx and ny), as one
-//! pool of payloads and a table per volume, and runs five kernels over its tiles: gather, centrality, seeds, then
-//! slots and pack, which pack the nonzero centrality bricks densely for the download. Two units are in flight at a
-//! time on two streams, so the host stages one unit's bricks and installs another's results while the device works
+//! pool of payloads and a table per volume, and runs seven kernels over its tiles: gather, the centrality list and
+//! centrality, seeds and the seed test (each list holds the voxels a cheap check passes, so the float64 work runs on
+//! full warps), then slots and pack, which pack the nonzero centrality bricks densely for the download. Two units are
+//! in flight at a time on two streams, so the host stages one unit's bricks and installs another's results while the
+//! device works
 //!
 //! The direction field runs the same way over its own tiles (`axes.rs`); trace finishing keeps both pooled
 //! predictions and a cache of native slabs on the device across a family's batches of curves (`finish.rs`)
 
 mod axes;
 mod finish;
+mod nvcomp;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
 use cudarc::driver::{
@@ -26,6 +29,7 @@ use rayon::prelude::*;
 
 pub use finish::GpuFinisher;
 
+use self::nvcomp::NvComp;
 use super::Stages;
 use crate::fields::{FamilyFields, Seed, TILE, TILE_HALO, tiles};
 use crate::stage1::{Arith, Fused};
@@ -51,14 +55,22 @@ const UNIT_TILES: usize = 32;
 const MIN_DRIVER: i32 = 12000;
 /// Most device memory one tile can need in a slot, `fit`'s spare half included: the brick pool and tables of the
 /// four volumes over its region's bricks, three u8 and one u16 scratch arrays over its region, the u16 output and
-/// its packed copy, the seed list, and the per-brick flags, slots and ids
+/// its packed copy, the seed list, the per-brick flags, slots and ids, and the centrality and seed candidate lists
+/// with their counts
 const TILE_DEVICE_BYTES: usize = {
     let side = TILE + 2 * TILE_HALO;
     let region = side.pow(3);
     let region_bricks = (side / EDGE + 1).pow(3);
     let core = TILE.pow(3);
-    let bytes =
-        4 * region_bricks * (BRICK + 4) + 5 * region + 2 * 2 * core + 8 * core.div_ceil(2) + 3 * 4 * core / BRICK;
+    let band = (TILE + 2 * BAND_REACH).pow(3);
+    let bytes = 4 * region_bricks * (BRICK + 4)
+        + 5 * region
+        + 2 * 2 * core
+        + 8 * core.div_ceil(2)
+        + 3 * 4 * core / BRICK
+        + 4 * band
+        + 4 * core.div_ceil(2)
+        + 2 * 4;
     bytes + bytes / 2
 };
 
@@ -74,10 +86,12 @@ use Param::{Ptr, U32};
 /// Each kernel's PTX params, in the order every launch here, in `axes.rs` and in `finish.rs` passes them; checked
 /// against the embedded PTX when the device opens, so a stale PTX fails there instead of launching with mismatched
 /// arguments
-const KERNELS: [(&str, &[Param]); 14] = [
+const KERNELS: [(&str, &[Param]); 16] = [
     ("fb_gather", &[Ptr, Ptr, Ptr, U32, U32, U32, U32, U32, U32, U32, Ptr, Ptr, Ptr]),
-    ("fb_centrality", &[Ptr, Ptr, Ptr, Ptr, Ptr, Ptr]),
-    ("fb_seeds", &[Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, U32, Ptr, Ptr, Ptr, U32, Ptr]),
+    ("fb_cent_list", &[Ptr, Ptr, U32, Ptr, Ptr, Ptr]),
+    ("fb_centrality", &[Ptr, Ptr, Ptr, Ptr, Ptr, U32, Ptr, Ptr, Ptr]),
+    ("fb_seeds", &[Ptr, Ptr, Ptr, Ptr, Ptr, U32, Ptr, Ptr]),
+    ("fb_seed_test", &[Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, U32, U32, Ptr, Ptr, Ptr, U32, Ptr]),
     ("fb_slots", &[Ptr, U32, Ptr, Ptr, Ptr]),
     ("fb_pack", &[Ptr, U32, Ptr, Ptr]),
     ("fb_ax_gather", &[Ptr, Ptr, Ptr, U32, U32, U32, U32, U32, U32, U32, U32, Ptr, Ptr, Ptr]),
@@ -125,8 +139,10 @@ fn entry_params(ptx: &str, name: &str) -> Result<Vec<Param>> {
 
 struct Kernels {
     gather: CudaFunction,
+    cent_list: CudaFunction,
     centrality: CudaFunction,
     seeds: CudaFunction,
+    seed_test: CudaFunction,
     slots: CudaFunction,
     pack: CudaFunction,
     ax_gather: CudaFunction,
@@ -152,6 +168,8 @@ pub struct Gpu {
     dirs: CudaSlice<f64>,
     /// Every byte of a pooled prediction as the direction field's float32, `v as f32 / 255.0` as the CPU computes it
     unit: CudaSlice<f32>,
+    /// nvCOMP for finishing's native slabs, loaded when the first finisher opens: `None` when slabs decode on the CPU
+    nvcomp: OnceLock<Option<Arc<NvComp>>>,
 }
 
 impl Gpu {
@@ -225,8 +243,10 @@ impl Gpu {
         let function = |name: &str| module.load_function(name).wrap_err_with(|| format!("kernel {name}"));
         let k = Kernels {
             gather: function("fb_gather")?,
+            cent_list: function("fb_cent_list")?,
             centrality: function("fb_centrality")?,
             seeds: function("fb_seeds")?,
+            seed_test: function("fb_seed_test")?,
             slots: function("fb_slots")?,
             pack: function("fb_pack")?,
             ax_gather: function("fb_ax_gather")?,
@@ -249,7 +269,7 @@ impl Gpu {
         stream.synchronize()?;
         let (free, _) = ctx.mem_get_info()?;
         let name = format!("CUDA device {device}, {} (compute capability {major}.{minor})", ctx.name()?);
-        Ok(Self { ctx, name, k, free, dirs, unit })
+        Ok(Self { ctx, name, k, free, dirs, unit, nvcomp: OnceLock::new() })
     }
 
     pub fn name(&self) -> &str {
@@ -416,6 +436,9 @@ struct Meta {
     bricks: Vec<usize>,
     /// Room in the seed list: every even voxel of every core, more than the seed test can pass
     cap: usize,
+    /// Room per tile in the seed candidate list: the even voxels of the largest core, at most half of it rounded
+    /// up, which every candidate is
+    seed_list_cap: usize,
 }
 
 /// The pinned host memory a unit needs, in bricks: the payloads its pool stages and the output bricks it can pack
@@ -467,8 +490,24 @@ impl<'v> Plan<'v> {
         let out = bricks.len() * BRICK;
         ensure!(base <= u32::MAX as usize && out <= u32::MAX as usize, "a unit is too large for the kernels' indices");
         let pool = BrickPool::new(vols, (b0, nb))?;
-        let meta =
-            Meta { tiles: unit.len() as u32, b0, nb, region_voxels: base, max_region, max_band, max_core, bricks, cap };
+        // the per-tile lists are indexed `tile · cap + k` in u32
+        let tiles = unit.len();
+        ensure!(
+            tiles * max_band <= u32::MAX as usize && tiles * max_core.div_ceil(2) <= u32::MAX as usize,
+            "a unit's candidate lists are too large for the kernels' indices"
+        );
+        let meta = Meta {
+            tiles: tiles as u32,
+            b0,
+            nb,
+            region_voxels: base,
+            max_region,
+            max_band,
+            max_core,
+            bricks,
+            cap,
+            seed_list_cap: max_core.div_ceil(2),
+        };
         Ok(Self { meta, desc, pool })
     }
 
@@ -506,6 +545,12 @@ struct Slot {
     ids: CudaSlice<u32>,
     packed: CudaSlice<u16>,
     seeds: CudaSlice<u64>,
+    /// The band voxels with presence enough for centrality and the core voxels that pass the seed test's cheap
+    /// checks, `max_band` and `seed_list_cap` entries per tile, and each tile's count of both: centrality's for
+    /// tile `t` at `t`, the seeds' at `tiles + t`
+    cent_list: CudaSlice<u32>,
+    seed_list: CudaSlice<u32>,
+    list_count: CudaSlice<u32>,
     /// The seed list's length and the number of packed bricks
     count: CudaSlice<u32>,
     host_count: PinnedHostSlice<u32>,
@@ -693,6 +738,9 @@ impl Slot {
             ids: stream.alloc_zeros(1)?,
             packed: stream.alloc_zeros(1)?,
             seeds: stream.alloc_zeros(1)?,
+            cent_list: stream.alloc_zeros(1)?,
+            seed_list: stream.alloc_zeros(1)?,
+            list_count: stream.alloc_zeros(1)?,
             count: stream.alloc_zeros(2)?,
             stream,
         })
@@ -721,9 +769,14 @@ impl Slot {
             fit(&stream, buf, n_bricks)?;
         }
         fit(&stream, &mut self.seeds, m.cap)?;
+        let tiles = m.tiles as usize;
+        fit(&stream, &mut self.cent_list, tiles * m.max_band)?;
+        fit(&stream, &mut self.seed_list, tiles * m.seed_list_cap)?;
+        fit(&stream, &mut self.list_count, 2 * tiles)?;
         // the output's bricks past a core's edge are never written, and read as centrality 0
         stream.memset_zeros(&mut self.out.slice_mut(..n_out))?;
         stream.memset_zeros(&mut self.flags.slice_mut(..n_bricks))?;
+        stream.memset_zeros(&mut self.list_count.slice_mut(..2 * tiles))?;
         stream.memset_zeros(&mut self.count)?;
 
         let per_tile = |n: usize| -> Result<LaunchConfig> {
@@ -738,6 +791,8 @@ impl Slot {
         let family = family as u32;
         let (shape_h, shape_w) = (shape[1] as u32, shape[2] as u32);
         let cap = u32::try_from(m.cap).map_err(|_| eyre!("a unit's seed list is too long"))?;
+        // `Plan::new` checked both lists' `tiles · cap` fit in u32
+        let (cent_list_cap, seed_list_cap) = (m.max_band as u32, m.seed_list_cap as u32);
         let (n_bricks_u32, n_out_u32) = (n_bricks as u32, n_out as u32);
         let dirs = &gpu.dirs;
         // SAFETY: each launch passes the kernel's params in its PTX order (checked in `Gpu::open`), every buffer
@@ -760,6 +815,17 @@ impl Slot {
                 .arg(&mut self.nx)
                 .arg(&mut self.ny)
                 .launch(per_tile(m.max_region)?)?;
+            // the band split by presence, then centrality on the listed voxels only, whose float64 work then runs on
+            // full warps; the grid covers the largest band, and threads past a tile's count exit
+            stream
+                .launch_builder(&gpu.k.cent_list)
+                .arg(&inputs.desc)
+                .arg(&self.pres)
+                .arg(&cent_list_cap)
+                .arg(&mut self.cent)
+                .arg(&mut self.list_count.slice_mut(..tiles))
+                .arg(&mut self.cent_list)
+                .launch(per_tile(m.max_band)?)?;
             stream
                 .launch_builder(&gpu.k.centrality)
                 .arg(&inputs.desc)
@@ -767,10 +833,25 @@ impl Slot {
                 .arg(&self.nx)
                 .arg(&self.ny)
                 .arg(dirs)
+                .arg(&cent_list_cap)
+                .arg(&self.list_count.slice(..tiles))
+                .arg(&self.cent_list)
                 .arg(&mut self.cent)
                 .launch(per_tile(m.max_band)?)?;
+            // the core copied out and flagged, and the seed candidates listed for the float64 test
             stream
                 .launch_builder(&gpu.k.seeds)
+                .arg(&inputs.desc)
+                .arg(&self.pres)
+                .arg(&self.cent)
+                .arg(&mut self.out)
+                .arg(&mut self.flags)
+                .arg(&seed_list_cap)
+                .arg(&mut self.list_count.slice_mut(tiles..2 * tiles))
+                .arg(&mut self.seed_list)
+                .launch(per_tile(m.max_core)?)?;
+            stream
+                .launch_builder(&gpu.k.seed_test)
                 .arg(&inputs.desc)
                 .arg(&self.pres)
                 .arg(&self.nx)
@@ -779,12 +860,13 @@ impl Slot {
                 .arg(&self.cent)
                 .arg(&shape_h)
                 .arg(&shape_w)
-                .arg(&mut self.out)
-                .arg(&mut self.flags)
+                .arg(&seed_list_cap)
+                .arg(&self.list_count.slice(tiles..2 * tiles))
+                .arg(&self.seed_list)
                 .arg(&mut self.seeds)
                 .arg(&cap)
                 .arg(&mut self.count)
-                .launch(per_tile(m.max_core)?)?;
+                .launch(per_tile(m.seed_list_cap)?)?;
             let mut brick_count = self.count.slice_mut(1..2);
             stream
                 .launch_builder(&gpu.k.slots)

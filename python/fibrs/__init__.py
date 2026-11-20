@@ -7,11 +7,14 @@ Takes the reference CLI's arguments unchanged (``avf_spline_generator.cli.parser
 The native binary is found through ``FIBRS_BIN``, then ``bin/fibrs`` next to this package,
 then the environment's scripts directory (where the wheel installs it), then ``PATH``. When ``FIBRS_LAPACK`` is
 unset, the OpenBLAS that supplies the binary's ``dsyevd`` is numpy's bundled copy (Linux), else the
-``scipy-openblas64`` package's (macOS, whose numpy wheels link Accelerate)
+``scipy-openblas64`` package's (macOS, whose numpy wheels link Accelerate). GPU slab decoding with nvCOMP is
+opt-in: with ``FIBRS_NVCOMP=on``, the binary is pointed at the ``nvidia-libnvcomp-cu12`` wheel the
+``fibrs[gpu-zstd]`` extra put in this Python's environment, when there is one; unset, slabs decode on the CPU
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -42,13 +45,33 @@ def binary() -> str:
 
 def _environment() -> dict[str, str]:
     env = dict(os.environ)
-    if "FIBRS_LAPACK" in env:
-        return env
-    lib = _openblas()
-    if lib:
-        env["FIBRS_LAPACK"] = lib
-    # otherwise the binary looks next to its own path and in $VIRTUAL_ENV
+    # a library not found here the binary looks for next to its own path and in $VIRTUAL_ENV, which miss an
+    # environment that is not a venv
+    if "FIBRS_LAPACK" not in env:
+        lib = _openblas()
+        if lib:
+            env["FIBRS_LAPACK"] = lib
+    # only FIBRS_NVCOMP=on opts in to GPU slab decoding, since the wheel can be another package's dependency; this
+    # environment's wheel then stands in for the binary's own search
+    if env.get("FIBRS_NVCOMP", "").lower() == "on":
+        lib = _nvcomp()
+        if lib:
+            env["FIBRS_NVCOMP"] = lib
     return env
+
+
+def _nvcomp() -> str | None:
+    """The nvidia-libnvcomp-cu12 wheel's libnvcomp.so.6, found through the import system without loading it, so
+    nothing CUDA starts in this process"""
+    try:
+        spec = importlib.util.find_spec("nvidia.libnvcomp")
+    except (ImportError, ValueError):
+        return None
+    for root in (spec and spec.submodule_search_locations) or []:
+        lib = Path(root) / "lib64" / "libnvcomp.so.6"
+        if lib.is_file():
+            return str(lib)
+    return None
 
 
 def _openblas() -> str | None:
