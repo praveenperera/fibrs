@@ -164,8 +164,10 @@ pub fn cut(points: Vec<Point>, family: usize, core: &CoreBox, interior: &[Face])
     let mut i = 0;
     while i < n {
         if !inside[i] {
-            // two points outside whose segment passes through the core, across a corner
-            if let Some((enter, leave)) = points.get(i + 1).and_then(|q| core.passage(&points[i], q)) {
+            // two points outside whose segment passes through the core, across a corner; a segment that ends
+            // inside is the next run's head, and passage, which works on the open line, would extend it past q
+            let next_outside = points.get(i + 1).filter(|_| !inside[i + 1]);
+            if let Some((enter, leave)) = next_outside.and_then(|q| core.passage(&points[i], q)) {
                 let (head, tail) = (interior_face(enter), interior_face(leave));
                 let ends = [head, tail].into_iter().flatten();
                 keep(ends.map(|f| crossing(&points[i], &points[i + 1], f)).collect(), head, tail);
@@ -448,6 +450,18 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].points, vec![[10.0, 9.5, 5.0], [9.5, 10.0, 5.0]]);
         assert_eq!((got[0].head, got[0].tail), (Some(interior[0]), Some(interior[1])));
+    }
+
+    /// A segment that enters the core and ends inside gives only the run it starts, with no piece extended along
+    /// its line to the face it would leave by
+    #[test]
+    fn a_segment_ending_inside_gives_no_corner_piece() {
+        let (cores, interior) = quadrants();
+        // into the high-x, low-y core across x = 10 at t = 0.5; the line would leave across y = 10 at t = 2
+        let got = runs(cut(vec![[9.0, 8.0, 5.0], [11.0, 9.0, 5.0]], 1, &cores[1], &interior));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].points, vec![[10.0, 8.5, 5.0], [11.0, 9.0, 5.0]]);
+        assert_eq!((got[0].head, got[0].tail), (Some(interior[0]), None));
     }
 
     /// Cut ends on one face from cores that meet only at a corner are not joined, however near
