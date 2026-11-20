@@ -199,7 +199,6 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         let [_, ey, ex] = self.edge;
         let half = self.planes * ey * ex;
         let mut data = Vec::with_capacity_in(2 * half, self.pool);
-        data.resize(2 * half, 0);
         let planes = s * self.planes..(s + 1) * self.planes;
         self.pred.decode_planes(&packed, planes, &mut data).map_err(|e| eyre!("chunk {:?}: {e}", [cz, cy, cx]))?;
         Ok(self.slab_at([cz, cy, cx], s, data))
@@ -217,7 +216,6 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         let [ez, ey, ex] = self.edge;
         let channel = ez * ey * ex;
         let mut all = Vec::with_capacity_in(2 * channel, self.pool);
-        all.resize(2 * channel, 0);
         self.pred.decode_planes(packed, 0..ez, &mut all).map_err(|e| eyre!("chunk {chunk:?}: {e}"))?;
         let half = self.planes * ey * ex;
         let slab = |i: usize| {
