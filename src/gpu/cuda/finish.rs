@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use color_eyre::eyre::{Result, WrapErr, ensure, eyre};
 use cudarc::driver::{
-    CudaEvent, CudaFunction, CudaSlice, CudaStream, LaunchArgs, LaunchConfig, PinnedHostSlice, PushKernelArg, sys,
+    CudaEvent, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchArgs, LaunchConfig, PinnedHostSlice,
+    PushKernelArg, result, sys,
 };
 use rayon::ThreadPool;
 use rayon::prelude::*;
@@ -94,10 +95,12 @@ impl Gpu {
         let fits = |n: &usize| u32::try_from(*n).is_ok();
         ensure!(shape.iter().all(fits), "volume of {shape:?} voxels is too large");
         ensure!(
-            layout.shape.iter().chain(&layout.edge).all(fits) && layout.len() < NO_SLAB as usize,
-            "native predictions of {:?} voxels in chunks of {:?} are too large for the slab table",
+            kernels_index(&layout),
+            "native predictions of {:?} voxels in chunks of {:?}, {} planes a slab, are too large for the finishing \
+             kernels' u32 indices",
             layout.shape,
-            layout.edge
+            layout.edge,
+            layout.planes
         );
         let stream = self.ctx.new_stream()?;
         let mut staging = Staging::new(&stream, layout.slab_bytes())?;
@@ -260,7 +263,8 @@ impl GpuFinisher {
 
 /// Waits, when dropped, for the work queued on a stream, so host memory its copies read or write outlives them
 /// when an error returns early: cudarc does not track plain host slices, and the driver may read pageable memory
-/// after an asynchronous copy returns. Locals drop in reverse order, so it guards the memory declared before it
+/// after an asynchronous copy returns. Locals drop in reverse order, so it guards the memory declared before it.
+/// It waits through [`drain`], so an error cudarc stored cannot skip the wait
 struct Pending<'a>(&'a CudaStream);
 
 impl Pending<'_> {
@@ -269,15 +273,31 @@ impl Pending<'_> {
         let stream = self.0;
         // waited for here, so the drop has nothing left to wait for
         std::mem::forget(self);
-        stream.synchronize().wrap_err(what)
+        drain(stream).wrap_err(what)
     }
 }
 
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
-        // a failed sync means the context is broken, and freeing then is all that is left to do
-        let _ = self.0.synchronize();
+        // a failed wait means the context is broken, and freeing then is all that is left to do
+        let _ = drain(self.0);
     }
+}
+
+/// Wait for everything queued on `stream`, then return any error cudarc stored before, as
+/// `CudaStream::synchronize` would; every wait that keeps host memory alive for a copy goes through here
+///
+/// `CudaStream::synchronize` returns a stored error, such as a failed record of a copy's tracking event after the
+/// copy was queued, before it reaches the driver, so it could return while that copy still reads memory about to
+/// be freed. This waits through the driver first, whatever is stored
+fn drain(stream: &CudaStream) -> Result<(), DriverError> {
+    let ctx = stream.context();
+    // SAFETY: the context and stream handles are live for as long as `stream` is borrowed, and neither call frees
+    // or changes them; the stream is still waited for when making its context current fails
+    let (bound, waited) =
+        unsafe { (result::ctx::set_current(ctx.cu_ctx()), result::stream::synchronize(stream.cu_stream())) };
+    ctx.check_err()?;
+    bound.and(waited)
 }
 
 /// The reason in a kernel's `err` word, if it set one
@@ -567,7 +587,7 @@ impl Tracing {
         }
         let device_table = stream.clone_htod(&table)?;
         // the driver may read pageable memory after the copy returns, and `table` is freed here
-        stream.synchronize().wrap_err("upload the pooled predictions")?;
+        drain(stream).wrap_err("upload the pooled predictions")?;
         Ok((device_table, pool))
     }
 
@@ -625,8 +645,8 @@ impl Drop for Staging {
     /// were given, and an error, while the finisher is set up or later, can leave copies queued that no event in
     /// `queued` covers yet
     fn drop(&mut self) {
-        // a failed sync means the context is broken, and freeing then is all that is left to do
-        let _ = self.stream.synchronize();
+        // a failed wait means the context is broken, and freeing then is all that is left to do
+        let _ = drain(&self.stream);
     }
 }
 
@@ -666,7 +686,7 @@ impl SlabCache {
         let table = stream.clone_htod(&host)?;
         // the driver may read pageable memory after the copy returns, and `host` is freed with the cache, which an
         // error before the first batch's table write can drop
-        stream.synchronize().wrap_err("upload the slab table")?;
+        drain(stream).wrap_err("upload the slab table")?;
         let [_, ncy, ncx] = layout.chunks();
         let (s, e) = (layout.shape, layout.edge);
         let params =
@@ -767,7 +787,7 @@ impl SlabCache {
         let Some((lo, hi)) = self.dirty.take() else { return Ok(()) };
         stream.memcpy_htod(&self.host[lo..=hi], &mut self.table.slice_mut(lo..=hi))?;
         // the driver may read pageable memory after the copy returns, and the next batch changes `host`
-        stream.synchronize().wrap_err("upload the native slabs")?;
+        drain(stream).wrap_err("upload the native slabs")?;
         Ok(())
     }
 
@@ -778,6 +798,19 @@ impl SlabCache {
             args.arg(v);
         }
     }
+}
+
+/// Whether the kernels can index native predictions laid out as `layout`: `Native::value`
+/// (fibrs-kernels/src/finish.rs) takes the shape and chunk edge as u32 and computes in u32 a slab's table index,
+/// which must stay below [`NO_SLAB`], and a slab's bytes per channel, `planes · ey · ex`, which bound a voxel's
+/// offset in it; the slot's offset in the pool it computes in usize
+fn kernels_index(layout: &SlabLayout) -> bool {
+    let fits = |n: usize| u32::try_from(n).is_ok();
+    let [_, ey, ex] = layout.edge;
+    let per_channel = layout.planes.checked_mul(ey).and_then(|n| n.checked_mul(ex));
+    layout.shape.iter().chain(&layout.edge).all(|&n| fits(n))
+        && layout.len() < NO_SLAB as usize
+        && per_channel.is_some_and(fits)
 }
 
 /// Slots of `bytes` each for the slab cache: three quarters of the device memory `free` beyond `reserve`, the
@@ -1049,6 +1082,21 @@ mod tests {
         let high = slab_slots(24 * GIB, reserve, SLAB_CACHE_MAX, bytes, band.len());
         assert_eq!(high * bytes, SLAB_CACHE_MAX);
         assert_eq!(slab_slots(reserve / 2, reserve, SLAB_CACHE_MAX, bytes, band.len()), 0);
+    }
+
+    /// The kernels index a slab of up to u32::MAX bytes per channel, so a uint8 chunk of 1024 × 2048 × 2048 decoded
+    /// whole, 4 GiB a channel, goes to the CPU, while the same chunk decoded by planes stays on the GPU
+    #[test]
+    fn kernels_index_slabs_up_to_u32_bytes_per_channel() {
+        let whole = SlabLayout { shape: [1024, 2048, 2048], edge: [1024, 2048, 2048], planes: 1024 };
+        assert_eq!(whole.slab_bytes(), 8 << 30);
+        assert!(!kernels_index(&whole));
+        assert!(kernels_index(&SlabLayout { planes: 8, ..whole }));
+
+        // 65535 × 65537 is u32::MAX
+        let edge = SlabLayout { shape: [1, 65535, 65537], edge: [1, 65535, 65537], planes: 1 };
+        assert!(kernels_index(&edge));
+        assert!(!kernels_index(&SlabLayout { shape: [1, 65535, 65538], edge: [1, 65535, 65538], ..edge }));
     }
 
     /// Bit patterns of each curve's pieces, so 0.0 and -0.0 differ
