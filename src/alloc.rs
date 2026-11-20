@@ -79,8 +79,9 @@ unsafe impl GlobalAlloc for Dispatch {
 /// With THP allowed, mimalloc asks the kernel for huge pages on its large regions. On a host with THP set to
 /// `madvise`, most of those faults fall back to small pages after the kernel has tried to compact memory, which on
 /// a dense PHerc0358 window cost the tracer about a sixth of its wall time and more than doubled its kernel time.
-/// Off, mimalloc also disables THP for the whole process with `PR_SET_THP_DISABLE`, exactly as
-/// `MIMALLOC_ALLOW_THP=0` does. `fibrs predict` runs on the system allocator and keeps the host's setting
+/// Off, mimalloc also asks Linux to disable THP for the whole process with `PR_SET_THP_DISABLE`, unless the process
+/// already has a THP-disable mode, exactly as `MIMALLOC_ALLOW_THP=0` does. `fibrs predict` runs on the system
+/// allocator and keeps the host's setting
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod thp {
     use libmimalloc_sys::{_mi_option_last, mi_option_set_default, mi_option_t};
@@ -89,8 +90,9 @@ mod thp {
     /// `tests/allocator.rs` checks it by the name mimalloc prints
     const ALLOW_THP: mi_option_t = 43;
 
-    // a mimalloc with a different option list may have moved `allow_thp`, so the build stops for the index to be
-    // checked again
+    // a libmimalloc-sys that adds or removes options may have moved `allow_thp`, so the build stops for the index to
+    // be checked again; this sees only the binding's option count, and a reordering that keeps it is caught by name
+    // in `tests/allocator.rs`
     const _: () = assert!(_mi_option_last == 47, "mimalloc's options changed: check ALLOW_THP");
 
     /// Makes THP off mimalloc's default for the tracer. mimalloc reads its options once, at process load, so this
