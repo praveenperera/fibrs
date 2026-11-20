@@ -14,7 +14,7 @@
     the `--threads` pool once the next unit on its stream is queued.
 
   The centrality and seeds are unchanged. On a dense PHerc0358 window on an RTX 5090, V and H centrality take
-  17.8 s together instead of 20.8 s (mean of two runs each), about 2% of the whole run.
+  19.1 s together instead of 20.9 s (mean of two runs each), about 1% of the whole run.
 
 - **Trace finishing on the GPU.** When a run uses the GPU, finishing (cutting each traced curve where the
   predictions disagree, then smoothing, resampling and re-checking each piece) runs there too. It gives the CPU's
