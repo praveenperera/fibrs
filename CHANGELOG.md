@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-19
+
+fibrs 0.3.1 traces dense data faster: threads that finishing leaves idle trace seeds ahead, and the binary
+allocates through mimalloc instead of glibc malloc. The `.afv` is unchanged. On a PHerc1545 and a PHerc0826 band
+it was identical to the original's with `--device cpu` and to 0.3.0's with `--device cuda`.
+
+### What's new
+
 - **Faster tracing on dense data.** Threads that finishing leaves idle now trace seeds ahead of the one being
   committed. A seed traced ahead is traced again if an earlier seed marked the region it read before it was
   committed, so the `.afv` is the same as before at every `--threads`. On a dense 512 × 2048 × 2048 crop of
@@ -13,8 +21,16 @@
   Size the cores you give a run with that in mind.
 - **mimalloc is the allocator.** The binary now allocates through mimalloc 3.3.2 instead of the system allocator.
   On dense windows, glibc malloc maps and unmaps large blocks while holding the kernel's `mmap_lock`, which stalls
-  the page faults of every tracing thread. Output is unchanged. `cargo build --release --no-default-features` builds
-  with the system allocator.
+  the page faults of every tracing thread. On the dense PHerc0358 window z02304–02816 at `--threads 8`, 0.3.0 traced
+  both families in 682 s with glibc malloc and in 200 s and 274 s with mimalloc, and the whole run took 500–640 s
+  instead of 1,084 s. Peak memory is unchanged: 9.0 GiB on a PHerc0826 band and 5.6 GiB on a PHerc1545 band at
+  `--threads 4`. Output is unchanged. `cargo build --release --no-default-features` builds with the system
+  allocator.
+
+### Documentation
+
+- **Running the CLI archive's binary.** The README's Install section says how the archive's binary finds numpy's
+  OpenBLAS, and how to point it there with `FIBRS_LAPACK` when it runs outside a numpy environment.
 
 ## [0.3.0] - 2026-11-19
 
@@ -274,6 +290,7 @@ The first release.
   Python module, and a CLI archive for each with `scripts/install-dropin.sh`
 - `--version` prints `0.2.0`, the original's version, as a drop-in has to
 
+[0.3.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.3.1
 [0.3.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.3.0
 [0.2.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.2.0
 [0.1.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.1.1
