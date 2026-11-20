@@ -60,7 +60,8 @@ fn sites_in(root: &Path) -> Vec<PathBuf> {
     vec![root.join("Lib").join("site-packages"), root.join("site-packages")]
 }
 
-/// Opens the shared library at `path`, or by a bare name, the one the system's loader finds
+/// Opens the shared library file at `path`. As with `dlopen`, a name with no `/` is left to the dynamic loader's
+/// search
 ///
 /// # Safety
 ///
@@ -70,10 +71,9 @@ pub unsafe fn open_library(path: &Path) -> Result<Library, libloading::Error> {
     unsafe { Library::new(path) }
 }
 
-/// Opens the DLL at `path`, resolving the DLLs it imports from its own directory, then the executable's and
-/// System32, since the binary takes the current directory and `PATH` out of the search at startup. A relative path
-/// is taken from the current directory, as it names a file there; a bare name is found in the executable's
-/// directory or System32, or reuses a DLL of that name already loaded
+/// Opens the DLL file at `path`, resolving the DLLs it imports from its own directory, then the executable's and
+/// System32, since the binary takes the current directory and `PATH` out of the search at startup. A relative path,
+/// a bare file name included, is taken from the current directory, as it names a file there
 ///
 /// # Safety
 ///
@@ -82,15 +82,21 @@ pub unsafe fn open_library(path: &Path) -> Result<Library, libloading::Error> {
 pub unsafe fn open_library(path: &Path) -> Result<Library, libloading::Error> {
     use libloading::os::windows::{LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR};
 
-    // the DLL's own directory can only be searched for a full path; with a bare name the flag is an error
-    let bare = path.parent().is_none_or(|p| p.as_os_str().is_empty()) && !path.has_root();
-    if bare {
-        return unsafe { Library::new(path) };
-    }
-
-    // the restricted search would look for a relative path under its own directories, not the current one; a path
-    // with no absolute form (an empty one) is left for the load to refuse
+    // the restricted search would look for a relative path under its own directories, not the current one, and the
+    // DLL's own directory can only be searched for a full path; a path with no absolute form (an empty one) is left
+    // for the load to refuse
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
     unsafe { libloading::os::windows::Library::load_with_flags(&path, flags) }.map(Library::from)
+}
+
+/// Opens the shared library called `name` wherever the system's loader finds it: on Windows the executable's
+/// directory or System32 (the binary takes the current directory and `PATH` out of the search), or a DLL of that name
+/// already loaded
+///
+/// # Safety
+///
+/// Loading a library runs its initialisers
+pub unsafe fn open_named(name: &str) -> Result<Library, libloading::Error> {
+    unsafe { Library::new(name) }
 }

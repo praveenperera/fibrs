@@ -5,7 +5,8 @@
 
 Takes the reference CLI's arguments unchanged (``avf_spline_generator.cli.parser``) and writes the same ``.afv``.
 The native binary is found through ``FIBRS_BIN``, then ``bin/fibrs`` next to this package,
-then the environment's scripts directory (where the wheel installs it), then ``PATH``; on Windows each name ends in
+then the environment's scripts directory (where the wheel installs it) and the per-user one
+(``pip install --user``), then ``PATH``; on Windows each name ends in
 ``.exe``. When ``FIBRS_LAPACK`` is unset, the OpenBLAS that supplies the binary's ``dsyevd`` is numpy's bundled
 copy (Linux and Windows), else the ``scipy-openblas64`` package's (macOS, whose numpy wheels link Accelerate). GPU slab decoding with nvCOMP is
 opt-in: with ``FIBRS_NVCOMP=on``, the binary is pointed at the ``nvidia-libnvcomp-cu12`` wheel the
@@ -17,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+import site
 import subprocess
 import sys
 import sysconfig
@@ -36,14 +38,29 @@ def binary() -> str:
     bundled = Path(__file__).resolve().parent / "bin" / _EXE
     if bundled.is_file():
         return str(bundled)
-    # the wheel installs the binary as a script; a venv's python run without activating the venv has no PATH to it
-    scripts = Path(sysconfig.get_path("scripts")) / _EXE
-    if scripts.is_file():
-        return str(scripts)
+    # the wheel installs the binary as a script; a venv's python run without activating the venv has no PATH to it,
+    # and neither has one whose per-user scripts directory (pip install --user) is off PATH, as it is by default
+    # on Windows
+    for scripts in (d / _EXE for d in _script_dirs()):
+        if scripts.is_file():
+            return str(scripts)
     found = shutil.which("fibrs")
     if found:
         return found
     raise FileNotFoundError("fibrs not found; set FIBRS_BIN or put it on PATH")
+
+
+def _script_dirs() -> list[Path]:
+    """The scripts directories that may hold the wheel's binary: this interpreter's default one, then its per-user
+    one when user site-packages are enabled (never in a venv)"""
+    dirs = [Path(sysconfig.get_path("scripts"))]
+    if site.ENABLE_USER_SITE:
+        # get_preferred_scheme came in 3.10; before it, the user scheme is named after os.name
+        preferred = getattr(sysconfig, "get_preferred_scheme", None)
+        user = preferred("user") if preferred else f"{os.name}_user"
+        if user in sysconfig.get_scheme_names():
+            dirs.append(Path(sysconfig.get_path("scripts", user)))
+    return dirs
 
 
 def _environment() -> dict[str, str]:

@@ -188,19 +188,20 @@ impl NvComp {
     /// out of the DLL search);
     /// any other value is a path to `libnvcomp.so.6` (`nvcomp64_6.dll` on Windows), the only place then tried
     pub fn open() -> Result<Self> {
-        let wheels =
-            || site_packages().into_iter().map(|site| site.join(WHEEL_DIR).join(SONAME)).filter(|p| p.is_file());
-        let paths: Vec<PathBuf> = match Choice::parse(std::env::var_os("FIBRS_NVCOMP").as_deref()) {
+        match Choice::parse(std::env::var_os("FIBRS_NVCOMP").as_deref()) {
             // the default: GPU decoding was never asked for, so say how to ask
             Choice::Unset => bail!("GPU slab decoding with nvCOMP is opt-in; set FIBRS_NVCOMP=on"),
             // nvCOMP trusts its input, so this is how a run that doubts its prediction files decodes them on the CPU
             Choice::Off => bail!("FIBRS_NVCOMP is off"),
             Choice::Path(path) => return Self::load(&path),
-            Choice::On => wheels().chain([PathBuf::from(SONAME)]).collect(),
-        };
+            Choice::On => {}
+        }
+
+        let wheels = site_packages().into_iter().map(|site| site.join(WHEEL_DIR).join(SONAME)).filter(|p| p.is_file());
+        let attempts = wheels.map(|path| Self::load(&path)).chain(std::iter::once_with(Self::load_named));
         let mut reasons = Vec::new();
-        for path in paths {
-            match Self::load(&path) {
+        for attempt in attempts {
+            match attempt {
                 Ok(nvcomp) => return Ok(nvcomp),
                 Err(e) => reasons.push(format!("{e:#}")),
             }
@@ -208,12 +209,25 @@ impl NvComp {
         bail!("cannot load nvCOMP ({}); set FIBRS_NVCOMP to a {SONAME} path, or off", reasons.join("; "))
     }
 
-    /// Load nvCOMP from `path`, a path or a bare soname for the dynamic loader to find, and check it is major 6
+    /// Load nvCOMP from the library file at `path` and check it is major 6. On Windows a bare file name is a file in
+    /// the current directory, as for any other path
     pub fn load(path: &Path) -> Result<Self> {
-        let at = path.display();
         // SAFETY: loading the library runs its initializers, which set up its statically linked CUDA runtime
         // without touching a device; nvCOMP is built to be loaded into any process
-        let lib = unsafe { crate::pyenv::open_library(path) }.wrap_err_with(|| format!("load {at}"))?;
+        let lib = unsafe { crate::pyenv::open_library(path) }.wrap_err_with(|| format!("load {}", path.display()))?;
+        Self::bind(lib, path.to_path_buf())
+    }
+
+    /// Load nvCOMP by its library name, wherever the dynamic loader's search finds it, and check it is major 6
+    fn load_named() -> Result<Self> {
+        // SAFETY: as in `load`
+        let lib = unsafe { crate::pyenv::open_named(SONAME) }.wrap_err_with(|| format!("load {SONAME}"))?;
+        Self::bind(lib, PathBuf::from(SONAME))
+    }
+
+    /// Bind nvCOMP's functions in `lib`, loaded from `path`, and check it is major 6
+    fn bind(lib: Library, path: PathBuf) -> Result<Self> {
+        let at = path.display();
         let missing = |name: &str| format!("{at} has no {name}");
         // SAFETY: each symbol is declared in nvCOMP 6's `nvcomp.h` and `nvcomp/zstd.h` with the signature of its
         // type here; the version is checked before any but `nvcompGetProperties`, which every major has, is called
@@ -241,7 +255,7 @@ impl NvComp {
         // reserved bytes zero
         let status = unsafe { alignments_fn(OPTS, &mut alignments) };
         ensure!(status.is_success(), "{at}: nvCOMP's zstd alignment query failed ({})", status.0);
-        Ok(Self { _lib: lib, path: path.to_path_buf(), properties, alignments, status_string, temp_size, decompress })
+        Ok(Self { _lib: lib, path, properties, alignments, status_string, temp_size, decompress })
     }
 
     /// Where the library was loaded from, and its version and CUDA runtime, for the log

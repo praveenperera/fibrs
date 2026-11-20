@@ -93,8 +93,8 @@ cached, by where they were decoded, and the batches the CPU finished. If the GPU
 
 By default the slabs are decoded on the CPU, with c-blosc's checks. Decoding them on the GPU with NVIDIA's nvCOMP is
 opt-in, with the same output on sound files: run `pip install "fibrs[gpu-zstd]"` and set `FIBRS_NVCOMP=on`, or
-set `FIBRS_NVCOMP` to the path of a `libnvcomp.so.6` (`nvcomp64_6.dll` on Windows). GPU slab decoding trusts the prediction files: on a corrupt
-chunk nvCOMP's behaviour is undefined, so it may give wrong output or a CUDA fault where the CPU decoder would
+set `FIBRS_NVCOMP` to the path of a `libnvcomp.so.6` (`nvcomp64_6.dll` on Windows, where a relative path or bare
+file name is taken from the current directory). GPU slab decoding trusts the prediction files: on a corrupt chunk nvCOMP's behaviour is undefined, so it may give wrong output or a CUDA fault where the CPU decoder would
 report the corruption.
 
 nvCOMP is not part of fibrs: it is NVIDIA's own PyPI package, `nvidia-libnvcomp-cu12` (version 6, under NVIDIA's
@@ -129,13 +129,13 @@ scripts/install-dropin.sh VENV [BINARY]   # VENV/bin/avf-spline-generator -> fib
 scripts/install-dropin.sh --restore VENV  # put the original back
 ```
 
-BINARY defaults to the `fibrs` in the archive the script came from, then to the one on `PATH`. On Windows, run it
-from Git Bash: `VENV\Scripts\avf-spline-generator.exe` becomes a copy of `fibrs.exe`, and the original is kept as
-`avf-spline-generator.reference.exe`. A caller there that builds the path itself names it with `.exe`
-(`Path(sys.executable).parent / "avf-spline-generator.exe"`).
-The original entry is kept as `avf-spline-generator.reference`, and `NOTICE` and `licenses/` are copied to
-`VENV/share/fibrs`. Callers that run `Path(sys.executable).parent / "avf-spline-generator"`
-need no other change. Run as `avf-spline-generator`, `--version` prints `0.2.0`, the release it stands in for; run
+BINARY defaults to the `fibrs` in the archive the script came from, then to the one on `PATH`. On Linux and macOS
+the original entry is kept as `VENV/bin/avf-spline-generator.reference`, and callers that run
+`Path(sys.executable).parent / "avf-spline-generator"` need no other change. On Windows, run it from Git Bash:
+`VENV\Scripts\avf-spline-generator.exe` becomes a copy of `fibrs.exe`, the original is kept as
+`VENV\Scripts\avf-spline-generator.reference.exe`, and a caller that builds the path itself names it with `.exe`
+(`Path(sys.executable).parent / "avf-spline-generator.exe"`). Either way `NOTICE` and `licenses/` are copied to
+`VENV/share/fibrs`. Run as `avf-spline-generator`, `--version` prints `0.2.0`, the release it stands in for; run
 as `fibrs` or `python -m fibrs`, it prints fibrs' own version.
 
 ## Tiled tracing
