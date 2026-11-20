@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### What's new
+
+- **Trace finishing on the GPU.** When a run uses the GPU, finishing (cutting each traced curve where the
+  predictions disagree, then smoothing, resampling and re-checking each piece) runs there too. It gives the CPU's
+  pieces bit for bit, so the `.afv` is unchanged, whatever rounding the run started with. Both pooled predictions
+  and a cache of native prediction slabs, up to 8 GiB, stay on the GPU while a family is finished; the slabs are
+  still decoded on the CPU. A batch of curves the GPU cannot finish, for example one that reads more slabs than
+  its cache holds, is finished on the CPU, and the log counts those batches and the slabs uploaded at the end of
+  each family. If the GPU fails while finishing, `--device auto` finishes the rest of the family on the CPU and
+  `--device cuda` stops the run, as in the other GPU stages. `--device cpu` finishes on the CPU as before.
+
 ## [0.3.1] - 2026-11-19
 
 fibrs 0.3.1 traces dense data faster: threads that finishing leaves idle trace seeds ahead, and the binary

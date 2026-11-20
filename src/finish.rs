@@ -7,14 +7,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
 
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, ensure, eyre};
 
 use crate::arena::BufferPool;
 use crate::fields::Presence;
 use crate::input::{NativeChunk, PackedChunk, Predictions};
-use crate::kernels::{evaluate_curve, fit_curve};
+use crate::kernels::{MIN_FIT_POINTS, evaluate_curve, fit_curve};
 use crate::vol::{Shape, Vol};
 
 /// Planes of a chunk decoded together: in prediction zarrs one Blosc block of each channel holds 8 planes of
@@ -22,12 +23,77 @@ use crate::vol::{Shape, Vol};
 const SLAB_PLANES: usize = 8;
 
 /// The cache's unit: a native chunk's index z, y, x and the index of the slab of planes within it
-type SlabKey = [usize; 4];
+pub(crate) type SlabKey = [usize; 4];
+
+/// Where the native predictions' slabs lie: chunks of `edge` over `shape`, each cut into slabs of `planes` z planes
+///
+/// The GPU's slab cache keeps a table entry per slab in this order and each slab's voxels in
+/// [`NativeCache::copy_slab`]'s layout, so its kernels read what [`NativeSampler`] reads
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SlabLayout {
+    /// The native shape, z, y, x
+    pub shape: Shape,
+    /// The chunk edge, z, y, x
+    pub edge: Shape,
+    /// Planes per slab, which divides `edge[0]`
+    pub planes: usize,
+}
+
+#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+impl SlabLayout {
+    /// The chunk grid, z, y, x
+    pub fn chunks(&self) -> Shape {
+        [0, 1, 2].map(|a| self.shape[a].div_ceil(self.edge[a]))
+    }
+
+    /// Slabs per chunk
+    pub fn per_chunk(&self) -> usize {
+        self.edge[0] / self.planes
+    }
+
+    /// Slabs in the whole grid: the length of a table with an entry per slab
+    pub fn len(&self) -> usize {
+        self.chunks().iter().product::<usize>() * self.per_chunk()
+    }
+
+    /// Bytes of one slab in [`NativeCache::copy_slab`]'s layout
+    pub fn slab_bytes(&self) -> usize {
+        2 * self.planes * self.edge[1] * self.edge[2]
+    }
+
+    /// The table index of the slab with key `[cz, cy, cx, s]`: `((cz · ncy + cy) · ncx + cx) · spc + s`
+    pub fn index(&self, [cz, cy, cx, s]: SlabKey) -> usize {
+        let [_, ncy, ncx] = self.chunks();
+        ((cz * ncy + cy) * ncx + cx) * self.per_chunk() + s
+    }
+
+    /// The key of the slab at table index `i`
+    pub fn key(&self, i: usize) -> SlabKey {
+        let [_, ncy, ncx] = self.chunks();
+        let spc = self.per_chunk();
+        let chunk = i / spc;
+        [chunk / ncx / ncy, chunk / ncx % ncy, chunk % ncx, i % spc]
+    }
+
+    /// The table index of every slab holding a voxel of the box from `lo` to `hi`, both inclusive
+    pub fn indices_in(&self, lo: Shape, hi: Shape) -> impl Iterator<Item = usize> + '_ {
+        let [_, ey, ex] = self.edge;
+        let spc = self.per_chunk();
+        // slab row `r` along z is slab `r % spc` of chunk `r / spc`, as `cz · ez + s · planes = r · planes`
+        (lo[0] / self.planes..=hi[0] / self.planes).flat_map(move |r| {
+            (lo[1] / ey..=hi[1] / ey)
+                .flat_map(move |cy| (lo[2] / ex..=hi[2] / ex).map(move |cx| self.index([r / spc, cy, cx, r % spc])))
+        })
+    }
+}
 
 /// Decoded native predictions for a box of voxels, both channels, in a buffer of the cache's pool
 struct Slab<'p> {
     /// The box's first voxel, z, y, x
     lo: Shape,
+    /// The box's extent, z, y, x: a chunk clipped to the array for a whole chunk read, else the slab's planes of
+    /// the chunk's full extent
+    dims: Shape,
     /// Elements between consecutive planes and rows
     stride: [usize; 2],
     /// Offset of the H channel
@@ -38,7 +104,8 @@ struct Slab<'p> {
 impl<'p> Slab<'p> {
     fn from_chunk(chunk: NativeChunk<&'p BufferPool>) -> Self {
         let [_, dy, dx] = chunk.dims;
-        Self { lo: chunk.lo, stride: [dy * dx, dx], half: chunk.dims.iter().product(), data: chunk.data }
+        let (lo, dims) = (chunk.lo, chunk.dims);
+        Self { lo, dims, stride: [dy * dx, dx], half: dims.iter().product(), data: chunk.data }
     }
 
     /// V and H at a voxel inside the box
@@ -175,6 +242,43 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         self.counts.lock().expect("cache lock").read
     }
 
+    /// Where the cache's slabs lie
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn layout(&self) -> SlabLayout {
+        SlabLayout { shape: self.pred.shape, edge: self.edge, planes: self.planes }
+    }
+
+    /// Write slab `key`, decoded through the cache, into `out` as [`SlabLayout`] lays a slab out: V then H, each
+    /// `planes × ey × ex` at the chunk's full extent, voxel z, y, x at `(z - lo_z) · ey · ex + (y - lo_y) · ex +
+    /// (x - lo_x)`; voxels past the array's edge, which no sample reads, are zero
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn copy_slab(&self, key: SlabKey, out: &mut [u8]) -> Result<()> {
+        let slab = self.slab(key)?;
+        let [_, ey, ex] = self.edge;
+        let half = self.planes * ey * ex;
+        ensure!(out.len() == 2 * half, "a slab of {half} voxels a channel copied into {} bytes", out.len());
+        let channels = [&slab.data[..slab.half], &slab.data[slab.half..2 * slab.half]];
+        // a slab decoded by planes, or a whole chunk inside the array, is already in this layout
+        if slab.dims == [self.planes, ey, ex] {
+            for (to, from) in out.chunks_exact_mut(half).zip(channels) {
+                to.copy_from_slice(from);
+            }
+            return Ok(());
+        }
+
+        out.fill(0);
+        let [dz, dy, dx] = slab.dims;
+        for (to, from) in out.chunks_exact_mut(half).zip(channels) {
+            for z in 0..dz {
+                for y in 0..dy {
+                    let row = z * slab.stride[0] + y * slab.stride[1];
+                    to[(z * ey + y) * ex..][..dx].copy_from_slice(&from[row..row + dx]);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn slab(&self, key: SlabKey) -> Result<Arc<Slab<'p>>> {
         if let Some(slab) = self.slabs.lock().expect("cache lock").get(&key) {
             return Ok(slab);
@@ -245,7 +349,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
     fn slab_at(&self, chunk: Shape, s: usize, data: Vec<u8, &'p BufferPool>) -> Slab<'p> {
         let [ez, ey, ex] = self.edge;
         let lo = [chunk[0] * ez + s * self.planes, chunk[1] * ey, chunk[2] * ex];
-        Slab { lo, stride: [ey * ex, ex], half: self.planes * ey * ex, data }
+        Slab { lo, dims: [self.planes, ey, ex], stride: [ey * ex, ex], half: self.planes * ey * ex, data }
     }
 
     fn packed(&self, key: Shape) -> Result<Arc<PackedChunk<&'p BufferPool>>> {
@@ -357,6 +461,30 @@ fn sample_tracing(tracing: &[Vol<u8>; 2], p: [f32; 3]) -> [f32; 2] {
     out
 }
 
+/// The pieces `finish` cuts a curve of `segments + 1` points into: each maximal run of segments `valid` accepts,
+/// as the range of its points, the run's segments and the point after the last
+///
+/// The GPU path forms its pieces from the kernels' flags with this too, so both cut a curve alike
+pub(crate) fn valid_runs(
+    segments: usize,
+    valid: impl Fn(usize) -> bool,
+) -> impl Iterator<Item = RangeInclusive<usize>> {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < segments && !valid(i) {
+            i += 1;
+        }
+        if i == segments {
+            return None;
+        }
+        let start = i;
+        while i < segments && valid(i) {
+            i += 1;
+        }
+        Some(start..=i)
+    })
+}
+
 /// What finishing reads: the pooled predictions, the family's presence and the native predictions
 pub struct FinishCtx<'a> {
     pub tracing: &'a [Vol<u8>; 2],
@@ -402,25 +530,13 @@ impl FinishCtx<'_> {
     /// `finish` for one raw curve: the finished pieces in order
     pub fn finish(&self, raw: &[[f32; 3]], native: &mut NativeSampler) -> Result<Vec<Vec<[f32; 3]>>> {
         let valid = self.valid_segments(raw, native, false)?;
-        let mut pieces = Vec::new();
-        let mut i = 0;
-        while i < valid.len() {
-            if !valid[i] {
-                i += 1;
-                continue;
-            }
-            let start = i;
-            while i < valid.len() && valid[i] {
-                i += 1;
-            }
-            pieces.push(raw[start..=i].to_vec());
-        }
+        let mut pieces: Vec<Vec<[f32; 3]>> = valid_runs(valid.len(), |i| valid[i]).map(|r| raw[r].to_vec()).collect();
         let shape = self.pres.shape();
         for piece in pieces.iter_mut() {
-            let (smoothed, count) = fit_curve(piece, self.pres);
-            if count < 2 {
+            if piece.len() < MIN_FIT_POINTS {
                 continue;
             }
+            let (smoothed, count) = fit_curve(piece, self.pres);
             let fitted = evaluate_curve(&smoothed, count, shape);
             if self.valid_segments(&fitted, native, true)?.iter().all(|&v| v) {
                 *piece = fitted;
@@ -430,14 +546,17 @@ impl FinishCtx<'_> {
     }
 }
 
+/// Synthetic prediction stores for tests
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use std::fs;
+    use std::path::PathBuf;
 
-    use super::*;
+    use crate::input::Predictions;
+    use crate::vol::Shape;
 
     /// A zstd Blosc frame of uint8 data with blocks of `blocksize` bytes
-    fn frame(data: &[u8], blocksize: usize) -> Vec<u8> {
+    pub fn frame(data: &[u8], blocksize: usize) -> Vec<u8> {
         let mut out = vec![0u8; data.len() + 64];
         // SAFETY: `out` has room for the frame and its 16-byte header; the context call keeps no global state
         let n = unsafe {
@@ -459,25 +578,108 @@ mod tests {
         out
     }
 
-    /// A uint8 prediction store in `name` under the temp directory with one row of chunks of `edge`³ along x,
-    /// chunk x compressed in blocks of `blocks[x]` bytes
-    fn store(name: &str, edge: usize, blocks: &[usize]) -> (std::path::PathBuf, Predictions) {
-        let n = edge * edge * edge;
+    /// A uint8 prediction store in `name` under the temp directory over `shape` in chunks of `edge`³, chunk
+    /// z, y, x compressed in blocks of `blocksize([cz, cy, cx])` bytes and voxel z, y, x of channel `c` (0 = V)
+    /// holding `value(c, z, y, x)`
+    ///
+    /// Chunks at the array's edge are stored at their full extent, as Zarr stores them, zero past the edge
+    pub fn store_with(
+        name: &str,
+        shape: Shape,
+        edge: usize,
+        blocksize: impl Fn(Shape) -> usize,
+        value: impl Fn(usize, usize, usize, usize) -> u8,
+    ) -> (PathBuf, Predictions) {
         let dir = std::env::temp_dir().join(format!("fibrs-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        for (x, &blocksize) in blocks.iter().enumerate() {
-            let data: Vec<u8> = (0..2 * n).map(|i| (i * 7 + i / 977 + 101 * x) as u8).collect();
-            fs::write(dir.join(format!("0.0.0.{x}")), frame(&data, blocksize)).unwrap();
+        let n = edge * edge * edge;
+        let grid = shape.map(|s| s.div_ceil(edge));
+        for cz in 0..grid[0] {
+            for cy in 0..grid[1] {
+                for cx in 0..grid[2] {
+                    let mut data = vec![0u8; 2 * n];
+                    for (i, v) in data.iter_mut().enumerate() {
+                        let (c, at) = (i / n, i % n);
+                        let [z, y, x] =
+                            [cz * edge + at / (edge * edge), cy * edge + at / edge % edge, cx * edge + at % edge];
+                        if z < shape[0] && y < shape[1] && x < shape[2] {
+                            *v = value(c, z, y, x);
+                        }
+                    }
+                    let path = dir.join(format!("0.{cz}.{cy}.{cx}"));
+                    fs::write(path, frame(&data, blocksize([cz, cy, cx]))).unwrap();
+                }
+            }
         }
         let meta = serde_json::json!({
-            "zarr_format": 2, "shape": [2, edge, edge, blocks.len() * edge], "chunks": [2, edge, edge, edge],
+            "zarr_format": 2, "shape": [2, shape[0], shape[1], shape[2]], "chunks": [2, edge, edge, edge],
             "dtype": "|u1", "fill_value": 0, "order": "C", "filters": null, "dimension_separator": ".",
             "compressor": {"id": "blosc", "cname": "zstd", "clevel": 3, "shuffle": 1, "blocksize": 0},
         });
         fs::write(dir.join(".zarray"), meta.to_string()).unwrap();
         let pred = Predictions::open(&dir, None, "VH").unwrap();
         (dir, pred)
+    }
+
+    /// A uint8 prediction store in `name` under the temp directory with one row of chunks of `edge`³ along x,
+    /// chunk x compressed in blocks of `blocks[x]` bytes
+    pub fn store(name: &str, edge: usize, blocks: &[usize]) -> (PathBuf, Predictions) {
+        let n = edge * edge * edge;
+        let shape = [edge, edge, blocks.len() * edge];
+        let value = |c: usize, z: usize, y: usize, x: usize| {
+            let i = c * n + (z * edge + y) * edge + x % edge;
+            (i * 7 + i / 977 + 101 * (x / edge)) as u8
+        };
+        store_with(name, shape, edge, |[_, _, cx]| blocks[cx], value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::test_support::{store, store_with};
+    use super::*;
+
+    /// Every slab, in both cache modes, copies out in the GPU's layout with every voxel's values where the layout
+    /// puts them, including the chunks clipped at the array's edge, which a whole-chunk read returns at their
+    /// clipped extent; and the layout's table index and key agree with the cache's own slab keys
+    #[test]
+    fn copied_slabs_hold_each_voxel_where_the_layout_says() {
+        let edge = 2 * SLAB_PLANES;
+        let shape = [40, 37, 35];
+        let value = |c: usize, z: usize, y: usize, x: usize| ((z * 31 + y * 7 + x * 3 + c * 101) % 251) as u8;
+        let one_block = 2 * edge * edge * edge;
+        for (name, blocksize, planes) in
+            [("copy-sliced", SLAB_PLANES * edge * edge, SLAB_PLANES), ("copy-whole", one_block, edge)]
+        {
+            let (dir, pred) = store_with(name, shape, edge, |_| blocksize, value);
+            let pool = BufferPool::new(1 << 20);
+            let cache = NativeCache::new(&pred, 64 << 20, &pool);
+            let layout = cache.layout();
+            assert_eq!(layout, SlabLayout { shape, edge: [edge; 3], planes }, "{name}");
+            let half = layout.slab_bytes() / 2;
+            let mut out = vec![0u8; 2 * half];
+            for i in 0..layout.len() {
+                let key = layout.key(i);
+                assert_eq!(layout.index(key), i);
+                cache.copy_slab(key, &mut out).unwrap();
+                let [cz, cy, cx, s] = key;
+                let lo = [cz * edge + s * planes, cy * edge, cx * edge];
+                for z in lo[0]..(lo[0] + planes).min(shape[0]) {
+                    for y in lo[1]..(lo[1] + edge).min(shape[1]) {
+                        for x in lo[2]..(lo[2] + edge).min(shape[2]) {
+                            assert_eq!(cache.slab_key(z, y, x), key);
+                            let at = ((z - lo[0]) * edge + y - lo[1]) * edge + x - lo[2];
+                            let want = [value(0, z, y, x), value(1, z, y, x)];
+                            assert_eq!([out[at], out[half + at]], want, "{name}: voxel {z} {y} {x}");
+                        }
+                    }
+                }
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     /// A cache in slab mode with `slab_budget` bytes for slabs, as the probe chooses it when the chunk it lists
