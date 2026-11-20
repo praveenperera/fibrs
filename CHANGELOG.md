@@ -3,10 +3,10 @@
 ## [0.4.0] - 2026-11-20
 
 fibrs 0.4.0 does more of a GPU run on the GPU and spends less CPU time around tracing. Traced curves are finished
-on the GPU, and centrality waits less on the host. The seed catalogue and the export's rows are built on the
-`--threads` pool, idle threads trace further ahead, and finishing does less memory work. `fibrs predict` allocates
-through the system allocator again, which brings its speed back to 0.3.0's. None of these changes alters the
-`.afv` or the predictions.
+on the GPU, and GPU centrality takes less than half as long on dense data. The seed catalogue and the export's
+rows are built on the `--threads` pool, idle threads trace further ahead, and finishing does less memory work.
+`fibrs predict` allocates through the system allocator again, which brings its speed back to 0.3.0's. None of
+these changes alters the `.afv` or the predictions.
 
 ### What's new
 
