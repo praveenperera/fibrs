@@ -220,6 +220,13 @@ struct Batch {
     error: Option<color_eyre::Report>,
 }
 
+/// A batch's rows up to its first error in input order, and that error. The rows are inserted before the error is
+/// reported, so a failed insert of an earlier fibre is the error, as when the curves were written one by one
+struct Rows {
+    fibers: Vec<FiberRows>,
+    error: Option<color_eyre::Report>,
+}
+
 impl Batch {
     /// The next batch, or `None` once the input has nothing left
     fn read(curves: &mut impl Iterator<Item = Result<(usize, Vec<[f32; 3]>)>>) -> Option<Self> {
@@ -289,29 +296,28 @@ impl Geometry {
 
     /// The rows of the input's next batch, numbered from `first`, or `None` once the input has nothing left. A
     /// batch can have no rows when all its fibres are too short; that does not end the input
-    fn next_rows(
-        &self,
-        curves: &mut impl Iterator<Item = Result<(usize, Vec<[f32; 3]>)>>,
-        first: i64,
-    ) -> Result<Option<Vec<FiberRows>>> {
-        Batch::read(curves).map(|batch| self.rows(batch, first)).transpose()
+    fn next_rows(&self, curves: &mut impl Iterator<Item = Result<(usize, Vec<[f32; 3]>)>>, first: i64) -> Option<Rows> {
+        Batch::read(curves).map(|batch| self.rows(batch, first))
     }
 
-    /// The rows of a batch's fibres, numbered from `first`; the batch's first error, in input order, ends it as
-    /// writing the curves one by one would have
-    fn rows(&self, batch: Batch, first: i64) -> Result<Vec<FiberRows>> {
+    /// The rows of a batch's fibres, numbered from `first`, up to the batch's first error in input order
+    fn rows(&self, batch: Batch, first: i64) -> Rows {
         let kept: Vec<Result<Option<Kept>>> = batch.curves.par_iter().map(|(f, p)| self.kept(*f, p)).collect();
         let mut numbered = Vec::with_capacity(kept.len());
+        let mut error = batch.error;
         for k in kept {
-            if let Some(k) = k? {
-                numbered.push((first + numbered.len() as i64, k));
+            match k {
+                Ok(Some(k)) => numbered.push((first + numbered.len() as i64, k)),
+                Ok(None) => {}
+                Err(e) => {
+                    // an invalid curve comes before the read error that ended the batch
+                    error = Some(e);
+                    break;
+                }
             }
         }
-        let rows = numbered.into_par_iter().map(|(count, k)| fiber_rows(count, k)).collect();
-        match batch.error {
-            Some(e) => Err(e),
-            None => Ok(rows),
-        }
+        let fibers = numbered.into_par_iter().map(|(count, k)| fiber_rows(count, k)).collect();
+        Rows { fibers, error }
     }
 }
 
@@ -397,18 +403,24 @@ where
             }
             Ok(())
         };
-        let mut curves = curves.into_iter();
-        let mut next = geometry.next_rows(&mut curves, 1)?;
-        while let Some(rows) = next {
-            let first = s.fiber_count + rows.len() as i64 + 1;
+        // fused so that, as when the curves were written one by one, the input ends at its first `None`
+        let mut curves = curves.into_iter().fuse();
+        let mut next = geometry.next_rows(&mut curves, 1);
+        while let Some(Rows { fibers, error }) = next {
+            // the input is not read past its first error
+            if let Some(e) = error {
+                insert(fibers, &mut s)?;
+                return Err(e);
+            }
+            let first = s.fiber_count + fibers.len() as i64 + 1;
             let mut prepared = None;
             // the pool makes the next batch's rows while this thread inserts this batch's
             let inserted = rayon::in_place_scope(|scope| {
                 scope.spawn(|_| prepared = Some(geometry.next_rows(&mut curves, first)));
-                insert(rows, &mut s)
+                insert(fibers, &mut s)
             });
             inserted?;
-            next = prepared.expect("the spawned batch has finished")?;
+            next = prepared.expect("the spawned batch has finished");
         }
     }
     tx.execute_batch("CREATE INDEX fibers_length ON fibers(length DESC,id)")?;
@@ -561,5 +573,22 @@ mod tests {
         assert_eq!(e, "Spline contains invalid native coordinates");
         assert!(!out.exists());
         let _ = fs::remove_dir_all(out.parent().unwrap());
+    }
+
+    /// The input ends at its first `None`, even for an iterator that would yield more after it
+    #[test]
+    fn the_input_ends_at_its_first_none() {
+        let mut i = 0;
+        let curves = std::iter::from_fn(move || {
+            i += 1;
+            (i != 2).then(|| Ok(curve(i)))
+        })
+        .take(3);
+        let dir = std::env::temp_dir().join(format!("fibrs-afv-none-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let out = dir.join("out.afv");
+        let summary = export_afv(curves, &out, &options()).unwrap();
+        assert_eq!(summary.fiber_count, 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
