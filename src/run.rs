@@ -980,7 +980,7 @@ impl CentralityDevice {
     /// it on, opened only when a family still needs centrality
     ///
     /// `auto` takes the GPU when one opens, and otherwise the CPU, saying why. A run started on the CPU keeps
-    /// centrality there, but its direction field, the same bytes on either device, still takes the GPU
+    /// centrality there, but its direction field and finishing, the same bytes on either device, still take the GPU
     fn choose(
         device: Device,
         index: Option<usize>,
