@@ -705,9 +705,9 @@ mod tests {
             gpu_crop(&dir, CHUNK);
         }
 
-        /// Chunks of 16K, 32K and 64K seeds of the larger crop's V family on an empty coverage: each chunk alone,
-        /// launch to collect, then two at a time as the look-ahead runs them, for seeds per second and the share
-        /// sent back to the CPU
+        /// The larger crop's V family in chunks of 16K, 32K and 64K seeds, each launched with the coverage the
+        /// CPU has committed up to its first seed, as the look-ahead launches just past the commit point: device
+        /// time per chunk (update, launch and collect), seeds per second and the share sent back to the CPU
         #[test]
         #[ignore = "needs a CUDA device and a crop's field dumps"]
         fn gpu_walk_speed() {
@@ -716,44 +716,56 @@ mod tests {
             let shape = crop_shape(FsPath::new(&dir));
             let Dumps { pres, cent, dirs, cat } = load(&FsPath::new(&dir).join("work"), 1, shape);
             let tracing = [pres, Vol::new(shape, 0u8)];
-            let mut walk: gw::Walk = gpu.walk(&tracing, 1, &cent, &dirs, &cat, kernels::ring()).unwrap();
-            eprintln!("walk device bytes: {:.2} GiB", walk.device_bytes() as f64 / (1u64 << 30) as f64);
+            let f = kernels::Fields { pres: &tracing[0], cent: &cent, dirs: &dirs };
             let n = cat.coords.len();
-            // one warm-up chunk for the driver's JIT and first-touch costs
-            walk.launch(0..CHUNK.min(n)).unwrap();
-            walk.collect().unwrap();
-            for size in [CHUNK / 4, CHUNK / 2, CHUNK] {
-                let chunks: Vec<Range<usize>> = (0..n).step_by(size).map(|s| s..(s + size).min(n)).collect();
-                let (mut cpu, mut worst) = (0, 0.0f64);
-                let start = Instant::now();
-                for c in &chunks {
+            let wide = Caps { survivors: 32 << 10, checks: 4 << 20, pts: 2 << 20, curves: 256 << 10, marks: 32 << 20 };
+            let runs = [
+                (CHUNK / 4, Caps::default()),
+                (CHUNK / 2, Caps::default()),
+                (CHUNK, Caps::default()),
+                (CHUNK / 2, wide),
+            ];
+            for (size, caps) in runs {
+                let mut walk: gw::Walk = gpu.walk_with(&tracing, 1, &cent, &dirs, &cat, kernels::ring(), caps).unwrap();
+                let bytes = walk.device_bytes() as f64 / (1u64 << 30) as f64;
+                // one warm-up chunk for the driver's JIT and first-touch costs
+                walk.launch(0..size.min(n)).unwrap();
+                walk.collect().unwrap();
+                let cov = Coverage::new(shape);
+                let mut writer = cov.writer();
+                writer.log_changes();
+                let (mut scratch, mut traced, mut changes) = (Scratch::default(), Traced::default(), Vec::new());
+                let (mut committed, mut cpu, mut total, mut worst) = (0, 0, 0.0f64, 0.0f64);
+                for start in (0..n).step_by(size) {
+                    while committed < start {
+                        let seed = cat.coords[committed];
+                        if trace_seed(&f, &cov, &mut scratch, seed, primary(&cat, committed), &mut traced).is_ok() {
+                            writer.apply(committed as u32, &traced);
+                        }
+                        committed += 1;
+                    }
+                    changes.clear();
+                    writer.take_changes(&mut changes);
                     let t = Instant::now();
-                    walk.launch(c.clone()).unwrap();
+                    walk.update(&changes).unwrap();
+                    walk.launch(start..(start + size).min(n)).unwrap();
                     let out = walk.collect().unwrap().unwrap();
                     let ms = t.elapsed().as_secs_f64() * 1e3;
-                    worst = worst.max(ms);
                     let back = out.results.iter().filter(|r| r.status == lookahead::Status::Cpu).count();
-                    cpu += back;
-                    eprintln!("chunk {size}: seeds {c:?} in {ms:.1} ms, {back} to the CPU, {} marks", out.marks.len());
+                    let marks = out.marks.len();
+                    eprintln!(
+                        "chunk {size} at {start}: {ms:.1} ms, {back} to the CPU, {marks} marks, {} changes",
+                        changes.len()
+                    );
+                    (cpu, total, worst) = (cpu + back, total + ms, worst.max(ms));
                 }
-                let alone = start.elapsed().as_secs_f64();
-                let start = Instant::now();
-                let mut queued = chunks.iter();
-                loop {
-                    while walk.in_flight() < 2 {
-                        let Some(c) = queued.next() else { break };
-                        walk.launch(c.clone()).unwrap();
-                    }
-                    if walk.collect().unwrap().is_none() {
-                        break;
-                    }
-                }
-                let piped = start.elapsed().as_secs_f64();
+                let chunks = n.div_ceil(size);
                 eprintln!(
-                    "chunk {size}: {n} seeds, alone {:.0} seeds/s (slowest chunk {worst:.1} ms), two in flight {:.0} \
-                     seeds/s, {:.2}% to the CPU",
-                    n as f64 / alone,
-                    n as f64 / piped,
+                    "chunk {size}, {} survivors: {n} seeds, {:.0} seeds/s, {:.1} ms a chunk (slowest {worst:.1}), \
+                     {:.2}% to the CPU, {bytes:.2} GiB on the device",
+                    caps.survivors,
+                    n as f64 / (total / 1e3),
+                    total / chunks as f64,
                     100.0 * cpu as f64 / n as f64
                 );
             }

@@ -8,9 +8,9 @@
 //! returns its results ([`ChunkOut`]). The kernels read the coverage while updates change it, and every result
 //! records the values it read, which the host checks against its own coverage before committing it
 //!
-//! Kernels take raw device pointers, so cudarc does not order the update stream behind the chunks reading the
-//! coverage; the uploads are synchronized before the walk is handed out, and each slot's buffers are reused only
-//! after its stream is synchronized
+//! Kernels take raw device pointers, so cudarc's events order none of their launches: the uploads are
+//! synchronized before the walk is handed out, each chunk waits on an event recorded after the last update so it
+//! reads every change sent before it, and each slot's buffers are reused only after its stream is synchronized
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
 use cudarc::driver::{
-    CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig, PinnedHostSlice, PushKernelArg, ValidAsZeroBits,
+    CudaEvent, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig, PinnedHostSlice, PushKernelArg,
+    ValidAsZeroBits, sys,
 };
 use rayon::prelude::*;
 
@@ -145,6 +146,8 @@ struct Mirror {
     set_host: PinnedHostSlice<u32>,
     new_dev: CudaSlice<u64>,
     set_dev: CudaSlice<u32>,
+    /// Recorded after each update, so a chunk launched later reads every change sent before it
+    applied: CudaEvent,
 }
 
 /// One chunk slot: a stream and the device and pinned host buffers one chunk uses
@@ -370,6 +373,8 @@ impl Gpu {
             set_host: pinned(&self.ctx, 1, 0)?,
             new_dev: cov_stream.alloc_zeros(1)?,
             set_dev: cov_stream.alloc_zeros(1)?,
+            // never recorded until the first update, which a wait on it then passes at once
+            applied: self.ctx.new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
             stream: cov_stream,
         };
         let slots = (0..IN_FLIGHT).map(|_| ChunkSlot::new(self, &caps)).collect::<Result<Vec<_>>>()?;
@@ -479,6 +484,7 @@ impl Walk<'_> {
                 .arg(&n32)
                 .launch(grid(changes.len(), 256)?)?;
         }
+        m.applied.record(&m.stream)?;
         Ok(())
     }
 
@@ -501,6 +507,9 @@ impl Walk<'_> {
         let slot = &mut self.slots[s];
         let st = slot.stream.clone();
         let n = seeds.len();
+        // the updates sent so far land before this chunk reads the coverage; chunks already running may still
+        // read either value of a voxel they change
+        st.wait(&self.cov.applied)?;
         st.memset_zeros(&mut slot.totals)?;
         st.memset_zeros(&mut slot.n_pts.slice_mut(..n))?;
         st.memset_zeros(&mut slot.n_curves.slice_mut(..n))?;
