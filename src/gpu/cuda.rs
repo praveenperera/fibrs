@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PinnedHostSlice, PushKernelArg,
-    ValidAsZeroBits, sys,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DeviceRepr, DriverError, LaunchConfig, PinnedHostSlice,
+    PushKernelArg, ValidAsZeroBits, result, sys,
 };
 use cudarc::nvrtc::Ptx;
 use rayon::prelude::*;
@@ -42,8 +42,9 @@ const DESC: usize = 16;
 const BAND_REACH: usize = 3;
 /// Threads per block of every launch
 const BLOCK: u32 = 256;
-/// Most tiles in one unit: bounds the pinned host memory each of the two units in flight holds (at most about
-/// 16 MB of bricks and 8 MB of centrality per tile, far less in a band's mostly empty bricks)
+/// Most tiles in one unit: bounds the pinned host memory each of the two slots holds, sized for the largest unit it
+/// runs (at most about 16 MB of bricks and 4 MB of centrality per tile, far less in a band's mostly empty bricks;
+/// the seeds come back into pageable memory)
 const UNIT_TILES: usize = 32;
 /// Oldest driver fibrs opens, as `cuDriverGetVersion` reports it (1000 × major + 10 × minor): cudarc's bindings are
 /// CUDA 12's
@@ -285,27 +286,46 @@ impl Gpu {
                 && shape.iter().all(|&n| u32::try_from(n).is_ok()),
             "volume of {shape:?} voxels is too large to index seeds"
         );
-        let units = units(&tracing[family - 1], shape, self.unit_tiles()?);
+        let own = &tracing[family - 1];
+        let units = units(own, shape, self.unit_tiles()?);
+        // allocating or freeing pinned memory synchronizes the whole device, so a buffer regrown between units
+        // would drain the other slot's kernels: each slot's pinned buffers are sized once, here, for the largest
+        // of the units it runs (every other one), from each unit's plan
+        let rooms: Vec<Room> =
+            units.par_iter().map(|u| Plan::new(u, &vols, shape).map(|p| p.room(own))).collect::<Result<_>>()?;
+        let room = |s: usize| rooms.iter().skip(s).step_by(2).fold(Room::default(), |a, &b| a.max(b));
+        let mut slots = [Slot::new(&self.ctx, room(0))?, Slot::new(&self.ctx, room(1))?];
         let mut cent = Vol::new(shape, 0u16);
-        let mut seeds = Vec::new();
-        let mut slots = [Slot::new(&self.ctx)?, Slot::new(&self.ctx)?];
-        // unit i stages and launches on slot i % 2 while unit i - 1 finishes on the other; a slot's previous
-        // unit was collected (its stream synchronized) before the slot stages again
-        let mut pending: Option<(usize, Meta)> = None;
+        let mut unit_seeds = Vec::with_capacity(units.len());
+        // unit i runs on slot i % 2 once the slot's previous unit, i - 2, has finished and been downloaded, which
+        // synchronizes the slot's stream before its staging buffer is written again. Only the download and the
+        // staging lie between unit i - 2 finishing and unit i being queued behind unit i - 1: unit i is planned
+        // while the device still runs both, and unit i - 2 is installed once unit i is queued
+        let mut launched: [Option<Meta>; 2] = [None, None];
         for (i, unit) in units.iter().enumerate() {
             let s = i % 2;
-            let meta = slots[s].stage(unit, &vols, shape)?;
+            let plan = Plan::new(unit, &vols, shape)?;
+            let done = launched[s].take().map(|m| slots[s].download(m)).transpose()?;
+            let meta = slots[s].stage(plan)?;
             slots[s].launch(self, &meta, family, shape)?;
-            if let Some((p, m)) = pending.replace((s, meta)) {
-                slots[p].collect(&m, &mut cent, &mut seeds)?;
+            launched[s] = Some(meta);
+            if let Some(done) = done {
+                slots[s].install(done, &mut cent, &mut unit_seeds)?;
             }
         }
-        if let Some((p, m)) = pending {
-            slots[p].collect(&m, &mut cent, &mut seeds)?;
+        // the older of the last two units first
+        for s in [units.len() % 2, (units.len() + 1) % 2] {
+            if let Some(m) = launched[s].take() {
+                let done = slots[s].download(m)?;
+                slots[s].install(done, &mut cent, &mut unit_seeds)?;
+            }
         }
+
+        // the slots' pinned buffers are no longer needed, so they are freed before the seeds are joined
+        drop(slots);
+        let mut seeds = unit_seeds.concat();
         // the catalogue reads seeds in C order over the whole volume; indices are unique, so any sort agrees
         seeds.sort_unstable();
-        seeds.shrink_to_fit();
         Ok(FamilyFields { cent, seeds })
     }
 }
@@ -398,7 +418,81 @@ struct Meta {
     cap: usize,
 }
 
-/// One unit in flight: a stream with the device buffers and pinned host buffers it uses, grown as units need
+/// The pinned host memory a unit needs, in bricks: the payloads its pool stages and the output bricks it can pack
+#[derive(Clone, Copy, Default)]
+struct Room {
+    pool: usize,
+    out: usize,
+}
+
+impl Room {
+    fn max(self, other: Self) -> Self {
+        Self { pool: self.pool.max(other.pool), out: self.out.max(other.out) }
+    }
+}
+
+/// A unit's inputs and launch geometry, which the host builds before the unit's slot is free
+struct Plan<'v> {
+    meta: Meta,
+    desc: Vec<u32>,
+    pool: BrickPool<'v>,
+}
+
+impl<'v> Plan<'v> {
+    fn new(unit: &[TileSpan], vols: &[&'v Vol<u8>; 4], shape: Shape) -> Result<Self> {
+        let grid = vols[0].grid();
+        let regions: Vec<(Shape, Shape)> = unit.iter().map(|&t| region(t, shape, TILE_HALO)).collect();
+        let (b0, nb) = brick_box(&regions);
+        let mut desc = Vec::with_capacity(unit.len() * DESC);
+        let mut bricks = Vec::new();
+        let (mut base, mut cap) = (0usize, 0usize);
+        let (mut max_region, mut max_band, mut max_core) = (0, 0, 0);
+        for (&(start, end), &(rlo, dims)) in unit.iter().zip(&regions) {
+            let off = [0, 1, 2].map(|a| start[a] - rlo[a]);
+            let core = [0, 1, 2].map(|a| end[a] - start[a]);
+            let band =
+                [0, 1, 2].map(|a| (off[a] + core[a] + BAND_REACH).min(dims[a]) - off[a].saturating_sub(BAND_REACH));
+            let fields = [rlo, dims, off, core].concat();
+            desc.extend(fields.iter().map(|&v| v as u32));
+            desc.extend([base as u32, (bricks.len() * BRICK) as u32, 0, 0]);
+            core_bricks(start, core, grid, &mut bricks);
+            let region_voxels = dims.iter().product::<usize>();
+            base += region_voxels;
+            cap += core.iter().product::<usize>().div_ceil(2);
+            max_region = max_region.max(region_voxels);
+            max_band = max_band.max(band.iter().product());
+            max_core = max_core.max(core.iter().product());
+        }
+        // the kernels index the scratch arrays and the output in u32
+        let out = bricks.len() * BRICK;
+        ensure!(base <= u32::MAX as usize && out <= u32::MAX as usize, "a unit is too large for the kernels' indices");
+        let pool = BrickPool::new(vols, (b0, nb))?;
+        let meta =
+            Meta { tiles: unit.len() as u32, b0, nb, region_voxels: base, max_region, max_band, max_core, bricks, cap };
+        Ok(Self { meta, desc, pool })
+    }
+
+    /// The unit's room, given the family's own pooled prediction `own`
+    ///
+    /// Centrality is 0 below presence 64, and presence is 0 unless `own` is at least the other family's value, so
+    /// it reaches 64 only where `own` is at least 32: only the output bricks with such a voxel can hold a nonzero
+    /// value and be packed, and a sparse or faint unit pins room for those alone
+    fn room(&self, own: &Vol<u8>) -> Room {
+        let out =
+            self.meta.bricks.iter().filter(|&&b| own.brick_at(b).is_some_and(|v| v.iter().any(|&p| p >= 32))).count();
+        Room { pool: self.pool.payloads.len(), out }
+    }
+}
+
+/// A downloaded unit: its meta, its seeds, and how many of its packed bricks the slot's host buffers hold
+struct Done {
+    meta: Meta,
+    packed: usize,
+    seeds: Vec<Seed>,
+}
+
+/// One unit in flight: a stream with the device buffers it uses, grown as units need, and pinned host buffers
+/// sized once for the largest unit it runs
 struct Slot {
     stream: Arc<CudaStream>,
     inputs: Inputs,
@@ -415,9 +509,10 @@ struct Slot {
     /// The seed list's length and the number of packed bricks
     count: CudaSlice<u32>,
     host_count: PinnedHostSlice<u32>,
+    /// The last downloaded unit's packed bricks and their indices in its output, read by `install` until the
+    /// slot's next download
     host_packed: PinnedHostSlice<u16>,
     host_ids: PinnedHostSlice<u32>,
-    host_seeds: PinnedHostSlice<u64>,
 }
 
 /// Grow a device buffer to hold `n` elements, by half again beyond, so slowly growing units reallocate rarely
@@ -484,29 +579,16 @@ struct Inputs {
     host_desc: Vec<u32>,
 }
 
-impl Inputs {
-    fn new(stream: &Arc<CudaStream>) -> Result<Self> {
-        Ok(Self {
-            desc: stream.alloc_zeros(1)?,
-            table: stream.alloc_zeros(1)?,
-            pool: stream.alloc_zeros(1)?,
-            staging: pinned(stream.context(), 1, sys::CU_MEMHOSTALLOC_WRITECOMBINED)?,
-            host_table: Vec::new(),
-            host_desc: Vec::new(),
-        })
-    }
+/// A unit's brick pool on the host: a table per volume from each brick of the unit's box to its payload's place
+/// in the pool, or [`NO_BRICK`], and the payloads in pool order, still in their volumes
+struct BrickPool<'v> {
+    table: Vec<u32>,
+    payloads: Vec<&'v [u8; BRICK]>,
+}
 
-    /// Start the upload of the descriptors `desc` and of the bricks of `vols` in the box from brick `b0` with
-    /// extent `nb`
-    ///
-    /// The staging buffer must not be in use: the stream's previous unit was synchronized
-    fn upload(
-        &mut self,
-        stream: &Arc<CudaStream>,
-        vols: &[&Vol<u8>],
-        (b0, nb): (Shape, Shape),
-        desc: Vec<u32>,
-    ) -> Result<()> {
+impl<'v> BrickPool<'v> {
+    /// The pool of the bricks of `vols` in the box from brick `b0` with extent `nb`
+    fn new(vols: &[&'v Vol<u8>], (b0, nb): (Shape, Shape)) -> Result<Self> {
         let grid = vols[0].grid();
         let n_box = nb.iter().product::<usize>();
         let mut table = vec![NO_BRICK; vols.len() * n_box];
@@ -527,9 +609,50 @@ impl Inputs {
             }
         }
         ensure!(payloads.len() < NO_BRICK as usize, "a unit holds too many bricks");
+        Ok(Self { table, payloads })
+    }
+}
 
+impl Inputs {
+    fn new(stream: &Arc<CudaStream>) -> Result<Self> {
+        Self::with_staging(stream, 1)
+    }
+
+    /// Inputs whose staging buffer holds `staging` bytes, at least one
+    fn with_staging(stream: &Arc<CudaStream>, staging: usize) -> Result<Self> {
+        Ok(Self {
+            desc: stream.alloc_zeros(1)?,
+            table: stream.alloc_zeros(1)?,
+            pool: stream.alloc_zeros(1)?,
+            staging: pinned(stream.context(), staging.max(1), sys::CU_MEMHOSTALLOC_WRITECOMBINED)?,
+            host_table: Vec::new(),
+            host_desc: Vec::new(),
+        })
+    }
+
+    /// Start the upload of the descriptors `desc` and of the bricks of `vols` in the box from brick `b0` with
+    /// extent `nb`, growing the staging buffer as they need
+    ///
+    /// The staging buffer must not be in use: the stream's previous unit was synchronized
+    fn upload(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        vols: &[&Vol<u8>],
+        (b0, nb): (Shape, Shape),
+        desc: Vec<u32>,
+    ) -> Result<()> {
+        let pool = BrickPool::new(vols, (b0, nb))?;
+        fit_host(stream, &mut self.staging, pool.payloads.len() * BRICK, sys::CU_MEMHOSTALLOC_WRITECOMBINED)?;
+        self.send(stream, pool, desc)
+    }
+
+    /// Start the upload of the descriptors `desc` and of the bricks of `pool`, which the staging buffer has room for
+    ///
+    /// The staging buffer must not be in use: the stream's previous unit was synchronized
+    fn send(&mut self, stream: &Arc<CudaStream>, pool: BrickPool, desc: Vec<u32>) -> Result<()> {
+        let BrickPool { table, payloads } = pool;
         let n_pool = payloads.len() * BRICK;
-        fit_host(stream, &mut self.staging, n_pool, sys::CU_MEMHOSTALLOC_WRITECOMBINED)?;
+        ensure!(n_pool <= self.staging.len(), "{n_pool} bytes of bricks overflow {} of staging", self.staging.len());
         // the pool gathers the scattered bricks into pinned memory, so its upload is one asynchronous copy
         let host = &mut self.staging.as_mut_slice()?[..n_pool];
         host.par_chunks_mut(BRICK).zip(payloads.par_iter()).for_each(|(d, s)| d.copy_from_slice(&s[..]));
@@ -551,14 +674,15 @@ impl Inputs {
 }
 
 impl Slot {
-    fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
+    /// A slot whose pinned buffers have `room` for every unit it will run, and at least one element each
+    fn new(ctx: &Arc<CudaContext>, room: Room) -> Result<Self> {
         let stream = ctx.new_stream()?;
+        let out = room.out.max(1);
         Ok(Self {
-            inputs: Inputs::new(&stream)?,
+            inputs: Inputs::with_staging(&stream, room.pool * BRICK)?,
             host_count: pinned(ctx, 2, 0)?,
-            host_packed: pinned(ctx, 1, 0)?,
-            host_ids: pinned(ctx, 1, 0)?,
-            host_seeds: pinned(ctx, 1, 0)?,
+            host_packed: pinned(ctx, out * BRICK, 0)?,
+            host_ids: pinned(ctx, out, 0)?,
             pres: stream.alloc_zeros(1)?,
             nx: stream.alloc_zeros(1)?,
             ny: stream.alloc_zeros(1)?,
@@ -574,36 +698,12 @@ impl Slot {
         })
     }
 
-    /// Build a unit's brick pool, tables and tile descriptors and start their upload
-    fn stage(&mut self, unit: &[TileSpan], vols: &[&Vol<u8>; 4], shape: Shape) -> Result<Meta> {
-        let grid = vols[0].grid();
-        let regions: Vec<(Shape, Shape)> = unit.iter().map(|&t| region(t, shape, TILE_HALO)).collect();
-        let (b0, nb) = brick_box(&regions);
-        let mut desc = Vec::with_capacity(unit.len() * DESC);
-        let mut bricks = Vec::new();
-        let (mut base, mut cap) = (0usize, 0usize);
-        let (mut max_region, mut max_band, mut max_core) = (0, 0, 0);
-        for (&(start, end), &(rlo, dims)) in unit.iter().zip(&regions) {
-            let off = [0, 1, 2].map(|a| start[a] - rlo[a]);
-            let core = [0, 1, 2].map(|a| end[a] - start[a]);
-            let band =
-                [0, 1, 2].map(|a| (off[a] + core[a] + BAND_REACH).min(dims[a]) - off[a].saturating_sub(BAND_REACH));
-            let fields = [rlo, dims, off, core].concat();
-            desc.extend(fields.iter().map(|&v| v as u32));
-            desc.extend([base as u32, (bricks.len() * BRICK) as u32, 0, 0]);
-            core_bricks(start, core, grid, &mut bricks);
-            let region_voxels = dims.iter().product::<usize>();
-            base += region_voxels;
-            cap += core.iter().product::<usize>().div_ceil(2);
-            max_region = max_region.max(region_voxels);
-            max_band = max_band.max(band.iter().product());
-            max_core = max_core.max(core.iter().product());
-        }
-        // the kernels index the scratch arrays and the output in u32
-        let out = bricks.len() * BRICK;
-        ensure!(base <= u32::MAX as usize && out <= u32::MAX as usize, "a unit is too large for the kernels' indices");
-        self.inputs.upload(&self.stream, vols, (b0, nb), desc)?;
-        Ok(Meta { tiles: unit.len() as u32, b0, nb, region_voxels: base, max_region, max_band, max_core, bricks, cap })
+    /// Gather a planned unit's bricks into the staging buffer and start the upload of its inputs
+    ///
+    /// The slot's previous unit was downloaded, so its stream is synchronized and the staging buffer is free
+    fn stage(&mut self, plan: Plan) -> Result<Meta> {
+        self.inputs.send(&self.stream, plan.pool, plan.desc)?;
+        Ok(plan.meta)
     }
 
     /// Queue a staged unit's kernels and the copy of its counts
@@ -706,8 +806,9 @@ impl Slot {
         Ok(())
     }
 
-    /// Wait for a launched unit, then install its nonzero centrality bricks and append its seeds
-    fn collect(&mut self, m: &Meta, cent: &mut Vol<u16>, seeds: &mut Vec<Seed>) -> Result<()> {
+    /// Wait for a launched unit, then copy back its seeds and its nonzero centrality bricks, which stay in the
+    /// slot's host buffers for `install`
+    fn download(&mut self, m: Meta) -> Result<Done> {
         self.stream.synchronize().wrap_err("run the centrality kernels")?;
         let (n_seeds, n_packed) = {
             let c = self.host_count.as_slice()?;
@@ -715,34 +816,90 @@ impl Slot {
         };
         ensure!(n_seeds <= m.cap, "{n_seeds} seeds overflow a unit's list of {}", m.cap);
         ensure!(n_packed <= m.bricks.len(), "{n_packed} packed bricks of {}", m.bricks.len());
+        ensure!(n_packed <= self.host_ids.len(), "{n_packed} packed bricks overflow room for {}", self.host_ids.len());
         let n_values = n_packed * BRICK;
-        fit_host(&self.stream, &mut self.host_packed, n_values, 0)?;
-        fit_host(&self.stream, &mut self.host_ids, n_packed, 0)?;
-        fit_host(&self.stream, &mut self.host_seeds, n_seeds, 0)?;
+        // the seed count is known only now, and the device list's bound (every even core voxel, 8 MiB per tile)
+        // would pin far more than the seeds need, so they come back into pageable memory of their exact size, which
+        // unlike a pinned allocation does not synchronize the device. The driver may still write it after the copy
+        // returns, so it must outlive the wait below even when an error returns first
+        let mut raw = vec![0u64; n_seeds];
+        // declared after `raw`, so an early return waits for the copies before `raw` is freed
+        let pending = Pending(&self.stream);
         if n_packed > 0 {
             self.stream
                 .memcpy_dtoh(&self.packed.slice(..n_values), &mut self.host_packed.as_mut_slice()?[..n_values])?;
             self.stream.memcpy_dtoh(&self.ids.slice(..n_packed), &mut self.host_ids.as_mut_slice()?[..n_packed])?;
         }
         if n_seeds > 0 {
-            self.stream.memcpy_dtoh(&self.seeds.slice(..n_seeds), &mut self.host_seeds.as_mut_slice()?[..n_seeds])?;
+            self.stream.memcpy_dtoh(&self.seeds.slice(..n_seeds), &mut raw)?;
         }
-        self.stream.synchronize().wrap_err("copy the centrality back")?;
-        let packed = &self.host_packed.as_slice()?[..n_values];
-        for (&id, values) in self.host_ids.as_slice()?[..n_packed].iter().zip(packed.as_chunks::<BRICK>().0) {
-            cent.set_brick(m.bricks[id as usize], values);
-        }
-        seeds.extend(self.host_seeds.as_slice()?[..n_seeds].iter().map(|&raw| Seed::from_raw(raw)));
+        pending.wait("copy the centrality back")?;
+        let seeds = raw.into_iter().map(Seed::from_raw).collect();
+        Ok(Done { meta: m, packed: n_packed, seeds })
+    }
+
+    /// Install a downloaded unit's nonzero centrality bricks on the rayon pool, and keep its seeds
+    ///
+    /// The slot's host buffers hold the unit's bricks until the slot's next download, and launching the slot's
+    /// next unit writes only device memory and the counts, so this may run while that unit is on the device
+    fn install(&self, done: Done, cent: &mut Vol<u16>, seeds: &mut Vec<Vec<Seed>>) -> Result<()> {
+        let packed = &self.host_packed.as_slice()?[..done.packed * BRICK];
+        let ids = &self.host_ids.as_slice()?[..done.packed];
+        let bricks = &done.meta.bricks;
+        // each output brick belongs to one tile's core and each tile to one unit, so every brick is installed once
+        cent.set_bricks(
+            ids.par_iter().zip(packed.as_chunks::<BRICK>().0).map(|(&id, values)| (bricks[id as usize], values)),
+        );
+        seeds.push(done.seeds);
         Ok(())
     }
+}
+
+/// Waits, when dropped, for the work queued on a stream, so host memory its copies read or write outlives them
+/// when an error returns early: cudarc does not track plain host slices, and the driver may still read or write
+/// pageable memory after an asynchronous copy returns. Locals drop in reverse order, so it guards the memory declared before it.
+/// It waits through [`drain`], so an error cudarc stored cannot skip the wait
+struct Pending<'a>(&'a CudaStream);
+
+impl Pending<'_> {
+    /// Wait for the queued work, saying on failure that it was `what`
+    fn wait(self, what: &'static str) -> Result<()> {
+        let stream = self.0;
+        // waited for here, so the drop has nothing left to wait for
+        std::mem::forget(self);
+        drain(stream).wrap_err(what)
+    }
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        // a failed wait means the context is broken, and freeing then is all that is left to do
+        let _ = drain(self.0);
+    }
+}
+
+/// Wait for everything queued on `stream`, then return any error cudarc stored before, as
+/// `CudaStream::synchronize` would; every wait that keeps host memory alive for a copy goes through here
+///
+/// `CudaStream::synchronize` returns a stored error, such as a failed record of a copy's tracking event after the
+/// copy was queued, before it reaches the driver, so it could return while that copy still reads memory about to
+/// be freed. This waits through the driver first, whatever is stored
+fn drain(stream: &CudaStream) -> Result<(), DriverError> {
+    let ctx = stream.context();
+    // SAFETY: the context and stream handles are live for as long as `stream` is borrowed, and neither call frees
+    // or changes them; the stream is still waited for when making its context current fails
+    let (bound, waited) =
+        unsafe { (result::ctx::set_current(ctx.cu_ctx()), result::stream::synchronize(stream.cu_stream())) };
+    ctx.check_err()?;
+    bound.and(waited)
 }
 
 impl Drop for Slot {
     /// Wait for the slot's queued copies before its host buffers are freed: cudarc does not track the plain
     /// slices they were given, and an error can leave a copy queued after `stage` or `launch` returns early
     fn drop(&mut self) {
-        // a failed sync means the context is broken, and freeing then is all that is left to do
-        let _ = self.stream.synchronize();
+        // a failed wait means the context is broken, and freeing then is all that is left to do
+        let _ = drain(&self.stream);
     }
 }
 
