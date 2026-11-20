@@ -24,31 +24,11 @@ pub const OWN_MAPPING_BYTES: usize = 1 << 20;
 /// Requests below this size go straight to the global allocator: they come from its per-thread caches and never
 /// map memory of their own
 const MIN_POOLED: usize = 64 << 10;
-/// Pooled buffers are kept in size classes at least this far apart ([`Classes`])
-pub const GRANULE: usize = 64 << 10;
+/// Pooled buffers are kept in size classes this far apart, so buffers of nearly equal size (compressed chunks,
+/// clipped tiles) share a class
+const GRANULE: usize = 64 << 10;
 /// Alignment of every pooled buffer; larger alignments go to the global allocator
 const POOL_ALIGN: usize = 64;
-
-/// How a pool rounds a request up to the size class its buffer is kept in
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Classes {
-    /// Multiples of [`GRANULE`], so buffers of one size or of nearly equal sizes (clipped tiles) share a class
-    Even,
-    /// Four classes per doubling and never closer than [`GRANULE`]: buffers of widely varying sizes fall into few
-    /// classes, while rounding wastes less than a quarter of a large buffer and less than [`GRANULE`] of a small one
-    Scaled,
-}
-
-impl Classes {
-    /// How far apart the classes around a request of `bytes` (at least 1) are
-    fn granule(self, bytes: usize) -> usize {
-        match self {
-            Self::Even => GRANULE,
-            // a quarter of the power of two at or below `bytes`
-            Self::Scaled => GRANULE.max((1 << bytes.ilog2()) / 4),
-        }
-    }
-}
 
 /// An allocator that keeps large freed buffers and serves later requests of the same size class from them
 ///
@@ -61,7 +41,6 @@ impl Classes {
 pub struct BufferPool {
     free: Mutex<FreeLists>,
     retain: usize,
-    classes: Classes,
 }
 
 #[derive(Default)]
@@ -93,41 +72,26 @@ struct Block(NonNull<u8>);
 unsafe impl Send for Block {}
 
 impl BufferPool {
-    /// A pool that keeps at most `retain` bytes of freed buffers, in [`Classes::Even`] size classes
+    /// A pool that keeps at most `retain` bytes of freed buffers
     pub fn new(retain: usize) -> Self {
-        Self::with_classes(retain, Classes::Even)
-    }
-
-    /// A pool that keeps at most `retain` bytes of freed buffers, in size classes rounded by `classes`: coarser
-    /// classes waste more of each buffer and find a kept buffer of the class asked for more often
-    pub fn with_classes(retain: usize, classes: Classes) -> Self {
-        Self { free: Mutex::default(), retain, classes }
+        Self { free: Mutex::default(), retain }
     }
 
     /// The bytes a buffer of `bytes` occupies while it is in use: its size class when the pool serves it
-    pub fn footprint(&self, bytes: usize) -> usize {
-        Self::footprint_in(bytes, self.classes)
-    }
-
-    /// [`BufferPool::footprint`] in a pool of the given `classes`, before the pool is made
-    pub fn footprint_in(bytes: usize, classes: Classes) -> usize {
-        Layout::from_size_align(bytes, 1).ok().and_then(|l| Self::class_in(l, classes)).unwrap_or(bytes)
+    pub fn footprint(bytes: usize) -> usize {
+        Layout::from_size_align(bytes, 1).ok().and_then(Self::class).unwrap_or(bytes)
     }
 
     /// The size class of a pooled request, or `None` for one the global allocator serves directly
-    fn class(&self, layout: Layout) -> Option<usize> {
-        Self::class_in(layout, self.classes)
-    }
-
-    fn class_in(layout: Layout, classes: Classes) -> Option<usize> {
+    fn class(layout: Layout) -> Option<usize> {
         if layout.size() < MIN_POOLED || layout.align() > POOL_ALIGN {
             return None;
         }
 
-        // a request near `isize::MAX` would round up past the largest valid pooled layout; the global allocator
+        // a request just under `isize::MAX` would round up past the largest valid layout; the global allocator
         // refuses such a request itself, where an allocator may not panic
-        let class = layout.size().checked_next_multiple_of(classes.granule(layout.size()))?;
-        Layout::from_size_align(class, POOL_ALIGN).is_ok().then_some(class)
+        let class = layout.size().next_multiple_of(GRANULE);
+        (class <= isize::MAX as usize).then_some(class)
     }
 
     fn class_layout(class: usize) -> Layout {
@@ -140,7 +104,7 @@ impl BufferPool {
 // layout (the pool returns exactly the requested length), which maps to the same class
 unsafe impl Allocator for BufferPool {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let Some(class) = self.class(layout) else { return Global.allocate(layout) };
+        let Some(class) = Self::class(layout) else { return Global.allocate(layout) };
         let (reused, stale) = {
             let mut free = self.free.lock().expect("pool lock");
             match free.by_class.get_mut(&class).and_then(Vec::pop) {
@@ -165,7 +129,7 @@ unsafe impl Allocator for BufferPool {
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        let Some(class) = self.class(layout) else {
+        let Some(class) = Self::class(layout) else {
             // SAFETY: requests outside the pool's classes were served by `Global` with this layout
             return unsafe { Global.deallocate(ptr, layout) };
         };
@@ -388,34 +352,6 @@ mod tests {
         assert_eq!(b.as_ptr().cast::<u8>(), first);
         let small: Vec<u8, &BufferPool> = Vec::with_capacity_in(100, &pool);
         assert_ne!(small.as_ptr(), first);
-    }
-
-    #[test]
-    fn scaled_classes_waste_less_than_a_quarter() {
-        let scaled = |bytes| BufferPool::footprint_in(bytes, Classes::Scaled);
-        // below 256 KiB the classes stay 64 KiB apart, as in an even pool
-        assert_eq!(scaled(131 << 10), 192 << 10);
-        assert_eq!(BufferPool::footprint_in(131 << 10, Classes::Even), 192 << 10);
-        // from 1 MiB to 2 MiB they are 256 KiB apart
-        assert_eq!(scaled((1 << 20) + 1), (1 << 20) + (256 << 10));
-        assert_eq!(scaled(1 << 20), 1 << 20);
-        assert_eq!(scaled(100), 100);
-        for bytes in [(64 << 10) + 1, 300 << 10, (2 << 20) - 1, (7 << 20) + 3] {
-            assert!(scaled(bytes) >= bytes && scaled(bytes) - bytes < (bytes / 4).max(GRANULE), "{bytes}");
-        }
-    }
-
-    #[test]
-    fn a_request_too_large_to_pool_fails_without_a_panic() {
-        for classes in [Classes::Even, Classes::Scaled] {
-            let pool = BufferPool::with_classes(1 << 20, classes);
-            for size in [isize::MAX as usize - 100, isize::MAX as usize - (64 << 10)] {
-                let layout = Layout::from_size_align(size, POOL_ALIGN).unwrap();
-                assert!(pool.allocate(layout).is_err(), "{classes:?} {size}");
-            }
-            // its class would pass `isize::MAX`, so the pool leaves it to the global allocator
-            assert_eq!(BufferPool::footprint_in(isize::MAX as usize - 100, classes), isize::MAX as usize - 100);
-        }
     }
 
     #[test]

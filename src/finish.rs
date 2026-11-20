@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use color_eyre::eyre::{Result, eyre};
 
-use crate::arena::{BufferPool, Classes};
+use crate::arena::BufferPool;
 use crate::fields::Presence;
 use crate::input::{NativeChunk, PackedChunk, Predictions};
 use crate::kernels::{evaluate_curve, fit_curve};
@@ -121,11 +121,10 @@ impl CachePools {
     pub fn new() -> Self {
         Self {
             decoded: BufferPool::new(DECODED_RETAIN),
-            // in PHerc0358's prediction zarrs compressed chunks of about 1 MiB spread over 10 classes 64 KiB apart,
-            // and a read found no kept buffer of its class one time in five. Scaled classes put them in about 4,
-            // and keep the classes of chunks under 256 KiB 64 KiB apart, so the cache's budget holds as many of
-            // those as before; a simulated z02304 run held 6% fewer chunks with classes 128 KiB apart
-            packed: BufferPool::with_classes(PACKED_RETAIN, Classes::Scaled),
+            // the same 64 KiB classes as decoded buffers: coarser classes found a kept buffer more often (2% of
+            // reads missed in a replay of z02304's chunk sizes, against 9% here) but charged some chunk sizes more
+            // of the cache's budget, so a small cache held fewer chunks and read them again
+            packed: BufferPool::new(PACKED_RETAIN),
         }
     }
 }
@@ -219,8 +218,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         // decode outside the lock; two threads may decode the same slab once each, which only costs time
         let slab = Arc::new(self.decode(key)?);
         self.counts.lock().expect("cache lock").decoded += 1;
-        let bytes = self.pools.decoded.footprint(slab.data.capacity());
-        self.slabs.lock().expect("cache lock").insert(key, slab.clone(), bytes);
+        self.slabs.lock().expect("cache lock").insert(key, slab.clone(), BufferPool::footprint(slab.data.capacity()));
         Ok(slab)
     }
 
@@ -268,7 +266,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
             self.slab_at(chunk, i, data)
         };
         let n = ez / self.planes;
-        let bytes = self.pools.decoded.footprint(2 * half);
+        let bytes = BufferPool::footprint(2 * half);
         let others = self.slabs.lock().expect("cache lock").capacity(bytes).saturating_sub(1);
         let wanted: Vec<usize> = (s + 1..n).chain((0..s).rev()).take(others).collect();
         // each copy is made before the lock is taken, so threads reading cached slabs do not wait on it, and is
@@ -295,7 +293,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         }
         let packed = Arc::new(self.pred.packed_chunk_in(key, &self.pools.packed)?);
         let bytes = match &*packed {
-            PackedChunk::Blosc(b) => self.pools.packed.footprint(b.capacity()),
+            PackedChunk::Blosc(b) => BufferPool::footprint(b.capacity()),
             PackedChunk::Fill(_) => 0,
         };
         self.counts.lock().expect("cache lock").read += 1;
@@ -570,7 +568,7 @@ mod tests {
         let edge = 8 * SLAB_PLANES;
         let (dir, pred) = store("small-cache", edge, &[2 * edge * edge * edge]);
         let pools = CachePools::new();
-        let slab = pools.decoded.footprint(2 * SLAB_PLANES * edge * edge) + ENTRY_BYTES;
+        let slab = BufferPool::footprint(2 * SLAB_PLANES * edge * edge) + ENTRY_BYTES;
         let decodes = |reads: &[usize]| {
             let cache = slab_cache(&pred, &pools, 3 * slab);
             for &s in reads {

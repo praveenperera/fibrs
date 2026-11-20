@@ -16,7 +16,7 @@ use color_eyre::eyre::{Result, bail, eyre};
 use libloading::Library;
 use rayon::prelude::*;
 
-use crate::arena::{BufferPool, Classes};
+use crate::arena::BufferPool;
 use crate::kernels::{DirForm, Directions};
 use crate::vol::{Shape, Vol};
 
@@ -377,7 +377,7 @@ pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack, form: DirForm) -
     // the pool keeps one tile's buffers per thread, up to TILE_POOL_RETAIN
     let threads = rayon::current_num_threads();
     let in_flight = 4 * threads;
-    let per_tile = TILE_BUFFERS * BufferPool::footprint_in(tile_bytes(shape), Classes::Even);
+    let per_tile = TILE_BUFFERS * BufferPool::footprint(tile_bytes(shape));
     let pool = BufferPool::new((threads * per_tile).min(TILE_POOL_RETAIN));
     // tiles run a few per thread at a time and are written before the next run, so the dense tile results held
     // at once stay small; tile cores are disjoint, so the order they are written in does not matter
