@@ -830,7 +830,7 @@ fn kernels_index_pooled(shape: Shape, grid: Shape) -> bool {
     shape.iter().all(|&n| n <= POOLED_AXIS_MAX) && bricks.is_some_and(|n| n == 0 || fits(n - 1))
 }
 
-/// Longest pooled axis the GPU finishes, 2^15 voxels, four times the longest pooled axis of the scrolls traced so far
+/// Longest pooled axis the GPU finishes, 2^15 voxels, three times the longest pooled axis of the scrolls traced so far (about 10,500)
 const POOLED_AXIS_MAX: usize = 1 << 15;
 
 /// Slots of `bytes` each for the slab cache: three quarters of the device memory `free` beyond `reserve` and the
