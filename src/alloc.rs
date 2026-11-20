@@ -8,6 +8,9 @@
 //! The choice is made at the first allocation, from the command line, and never changes, so every block is freed
 //! by the allocator that made it. Where the command line cannot be read without allocating, the binary keeps
 //! mimalloc
+//!
+//! On Linux with glibc the tracer's mimalloc runs without transparent huge pages unless `MIMALLOC_ALLOW_THP` asks
+//! for them (`thp`)
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -71,6 +74,35 @@ unsafe impl GlobalAlloc for Dispatch {
     }
 }
 
+/// The tracer's transparent huge pages: off unless `MIMALLOC_ALLOW_THP` turns them on
+///
+/// With THP allowed, mimalloc asks the kernel for huge pages on its large regions. On a host with THP set to
+/// `madvise`, most of those faults fall back to small pages after the kernel has tried to compact memory, which on
+/// a dense PHerc0358 window cost the tracer about a sixth of its wall time and more than doubled its kernel time.
+/// Off, mimalloc also disables THP for the whole process with `PR_SET_THP_DISABLE`, exactly as
+/// `MIMALLOC_ALLOW_THP=0` does. `fibrs predict` runs on the system allocator and keeps the host's setting
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod thp {
+    use libmimalloc_sys::{mi_option_set_default, mi_option_t};
+
+    /// mimalloc's `allow_thp`, by its place in mimalloc 3.3's `mi_option_e`, which libmimalloc-sys does not name;
+    /// `tests/allocator.rs` checks it by the name mimalloc prints
+    const ALLOW_THP: mi_option_t = 43;
+
+    /// Makes THP off mimalloc's default for the tracer. mimalloc reads its options once, at process load, so this
+    /// runs before that, from the `.init_array` function that captures the command line. A value in the
+    /// environment still wins, as mimalloc reads it in place of the default
+    pub fn default_off() {
+        if super::args::predict() {
+            return;
+        }
+
+        // SAFETY: mimalloc's option table is a static that needs no initialisation, and setting a default before
+        // mimalloc reads its options is what `mi_option_set_default` is for
+        unsafe { mi_option_set_default(ALLOW_THP, 0) };
+    }
+}
+
 /// The process's command line, read without allocating
 mod args {
     use std::ffi::{CStr, c_char};
@@ -96,7 +128,8 @@ mod args {
     }
 
     // glibc passes argc and argv to `.init_array` functions, which run before any Rust code; std reads its
-    // `env::args` the same way
+    // `env::args` the same way. Priority 99 also runs this before mimalloc's own constructor (priority 101 when
+    // built with clang, none with gcc), which reads mimalloc's options, so `thp` can set their defaults
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     mod capture {
         use std::ffi::{c_char, c_int};
@@ -113,6 +146,7 @@ mod args {
         extern "C" fn capture(argc: c_int, argv: *const *const c_char, _envp: *const *const c_char) {
             ARGC.store(argc as isize, Ordering::Relaxed);
             ARGV.store(argv.cast_mut(), Ordering::Relaxed);
+            super::super::thp::default_off();
         }
 
         pub fn get() -> Option<(isize, *const *const c_char)> {
