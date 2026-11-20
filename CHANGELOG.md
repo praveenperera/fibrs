@@ -1,6 +1,13 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0] - 2026-11-20
+
+fibrs 0.4.0 does more of a GPU run on the GPU and spends less CPU time around tracing. Traced curves are finished
+on the GPU, and GPU centrality takes less than half as long on dense data. The seed catalogue and the export's
+rows are built on the `--threads` pool, idle threads trace further ahead, and finishing does less memory work.
+`fibrs predict` allocates through the system allocator again, which brings its speed back to 0.3.0's. Finishing
+can also decode prediction slabs on the GPU with nvCOMP, off by default and opted into with `FIBRS_NVCOMP`. None
+of these changes alters the `.afv` or the predictions; nvCOMP decoding gives the same output on sound files.
 
 ### What's new
 
@@ -30,6 +37,7 @@
   CPU, and the log counts those batches and the slabs cached, by where they were decoded, at the end of each
   family. If the GPU fails while finishing, `--device auto` finishes the rest of the family on the CPU and
   `--device cuda` stops the run, as in the other GPU stages. `--device cpu` finishes on the CPU as before.
+
 - **Opt-in GPU decoding of prediction slabs with nvCOMP.** With NVIDIA's nvCOMP 6, the native slabs GPU
   finishing reads go to the GPU still compressed and are decoded there, with the same output on sound files. It is
   off by default, so slabs decode on the CPU with c-blosc's checks; opt in with `FIBRS_NVCOMP=on`, which loads
@@ -78,6 +86,13 @@
   the dense PHerc0358 window z02304–02816 the export took 16 s on one thread. About a third of that was formatting
   rows, and a fifth was SQLite reading evicted pages back from the file of over 1.5 GiB. Fibre numbering, every
   table and the first error in input order are unchanged.
+
+### Upgrading
+
+- 0.4.0 doesn't resume a tracer work directory that 0.3.1 started, finished or not, so a `--resume` that only
+  writes the `.afv` again needs 0.3.1 too. Finish a run with the binary that started it, or start a new work
+  directory. A `fibrs predict` output that 0.3.1 started, in band or villa mode, is refused on resume as well, as
+  it is by any other binary; finish it with 0.3.1 or write a new `--out`.
 
 ## [0.3.1] - 2026-11-19
 
@@ -375,6 +390,7 @@ The first release.
   Python module, and a CLI archive for each with `scripts/install-dropin.sh`
 - `--version` prints `0.2.0`, the original's version, as a drop-in has to
 
+[0.4.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.0
 [0.3.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.3.1
 [0.3.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.3.0
 [0.2.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.2.0
