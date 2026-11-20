@@ -13,10 +13,11 @@
 //! value. [`fb_slots`] and [`fb_pack`] then pack the flagged bricks densely, so the host downloads only those:
 //! most of a band's centrality is zero. Coordinates and clamps are local to the region, as in the reference.
 //!
-//! The arithmetic is the reference's CUDA rounding, operation by operation: every float64 multiply, add and
-//! multiply-add is an explicit round-to-nearest instruction (`mul.rn`, `add.rn`, `fma.rn`), which neither LLVM
-//! nor ptxas contracts, placed where Numba's PTX and the SASS ptxas builds from it put theirs. The host's
-//! `stage1::<Fused>` (src/stage1.rs) is the same computation on the CPU, and the GPU tests hold the two equal
+//! The centrality and seed arithmetic is float32 throughout, the reference's float64 steps narrowed in place:
+//! every multiply, add, multiply-add, division and square root is an explicit round-to-nearest float32
+//! instruction (`mul.rn`, `add.rn`, `fma.rn`, `div.rn`, `sqrt.rn`), and the direction table arrives as float32,
+//! so the two kernels use no float64 unit, which runs at 1/64 of the float32 rate on consumer GPUs. Their output
+//! therefore differs slightly from the host's float64 `stage1::<Fused>` (src/stage1.rs)
 //!
 //! The `fb_ax_*` kernels compute the direction field (`axes::direction_field`, src/axes.rs) on the CPU's tiles:
 //! 64³ cores with an 11-voxel halo, each box clipped to the volume. [`fb_ax_gather`] writes both tracing channels
@@ -35,7 +36,9 @@
 #![allow(clippy::missing_safety_doc)]
 
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
-use cuda_device::float::{add_rn_f32, add_rn_f64, div_rn_f64, fma_rn_f64, mul_rn_f32, mul_rn_f64, sqrt_rn_f64};
+use cuda_device::float::{
+    add_rn_f32, add_rn_f64, div_rn_f32, div_rn_f64, fma_rn_f32, mul_rn_f32, mul_rn_f64, sqrt_rn_f32, sqrt_rn_f64,
+};
 use cuda_device::kernel;
 use cuda_device::thread::{__unroll_config, blockDim_x, blockIdx_x, blockIdx_y, threadIdx_x};
 
@@ -91,29 +94,31 @@ impl Tile {
     }
 }
 
+// float32 arithmetic of the centrality and seed kernels
+
 #[inline(always)]
-fn mul(a: f64, b: f64) -> f64 {
-    mul_rn_f64(a, b)
+fn mul(a: f32, b: f32) -> f32 {
+    mul_rn_f32(a, b)
 }
 
 #[inline(always)]
-fn add(a: f64, b: f64) -> f64 {
-    add_rn_f64(a, b)
+fn add(a: f32, b: f32) -> f32 {
+    add_rn_f32(a, b)
 }
 
 #[inline(always)]
-fn sub(a: f64, b: f64) -> f64 {
-    add_rn_f64(a, -b)
+fn sub(a: f32, b: f32) -> f32 {
+    add_rn_f32(a, -b)
 }
 
 /// `a * b + c`, rounded once
 #[inline(always)]
-fn mad(a: f64, b: f64, c: f64) -> f64 {
-    fma_rn_f64(a, b, c)
+fn mad(a: f32, b: f32, c: f32) -> f32 {
+    fma_rn_f32(a, b, c)
 }
 
 #[inline(always)]
-fn abs(v: f64) -> f64 {
+fn abs(v: f32) -> f32 {
     if v < 0.0 { -v } else { v }
 }
 
@@ -129,61 +134,72 @@ fn py_min(a: f64, b: f64) -> f64 {
     if b < a { b } else { a }
 }
 
-/// `decode_dir` from the host's table of all byte pairs (`nx << 8 | ny`, four float64 per entry), computed in
-/// the reference's CUDA rounding
+/// [`py_max`] in float32, for the centrality kernel
 #[inline(always)]
-unsafe fn dir(dirs: *const f64, nx: u8, ny: u8) -> [f64; 3] {
+fn py_max32(a: f32, b: f32) -> f32 {
+    if b > a { b } else { a }
+}
+
+/// [`py_min`] in float32, for the centrality kernel
+#[inline(always)]
+fn py_min32(a: f32, b: f32) -> f32 {
+    if b < a { b } else { a }
+}
+
+/// `decode_dir` from the host's table of all byte pairs (`nx << 8 | ny`, four float32 per entry), the reference's
+/// float64 directions rounded once to float32 on the host
+#[inline(always)]
+unsafe fn dir(dirs: *const f32, nx: u8, ny: u8) -> [f32; 3] {
     let i = ((nx as usize) << 8 | ny as usize) * 4;
     unsafe { [*dirs.add(i), *dirs.add(i + 1), *dirs.add(i + 2)] }
 }
 
 /// The clamp and cell split of the trilinear helpers (cuda.py:26-44)
 #[inline(always)]
-fn cell(t: &Tile, mut x: f64, mut y: f64, mut z: f64) -> ([i32; 3], [f32; 3]) {
-    let ww = sub(t.dims[2] as f64, 1.001);
-    let hh = sub(t.dims[1] as f64, 1.001);
-    let dd = sub(t.dims[0] as f64, 1.001);
+fn cell(t: &Tile, mut x: f32, mut y: f32, mut z: f32) -> ([i32; 3], [f32; 3]) {
+    let ww = sub(t.dims[2] as f32, 1.001);
+    let hh = sub(t.dims[1] as f32, 1.001);
+    let dd = sub(t.dims[0] as f32, 1.001);
     if x < 0.0 {
         x = 0.0;
     } else if x > ww {
-        x = ww as f32 as f64;
+        x = ww;
     }
     if y < 0.0 {
         y = 0.0;
     } else if y > hh {
-        y = hh as f32 as f64;
+        y = hh;
     }
     if z < 0.0 {
         z = 0.0;
     } else if z > dd {
-        z = dd as f32 as f64;
+        z = dd;
     }
     let (ix, iy, iz) = (x as i32, y as i32, z as i32);
-    let fx = sub(x, ix as f64) as f32;
-    let fy = sub(y, iy as f64) as f32;
-    let fz = sub(z, iz as f64) as f32;
+    let fx = sub(x, ix as f32);
+    let fy = sub(y, iy as f32);
+    let fz = sub(z, iz as f32);
     ([iz, iy, ix], [fz, fy, fx])
 }
 
 /// `(1 - fz) * ((1 - fy) * p00 + fy * p01) + fz * ((1 - fy) * p10 + fy * p11)`
 #[inline(always)]
-fn blend(p00: f64, p01: f64, p10: f64, p11: f64, fy: f32, fz: f32) -> f64 {
-    let (fy, fz) = (fy as f64, fz as f64);
+fn blend(p00: f32, p01: f32, p10: f32, p11: f32, fy: f32, fz: f32) -> f32 {
     let lo = mad(sub(1.0, fy), p00, mul(p01, fy));
     let hi = mad(sub(1.0, fy), p10, mul(p11, fy));
     mad(sub(1.0, fz), lo, mul(hi, fz))
 }
 
-/// One x-lerp of `trilin_scalar_u8`; `fx * arr[..]` is a float32 product
+/// One x-lerp of `trilin_scalar_u8`
 #[inline(always)]
-unsafe fn lerp_u8(a: *const u8, t: &Tile, z: i32, y: i32, ix: i32, fx: f32) -> f64 {
+unsafe fn lerp_u8(a: *const u8, t: &Tile, z: i32, y: i32, ix: i32, fx: f32) -> f32 {
     let (a0, a1) = unsafe { (*a.add(t.idx(z, y, ix)), *a.add(t.idx(z, y, ix + 1))) };
-    mad(sub(1.0, fx as f64), a0 as f64, mul_rn_f32(fx, a1 as f32) as f64)
+    mad(sub(1.0, fx), a0 as f32, mul(fx, a1 as f32))
 }
 
 /// `trilin_scalar_u8` (cuda.py:25)
 #[inline(always)]
-unsafe fn trilin_u8(a: *const u8, t: &Tile, x: f64, y: f64, z: f64) -> f64 {
+unsafe fn trilin_u8(a: *const u8, t: &Tile, x: f32, y: f32, z: f32) -> f32 {
     let ([iz, iy, ix], [fz, fy, fx]) = cell(t, x, y, z);
     unsafe {
         let p00 = lerp_u8(a, t, iz, iy, ix, fx);
@@ -194,18 +210,17 @@ unsafe fn trilin_u8(a: *const u8, t: &Tile, x: f64, y: f64, z: f64) -> f64 {
     }
 }
 
-/// One x-lerp of `trilin_scalar_u16`, all float64
+/// One x-lerp of `trilin_scalar_u16`
 #[inline(always)]
-unsafe fn lerp_u16(a: *const u16, t: &Tile, z: i32, y: i32, ix: i32, fx: f64) -> f64 {
+unsafe fn lerp_u16(a: *const u16, t: &Tile, z: i32, y: i32, ix: i32, fx: f32) -> f32 {
     let (a0, a1) = unsafe { (*a.add(t.idx(z, y, ix)), *a.add(t.idx(z, y, ix + 1))) };
-    mad(sub(1.0, fx), a0 as f64, mul(fx, a1 as f64))
+    mad(sub(1.0, fx), a0 as f32, mul(fx, a1 as f32))
 }
 
 /// `trilin_scalar_u16` (cuda.py:53) before its final `0.01` scale, which the seed test fuses into a sum
 #[inline(always)]
-unsafe fn trilin_u16_unscaled(a: *const u16, t: &Tile, x: f64, y: f64, z: f64) -> f64 {
+unsafe fn trilin_u16_unscaled(a: *const u16, t: &Tile, x: f32, y: f32, z: f32) -> f32 {
     let ([iz, iy, ix], [fz, fy, fx]) = cell(t, x, y, z);
-    let fx = fx as f64;
     unsafe {
         let p00 = lerp_u16(a, t, iz, iy, ix, fx);
         let p01 = lerp_u16(a, t, iz, iy + 1, ix, fx);
@@ -216,14 +231,14 @@ unsafe fn trilin_u16_unscaled(a: *const u16, t: &Tile, x: f64, y: f64, z: f64) -
 }
 
 /// `float32(0.01)`, the scale of `trilin_scalar_u16`
-const CENT_SCALE: f64 = 0.01f32 as f64;
+const CENT_SCALE: f32 = 0.01;
 
 /// `ortho_basis` (cuda.py:83); ptxas fuses each cross-product component's first product
 #[inline(always)]
-fn ortho_basis(ux: f64, uy: f64, uz: f64) -> [f64; 6] {
+fn ortho_basis(ux: f32, uy: f32, uz: f32) -> [f32; 6] {
     let (e1x, e1y, e1z) = if abs(uz) < 0.85 { (-uy, ux, 0.0) } else { (0.0, -uz, uy) };
-    let n1 = sqrt_rn_f64(mad(e1z, e1z, mad(e1x, e1x, mul(e1y, e1y))));
-    let (e1x, e1y, e1z) = (div_rn_f64(e1x, n1), div_rn_f64(e1y, n1), div_rn_f64(e1z, n1));
+    let n1 = sqrt_rn_f32(mad(e1z, e1z, mad(e1x, e1x, mul(e1y, e1y))));
+    let (e1x, e1y, e1z) = (div_rn_f32(e1x, n1), div_rn_f32(e1y, n1), div_rn_f32(e1z, n1));
     let e2x = mad(uy, e1z, -mul(uz, e1y));
     let e2y = mad(uz, e1x, -mul(ux, e1z));
     let e2z = mad(ux, e1y, -mul(uy, e1x));
@@ -236,13 +251,13 @@ const COS_A: [f32; 8] = [1.0, 0.70710678, 0.0, -0.70710678, -1.0, -0.70710678, 0
 #[allow(clippy::approx_constant)]
 const SIN_A: [f32; 8] = [0.0, 0.70710678, 1.0, 0.70710678, 0.0, -0.70710678, -1.0, -0.70710678];
 /// Ring radii and their weights over 8 (`wr / 8.0`, which the reference computes as `wr * 0.125`)
-const RADII: [f64; 4] = [1.0, 1.8, 2.7, 3.6];
-const WEIGHTS: [f64; 4] = [0.5, 0.28, 0.14, 0.06];
+const RADII: [f32; 4] = [1.0, 1.8, 2.7, 3.6];
+const WEIGHTS: [f32; 4] = [0.5, 0.28, 0.14, 0.06];
 
 /// Direction `k` of the ring in the plane of `e1`, `e2`
 #[inline(always)]
-fn ring_dir(b: &[f64; 6], k: usize) -> [f64; 3] {
-    let (ca, sa) = (COS_A[k] as f64, SIN_A[k] as f64);
+fn ring_dir(b: &[f32; 6], k: usize) -> [f32; 3] {
+    let (ca, sa) = (COS_A[k], SIN_A[k]);
     [mad(b[0], ca, mul(b[3], sa)), mad(b[1], ca, mul(b[4], sa)), mad(b[2], ca, mul(b[5], sa))]
 }
 
@@ -325,7 +340,7 @@ pub unsafe fn fb_gather(
 ///
 /// Grid: x over band voxels in blocks, y over tiles
 #[kernel]
-pub unsafe fn fb_centrality(desc: *const u32, pres: *const u8, nx: *const u8, ny: *const u8, dirs: *const f64, cent: *mut u16) {
+pub unsafe fn fb_centrality(desc: *const u32, pres: *const u8, nx: *const u8, ny: *const u8, dirs: *const f32, cent: *mut u16) {
     let t = unsafe { tile(desc, blockIdx_y()) };
     let lo = [0, 1, 2].map(|a| (t.off[a] - 3).max(0));
     let ext = [0, 1, 2].map(|a| (t.off[a] + t.core[a] + 3).min(t.dims[a]) - lo[a]);
@@ -343,41 +358,41 @@ pub unsafe fn fb_centrality(desc: *const u32, pres: *const u8, nx: *const u8, ny
 }
 
 #[inline(always)]
-unsafe fn centrality_at(t: &Tile, pres: *const u8, nx: *const u8, ny: *const u8, dirs: *const f64, z: i32, y: i32, x: i32) -> u16 {
+unsafe fn centrality_at(t: &Tile, pres: *const u8, nx: *const u8, ny: *const u8, dirs: *const f32, z: i32, y: i32, x: i32) -> u16 {
     let c = t.idx(z, y, x);
     let p0 = unsafe { *pres.add(c) } as f32;
     if p0 < 64.0 {
         return 0;
     }
-    let (wf, hf, df) = (sub(t.dims[2] as f64, 1.001), sub(t.dims[1] as f64, 1.001), sub(t.dims[0] as f64, 1.001));
-    let (xf, yf, zf) = (x as f64, y as f64, z as f64);
+    let (wf, hf, df) = (sub(t.dims[2] as f32, 1.001), sub(t.dims[1] as f32, 1.001), sub(t.dims[0] as f32, 1.001));
+    let (xf, yf, zf) = (x as f32, y as f32, z as f32);
     let [ux, uy, uz] = unsafe { dir(dirs, *nx.add(c), *ny.add(c)) };
     let p_p = unsafe { trilin_u8(pres, t, add(xf, ux), add(yf, uy), add(zf, uz)) };
     let p_m = unsafe { trilin_u8(pres, t, sub(xf, ux), sub(yf, uy), sub(zf, uz)) };
-    let p_par = mad(p_m, 0.25, mad(p0 as f64, 0.5, mul(p_p, 0.25)));
+    let p_par = mad(p_m, 0.25, mad(p0, 0.5, mul(p_p, 0.25)));
     let basis = ortho_basis(ux, uy, uz);
-    let mut c_sum = 0.0f64;
+    let mut c_sum = 0.0f32;
     let mut k = 0;
     while k < 8 {
         let [dx, dy, dz] = ring_dir(&basis, k);
         let mut j = 0;
         while j < 4 {
             let r = RADII[j];
-            let xx = py_min(py_max(mad(dx, r, xf), 0.0), wf);
-            let yy = py_min(py_max(mad(dy, r, yf), 0.0), hf);
-            let zz = py_min(py_max(mad(dz, r, zf), 0.0), df);
+            let xx = py_min32(py_max32(mad(dx, r, xf), 0.0), wf);
+            let yy = py_min32(py_max32(mad(dy, r, yf), 0.0), hf);
+            let zz = py_min32(py_max32(mad(dz, r, zf), 0.0), df);
             let pr = unsafe { trilin_u8(pres, t, xx, yy, zz) };
             let n = t.idx(add(zz, 0.5) as i32, add(yy, 0.5) as i32, add(xx, 0.5) as i32);
             let [ux2, uy2, uz2] = unsafe { dir(dirs, *nx.add(n), *ny.add(n)) };
             let dr = abs(mad(uz, uz2, mad(uy, uy2, mul(ux, ux2))));
             if dr > 0.85 {
-                c_sum = mad(mul(mul(WEIGHTS[j], 0.125), pr), div_rn_f64(sub(dr, 0.85), 0.15), c_sum);
+                c_sum = mad(mul(mul(WEIGHTS[j], 0.125), pr), div_rn_f32(sub(dr, 0.85), 0.15), c_sum);
             }
             j += 1;
         }
         k += 1;
     }
-    py_min(py_max(mad(add(p_par, c_sum), 100.0, 0.5), 0.0), 65535.0) as u16
+    py_min32(py_max32(mad(add(p_par, c_sum), 100.0, 0.5), 0.0), 65535.0) as u16
 }
 
 /// Seeds of each tile's core (`seed_kernel`, cuda.py:157, seed stride 2), appended to `seeds` as
@@ -394,7 +409,7 @@ pub unsafe fn fb_seeds(
     pres: *const u8,
     nx: *const u8,
     ny: *const u8,
-    dirs: *const f64,
+    dirs: *const f32,
     cent: *const u16,
     shape_h: u32,
     shape_w: u32,
@@ -448,7 +463,7 @@ unsafe fn seed_at(
     pres: *const u8,
     nx: *const u8,
     ny: *const u8,
-    dirs: *const f64,
+    dirs: *const f32,
     cent: *const u16,
     z: i32,
     y: i32,
@@ -458,9 +473,8 @@ unsafe fn seed_at(
     if unsafe { *pres.add(c) } < 79 || (x + y + z) & 1 != 0 {
         return 0;
     }
-    let c0 = mul_rn_f32(unsafe { *cent.add(c) } as f32, 0.01f32);
-    let c0d = c0 as f64;
-    let (xf, yf, zf) = (x as f64, y as f64, z as f64);
+    let c0 = mul(unsafe { *cent.add(c) } as f32, CENT_SCALE);
+    let (xf, yf, zf) = (x as f32, y as f32, z as f32);
     let [ux, uy, uz] = unsafe { dir(dirs, *nx.add(c), *ny.add(c)) };
     let basis = ortho_basis(ux, uy, uz);
     let mut n_max = 0;
@@ -470,14 +484,14 @@ unsafe fn seed_at(
         k += 1;
         let tp = unsafe { trilin_u16_unscaled(cent, t, mad(dx, 1.15, xf), mad(dy, 1.15, yf), mad(dz, 1.15, zf)) };
         let tm = unsafe { trilin_u16_unscaled(cent, t, mad(dx, -1.15, xf), mad(dy, -1.15, yf), mad(dz, -1.15, zf)) };
-        if !(c0d >= mul(CENT_SCALE, tp) && c0d >= mul(CENT_SCALE, tm)) {
+        if !(c0 >= mul(CENT_SCALE, tp) && c0 >= mul(CENT_SCALE, tm)) {
             continue;
         }
         let (dx2, dy2, dz2) = (add(dx, dx), add(dy, dy), add(dz, dz));
         let tp2 = unsafe { trilin_u16_unscaled(cent, t, add(xf, dx2), add(yf, dy2), add(zf, dz2)) };
         let tm2 = unsafe { trilin_u16_unscaled(cent, t, sub(xf, dx2), sub(yf, dy2), sub(zf, dz2)) };
         // 0.5 * (cp2 + cm2) + 2.0, with cp2's scale fused into the sum
-        if c0d >= mad(mad(tp2, CENT_SCALE, mul(tm2, CENT_SCALE)), 0.5, 2.0) {
+        if c0 >= mad(mad(tp2, CENT_SCALE, mul(tm2, CENT_SCALE)), 0.5, 2.0) {
             n_max += 1;
         }
     }

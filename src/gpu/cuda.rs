@@ -148,8 +148,9 @@ pub struct Gpu {
     k: Kernels,
     /// Device memory free when it opened, which picks the device
     free: usize,
-    /// `decode_dir` in the reference's CUDA rounding for every `nx << 8 | ny`, four float64 per entry
-    dirs: CudaSlice<f64>,
+    /// `decode_dir` in the reference's CUDA rounding for every `nx << 8 | ny`, rounded once to float32 for the
+    /// float32 centrality and seed kernels, four float32 per entry
+    dirs: CudaSlice<f32>,
     /// Every byte of a pooled prediction as the direction field's float32, `v as f32 / 255.0` as the CPU computes it
     unit: CudaSlice<f32>,
 }
@@ -239,7 +240,8 @@ impl Gpu {
             fs_segments: function("fs_segments")?,
             fs_fit: function("fs_fit")?,
         };
-        let table: Vec<f64> = Fused::dir_table().iter().flat_map(|d| [d[0], d[1], d[2], 0.0]).collect();
+        let table: Vec<f32> =
+            Fused::dir_table().iter().flat_map(|d| [d[0] as f32, d[1] as f32, d[2] as f32, 0.0]).collect();
         let unit: Vec<f32> = (0..=255u8).map(|v| v as f32 / 255.0f32).collect();
         let stream = ctx.default_stream();
         // each pageable source is dropped on an early return, so its copy finishes before the next can fail
