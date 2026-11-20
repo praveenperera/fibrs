@@ -99,6 +99,42 @@ impl<K: Copy + Eq + Hash, V: Clone> Lru<K, V> {
     }
 }
 
+/// Freed decoded slabs (or whole chunks) kept for reuse: each eviction frees one and the decode that caused it
+/// takes one, so few wait at a time; this bounds a burst of evictions, at 512 slabs of the usual 2 × 8 × 128²
+const DECODED_RETAIN: usize = 128 << 20;
+/// Freed compressed chunks kept for reuse. A chunk's compressed size varies from chunk to chunk, so the chunk an
+/// eviction frees is seldom of the size class the next read asks for; a kept buffer of the asked class is found
+/// only when the pool holds many of each
+const PACKED_RETAIN: usize = 128 << 20;
+/// Size classes of compressed chunks: in PHerc0358's prediction zarrs those of about 1 MiB spread over 10 classes
+/// 64 KiB apart, and a read found no kept buffer of its class one time in five
+const PACKED_GRANULE: usize = 128 << 10;
+
+/// The buffer pools behind a [`NativeCache`]
+///
+/// Decoded slabs and compressed chunks are kept apart: a slab an eviction frees is the size the next decode asks
+/// for, and in one pool compressed chunks of many sizes filled the room kept slabs need, so freed slabs were let
+/// go and the next decodes mapped fresh memory
+pub struct CachePools {
+    decoded: BufferPool,
+    packed: BufferPool,
+}
+
+impl CachePools {
+    pub fn new() -> Self {
+        Self {
+            decoded: BufferPool::new(DECODED_RETAIN),
+            packed: BufferPool::with_granule(PACKED_RETAIN, PACKED_GRANULE),
+        }
+    }
+}
+
+impl Default for CachePools {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A bounded cache of decoded native predictions shared by the finishing threads, least recently used first out
 ///
 /// A point's value needs 8 voxels, so when the array allows ([`Predictions::slab_layout`]) the cache decodes
@@ -107,14 +143,14 @@ impl<K: Copy + Eq + Hash, V: Clone> Lru<K, V> {
 /// dense PHerc0358 crop whole-chunk decoding took about 87% of the finishing threads' time. Other arrays are
 /// decoded a whole chunk at a time.
 ///
-/// Dense windows evict and decode hundreds of times a second, so every buffer comes from `pool`: an evicted
-/// slab's buffer goes back to it once the last finishing thread lets go of the slab, and the next decode takes it
+/// Dense windows evict and decode hundreds of times a second, so every buffer comes from `pools`: an evicted
+/// slab's buffer goes back to them once the last finishing thread lets go of the slab, and the next decode takes it
 pub struct NativeCache<'a, 'p> {
     pred: &'a Predictions,
     edge: Shape,
     /// Planes per slab; a whole chunk when the array cannot be decoded by planes
     planes: usize,
-    pool: &'p BufferPool,
+    pools: &'p CachePools,
     slabs: Mutex<Lru<SlabKey, Arc<Slab<'p>>>>,
     packed: Mutex<Lru<Shape, Arc<PackedChunk<&'p BufferPool>>>>,
     counts: Mutex<Counts>,
@@ -129,7 +165,7 @@ struct Counts {
 impl<'a, 'p> NativeCache<'a, 'p> {
     /// `budget_bytes` bounds the decoded slabs and compressed chunks held at once, counted as the pool buffers they
     /// occupy; one of each is always kept. Freed buffers the pool keeps for reuse are outside the budget
-    pub fn new(pred: &'a Predictions, budget_bytes: usize, pool: &'p BufferPool) -> Self {
+    pub fn new(pred: &'a Predictions, budget_bytes: usize, pools: &'p CachePools) -> Self {
         // whole Zarr chunks are the unit of reading; NPY input uses the reference's 64³ blocks
         let edge = pred.chunk_shape().unwrap_or([64, 64, 64]);
         // a chunk of one slab is decoded whole either way, and needs no cache of compressed chunks
@@ -143,7 +179,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
             pred,
             edge,
             planes,
-            pool,
+            pools,
             slabs: Mutex::new(Lru::new(budget_bytes - packed)),
             packed: Mutex::new(Lru::new(packed)),
             counts: Mutex::default(),
@@ -182,7 +218,8 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         // decode outside the lock; two threads may decode the same slab once each, which only costs time
         let slab = Arc::new(self.decode(key)?);
         self.counts.lock().expect("cache lock").decoded += 1;
-        self.slabs.lock().expect("cache lock").insert(key, slab.clone(), BufferPool::footprint(slab.data.capacity()));
+        let bytes = self.pools.decoded.footprint(slab.data.capacity());
+        self.slabs.lock().expect("cache lock").insert(key, slab.clone(), bytes);
         Ok(slab)
     }
 
@@ -190,7 +227,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         let [cz, cy, cx, s] = key;
         if self.planes == self.edge[0] {
             self.counts.lock().expect("cache lock").read += 1;
-            return Ok(Slab::from_chunk(self.pred.read_chunk_in([cz, cy, cx], self.edge, self.pool)?));
+            return Ok(Slab::from_chunk(self.pred.read_chunk_in([cz, cy, cx], self.edge, &self.pools.decoded)?));
         }
         let packed = self.packed([cz, cy, cx])?;
         if !self.pred.planes_fit(&packed, self.planes) {
@@ -198,7 +235,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         }
         let [_, ey, ex] = self.edge;
         let half = self.planes * ey * ex;
-        let mut data = Vec::with_capacity_in(2 * half, self.pool);
+        let mut data = Vec::with_capacity_in(2 * half, &self.pools.decoded);
         let planes = s * self.planes..(s + 1) * self.planes;
         self.pred.decode_planes(&packed, planes, &mut data).map_err(|e| eyre!("chunk {:?}: {e}", [cz, cy, cx]))?;
         Ok(self.slab_at([cz, cy, cx], s, data))
@@ -215,17 +252,17 @@ impl<'a, 'p> NativeCache<'a, 'p> {
     fn decode_whole(&self, chunk: Shape, s: usize, packed: &PackedChunk<&'p BufferPool>) -> Result<Slab<'p>> {
         let [ez, ey, ex] = self.edge;
         let channel = ez * ey * ex;
-        let mut all = Vec::with_capacity_in(2 * channel, self.pool);
+        let mut all = Vec::with_capacity_in(2 * channel, &self.pools.decoded);
         self.pred.decode_planes(packed, 0..ez, &mut all).map_err(|e| eyre!("chunk {chunk:?}: {e}"))?;
         let half = self.planes * ey * ex;
         let slab = |i: usize| {
-            let mut data = Vec::with_capacity_in(2 * half, self.pool);
+            let mut data = Vec::with_capacity_in(2 * half, &self.pools.decoded);
             data.extend_from_slice(&all[i * half..(i + 1) * half]);
             data.extend_from_slice(&all[channel + i * half..channel + (i + 1) * half]);
             self.slab_at(chunk, i, data)
         };
         let n = ez / self.planes;
-        let bytes = BufferPool::footprint(2 * half);
+        let bytes = self.pools.decoded.footprint(2 * half);
         let others = self.slabs.lock().expect("cache lock").capacity(bytes).saturating_sub(1);
         let wanted: Vec<usize> = (s + 1..n).chain((0..s).rev()).take(others).collect();
         // each copy is made before the lock is taken, so threads reading cached slabs do not wait on it, and is
@@ -250,9 +287,9 @@ impl<'a, 'p> NativeCache<'a, 'p> {
         if let Some(packed) = self.packed.lock().expect("cache lock").get(&key) {
             return Ok(packed);
         }
-        let packed = Arc::new(self.pred.packed_chunk_in(key, self.pool)?);
+        let packed = Arc::new(self.pred.packed_chunk_in(key, &self.pools.packed)?);
         let bytes = match &*packed {
-            PackedChunk::Blosc(b) => BufferPool::footprint(b.capacity()),
+            PackedChunk::Blosc(b) => self.pools.packed.footprint(b.capacity()),
             PackedChunk::Fill(_) => 0,
         };
         self.counts.lock().expect("cache lock").read += 1;
@@ -480,12 +517,12 @@ mod tests {
 
     /// A cache in slab mode with `slab_budget` bytes for slabs, as the probe chooses it when the chunk it lists
     /// first fits; which chunk it lists first depends on the file system
-    fn slab_cache<'a, 'p>(pred: &'a Predictions, pool: &'p BufferPool, slab_budget: usize) -> NativeCache<'a, 'p> {
+    fn slab_cache<'a, 'p>(pred: &'a Predictions, pools: &'p CachePools, slab_budget: usize) -> NativeCache<'a, 'p> {
         NativeCache {
             pred,
             edge: pred.slab_layout().unwrap(),
             planes: SLAB_PLANES,
-            pool,
+            pools,
             slabs: Mutex::new(Lru::new(slab_budget)),
             packed: Mutex::new(Lru::new(16 << 20)),
             counts: Mutex::default(),
@@ -499,8 +536,8 @@ mod tests {
         let edge = 2 * SLAB_PLANES;
         let n = edge * edge * edge;
         let (dir, pred) = store("mixed-blocks", edge, &[SLAB_PLANES * edge * edge, 2 * n]);
-        let pool = BufferPool::new(1 << 20);
-        let cache = slab_cache(&pred, &pool, 64 << 20);
+        let pools = CachePools::new();
+        let cache = slab_cache(&pred, &pools, 64 << 20);
         let mut sampler = NativeSampler::new(&cache);
         let shape = [edge, edge, 2 * edge];
         let window = pred.read_u8([0; 3], shape).unwrap();
@@ -526,10 +563,10 @@ mod tests {
     fn a_one_block_chunk_in_a_small_cache_is_decoded_once_per_cached_run() {
         let edge = 8 * SLAB_PLANES;
         let (dir, pred) = store("small-cache", edge, &[2 * edge * edge * edge]);
-        let pool = BufferPool::new(1 << 20);
-        let slab = BufferPool::footprint(2 * SLAB_PLANES * edge * edge) + ENTRY_BYTES;
+        let pools = CachePools::new();
+        let slab = pools.decoded.footprint(2 * SLAB_PLANES * edge * edge) + ENTRY_BYTES;
         let decodes = |reads: &[usize]| {
-            let cache = slab_cache(&pred, &pool, 3 * slab);
+            let cache = slab_cache(&pred, &pools, 3 * slab);
             for &s in reads {
                 cache.slab([0, 0, 0, s]).unwrap();
             }
