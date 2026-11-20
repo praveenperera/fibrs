@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+### What's new
+
 - **Tiled tracing.** `--tiles-yx NY NX` traces a window as NY × NX tiles in Y and X, one at a time, so the run's
   peak memory is about its densest tile's instead of the whole window's. Each tile is traced from its core plus
   `--tile-halo` native voxels (default 256) of its neighbours. Core edges and the halo are whole units of 256 native
@@ -9,6 +11,12 @@
   v2-run pipeline uses for its Z bands: cut ends of the same family at most 1.5 voxels apart, shortest first, never
   into a loop. A `--tiles-yx 1 1` run writes the untiled run's `.afv`. Without `--tiles-yx`, runs, their output and
   their `run.json` are unchanged. See [Tiled tracing](README.md#tiled-tracing).
+
+### Fixes
+
+- **`fibrs --version` prints fibrs' version.** Run as `fibrs` or `python -m fibrs`, `--version` now prints fibrs'
+  own version; it printed `0.2.0`, the version of `avf-spline-generator` it reproduces, on every release. Run as the
+  drop-in `avf-spline-generator`, it still prints `0.2.0`. `fibrs predict --version` is unchanged.
 
 ## [0.4.0] - 2026-11-20
 

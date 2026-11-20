@@ -37,6 +37,20 @@ use crate::vol::{EDGE, Shape, Vol};
 /// The reference release whose interface and output this reproduces
 pub const REFERENCE_VERSION: &str = "0.2.0";
 
+/// Whether the binary runs as the drop-in `avf-spline-generator`, by the last component of the path it was run by,
+/// taken as `Path::file_name` takes it: trailing `/` and `.` components skipped. It allocates nothing, since the
+/// global allocator asks before `std::env::args` can be collected
+pub fn dropin(arg0: &[u8]) -> bool {
+    let name = arg0.split(|&b| b == b'/').rev().find(|c| !c.is_empty() && *c != b".");
+    name == Some(b"avf-spline-generator".as_slice())
+}
+
+/// What `--version` prints: run as the drop-in, the version of the reference release it stands in for, so callers
+/// that check it see the tool they expect; run as `fibrs`, this package's own version
+pub fn version(arg0: &[u8]) -> &'static str {
+    if dropin(arg0) { REFERENCE_VERSION } else { env!("CARGO_PKG_VERSION") }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ChannelOrder {
     #[value(name = "VH")]

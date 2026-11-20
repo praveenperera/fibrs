@@ -74,7 +74,8 @@ fn main() {
             return;
         }
         run::Prescan::Version => {
-            println!("{}", run::REFERENCE_VERSION);
+            let arg0 = argv.first().map(|a| a.as_encoded_bytes()).unwrap_or_default();
+            println!("{}", run::version(arg0));
             return;
         }
         run::Prescan::Error(e) => e.exit(),

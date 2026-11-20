@@ -30,10 +30,7 @@ pub fn requested(argv: &[OsString]) -> bool {
 /// [`requested`] on the raw bytes of the first two arguments, for the global allocator, which decides before
 /// `std::env::args` can be collected
 pub fn requested_bytes(arg0: &[u8], arg1: Option<&[u8]>) -> bool {
-    // the last component of the path, as `Path::file_name` takes it: trailing `/` and `.` components skipped
-    let name = arg0.split(|&b| b == b'/').rev().find(|c| !c.is_empty() && *c != b".");
-    let dropin = name == Some(b"avf-spline-generator".as_slice());
-    !dropin && arg1 == Some(b"predict".as_slice())
+    !crate::run::dropin(arg0) && arg1 == Some(b"predict".as_slice())
 }
 
 #[cfg(test)]
