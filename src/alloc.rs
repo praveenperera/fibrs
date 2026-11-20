@@ -83,11 +83,15 @@ unsafe impl GlobalAlloc for Dispatch {
 /// `MIMALLOC_ALLOW_THP=0` does. `fibrs predict` runs on the system allocator and keeps the host's setting
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod thp {
-    use libmimalloc_sys::{mi_option_set_default, mi_option_t};
+    use libmimalloc_sys::{_mi_option_last, mi_option_set_default, mi_option_t};
 
     /// mimalloc's `allow_thp`, by its place in mimalloc 3.3's `mi_option_e`, which libmimalloc-sys does not name;
     /// `tests/allocator.rs` checks it by the name mimalloc prints
     const ALLOW_THP: mi_option_t = 43;
+
+    // a mimalloc with a different option list may have moved `allow_thp`, so the build stops for the index to be
+    // checked again
+    const _: () = assert!(_mi_option_last == 47, "mimalloc's options changed: check ALLOW_THP");
 
     /// Makes THP off mimalloc's default for the tracer. mimalloc reads its options once, at process load, so this
     /// runs before that, from the `.init_array` function that captures the command line. A value in the

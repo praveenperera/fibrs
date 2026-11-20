@@ -4,7 +4,7 @@
 
 ### What's new
 
-- **The tracer runs without transparent huge pages.** On Linux the tracer's mimalloc no longer asks for
+- **The tracer runs without transparent huge pages.** On Linux with glibc the tracer's mimalloc no longer asks for
   transparent huge pages, and disables them for its process, unless `MIMALLOC_ALLOW_THP=1` is set. On a host with
   THP set to `madvise`, most of those requests fell back to small pages after the kernel had tried to compact
   memory. On a dense 1024-plane window of PHerc0358 with `--device cuda --threads 8`, the tracer took about 103 s
