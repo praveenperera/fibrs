@@ -6,14 +6,16 @@ same flags and writes the same `.afv`: every metadata value except the per-run u
 point block and spatial-index row. The tracing algorithm, the AFV format and the fibre model whose
 predictions it reads are Qual's; this port changes how fast the tracer runs, not what it writes.
 
-With `--threads 4` for both tools, it traces 22×–47× faster across three uninterrupted runs on 512-plane bands of
-PHerc0826, PHerc1545 and PHerc0358 (see [Speed](#speed)) and writes the same `.afv`. Tracing runs on the CPU;
-the direction field, centrality and the finishing of traced curves run on an NVIDIA GPU when one is found, and on
-the CPU otherwise.
-
 `fibrs predict` runs the step before: Qual's AFV fibre model V2 over a CT volume on an NVIDIA GPU, without
 PyTorch, writing the probability zarr the tracer reads, as villa's inference writes it (see
 [Predictions](#predictions)).
+
+From CT to `.afv`, fibrs 0.4.0 runs three 512-plane bands of PHerc1545, PHerc0826 and PHerc0358 in 800 s on one
+RTX 5090, with prediction at fp32. villa's public prediction at fp32 followed by the original tracer takes about
+35,000 s on the same machine, with villa's part estimated, so fibrs is about 44× faster (see [Speed](#speed)). A
+whole scroll end to end would take fibrs about 2.6–3 hours and villa with the original tracer roughly 80–140 hours,
+both estimated, at fp32. Tracing runs on the CPU; the direction field, centrality, the seed tests and the finishing
+of traced curves run on an NVIDIA GPU when one is found, and on the CPU otherwise.
 
 ## Install
 
@@ -149,10 +151,16 @@ from it; `cargo test` checks every case.
 
 ## Same output
 
-On that PHerc0826 band (z 12032–12544), the port's `.afv` is identical to the original's: 149,680 fibres,
-161,787 point blocks and 161,787 spatial-index rows, plus the metadata and schema. The 0.1.0 build was also
-checked on a 512³ crop of the band: the wheel and the drop-in were installed into a fresh environment beside
-the original, and the crop was traced through `avf-spline-generator` and through `python -m fibrs`. Both
+The published 0.4.0 binary, the one in the release archive and the PyPI wheel, writes the original's `.afv` with
+`--device cuda --threads 8` on a 512-plane band of PHerc1545 (z 1280–1792: 82,646 fibres, 83,741 point blocks) and
+on a 512-plane band of PHerc0826 (z 12032–12544: 149,680 fibres, 161,787 point blocks). The two files were compared
+table by table: every fibre row, point block and spatial-index row, and every metadata value except the per-run
+uuid. With `--device cpu --threads 4`, 0.4.0 also wrote the original's `.afv` on both bands, in four runs.
+
+Earlier releases were checked the same way. On the PHerc0826 band, the port's `.afv` is identical to the original's:
+149,680 fibres, 161,787 point blocks and 161,787 spatial-index rows, plus the metadata and schema. The 0.1.0 build
+was also checked on a 512³ crop of the band: the wheel and the drop-in were installed into a fresh environment
+beside the original, and the crop was traced through `avf-spline-generator` and through `python -m fibrs`. Both
 outputs were identical to the original's `.afv`.
 
 Centrality on the GPU gives the same `.afv`. On the PHerc0826 band and on a 512-plane band of PHerc1545
@@ -168,6 +176,67 @@ must also write it with no seed traced ahead of the one being committed (`FIBRS_
 traced ahead traced again (`FIBRS_DEBUG_RETRACE=1`).
 
 ## Speed
+
+### End to end, fibrs 0.4.0
+
+From CT to `.afv` on three 512-plane bands, each across the whole plane, on one RTX 5090 and an Intel Core Ultra 7
+270K Plus (24 cores). All prediction is fp32: float32 tensors with TF32 tensor-core convolutions, PyTorch's default
+and the precision villa's runner uses. fibrs 0.4.0, the published release binary, runs `fibrs predict` at fp32 in
+band mode, then traces with `--device cuda --threads 8`. Both fibrs times are measured; each is the faster of two
+runs on its band. The public pipeline is villa's `lasagna.qualzz_inference` at fp32 (villa main `0bddf2757`), run
+as published, followed by `avf-spline-generator` 0.2.0 on the CPU with `--threads 4`, its fastest setting here
+(`--threads 8` was slower on both bands tried). The original tracer's times are measured; villa's are estimated.
+
+| Band | Tiles with data | villa prediction, fp32 (estimated) | Original tracer, `--threads 4` | Public pipeline | fibrs 0.4.0 prediction, fp32 | fibrs 0.4.0 tracing | fibrs 0.4.0 total | Speed-up, fp32 |
+|---|---|---|---|---|---|---|---|---|
+| PHerc1545, z 1280–1792 | 8.4% | about 5,000 s | 1,613.8 s | about 6,614 s | 105.8 s | 11.0 s | 116.9 s | 56.6× |
+| PHerc0826, z 12032–12544 | 15.2% | about 5,850 s | 4,615.7 s | about 10,466 s | 215.2 s | 25.0 s | 240.2 s | 43.6× |
+| PHerc0358, z 2304–2816 | 33.2% | about 5,400 s | about 12,540 s (estimated) | about 17,940 s | 399.6 s | 43.2 s | 442.9 s | 40.5× |
+| All three | | | | about 35,020 s | | | 800.0 s | 43.8× |
+
+- **Tiles with data** is the share of the band's 128³ tiles with CT data inside the mask, the tiles band mode runs.
+  villa runs every tile.
+- **The machine's load.** The original tracer's runs had a one-minute load average of 10.9 (PHerc1545) and 14.9
+  (PHerc0826), against about 3–4 during fibrs's runs. It kept about 2.6 cores busy, so the load probably cost it
+  little, but it is not corrected for. Its PHerc0358 run took 15,631.6 s while the machine carried heavy other work
+  (load average 26.4, up to 79.9). The table uses an estimate for a lighter load instead: its 32,739 s of CPU time
+  over the 2.61 cores its other two runs got. Against the measured time, that band is 47.5× faster.
+- **villa's estimate.** On PHerc1545 villa ran all 37,446 tiles in 4,266 s and was stopped during its final
+  accumulator write, estimated at about 800 s from the 790 s write it made mid-band. PHerc0826 (44,376 tiles) and
+  PHerc0358 (about 40,300) are scaled from that rate, 114 ms per tile, plus the same final write.
+- Both tracers traced fibrs's predictions of each band. A trace of villa's predictions could take somewhat longer
+  or shorter, as the tracer's time depends on what it reads.
+
+By stage, prediction is 47.3×, 27.2× and 13.5× faster (fp32 for both tools; villa's side estimated), and tracing
+146×, 185× and 290× faster (362× against the measured PHerc0358 time; fibrs on the GPU at `--threads 8`, the original
+on the CPU at `--threads 4`).
+
+villa writes its tile accumulators to disk as float32 arrays as it runs, and on this machine that write took a large
+part of its time; its runner has no setting for a smaller accumulator type. Without the write, estimated from villa
+runs on 1,536-tile boxes of the same bands with the accumulators in memory (53–54 ms per tile), the public pipeline
+would take about 3,600 s, 7,000 s and 14,700 s on the three bands, and fibrs 0.4.0 would still be 30.9×, 29.1× and
+33.2× faster (31.6× over all three, fp32).
+
+A whole scroll, end to end on one RTX 5090, estimated (not measured), with prediction at fp32:
+
+| Scroll | Planes | fibrs 0.4.0 | villa and the original tracer |
+|---|---|---|---|
+| PHerc1545 | 20,961 | about 176–181 min | about 93–137 h |
+| PHerc0826 | 16,920 | about 156–163 min | about 87–127 h |
+| PHerc0358 | 14,744 | about 173–175 min | about 81–123 h |
+
+That is roughly 28–49× faster per scroll. For fibrs, prediction was run over the whole of PHerc1545 and PHerc0826
+with fibrs 0.2.0, whose prediction runs at about 0.4.0's speed (2.7 h and 2.4 h, fp32, measured). PHerc0358's
+prediction and all three traces are scaled from the bands above by each scroll's count of tiles with data, with each
+scroll traced as its 512-plane bands. For villa and the original tracer, villa's rate per tile above (114–134 ms, the
+upper figure including its final write) is multiplied by the scroll's tile count, and the original tracer's time
+per tile with data on the three bands (0.51–0.94 s) by the scroll's tiles with data; the range spans those rates.
+Neither counts the download or joining the bands' outputs into one file, and neither reference tool was run on a
+whole scroll.
+
+### Tracer alone, fibrs 0.1.0 to 0.3.1
+
+These runs, with earlier releases, time the tracer alone on the CPU.
 
 Five runs on an Intel Core Ultra 7 270K Plus (24 cores), with `--threads 4` for both tools and other work
 running on the machine each time. Runs 1 and 2 trace the same 512 × 8169 × 8169 band of PHerc0826, run 3 a
