@@ -27,6 +27,9 @@
 //! certify back to the host's `dsyevd`. Each filter runs over the whole box with the CPU's edge rules, and every
 //! float32 and float64 operation is an explicit round-to-nearest instruction in the CPU's order, so the bytes
 //! equal the CPU's
+//!
+//! The `fs_*` kernels ([`finish`]) finish traced curves: segment validation against the pooled and native
+//! predictions, then each valid piece's smoothing and resampling, bit for bit as the CPU's `FinishCtx::finish`
 
 #![no_std]
 #![allow(clippy::missing_safety_doc)]
@@ -37,6 +40,7 @@ use cuda_device::kernel;
 use cuda_device::thread::{__unroll_config, blockDim_x, blockIdx_x, blockIdx_y, threadIdx_x};
 
 pub mod eigen;
+pub mod finish;
 
 use eigen::{Ops, certify};
 

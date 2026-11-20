@@ -8,9 +8,11 @@
 //! slots and pack, which pack the nonzero centrality bricks densely for the download. Two units are in flight at a
 //! time on two streams, so the host stages one unit's bricks and installs another's results while the device works
 //!
-//! The direction field runs the same way over its own tiles (`axes.rs`)
+//! The direction field runs the same way over its own tiles (`axes.rs`); trace finishing keeps both pooled
+//! predictions and a cache of native slabs on the device across a family's batches of curves (`finish.rs`)
 
 mod axes;
+mod finish;
 
 use std::sync::Arc;
 
@@ -21,6 +23,8 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::Ptx;
 use rayon::prelude::*;
+
+pub use finish::GpuFinisher;
 
 use super::Stages;
 use crate::fields::{FamilyFields, Seed, TILE, TILE_HALO, tiles};
@@ -66,9 +70,10 @@ enum Param {
 
 use Param::{Ptr, U32};
 
-/// Each kernel's PTX params, in the order every launch here and in `axes.rs` passes them; checked against the
-/// embedded PTX when the device opens, so a stale PTX fails there instead of launching with mismatched arguments
-const KERNELS: [(&str, &[Param]); 12] = [
+/// Each kernel's PTX params, in the order every launch here, in `axes.rs` and in `finish.rs` passes them; checked
+/// against the embedded PTX when the device opens, so a stale PTX fails there instead of launching with mismatched
+/// arguments
+const KERNELS: [(&str, &[Param]); 14] = [
     ("fb_gather", &[Ptr, Ptr, Ptr, U32, U32, U32, U32, U32, U32, U32, Ptr, Ptr, Ptr]),
     ("fb_centrality", &[Ptr, Ptr, Ptr, Ptr, Ptr, Ptr]),
     ("fb_seeds", &[Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, U32, Ptr, Ptr, Ptr, U32, Ptr]),
@@ -81,6 +86,17 @@ const KERNELS: [(&str, &[Param]); 12] = [
     ("fb_ax_tensor_z", &[Ptr, Ptr, U32, U32, Ptr, Ptr]),
     ("fb_ax_tensor_y", &[Ptr, Ptr, U32, U32, Ptr, Ptr]),
     ("fb_ax_eigen", &[Ptr, Ptr, U32, U32, U32, Ptr, Ptr, Ptr, Ptr, Ptr, U32, Ptr]),
+    // the curves and their outputs, the family, both pooled predictions (tables, pools, shape and brick grid),
+    // then the native slab table and pool, shape, chunk edge, planes, chunk grid y and x, and slabs per chunk
+    (
+        "fs_segments",
+        &[
+            Ptr, Ptr, Ptr, U32, U32, U32, Ptr, Ptr, Ptr, U32, Ptr, Ptr, Ptr, Ptr, U32, U32, U32, U32, U32, U32, Ptr,
+            Ptr, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32,
+        ],
+    ),
+    // the raw pieces, smoothed and fitted points, room and lengths, the family and both pooled predictions
+    ("fs_fit", &[Ptr, Ptr, Ptr, U32, Ptr, Ptr, Ptr, Ptr, Ptr, U32, Ptr, Ptr, Ptr, Ptr, U32, U32, U32, U32, U32, U32]),
 ];
 
 /// The params of kernel `name` in `ptx`, in order, read from the PTX text
@@ -119,6 +135,8 @@ struct Kernels {
     ax_tensor_z: CudaFunction,
     ax_tensor_y: CudaFunction,
     ax_eigen: CudaFunction,
+    fs_segments: CudaFunction,
+    fs_fit: CudaFunction,
 }
 
 /// An open CUDA device with the kernels loaded
@@ -217,6 +235,8 @@ impl Gpu {
             ax_tensor_z: function("fb_ax_tensor_z")?,
             ax_tensor_y: function("fb_ax_tensor_y")?,
             ax_eigen: function("fb_ax_eigen")?,
+            fs_segments: function("fs_segments")?,
+            fs_fit: function("fs_fit")?,
         };
         let table: Vec<f64> = Fused::dir_table().iter().flat_map(|d| [d[0], d[1], d[2], 0.0]).collect();
         let unit: Vec<f32> = (0..=255u8).map(|v| v as f32 / 255.0f32).collect();
