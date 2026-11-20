@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### What's new
+
+- **H's centrality runs during V's walk.** When the GPU computes centrality, the H family's centrality and seeds
+  now run while the V family walks on the CPU, instead of after it. The run holds H's centrality and seed list
+  while V walks. The `.afv` is unchanged. With centrality on the CPU, the two still run one after the other.
+
 ## [0.3.1] - 2026-11-19
 
 fibrs 0.3.1 traces dense data faster: threads that finishing leaves idle trace seeds ahead, and the binary
