@@ -28,8 +28,10 @@ cp "$root"/licenses/*.txt "$stage/$name/licenses/"
 cp "$root/scripts/install-dropin.sh" "$stage/$name/scripts/"
 tar -C "$stage" -czf "$dist/$name.tar.gz" "$name"
 
-# a drop-in prints the original's version, not this package's
-test "$("$stage/$name/fibrs" --version)" = 0.2.0
+# run as fibrs, the binary prints this package's version; run as the drop-in, the original's
+test "$("$stage/$name/fibrs" --version)" = "$version"
+ln -s "$stage/$name/fibrs" "$stage/avf-spline-generator"
+test "$("$stage/avf-spline-generator" --version)" = 0.2.0
 
 sum=(sha256sum)
 command -v sha256sum > /dev/null || sum=(shasum -a 256)

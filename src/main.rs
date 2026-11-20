@@ -72,7 +72,7 @@ fn main() {
             return;
         }
         run::Prescan::Version => {
-            println!("{}", run::REFERENCE_VERSION);
+            println!("{}", run::version(argv.first().map(|a| a.as_encoded_bytes()).unwrap_or_default()));
             return;
         }
         run::Prescan::Error(e) => e.exit(),

@@ -1,0 +1,28 @@
+//! What `--version` prints, by the name the binary runs as
+
+use std::fs;
+use std::os::unix::fs::symlink;
+use std::path::Path;
+use std::process::Command;
+
+/// What `exe --version` prints, without its trailing newline, after checking that it exited cleanly
+fn version(exe: &Path) -> String {
+    let out = Command::new(exe).arg("--version").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout).unwrap().trim_end().to_owned()
+}
+
+/// Run as `fibrs`, the binary prints this package's version; run as the drop-in `avf-spline-generator`, the version
+/// of the reference release it stands in for, which callers of the original may check
+#[test]
+fn version_follows_the_name_the_binary_runs_as() {
+    let fibrs = Path::new(env!("CARGO_BIN_EXE_fibrs"));
+    assert_eq!(version(fibrs), env!("CARGO_PKG_VERSION"));
+
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("version");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let dropin = dir.join("avf-spline-generator");
+    symlink(fibrs, &dropin).unwrap();
+    assert_eq!(version(&dropin), "0.2.0");
+}
