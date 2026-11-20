@@ -20,6 +20,11 @@ use std::ffi::OsString;
 
 use clap::{CommandFactory, Parser};
 
+/// mimalloc in place of the system allocator, unless built with `--no-default-features`
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Print one log line as the reference's `logging` setup does: `HH:MM:SS message` on stderr
 #[macro_export]
 macro_rules! log {

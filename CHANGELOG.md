@@ -11,6 +11,10 @@
 - **Tracing can run one thread beyond `--threads`.** One more thread commits the seeds in order. On that crop,
   tracing kept 4.2–4.5 cores busy at `--threads 4` and 7.7 at `--threads 8`, where 0.3.0 kept 2.9 and 4.0 busy.
   Size the cores you give a run with that in mind.
+- **mimalloc is the allocator.** The binary now allocates through mimalloc 3.3.2 instead of the system allocator.
+  On dense windows, glibc malloc maps and unmaps large blocks while holding the kernel's `mmap_lock`, which stalls
+  the page faults of every tracing thread. Output is unchanged. `cargo build --release --no-default-features` builds
+  with the system allocator.
 
 ## [0.3.0] - 2026-11-19
 
