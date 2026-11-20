@@ -6904,3 +6904,2678 @@ $L__BB11_44:                            // %bb16
 	ret;
                                         // -- End function
 }
+	// .globl	fs_segments             // -- Begin function fs_segments
+.visible .entry fs_segments(
+	.param .u64 .ptr .align 1 fs_segments_param_0,
+	.param .u64 .ptr .align 1 fs_segments_param_1,
+	.param .u64 .ptr .align 1 fs_segments_param_2,
+	.param .u32 fs_segments_param_3,
+	.param .u32 fs_segments_param_4,
+	.param .u32 fs_segments_param_5,
+	.param .u64 .ptr .align 1 fs_segments_param_6,
+	.param .u64 .ptr .align 1 fs_segments_param_7,
+	.param .u64 .ptr .align 1 fs_segments_param_8,
+	.param .u32 fs_segments_param_9,
+	.param .u64 .ptr .align 1 fs_segments_param_10,
+	.param .u64 .ptr .align 1 fs_segments_param_11,
+	.param .u64 .ptr .align 1 fs_segments_param_12,
+	.param .u64 .ptr .align 1 fs_segments_param_13,
+	.param .u32 fs_segments_param_14,
+	.param .u32 fs_segments_param_15,
+	.param .u32 fs_segments_param_16,
+	.param .u32 fs_segments_param_17,
+	.param .u32 fs_segments_param_18,
+	.param .u32 fs_segments_param_19,
+	.param .u64 .ptr .align 1 fs_segments_param_20,
+	.param .u64 .ptr .align 1 fs_segments_param_21,
+	.param .u32 fs_segments_param_22,
+	.param .u32 fs_segments_param_23,
+	.param .u32 fs_segments_param_24,
+	.param .u32 fs_segments_param_25,
+	.param .u32 fs_segments_param_26,
+	.param .u32 fs_segments_param_27,
+	.param .u32 fs_segments_param_28,
+	.param .u32 fs_segments_param_29,
+	.param .u32 fs_segments_param_30,
+	.param .u32 fs_segments_param_31
+)                                       // @fs_segments
+{
+	.reg .pred 	%p<82>;
+	.reg .b16 	%rs<20>;
+	.reg .b32 	%r<159>;
+	.reg .b64 	%rd<430>;
+
+// %bb.0:                               // %entry
+	ld.param.b64 	%rd85, [fs_segments_param_8];
+	ld.param.b64 	%rd86, [fs_segments_param_0];
+	ld.param.b64 	%rd87, [fs_segments_param_7];
+	cvta.to.global.u64 	%rd1, %rd87;
+	ld.param.b64 	%rd88, [fs_segments_param_1];
+	cvta.to.global.u64 	%rd2, %rd86;
+	ld.param.b64 	%rd89, [fs_segments_param_2];
+	ld.param.b64 	%rd90, [fs_segments_param_10];
+	cvta.to.global.u64 	%rd3, %rd90;
+	ld.param.b64 	%rd91, [fs_segments_param_12];
+	cvta.to.global.u64 	%rd4, %rd91;
+	ld.param.b32 	%r63, [fs_segments_param_4];
+	ld.param.b64 	%rd92, [fs_segments_param_11];
+	cvta.to.global.u64 	%rd5, %rd92;
+	ld.param.b64 	%rd93, [fs_segments_param_13];
+	cvta.to.global.u64 	%rd6, %rd93;
+	ld.param.b64 	%rd94, [fs_segments_param_6];
+	ld.param.b64 	%rd95, [fs_segments_param_20];
+	cvta.to.global.u64 	%rd7, %rd95;
+	cvta.to.global.u64 	%rd8, %rd85;
+	ld.param.b64 	%rd96, [fs_segments_param_21];
+	cvta.to.global.u64 	%rd9, %rd96;
+	cvta.to.global.u64 	%rd10, %rd94;
+	cvta.to.global.u64 	%rd11, %rd88;
+	cvta.to.global.u64 	%rd12, %rd89;
+	mov.u32 	%r64, %ctaid.x;
+	mov.u32 	%r65, %ntid.x;
+	mov.u32 	%r66, %tid.x;
+	mad.lo.s32 	%r1, %r64, %r65, %r66;
+	setp.ge.u32 	%p1, %r1, %r63;
+	@%p1 bra 	$L__BB12_62;
+	bra.uni 	$L__BB12_1;
+$L__BB12_1:                             // %bb32.preheader
+	ld.param.b32 	%r156, [fs_segments_param_3];
+	setp.lt.u32 	%p2, %r156, 2;
+	mov.b64 	%rd429, 0;
+	@%p2 bra 	$L__BB12_65;
+	bra.uni 	$L__BB12_2;
+$L__BB12_2:                             // %bb33.preheader
+	mov.b32 	%r158, 0;
+	mov.b32 	%r157, %r156;
+	bra.uni 	$L__BB12_63;
+$L__BB12_3:                             // %bb7
+	ld.param.b32 	%r46, [fs_segments_param_5];
+	setp.ne.b32 	%p6, %r46, 1;
+	@%p6 bra 	$L__BB12_5;
+	bra.uni 	$L__BB12_4;
+$L__BB12_4:                             // %bb8
+	add.s64 	%rd103, %rd1, %rd99;
+	cvta.global.u64 	%rd102, %rd103;
+	// begin inline asm
+	ld.relaxed.gpu.b32 %r73, [%rd102];
+	// end inline asm
+	setp.eq.b32 	%p7, %r73, 0;
+	@%p7 bra 	$L__BB12_62;
+	bra.uni 	$L__BB12_5;
+$L__BB12_5:                             // %bb15
+	ld.param.b32 	%r59, [fs_segments_param_28];
+	ld.param.b32 	%r58, [fs_segments_param_27];
+	ld.param.b32 	%r57, [fs_segments_param_26];
+	ld.param.b32 	%r56, [fs_segments_param_25];
+	ld.param.b32 	%r55, [fs_segments_param_24];
+	ld.param.b32 	%r54, [fs_segments_param_23];
+	ld.param.b32 	%r53, [fs_segments_param_22];
+	ld.param.b32 	%r50, [fs_segments_param_16];
+	ld.param.b32 	%r49, [fs_segments_param_15];
+	ld.param.b32 	%r48, [fs_segments_param_14];
+	ld.param.b32 	%r47, [fs_segments_param_9];
+	max.u32 	%r3, %r57, 1;
+	max.u32 	%r4, %r58, 1;
+	max.u32 	%r5, %r59, 1;
+	mul.wide.u32 	%rd104, %r1, 12;
+	add.s64 	%rd105, %rd2, %rd104;
+	ld.global.b32 	%r6, [%rd105];
+	ld.global.b32 	%r7, [%rd105+4];
+	ld.global.b32 	%r8, [%rd105+8];
+	mul.wide.u32 	%rd106, %r45, 12;
+	add.s64 	%rd107, %rd2, %rd106;
+	ld.global.b32 	%r74, [%rd107];
+	ld.global.b32 	%r75, [%rd107+4];
+	ld.global.b32 	%r76, [%rd107+8];
+	sub.rn.f32 	%r9, %r74, %r6;
+	sub.rn.f32 	%r10, %r75, %r7;
+	sub.rn.f32 	%r11, %r76, %r8;
+	mul.rn.f32 	%r77, %r9, %r9;
+	mul.rn.f32 	%r78, %r10, %r10;
+	add.rn.f32 	%r79, %r77, %r78;
+	mul.rn.f32 	%r80, %r11, %r11;
+	add.rn.f32 	%r81, %r79, %r80;
+	sqrt.rn.f32 	%r82, %r81;
+	mov.b32 	%r83, 0f3E800000;
+	div.rn.f32 	%r12, %r82, %r83;
+	abs.f32 	%r84, %r12;
+	setp.num.f32 	%p8, %r12, %r12;
+	setp.ltu.f32 	%p9, %r84, 0f4B000000;
+	and.pred 	%p10, %p8, %p9;
+	@%p10 bra 	$L__BB12_57;
+	bra.uni 	$L__BB12_56;
+$L__BB12_6:                             // %bb6.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	add.s64 	%rd406, %rd406, 1;
+	setp.gt.s64 	%p79, %rd406, %rd75;
+	mov.pred 	%p81, -1;
+	@%p79 bra 	$L__BB12_58;
+	bra.uni 	$L__BB12_7;
+$L__BB12_7:                             // %bb7.i
+                                        // =>This Loop Header: Depth=1
+                                        //     Child Loop BB12_50 Depth 2
+	setp.eq.b64 	%p18, %rd406, %rd75;
+	cvt.rn.f64.s64 	%rd115, %rd406;
+	mul.rn.f64 	%rd116, %rd115, %rd76;
+	cvt.rn.f32.f64 	%r94, %rd116;
+	selp.f32 	%r95, 0f3F800000, %r94, %p18;
+	mul.rn.f32 	%r98, %r11, %r95;
+	add.rn.f32 	%r15, %r8, %r98;
+	cvt.f64.f32 	%rd14, %r15;
+	abs.f64 	%rd117, %rd14;
+	setp.nan.f32 	%p19, %r15, %r15;
+	setp.ge.f64 	%p20, %rd117, 0d4330000000000000;
+	or.pred 	%p21, %p19, %p20;
+	mov.b64 	%rd407, %rd14;
+	@%p21 bra 	$L__BB12_10;
+	bra.uni 	$L__BB12_8;
+$L__BB12_8:                             // %bb11.i151
+                                        //   in Loop: Header=BB12_7 Depth=1
+	setp.ltu.f64 	%p22, %rd14, 0dC3E0000000000000;
+	cvt.rzi.s64.f64 	%rd118, %rd14;
+	selp.b64 	%rd119, -9223372036854775808, %rd118, %p22;
+	setp.gt.f64 	%p23, %rd14, 0d43DFFFFFFFFFFFFF;
+	selp.b64 	%rd120, 9223372036854775807, %rd119, %p23;
+	setp.nan.f64 	%p24, %rd14, %rd14;
+	selp.b64 	%rd121, 0, %rd120, %p24;
+	cvt.rn.f64.s64 	%rd122, %rd121;
+	setp.eq.f64 	%p25, %rd14, %rd122;
+	mov.b64 	%rd407, %rd14;
+	@%p25 bra 	$L__BB12_10;
+	bra.uni 	$L__BB12_9;
+$L__BB12_9:                             // %bb13.i155
+                                        //   in Loop: Header=BB12_7 Depth=1
+	mov.b64 	%rd123, 0dBFF0000000000000;
+	add.rn.f64 	%rd124, %rd122, %rd123;
+	setp.geu.f64 	%p26, %rd14, %rd122;
+	selp.f64 	%rd407, %rd122, %rd124, %p26;
+$L__BB12_10:                            // %fibrs_kernels__finish__axis_weights.exit159
+                                        //   in Loop: Header=BB12_7 Depth=1
+	mul.rn.f32 	%r97, %r10, %r95;
+	add.rn.f32 	%r14, %r7, %r97;
+	setp.ltu.f64 	%p27, %rd407, 0dC3E0000000000000;
+	cvt.rzi.s64.f64 	%rd127, %rd407;
+	selp.b64 	%rd128, -9223372036854775808, %rd127, %p27;
+	setp.gt.f64 	%p28, %rd407, 0d43DFFFFFFFFFFFFF;
+	selp.b64 	%rd129, 9223372036854775807, %rd128, %p28;
+	setp.nan.f64 	%p29, %rd407, %rd407;
+	selp.b64 	%rd130, 0, %rd129, %p29;
+	max.s64 	%rd131, %rd130, 0;
+	min.s64 	%rd17, %rd77, %rd131;
+	cvt.f64.f32 	%rd19, %r14;
+	abs.f64 	%rd134, %rd19;
+	setp.nan.f32 	%p30, %r14, %r14;
+	setp.ge.f64 	%p31, %rd134, 0d4330000000000000;
+	or.pred 	%p32, %p30, %p31;
+	mov.b64 	%rd408, %rd19;
+	@%p32 bra 	$L__BB12_13;
+	bra.uni 	$L__BB12_11;
+$L__BB12_11:                            // %bb11.i117
+                                        //   in Loop: Header=BB12_7 Depth=1
+	setp.ltu.f64 	%p33, %rd19, 0dC3E0000000000000;
+	cvt.rzi.s64.f64 	%rd135, %rd19;
+	selp.b64 	%rd136, -9223372036854775808, %rd135, %p33;
+	setp.gt.f64 	%p34, %rd19, 0d43DFFFFFFFFFFFFF;
+	selp.b64 	%rd137, 9223372036854775807, %rd136, %p34;
+	setp.nan.f64 	%p35, %rd19, %rd19;
+	selp.b64 	%rd138, 0, %rd137, %p35;
+	cvt.rn.f64.s64 	%rd139, %rd138;
+	setp.eq.f64 	%p36, %rd19, %rd139;
+	mov.b64 	%rd408, %rd19;
+	@%p36 bra 	$L__BB12_13;
+	bra.uni 	$L__BB12_12;
+$L__BB12_12:                            // %bb13.i121
+                                        //   in Loop: Header=BB12_7 Depth=1
+	mov.b64 	%rd140, 0dBFF0000000000000;
+	add.rn.f64 	%rd141, %rd139, %rd140;
+	setp.geu.f64 	%p37, %rd19, %rd139;
+	selp.f64 	%rd408, %rd139, %rd141, %p37;
+$L__BB12_13:                            // %fibrs_kernels__finish__axis_weights.exit125
+                                        //   in Loop: Header=BB12_7 Depth=1
+	mul.rn.f32 	%r96, %r9, %r95;
+	add.rn.f32 	%r13, %r6, %r96;
+	cvt.u32.u64 	%r16, %rd17;
+	setp.ltu.f64 	%p38, %rd408, 0dC3E0000000000000;
+	cvt.rzi.s64.f64 	%rd143, %rd408;
+	selp.b64 	%rd144, -9223372036854775808, %rd143, %p38;
+	setp.gt.f64 	%p39, %rd408, 0d43DFFFFFFFFFFFFF;
+	selp.b64 	%rd145, 9223372036854775807, %rd144, %p39;
+	setp.nan.f64 	%p40, %rd408, %rd408;
+	selp.b64 	%rd146, 0, %rd145, %p40;
+	max.s64 	%rd147, %rd146, 0;
+	min.s64 	%rd22, %rd78, %rd147;
+	cvt.u32.u64 	%r18, %rd22;
+	add.s64 	%rd148, %rd146, 1;
+	max.s64 	%rd149, %rd148, 0;
+	cvt.f64.f32 	%rd24, %r13;
+	abs.f64 	%rd150, %rd24;
+	setp.nan.f32 	%p41, %r13, %r13;
+	setp.ge.f64 	%p42, %rd150, 0d4330000000000000;
+	or.pred 	%p43, %p41, %p42;
+	mov.b64 	%rd409, %rd24;
+	@%p43 bra 	$L__BB12_16;
+	bra.uni 	$L__BB12_14;
+$L__BB12_14:                            // %bb11.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	setp.ltu.f64 	%p44, %rd24, 0dC3E0000000000000;
+	cvt.rzi.s64.f64 	%rd151, %rd24;
+	selp.b64 	%rd152, -9223372036854775808, %rd151, %p44;
+	setp.gt.f64 	%p45, %rd24, 0d43DFFFFFFFFFFFFF;
+	selp.b64 	%rd153, 9223372036854775807, %rd152, %p45;
+	setp.nan.f64 	%p46, %rd24, %rd24;
+	selp.b64 	%rd154, 0, %rd153, %p46;
+	cvt.rn.f64.s64 	%rd155, %rd154;
+	setp.eq.f64 	%p47, %rd24, %rd155;
+	mov.b64 	%rd409, %rd24;
+	@%p47 bra 	$L__BB12_16;
+	bra.uni 	$L__BB12_15;
+$L__BB12_15:                            // %bb13.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	mov.b64 	%rd156, 0dBFF0000000000000;
+	add.rn.f64 	%rd157, %rd155, %rd156;
+	setp.geu.f64 	%p48, %rd24, %rd155;
+	selp.f64 	%rd409, %rd155, %rd157, %p48;
+$L__BB12_16:                            // %fibrs_kernels__finish__axis_weights.exit
+                                        //   in Loop: Header=BB12_7 Depth=1
+	add.s64 	%rd132, %rd130, 1;
+	min.s64 	%rd23, %rd78, %rd149;
+	setp.ltu.f64 	%p49, %rd409, 0dC3E0000000000000;
+	cvt.rzi.s64.f64 	%rd161, %rd409;
+	selp.b64 	%rd162, -9223372036854775808, %rd161, %p49;
+	setp.gt.f64 	%p50, %rd409, 0d43DFFFFFFFFFFFFF;
+	selp.b64 	%rd163, 9223372036854775807, %rd162, %p50;
+	setp.nan.f64 	%p51, %rd409, %rd409;
+	selp.b64 	%rd164, 0, %rd163, %p51;
+	max.s64 	%rd165, %rd164, 0;
+	min.s64 	%rd27, %rd79, %rd165;
+	cvt.u32.u64 	%r99, %rd27;
+	add.s64 	%rd166, %rd164, 1;
+	max.s64 	%rd167, %rd166, 0;
+	min.s64 	%rd28, %rd79, %rd167;
+	cvt.u32.u64 	%r20, %rd28;
+	shr.u32 	%r100, %r16, 4;
+	mul.lo.s32 	%r21, %r100, %r51;
+	shr.u32 	%r22, %r18, 4;
+	add.s32 	%r101, %r22, %r21;
+	mul.lo.s32 	%r23, %r101, %r52;
+	shr.u32 	%r24, %r99, 4;
+	add.s32 	%r102, %r24, %r23;
+	mul.wide.u32 	%rd168, %r102, 4;
+	add.s64 	%rd169, %rd3, %rd168;
+	ld.global.b32 	%rd30, [%rd169];
+	setp.eq.b64 	%p52, %rd30, 4294967295;
+	mov.b64 	%rd158, 0d0000000000000000;
+	shl.b64 	%rd400, %rd17, 8;
+	shl.b64 	%rd401, %rd22, 4;
+	and.b64 	%rd402, %rd27, 15;
+	mov.b64 	%rd410, %rd158;
+	@%p52 bra 	$L__BB12_18;
+	bra.uni 	$L__BB12_17;
+$L__BB12_17:                            // %bb2.i.i.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd170, %rd400, 3840;
+	and.b64 	%rd171, %rd401, 240;
+	shl.b64 	%rd172, %rd30, 12;
+	add.s64 	%rd173, %rd4, %rd172;
+	add.s64 	%rd174, %rd173, %rd171;
+	add.s64 	%rd175, %rd174, %rd170;
+	add.s64 	%rd176, %rd175, %rd402;
+	ld.global.b8 	%rs1, [%rd176];
+	cvt.rn.f64.u16 	%rd410, %rs1;
+$L__BB12_18:                            // %_RNCNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB8_7Tracing6sample00Ba_.exit.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	max.s64 	%rd133, %rd132, 0;
+	cvt.u32.u64 	%r19, %rd23;
+	shr.u32 	%r25, %r20, 4;
+	add.s32 	%r103, %r25, %r23;
+	mul.wide.u32 	%rd180, %r103, 4;
+	add.s64 	%rd181, %rd3, %rd180;
+	ld.global.b32 	%rd33, [%rd181];
+	setp.eq.b64 	%p53, %rd33, 4294967295;
+	and.b64 	%rd404, %rd28, 15;
+	mov.b64 	%rd411, %rd158;
+	@%p53 bra 	$L__BB12_20;
+	bra.uni 	$L__BB12_19;
+$L__BB12_19:                            // %bb2.i.i18.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd182, %rd400, 3840;
+	and.b64 	%rd183, %rd401, 240;
+	shl.b64 	%rd184, %rd33, 12;
+	add.s64 	%rd185, %rd4, %rd184;
+	add.s64 	%rd186, %rd185, %rd183;
+	add.s64 	%rd187, %rd186, %rd182;
+	add.s64 	%rd188, %rd187, %rd404;
+	ld.global.b8 	%rs2, [%rd188];
+	cvt.rn.f64.u16 	%rd411, %rs2;
+$L__BB12_20:                            // %_RNCNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB8_7Tracing6sample00Ba_.exit38.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	sub.rn.f64 	%rd125, %rd14, %rd407;
+	min.s64 	%rd18, %rd77, %rd133;
+	shr.u32 	%r26, %r19, 4;
+	add.s32 	%r104, %r26, %r21;
+	mul.lo.s32 	%r27, %r104, %r52;
+	add.s32 	%r105, %r24, %r27;
+	mul.wide.u32 	%rd192, %r105, 4;
+	add.s64 	%rd193, %rd3, %rd192;
+	ld.global.b32 	%rd36, [%rd193];
+	setp.eq.b64 	%p54, %rd36, 4294967295;
+	mov.b64 	%rd413, 0d0000000000000000;
+	shl.b64 	%rd403, %rd23, 4;
+	mov.b64 	%rd412, %rd413;
+	@%p54 bra 	$L__BB12_22;
+	bra.uni 	$L__BB12_21;
+$L__BB12_21:                            // %bb2.i.i56.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd194, %rd400, 3840;
+	and.b64 	%rd195, %rd403, 240;
+	shl.b64 	%rd196, %rd36, 12;
+	add.s64 	%rd197, %rd4, %rd196;
+	add.s64 	%rd198, %rd197, %rd402;
+	add.s64 	%rd199, %rd198, %rd194;
+	add.s64 	%rd200, %rd199, %rd195;
+	ld.global.b8 	%rs3, [%rd200];
+	cvt.rn.f64.u16 	%rd412, %rs3;
+$L__BB12_22:                            // %_RNCNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB8_7Tracing6sample00Ba_.exit76.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	sub.rn.f64 	%rd142, %rd19, %rd408;
+	mov.b64 	%rd126, 0d3FF0000000000000;
+	sub.rn.f64 	%rd15, %rd126, %rd125;
+	cvt.u32.u64 	%r17, %rd18;
+	add.s32 	%r106, %r25, %r27;
+	mul.wide.u32 	%rd204, %r106, 4;
+	add.s64 	%rd205, %rd3, %rd204;
+	ld.global.b32 	%rd39, [%rd205];
+	setp.eq.b64 	%p55, %rd39, 4294967295;
+	@%p55 bra 	$L__BB12_24;
+	bra.uni 	$L__BB12_23;
+$L__BB12_23:                            // %bb2.i.i94.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd206, %rd400, 3840;
+	and.b64 	%rd207, %rd403, 240;
+	shl.b64 	%rd208, %rd39, 12;
+	add.s64 	%rd209, %rd4, %rd208;
+	add.s64 	%rd210, %rd209, %rd404;
+	add.s64 	%rd211, %rd210, %rd206;
+	add.s64 	%rd212, %rd211, %rd207;
+	ld.global.b8 	%rs4, [%rd212];
+	cvt.rn.f64.u16 	%rd413, %rs4;
+$L__BB12_24:                            // %_RNCNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB8_7Tracing6sample00Ba_.exit114.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	sub.rn.f64 	%rd20, %rd126, %rd142;
+	sub.rn.f64 	%rd159, %rd24, %rd409;
+	mul.rn.f64 	%rd177, %rd410, %rd15;
+	shr.u32 	%r107, %r17, 4;
+	mul.lo.s32 	%r28, %r107, %r51;
+	add.s32 	%r108, %r22, %r28;
+	mul.lo.s32 	%r29, %r108, %r52;
+	add.s32 	%r109, %r24, %r29;
+	mul.wide.u32 	%rd216, %r109, 4;
+	add.s64 	%rd217, %rd3, %rd216;
+	ld.global.b32 	%rd42, [%rd217];
+	setp.eq.b64 	%p56, %rd42, 4294967295;
+	mov.b64 	%rd415, 0d0000000000000000;
+	shl.b64 	%rd405, %rd18, 8;
+	mov.b64 	%rd414, %rd415;
+	@%p56 bra 	$L__BB12_26;
+	bra.uni 	$L__BB12_25;
+$L__BB12_25:                            // %bb2.i.i132.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd218, %rd405, 3840;
+	and.b64 	%rd219, %rd401, 240;
+	shl.b64 	%rd220, %rd42, 12;
+	add.s64 	%rd221, %rd4, %rd220;
+	add.s64 	%rd222, %rd221, %rd402;
+	add.s64 	%rd223, %rd222, %rd219;
+	add.s64 	%rd224, %rd223, %rd218;
+	ld.global.b8 	%rs5, [%rd224];
+	cvt.rn.f64.u16 	%rd414, %rs5;
+$L__BB12_26:                            // %_RNCNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB8_7Tracing6sample00Ba_.exit152.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	mov.b64 	%rd160, 0d3FF0000000000000;
+	sub.rn.f64 	%rd25, %rd160, %rd159;
+	mul.rn.f64 	%rd178, %rd177, %rd20;
+	mul.rn.f64 	%rd189, %rd411, %rd15;
+	add.s32 	%r110, %r25, %r29;
+	mul.wide.u32 	%rd228, %r110, 4;
+	add.s64 	%rd229, %rd3, %rd228;
+	ld.global.b32 	%rd45, [%rd229];
+	setp.eq.b64 	%p57, %rd45, 4294967295;
+	@%p57 bra 	$L__BB12_28;
+	bra.uni 	$L__BB12_27;
+$L__BB12_27:                            // %bb2.i.i170.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd230, %rd405, 3840;
+	and.b64 	%rd231, %rd401, 240;
+	shl.b64 	%rd232, %rd45, 12;
+	add.s64 	%rd233, %rd4, %rd232;
+	add.s64 	%rd234, %rd233, %rd404;
+	add.s64 	%rd235, %rd234, %rd231;
+	add.s64 	%rd236, %rd235, %rd230;
+	ld.global.b8 	%rs6, [%rd236];
+	cvt.rn.f64.u16 	%rd415, %rs6;
+$L__BB12_28:                            // %_RNCNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB8_7Tracing6sample00Ba_.exit190.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	sub.rn.f64 	%rd26, %rd160, %rd25;
+	mul.rn.f64 	%rd179, %rd178, %rd25;
+	sub.rn.f64 	%rd21, %rd126, %rd20;
+	mul.rn.f64 	%rd190, %rd189, %rd20;
+	mul.rn.f64 	%rd201, %rd412, %rd15;
+	add.s32 	%r111, %r26, %r28;
+	mul.lo.s32 	%r30, %r111, %r52;
+	add.s32 	%r112, %r24, %r30;
+	mul.wide.u32 	%rd240, %r112, 4;
+	add.s64 	%rd241, %rd3, %rd240;
+	ld.global.b32 	%rd48, [%rd241];
+	setp.eq.b64 	%p58, %rd48, 4294967295;
+	mov.b64 	%rd417, 0d0000000000000000;
+	mov.b64 	%rd416, %rd417;
+	@%p58 bra 	$L__BB12_30;
+	bra.uni 	$L__BB12_29;
+$L__BB12_29:                            // %bb2.i.i208.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd242, %rd405, 3840;
+	and.b64 	%rd243, %rd403, 240;
+	shl.b64 	%rd244, %rd48, 12;
+	add.s64 	%rd245, %rd4, %rd244;
+	add.s64 	%rd246, %rd245, %rd243;
+	add.s64 	%rd247, %rd246, %rd402;
+	add.s64 	%rd248, %rd247, %rd242;
+	ld.global.b8 	%rs7, [%rd248];
+	cvt.rn.f64.u16 	%rd416, %rs7;
+$L__BB12_30:                            // %_RNCNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB8_7Tracing6sample00Ba_.exit228.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	add.rn.f64 	%rd31, %rd158, %rd179;
+	mul.rn.f64 	%rd191, %rd190, %rd26;
+	mul.rn.f64 	%rd202, %rd201, %rd21;
+	sub.rn.f64 	%rd16, %rd126, %rd15;
+	mul.rn.f64 	%rd213, %rd413, %rd15;
+	add.s32 	%r113, %r25, %r30;
+	mul.wide.u32 	%rd252, %r113, 4;
+	add.s64 	%rd253, %rd3, %rd252;
+	ld.global.b32 	%rd51, [%rd253];
+	setp.eq.b64 	%p59, %rd51, 4294967295;
+	@%p59 bra 	$L__BB12_32;
+	bra.uni 	$L__BB12_31;
+$L__BB12_31:                            // %bb2.i.i246.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd254, %rd405, 3840;
+	and.b64 	%rd255, %rd403, 240;
+	shl.b64 	%rd256, %rd51, 12;
+	add.s64 	%rd257, %rd4, %rd256;
+	add.s64 	%rd258, %rd257, %rd255;
+	add.s64 	%rd259, %rd258, %rd404;
+	add.s64 	%rd260, %rd259, %rd254;
+	ld.global.b8 	%rs8, [%rd260];
+	cvt.rn.f64.u16 	%rd417, %rs8;
+$L__BB12_32:                            // %_RNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB6_7Tracing6sample0B8_.exit
+                                        //   in Loop: Header=BB12_7 Depth=1
+	add.rn.f64 	%rd34, %rd31, %rd191;
+	mul.rn.f64 	%rd203, %rd202, %rd25;
+	mul.rn.f64 	%rd214, %rd213, %rd21;
+	mul.rn.f64 	%rd225, %rd414, %rd16;
+	cvt.u64.u32 	%rd29, %r102;
+	shl.b64 	%rd265, %rd29, 2;
+	add.s64 	%rd266, %rd5, %rd265;
+	ld.global.b32 	%rd52, [%rd266];
+	setp.eq.b64 	%p60, %rd52, 4294967295;
+	mov.b64 	%rd419, 0d0000000000000000;
+	mov.b64 	%rd418, %rd419;
+	@%p60 bra 	$L__BB12_34;
+	bra.uni 	$L__BB12_33;
+$L__BB12_33:                            // %bb2.i.i.i292
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd267, %rd400, 3840;
+	and.b64 	%rd268, %rd401, 240;
+	shl.b64 	%rd269, %rd52, 12;
+	add.s64 	%rd270, %rd6, %rd269;
+	add.s64 	%rd271, %rd270, %rd268;
+	add.s64 	%rd272, %rd271, %rd267;
+	add.s64 	%rd273, %rd272, %rd402;
+	ld.global.b8 	%rs9, [%rd273];
+	cvt.rn.f64.u16 	%rd418, %rs9;
+$L__BB12_34:                            // %_RNCNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB8_7Tracing6sample00Ba_.exit.i305
+                                        //   in Loop: Header=BB12_7 Depth=1
+	add.rn.f64 	%rd37, %rd34, %rd203;
+	mul.rn.f64 	%rd215, %rd214, %rd26;
+	mul.rn.f64 	%rd226, %rd225, %rd20;
+	mul.rn.f64 	%rd237, %rd415, %rd16;
+	cvt.u64.u32 	%rd32, %r103;
+	mul.rn.f64 	%rd274, %rd418, %rd15;
+	mul.rn.f64 	%rd275, %rd274, %rd20;
+	mul.rn.f64 	%rd276, %rd275, %rd25;
+	add.rn.f64 	%rd53, %rd419, %rd276;
+	shl.b64 	%rd277, %rd32, 2;
+	add.s64 	%rd278, %rd5, %rd277;
+	ld.global.b32 	%rd54, [%rd278];
+	setp.eq.b64 	%p61, %rd54, 4294967295;
+	@%p61 bra 	$L__BB12_36;
+	bra.uni 	$L__BB12_35;
+$L__BB12_35:                            // %bb2.i.i18.i323
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd279, %rd400, 3840;
+	and.b64 	%rd280, %rd401, 240;
+	shl.b64 	%rd281, %rd54, 12;
+	add.s64 	%rd282, %rd6, %rd281;
+	add.s64 	%rd283, %rd282, %rd280;
+	add.s64 	%rd284, %rd283, %rd279;
+	add.s64 	%rd285, %rd284, %rd404;
+	ld.global.b8 	%rs10, [%rd285];
+	cvt.rn.f64.u16 	%rd419, %rs10;
+$L__BB12_36:                            // %_RNCNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB8_7Tracing6sample00Ba_.exit38.i336
+                                        //   in Loop: Header=BB12_7 Depth=1
+	add.rn.f64 	%rd40, %rd37, %rd215;
+	mul.rn.f64 	%rd227, %rd226, %rd25;
+	mul.rn.f64 	%rd238, %rd237, %rd20;
+	mul.rn.f64 	%rd249, %rd416, %rd16;
+	cvt.u64.u32 	%rd35, %r105;
+	mul.rn.f64 	%rd286, %rd419, %rd15;
+	mul.rn.f64 	%rd287, %rd286, %rd20;
+	mul.rn.f64 	%rd288, %rd287, %rd26;
+	add.rn.f64 	%rd55, %rd53, %rd288;
+	shl.b64 	%rd289, %rd35, 2;
+	add.s64 	%rd290, %rd5, %rd289;
+	ld.global.b32 	%rd56, [%rd290];
+	setp.eq.b64 	%p62, %rd56, 4294967295;
+	mov.b64 	%rd421, 0d0000000000000000;
+	mov.b64 	%rd420, %rd421;
+	@%p62 bra 	$L__BB12_38;
+	bra.uni 	$L__BB12_37;
+$L__BB12_37:                            // %bb2.i.i56.i356
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd291, %rd400, 3840;
+	and.b64 	%rd292, %rd403, 240;
+	shl.b64 	%rd293, %rd56, 12;
+	add.s64 	%rd294, %rd6, %rd293;
+	add.s64 	%rd295, %rd294, %rd402;
+	add.s64 	%rd296, %rd295, %rd291;
+	add.s64 	%rd297, %rd296, %rd292;
+	ld.global.b8 	%rs11, [%rd297];
+	cvt.rn.f64.u16 	%rd420, %rs11;
+$L__BB12_38:                            // %_RNCNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB8_7Tracing6sample00Ba_.exit76.i369
+                                        //   in Loop: Header=BB12_7 Depth=1
+	add.rn.f64 	%rd43, %rd40, %rd227;
+	mul.rn.f64 	%rd239, %rd238, %rd26;
+	mul.rn.f64 	%rd250, %rd249, %rd21;
+	mul.rn.f64 	%rd261, %rd417, %rd16;
+	cvt.u64.u32 	%rd38, %r106;
+	mul.rn.f64 	%rd298, %rd420, %rd15;
+	mul.rn.f64 	%rd299, %rd298, %rd21;
+	mul.rn.f64 	%rd300, %rd299, %rd25;
+	add.rn.f64 	%rd57, %rd55, %rd300;
+	shl.b64 	%rd301, %rd38, 2;
+	add.s64 	%rd302, %rd5, %rd301;
+	ld.global.b32 	%rd58, [%rd302];
+	setp.eq.b64 	%p63, %rd58, 4294967295;
+	@%p63 bra 	$L__BB12_40;
+	bra.uni 	$L__BB12_39;
+$L__BB12_39:                            // %bb2.i.i94.i380
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd303, %rd400, 3840;
+	and.b64 	%rd304, %rd403, 240;
+	shl.b64 	%rd305, %rd58, 12;
+	add.s64 	%rd306, %rd6, %rd305;
+	add.s64 	%rd307, %rd306, %rd404;
+	add.s64 	%rd308, %rd307, %rd303;
+	add.s64 	%rd309, %rd308, %rd304;
+	ld.global.b8 	%rs12, [%rd309];
+	cvt.rn.f64.u16 	%rd421, %rs12;
+$L__BB12_40:                            // %_RNCNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB8_7Tracing6sample00Ba_.exit114.i393
+                                        //   in Loop: Header=BB12_7 Depth=1
+	add.rn.f64 	%rd46, %rd43, %rd239;
+	mul.rn.f64 	%rd251, %rd250, %rd25;
+	mul.rn.f64 	%rd262, %rd261, %rd21;
+	cvt.u64.u32 	%rd41, %r109;
+	mul.rn.f64 	%rd310, %rd421, %rd15;
+	mul.rn.f64 	%rd311, %rd310, %rd21;
+	mul.rn.f64 	%rd312, %rd311, %rd26;
+	add.rn.f64 	%rd59, %rd57, %rd312;
+	shl.b64 	%rd313, %rd41, 2;
+	add.s64 	%rd314, %rd5, %rd313;
+	ld.global.b32 	%rd60, [%rd314];
+	setp.eq.b64 	%p64, %rd60, 4294967295;
+	mov.b64 	%rd423, 0d0000000000000000;
+	mov.b64 	%rd422, %rd423;
+	@%p64 bra 	$L__BB12_42;
+	bra.uni 	$L__BB12_41;
+$L__BB12_41:                            // %bb2.i.i132.i414
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd315, %rd405, 3840;
+	and.b64 	%rd316, %rd401, 240;
+	shl.b64 	%rd317, %rd60, 12;
+	add.s64 	%rd318, %rd6, %rd317;
+	add.s64 	%rd319, %rd318, %rd402;
+	add.s64 	%rd320, %rd319, %rd316;
+	add.s64 	%rd321, %rd320, %rd315;
+	ld.global.b8 	%rs13, [%rd321];
+	cvt.rn.f64.u16 	%rd422, %rs13;
+$L__BB12_42:                            // %_RNCNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB8_7Tracing6sample00Ba_.exit152.i427
+                                        //   in Loop: Header=BB12_7 Depth=1
+	add.rn.f64 	%rd49, %rd46, %rd251;
+	mul.rn.f64 	%rd263, %rd262, %rd26;
+	cvt.u64.u32 	%rd44, %r110;
+	mul.rn.f64 	%rd322, %rd422, %rd16;
+	mul.rn.f64 	%rd323, %rd322, %rd20;
+	mul.rn.f64 	%rd324, %rd323, %rd25;
+	add.rn.f64 	%rd61, %rd59, %rd324;
+	shl.b64 	%rd325, %rd44, 2;
+	add.s64 	%rd326, %rd5, %rd325;
+	ld.global.b32 	%rd62, [%rd326];
+	setp.eq.b64 	%p65, %rd62, 4294967295;
+	@%p65 bra 	$L__BB12_44;
+	bra.uni 	$L__BB12_43;
+$L__BB12_43:                            // %bb2.i.i170.i438
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd327, %rd405, 3840;
+	and.b64 	%rd328, %rd401, 240;
+	shl.b64 	%rd329, %rd62, 12;
+	add.s64 	%rd330, %rd6, %rd329;
+	add.s64 	%rd331, %rd330, %rd404;
+	add.s64 	%rd332, %rd331, %rd328;
+	add.s64 	%rd333, %rd332, %rd327;
+	ld.global.b8 	%rs14, [%rd333];
+	cvt.rn.f64.u16 	%rd423, %rs14;
+$L__BB12_44:                            // %_RNCNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB8_7Tracing6sample00Ba_.exit190.i451
+                                        //   in Loop: Header=BB12_7 Depth=1
+	add.rn.f64 	%rd264, %rd49, %rd263;
+	cvt.u64.u32 	%rd47, %r112;
+	mul.rn.f64 	%rd334, %rd423, %rd16;
+	mul.rn.f64 	%rd335, %rd334, %rd20;
+	mul.rn.f64 	%rd336, %rd335, %rd26;
+	add.rn.f64 	%rd63, %rd61, %rd336;
+	shl.b64 	%rd337, %rd47, 2;
+	add.s64 	%rd338, %rd5, %rd337;
+	ld.global.b32 	%rd64, [%rd338];
+	setp.eq.b64 	%p66, %rd64, 4294967295;
+	mov.b64 	%rd425, 0d0000000000000000;
+	mov.b64 	%rd424, %rd425;
+	@%p66 bra 	$L__BB12_46;
+	bra.uni 	$L__BB12_45;
+$L__BB12_45:                            // %bb2.i.i208.i464
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd339, %rd405, 3840;
+	and.b64 	%rd340, %rd403, 240;
+	shl.b64 	%rd341, %rd64, 12;
+	add.s64 	%rd342, %rd6, %rd341;
+	add.s64 	%rd343, %rd342, %rd340;
+	add.s64 	%rd344, %rd343, %rd402;
+	add.s64 	%rd345, %rd344, %rd339;
+	ld.global.b8 	%rs15, [%rd345];
+	cvt.rn.f64.u16 	%rd424, %rs15;
+$L__BB12_46:                            // %_RNCNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB8_7Tracing6sample00Ba_.exit228.i477
+                                        //   in Loop: Header=BB12_7 Depth=1
+	cvt.u64.u32 	%rd50, %r113;
+	cvt.rn.f32.f64 	%r31, %rd264;
+	mul.rn.f64 	%rd346, %rd424, %rd16;
+	mul.rn.f64 	%rd347, %rd346, %rd21;
+	mul.rn.f64 	%rd348, %rd347, %rd25;
+	add.rn.f64 	%rd65, %rd63, %rd348;
+	shl.b64 	%rd349, %rd50, 2;
+	add.s64 	%rd350, %rd5, %rd349;
+	ld.global.b32 	%rd66, [%rd350];
+	setp.eq.b64 	%p67, %rd66, 4294967295;
+	@%p67 bra 	$L__BB12_48;
+	bra.uni 	$L__BB12_47;
+$L__BB12_47:                            // %bb2.i.i246.i488
+                                        //   in Loop: Header=BB12_7 Depth=1
+	and.b64 	%rd351, %rd405, 3840;
+	and.b64 	%rd352, %rd403, 240;
+	shl.b64 	%rd353, %rd66, 12;
+	add.s64 	%rd354, %rd6, %rd353;
+	add.s64 	%rd355, %rd354, %rd352;
+	add.s64 	%rd356, %rd355, %rd404;
+	add.s64 	%rd357, %rd356, %rd351;
+	ld.global.b8 	%rs16, [%rd357];
+	cvt.rn.f64.u16 	%rd425, %rs16;
+$L__BB12_48:                            // %_RNCNvMs_NtCsi0DaIIAXpBr_13fibrs_kernels6finishNtB6_7Tracing6sample0B8_.exit507
+                                        //   in Loop: Header=BB12_7 Depth=1
+	mul.rn.f64 	%rd358, %rd425, %rd16;
+	mul.rn.f64 	%rd359, %rd358, %rd21;
+	mul.rn.f64 	%rd360, %rd359, %rd26;
+	add.rn.f64 	%rd361, %rd65, %rd360;
+	cvt.rn.f32.f64 	%r114, %rd361;
+	selp.f32 	%r115, %r31, %r114, %p68;
+	selp.f32 	%r116, %r114, %r31, %p68;
+	mov.b32 	%r117, 0f38D1B717;
+	add.rn.f32 	%r118, %r115, %r117;
+	setp.ltu.f32 	%p69, %r118, %r116;
+	mov.pred 	%p81, 0;
+	@%p69 bra 	$L__BB12_58;
+	bra.uni 	$L__BB12_49;
+$L__BB12_49:                            // %bb12.i
+                                        //   in Loop: Header=BB12_7 Depth=1
+	mov.b32 	%r119, 0f40000000;
+	mul.rn.f32 	%r120, %r13, %r119;
+	mov.b32 	%r121, 0f3F000000;
+	add.rn.f32 	%r122, %r120, %r121;
+	mul.rn.f32 	%r123, %r14, %r119;
+	add.rn.f32 	%r124, %r123, %r121;
+	mul.rn.f32 	%r125, %r15, %r119;
+	add.rn.f32 	%r126, %r125, %r121;
+	max.f32 	%r127, %r126, 0f00000000;
+	cvt.f64.f32 	%rd362, %r127;
+	setp.lt.f64 	%p70, %rd80, %rd362;
+	selp.f64 	%rd363, %rd80, %rd362, %p70;
+	max.f64 	%rd364, %rd363, 0d0000000000000000;
+	min.f64 	%rd365, %rd364, 0d41EFFFFFFFE00000;
+	cvt.rzi.u32.f64 	%r32, %rd365;
+	cvt.rn.f64.u32 	%rd366, %r32;
+	sub.rn.f64 	%rd67, %rd363, %rd366;
+	max.f32 	%r128, %r124, 0f00000000;
+	cvt.f64.f32 	%rd367, %r128;
+	setp.lt.f64 	%p71, %rd81, %rd367;
+	selp.f64 	%rd368, %rd81, %rd367, %p71;
+	max.f64 	%rd369, %rd368, 0d0000000000000000;
+	min.f64 	%rd370, %rd369, 0d41EFFFFFFFE00000;
+	cvt.rzi.u32.f64 	%r33, %rd370;
+	cvt.rn.f64.u32 	%rd371, %r33;
+	sub.rn.f64 	%rd68, %rd368, %rd371;
+	max.f32 	%r129, %r122, 0f00000000;
+	cvt.f64.f32 	%rd372, %r129;
+	setp.lt.f64 	%p72, %rd82, %rd372;
+	selp.f64 	%rd373, %rd82, %rd372, %p72;
+	max.f64 	%rd374, %rd373, 0d0000000000000000;
+	min.f64 	%rd375, %rd374, 0d41EFFFFFFFE00000;
+	cvt.rzi.u32.f64 	%r34, %rd375;
+	cvt.rn.f64.u32 	%rd376, %r34;
+	sub.rn.f64 	%rd69, %rd373, %rd376;
+	neg.f64 	%rd70, %rd67;
+	neg.f64 	%rd71, %rd68;
+	neg.f64 	%rd72, %rd69;
+	mov.b32 	%r154, 0f00000000;
+	mov.b32 	%r153, 0;
+	mov.b32 	%r155, %r154;
+$L__BB12_50:                            // %bb2.i
+                                        //   Parent Loop BB12_7 Depth=1
+                                        // =>  This Inner Loop Header: Depth=2
+	shr.u32 	%r130, %r153, 2;
+	bfe.u32 	%r131, %r153, 1, 1;
+	and.b32 	%r132, %r153, 1;
+	add.s32 	%r133, %r130, %r32;
+	min.u32 	%r35, %r42, %r133;
+	add.s32 	%r134, %r131, %r33;
+	min.u32 	%r36, %r43, %r134;
+	add.s32 	%r135, %r132, %r34;
+	min.u32 	%r37, %r44, %r135;
+	setp.eq.b32 	%p73, %r130, 1;
+	mov.b64 	%rd377, 0d3FF0000000000000;
+	add.rn.f64 	%rd378, %rd377, %rd70;
+	selp.f64 	%rd379, %rd67, %rd378, %p73;
+	setp.eq.b32 	%p74, %r131, 0;
+	add.rn.f64 	%rd380, %rd377, %rd71;
+	selp.f64 	%rd381, %rd380, %rd68, %p74;
+	setp.eq.b32 	%p75, %r132, 0;
+	add.rn.f64 	%rd382, %rd377, %rd72;
+	selp.f64 	%rd383, %rd382, %rd69, %p75;
+	mul.rn.f64 	%rd384, %rd379, %rd381;
+	mul.rn.f64 	%rd73, %rd384, %rd383;
+	div.u32 	%r136, %r35, %r2;
+	div.u32 	%r38, %r36, %r3;
+	div.u32 	%r39, %r37, %r4;
+	mul.lo.s32 	%r40, %r136, %r2;
+	sub.s32 	%r137, %r35, %r40;
+	div.u32 	%r41, %r137, %r5;
+	mad.lo.s32 	%r138, %r136, %r60, %r38;
+	mad.lo.s32 	%r139, %r138, %r61, %r39;
+	mad.lo.s32 	%r140, %r139, %r62, %r41;
+	mul.wide.u32 	%rd385, %r140, 4;
+	add.s64 	%rd386, %rd7, %rd385;
+	ld.global.b32 	%rd74, [%rd386];
+	setp.ne.b64 	%p76, %rd74, 4294967295;
+	@%p76 bra 	$L__BB12_52;
+	bra.uni 	$L__BB12_51;
+$L__BB12_51:                            // %bb9.i
+                                        //   in Loop: Header=BB12_50 Depth=2
+	atom.relaxed.gpu.global.or.b32 	%r147, [%rd8], 1;
+	mov.b64 	%rd426, 0d0000000000000000;
+	mov.b64 	%rd427, %rd426;
+	bra.uni 	$L__BB12_53;
+$L__BB12_52:                            // %bb14.i
+                                        //   in Loop: Header=BB12_50 Depth=2
+	mad.lo.s32 	%r141, %r41, %r5, %r38;
+	add.s32 	%r142, %r40, %r141;
+	sub.s32 	%r143, %r35, %r142;
+	sub.s32 	%r144, %r36, %r39;
+	mad.lo.s32 	%r145, %r143, %r3, %r144;
+	mad.lo.s32 	%r146, %r145, %r4, %r37;
+	cvt.u64.u32 	%rd387, %r146;
+	mad.lo.s64 	%rd388, %rd84, %rd74, %rd9;
+	add.s64 	%rd389, %rd388, %rd387;
+	ld.global.b8 	%rs17, [%rd389];
+	add.s64 	%rd390, %rd389, %rd83;
+	ld.global.b8 	%rs18, [%rd390];
+	cvt.rn.f64.u16 	%rd426, %rs17;
+	cvt.rn.f64.u16 	%rd427, %rs18;
+$L__BB12_53:                            // %fibrs_kernels__finish__Native__value.exit
+                                        //   in Loop: Header=BB12_50 Depth=2
+	cvt.f64.f32 	%rd391, %r155;
+	mul.rn.f64 	%rd392, %rd426, %rd73;
+	add.rn.f64 	%rd393, %rd391, %rd392;
+	cvt.rn.f32.f64 	%r155, %rd393;
+	cvt.f64.f32 	%rd394, %r154;
+	mul.rn.f64 	%rd395, %rd427, %rd73;
+	add.rn.f64 	%rd396, %rd394, %rd395;
+	cvt.rn.f32.f64 	%r154, %rd396;
+	add.s32 	%r153, %r153, 1;
+	setp.ne.b32 	%p77, %r153, 8;
+	@%p77 bra 	$L__BB12_50;
+	bra.uni 	$L__BB12_54;
+$L__BB12_54:                            // %fibrs_kernels__finish__Native__sample.exit
+                                        //   in Loop: Header=BB12_7 Depth=1
+	selp.f32 	%r148, %r155, %r154, %p68;
+	selp.f32 	%r149, %r154, %r155, %p68;
+	mov.b32 	%r150, 0f38D1B717;
+	add.rn.f32 	%r151, %r148, %r150;
+	setp.ltu.f32 	%p78, %r151, %r149;
+	@%p78 bra 	$L__BB12_58;
+	bra.uni 	$L__BB12_6;
+$L__BB12_55:                            // %bb19.i
+	ld.param.b32 	%r62, [fs_segments_param_31];
+	ld.param.b32 	%r61, [fs_segments_param_30];
+	ld.param.b32 	%r60, [fs_segments_param_29];
+	ld.param.b32 	%r52, [fs_segments_param_19];
+	ld.param.b32 	%r51, [fs_segments_param_18];
+	max.u32 	%r2, %r56, 1;
+	cvt.u64.u32 	%rd13, %r1;
+	max.s64 	%rd75, %rd428, 1;
+	cvt.rn.f64.u64 	%rd111, %rd75;
+	rcp.rn.f64 	%rd76, %rd111;
+	mul.lo.s32 	%r92, %r4, %r3;
+	cvt.u64.u32 	%rd112, %r48;
+	add.s64 	%rd77, %rd112, -1;
+	cvt.u64.u32 	%rd113, %r49;
+	add.s64 	%rd78, %rd113, -1;
+	cvt.u64.u32 	%rd114, %r50;
+	add.s64 	%rd79, %rd114, -1;
+	add.s32 	%r42, %r53, -1;
+	cvt.rn.f64.u32 	%rd80, %r42;
+	add.s32 	%r43, %r54, -1;
+	cvt.rn.f64.u32 	%rd81, %r43;
+	add.s32 	%r44, %r55, -1;
+	cvt.rn.f64.u32 	%rd82, %r44;
+	mul.lo.s32 	%r93, %r92, %r5;
+	cvt.u64.u32 	%rd83, %r93;
+	mul.wide.u32 	%rd84, %r93, 2;
+	mov.b64 	%rd406, 0;
+	setp.eq.b32 	%p68, %r47, 1;
+	bra.uni 	$L__BB12_7;
+$L__BB12_56:                            // %bb24.i
+	setp.ltu.f32 	%p11, %r12, 0fDF000000;
+	cvt.rzi.s64.f32 	%rd108, %r12;
+	selp.b64 	%rd109, -9223372036854775808, %rd108, %p11;
+	setp.gt.f32 	%p12, %r12, 0f5EFFFFFF;
+	selp.b64 	%rd110, 9223372036854775807, %rd109, %p12;
+	setp.nan.f32 	%p13, %r12, %r12;
+	selp.b64 	%rd428, 0, %rd110, %p13;
+	bra.uni 	$L__BB12_55;
+$L__BB12_57:                            // %bb25.i
+	setp.ltu.f32 	%p14, %r12, 0fCF000000;
+	cvt.rzi.s32.f32 	%r85, %r12;
+	selp.b32 	%r86, -2147483648, %r85, %p14;
+	setp.gt.f32 	%p15, %r12, 0f4EFFFFFF;
+	selp.b32 	%r87, 2147483647, %r86, %p15;
+	setp.nan.f32 	%p16, %r12, %r12;
+	selp.b32 	%r88, 0, %r87, %p16;
+	cvt.rn.f32.s32 	%r89, %r88;
+	setp.gt.f32 	%p17, %r12, %r89;
+	selp.b32 	%r90, 1, 0, %p17;
+	add.s32 	%r91, %r88, %r90;
+	cvt.s64.s32 	%rd428, %r91;
+	bra.uni 	$L__BB12_55;
+$L__BB12_58:                            // %fibrs_kernels__finish__segment_valid.exit
+	setp.ne.b32 	%p80, %r46, 0;
+	@%p80 bra 	$L__BB12_60;
+	bra.uni 	$L__BB12_59;
+$L__BB12_59:                            // %bb21
+	add.s64 	%rd399, %rd10, %rd13;
+	selp.b16 	%rs19, 1, 0, %p81;
+	st.global.b8 	[%rd399], %rs19;
+	bra.uni 	$L__BB12_62;
+$L__BB12_60:                            // %bb22
+	@%p81 bra 	$L__BB12_62;
+	bra.uni 	$L__BB12_61;
+$L__BB12_61:                            // %bb23
+	add.s64 	%rd398, %rd1, %rd99;
+	cvta.global.u64 	%rd397, %rd398;
+	mov.b32 	%r152, 0;
+	// begin inline asm
+	st.relaxed.gpu.b32 [%rd397], %r152;
+	// end inline asm
+$L__BB12_62:                            // %bb31
+	ret;
+$L__BB12_63:                            // %bb33
+                                        // =>This Inner Loop Header: Depth=1
+	shr.u32 	%r67, %r156, 1;
+	add.s32 	%r68, %r67, %r158;
+	mul.wide.u32 	%rd97, %r68, 4;
+	add.s64 	%rd98, %rd11, %rd97;
+	ld.global.b32 	%r69, [%rd98];
+	setp.gt.u32 	%p3, %r69, %r1;
+	selp.b32 	%r158, %r158, %r68, %p3;
+	selp.b32 	%r157, %r68, %r157, %p3;
+	sub.s32 	%r156, %r157, %r158;
+	setp.gt.u32 	%p4, %r156, 1;
+	@%p4 bra 	$L__BB12_63;
+	bra.uni 	$L__BB12_64;
+$L__BB12_64:                            // %bb37.loopexit
+	cvt.u64.u32 	%rd429, %r158;
+$L__BB12_65:                            // %bb37
+	shl.b64 	%rd99, %rd429, 2;
+	add.s64 	%rd100, %rd11, %rd99;
+	ld.global.b32 	%r70, [%rd100];
+	add.s64 	%rd101, %rd12, %rd99;
+	ld.global.b32 	%r71, [%rd101];
+	add.s32 	%r72, %r71, %r70;
+	add.s32 	%r45, %r1, 1;
+	setp.lt.u32 	%p5, %r45, %r72;
+	@%p5 bra 	$L__BB12_3;
+	bra.uni 	$L__BB12_62;
+                                        // -- End function
+}
+	// .globl	fs_fit                  // -- Begin function fs_fit
+.visible .entry fs_fit(
+	.param .u64 .ptr .align 1 fs_fit_param_0,
+	.param .u64 .ptr .align 1 fs_fit_param_1,
+	.param .u64 .ptr .align 1 fs_fit_param_2,
+	.param .u32 fs_fit_param_3,
+	.param .u64 .ptr .align 1 fs_fit_param_4,
+	.param .u64 .ptr .align 1 fs_fit_param_5,
+	.param .u64 .ptr .align 1 fs_fit_param_6,
+	.param .u64 .ptr .align 1 fs_fit_param_7,
+	.param .u64 .ptr .align 1 fs_fit_param_8,
+	.param .u32 fs_fit_param_9,
+	.param .u64 .ptr .align 1 fs_fit_param_10,
+	.param .u64 .ptr .align 1 fs_fit_param_11,
+	.param .u64 .ptr .align 1 fs_fit_param_12,
+	.param .u64 .ptr .align 1 fs_fit_param_13,
+	.param .u32 fs_fit_param_14,
+	.param .u32 fs_fit_param_15,
+	.param .u32 fs_fit_param_16,
+	.param .u32 fs_fit_param_17,
+	.param .u32 fs_fit_param_18,
+	.param .u32 fs_fit_param_19
+)                                       // @fs_fit
+{
+	.reg .pred 	%p<111>;
+	.reg .b16 	%rs<81>;
+	.reg .b32 	%r<384>;
+	.reg .b64 	%rd<627>;
+
+// %bb.0:                               // %entry
+	ld.param.b64 	%rd98, [fs_fit_param_0];
+	ld.param.b64 	%rd99, [fs_fit_param_1];
+	cvta.to.global.u64 	%rd1, %rd99;
+	ld.param.b64 	%rd100, [fs_fit_param_2];
+	cvta.to.global.u64 	%rd2, %rd100;
+	cvta.to.global.u64 	%rd3, %rd98;
+	ld.param.b32 	%r68, [fs_fit_param_3];
+	ld.param.b64 	%rd101, [fs_fit_param_4];
+	cvta.to.global.u64 	%rd4, %rd101;
+	ld.param.b64 	%rd102, [fs_fit_param_11];
+	cvta.to.global.u64 	%rd5, %rd102;
+	ld.param.b64 	%rd103, [fs_fit_param_5];
+	ld.param.b64 	%rd104, [fs_fit_param_10];
+	cvta.to.global.u64 	%rd6, %rd104;
+	ld.param.b64 	%rd105, [fs_fit_param_6];
+	ld.param.b64 	%rd106, [fs_fit_param_13];
+	cvta.to.global.u64 	%rd7, %rd106;
+	ld.param.b64 	%rd107, [fs_fit_param_7];
+	ld.param.b64 	%rd108, [fs_fit_param_12];
+	cvta.to.global.u64 	%rd8, %rd108;
+	ld.param.b64 	%rd109, [fs_fit_param_8];
+	cvta.to.global.u64 	%rd9, %rd105;
+	cvta.to.global.u64 	%rd10, %rd107;
+	cvta.to.global.u64 	%rd11, %rd109;
+	cvta.to.global.u64 	%rd12, %rd103;
+	mov.u32 	%r69, %ctaid.x;
+	mov.u32 	%r70, %ntid.x;
+	mov.u32 	%r71, %tid.x;
+	mad.lo.s32 	%r1, %r69, %r70, %r71;
+	setp.ge.u32 	%p1, %r1, %r68;
+	@%p1 bra 	$L__BB13_127;
+	bra.uni 	$L__BB13_1;
+$L__BB13_1:                             // %bb5
+	mul.wide.u32 	%rd110, %r1, 4;
+	add.s64 	%rd111, %rd1, %rd110;
+	ld.global.b32 	%r72, [%rd111];
+	add.s64 	%rd112, %rd2, %rd110;
+	ld.global.b32 	%r2, [%rd112];
+	cvt.u64.u32 	%rd18, %r72;
+	mul.wide.u32 	%rd113, %r72, 12;
+	setp.eq.b32 	%p3, %r2, 0;
+	mul.lo.s64 	%rd599, %rd18, 12;
+	@%p3 bra 	$L__BB13_3;
+	bra.uni 	$L__BB13_2;
+$L__BB13_2:                             // %bb7.preheader
+	add.s64 	%rd114, %rd599, %rd4;
+	add.s64 	%rd610, %rd114, 4;
+	add.s64 	%rd115, %rd599, %rd3;
+	add.s64 	%rd609, %rd115, 8;
+	mov.b32 	%r366, %r2;
+	bra.uni 	$L__BB13_5;
+$L__BB13_3:                             // %bb1.i.preheader
+	ld.param.b32 	%r65, [fs_fit_param_16];
+	ld.param.b32 	%r64, [fs_fit_param_15];
+	ld.param.b32 	%r63, [fs_fit_param_14];
+	add.s64 	%rd19, %rd4, %rd113;
+	add.s32 	%r3, %r2, -1;
+	setp.lt.u32 	%p5, %r3, 2;
+	@%p5 bra 	$L__BB13_7;
+	bra.uni 	$L__BB13_4;
+$L__BB13_4:                             // %bb3.i.preheader.preheader
+	ld.param.b32 	%r62, [fs_fit_param_9];
+	setp.eq.b32 	%p2, %r62, 1;
+	ld.param.b32 	%r67, [fs_fit_param_19];
+	ld.param.b32 	%r66, [fs_fit_param_18];
+	selp.b64 	%rd13, %rd5, %rd6, %p2;
+	selp.b64 	%rd14, %rd7, %rd8, %p2;
+	selp.b64 	%rd15, %rd6, %rd5, %p2;
+	selp.b64 	%rd16, %rd8, %rd7, %p2;
+	cvt.rn.f64.u32 	%rd20, %r65;
+	cvt.rn.f64.u32 	%rd21, %r64;
+	cvt.rn.f64.u32 	%rd22, %r63;
+	neg.s32 	%r4, %r2;
+	add.s64 	%rd116, %rd599, %rd4;
+	add.s64 	%rd23, %rd116, 16;
+	add.s64 	%rd117, %rd599, %rd3;
+	add.s64 	%rd24, %rd117, 20;
+	mov.b32 	%r367, 0;
+	bra.uni 	$L__BB13_6;
+$L__BB13_5:                             // %bb7
+                                        // =>This Inner Loop Header: Depth=1
+	ld.global.b32 	%r73, [%rd609+-8];
+	ld.global.b32 	%r74, [%rd609+-4];
+	ld.global.b32 	%r75, [%rd609];
+	st.global.b32 	[%rd610+-4], %r73;
+	st.global.b32 	[%rd610], %r74;
+	st.global.b32 	[%rd610+4], %r75;
+	add.s32 	%r366, %r366, -1;
+	add.s64 	%rd610, %rd610, 12;
+	add.s64 	%rd609, %rd609, 12;
+	setp.eq.b32 	%p4, %r366, 0;
+	@%p4 bra 	$L__BB13_3;
+	bra.uni 	$L__BB13_5;
+$L__BB13_6:                             // %bb3.i.preheader
+                                        // =>This Loop Header: Depth=1
+                                        //     Child Loop BB13_9 Depth 2
+	mov.b32 	%r368, 3;
+	mov.b64 	%rd611, %rd24;
+	mov.b64 	%rd612, %rd23;
+	bra.uni 	$L__BB13_9;
+$L__BB13_7:                             // %bb29.i.preheader.split
+	cvt.u64.u32 	%rd17, %r1;
+	setp.lt.u32 	%p90, %r2, 2;
+	mov.b32 	%r378, 0f00000000;
+	@%p90 bra 	$L__BB13_116;
+	bra.uni 	$L__BB13_8;
+$L__BB13_8:                             // %bb30.i.preheader
+	mad.lo.s64 	%rd501, %rd18, 12, %rd4;
+	add.s64 	%rd624, %rd501, 12;
+	mov.b32 	%r378, 0f00000000;
+	mov.b32 	%r377, %r3;
+	bra.uni 	$L__BB13_115;
+$L__BB13_9:                             // %bb4.i
+                                        //   Parent Loop BB13_6 Depth=1
+                                        // =>  This Inner Loop Header: Depth=2
+	mov.b64 	%rd25, %rd612;
+	add.s32 	%r76, %r4, %r368;
+	ld.global.b32 	%r5, [%rd25+-16];
+	ld.global.b32 	%r6, [%rd25+-12];
+	ld.global.b32 	%r7, [%rd25+-8];
+	ld.global.b32 	%r8, [%rd25+-4];
+	ld.global.b32 	%r9, [%rd25];
+	ld.global.b32 	%r10, [%rd25+4];
+	ld.global.b32 	%r11, [%rd25+8];
+	ld.global.b32 	%r12, [%rd25+12];
+	ld.global.b32 	%r13, [%rd25+16];
+	setp.ne.b32 	%p6, %r368, 3;
+	setp.ne.b32 	%p7, %r76, 0;
+	and.pred 	%p8, %p6, %p7;
+	cvt.f64.f32 	%rd600, %r5;
+	cvt.f64.f32 	%rd601, %r8;
+	cvt.f64.f32 	%rd602, %r11;
+	cvt.f64.f32 	%rd603, %r6;
+	cvt.f64.f32 	%rd604, %r9;
+	cvt.f64.f32 	%rd605, %r12;
+	cvt.f64.f32 	%rd606, %r7;
+	cvt.f64.f32 	%rd607, %r10;
+	cvt.f64.f32 	%rd608, %r13;
+	@%p8 bra 	$L__BB13_11;
+	bra.uni 	$L__BB13_10;
+$L__BB13_10:                            // %bb8.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	mov.b64 	%rd168, 0d3FD0000000000000;
+	mul.rn.f64 	%rd169, %rd168, %rd600;
+	mov.b64 	%rd170, 0d3FE0000000000000;
+	mul.rn.f64 	%rd171, %rd170, %rd601;
+	add.rn.f64 	%rd172, %rd169, %rd171;
+	mul.rn.f64 	%rd173, %rd168, %rd602;
+	add.rn.f64 	%rd613, %rd172, %rd173;
+	mul.rn.f64 	%rd174, %rd168, %rd603;
+	mul.rn.f64 	%rd175, %rd170, %rd604;
+	add.rn.f64 	%rd176, %rd174, %rd175;
+	mul.rn.f64 	%rd177, %rd168, %rd605;
+	add.rn.f64 	%rd614, %rd176, %rd177;
+	mul.rn.f64 	%rd178, %rd168, %rd606;
+	mul.rn.f64 	%rd179, %rd170, %rd607;
+	add.rn.f64 	%rd180, %rd178, %rd179;
+	mul.rn.f64 	%rd181, %rd168, %rd608;
+	add.rn.f64 	%rd615, %rd180, %rd181;
+	bra.uni 	$L__BB13_12;
+$L__BB13_11:                            // %bb12.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	add.s32 	%r77, %r368, -4;
+	mul.wide.u32 	%rd118, %r77, 12;
+	add.s64 	%rd119, %rd19, %rd118;
+	ld.global.b32 	%r78, [%rd119];
+	ld.global.b32 	%r79, [%rd119+4];
+	ld.global.b32 	%r80, [%rd119+8];
+	mul.wide.u32 	%rd120, %r368, 12;
+	add.s64 	%rd121, %rd19, %rd120;
+	ld.global.b32 	%r81, [%rd121];
+	ld.global.b32 	%r82, [%rd121+4];
+	ld.global.b32 	%r83, [%rd121+8];
+	add.rn.f32 	%r84, %r5, %r11;
+	cvt.f64.f32 	%rd122, %r84;
+	mov.b64 	%rd123, 0d3FE0000000000000;
+	mul.rn.f64 	%rd124, %rd123, %rd122;
+	neg.f32 	%r85, %r78;
+	cvt.f64.f32 	%rd125, %r85;
+	mov.b64 	%rd126, 0d4010000000000000;
+	mul.rn.f64 	%rd127, %rd126, %rd600;
+	add.rn.f64 	%rd128, %rd125, %rd127;
+	mul.rn.f64 	%rd129, %rd126, %rd602;
+	add.rn.f64 	%rd130, %rd128, %rd129;
+	cvt.f64.f32 	%rd131, %r81;
+	sub.rn.f64 	%rd132, %rd130, %rd131;
+	div.rn.f64 	%rd133, %rd132, 0d4018000000000000;
+	mul.rn.f64 	%rd134, %rd123, %rd601;
+	mov.b64 	%rd135, 0d3FD3333333333333;
+	mul.rn.f64 	%rd136, %rd135, %rd124;
+	add.rn.f64 	%rd137, %rd134, %rd136;
+	mov.b64 	%rd138, 0d3FC999999999999A;
+	mul.rn.f64 	%rd139, %rd138, %rd133;
+	add.rn.f64 	%rd613, %rd137, %rd139;
+	add.rn.f32 	%r86, %r6, %r12;
+	cvt.f64.f32 	%rd140, %r86;
+	mul.rn.f64 	%rd141, %rd123, %rd140;
+	neg.f32 	%r87, %r79;
+	cvt.f64.f32 	%rd142, %r87;
+	mul.rn.f64 	%rd143, %rd126, %rd603;
+	add.rn.f64 	%rd144, %rd142, %rd143;
+	mul.rn.f64 	%rd145, %rd126, %rd605;
+	add.rn.f64 	%rd146, %rd144, %rd145;
+	cvt.f64.f32 	%rd147, %r82;
+	sub.rn.f64 	%rd148, %rd146, %rd147;
+	div.rn.f64 	%rd149, %rd148, 0d4018000000000000;
+	mul.rn.f64 	%rd150, %rd123, %rd604;
+	mul.rn.f64 	%rd151, %rd135, %rd141;
+	add.rn.f64 	%rd152, %rd150, %rd151;
+	mul.rn.f64 	%rd153, %rd138, %rd149;
+	add.rn.f64 	%rd614, %rd152, %rd153;
+	add.rn.f32 	%r88, %r7, %r13;
+	cvt.f64.f32 	%rd154, %r88;
+	mul.rn.f64 	%rd155, %rd123, %rd154;
+	neg.f32 	%r89, %r80;
+	cvt.f64.f32 	%rd156, %r89;
+	mul.rn.f64 	%rd157, %rd126, %rd606;
+	add.rn.f64 	%rd158, %rd156, %rd157;
+	mul.rn.f64 	%rd159, %rd126, %rd608;
+	add.rn.f64 	%rd160, %rd158, %rd159;
+	cvt.f64.f32 	%rd161, %r83;
+	sub.rn.f64 	%rd162, %rd160, %rd161;
+	div.rn.f64 	%rd163, %rd162, 0d4018000000000000;
+	mul.rn.f64 	%rd164, %rd123, %rd607;
+	mul.rn.f64 	%rd165, %rd135, %rd155;
+	add.rn.f64 	%rd166, %rd164, %rd165;
+	mul.rn.f64 	%rd167, %rd138, %rd163;
+	add.rn.f64 	%rd615, %rd166, %rd167;
+$L__BB13_12:                            // %bb16.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	ld.global.b32 	%r14, [%rd611+-8];
+	ld.global.b32 	%r15, [%rd611+-4];
+	ld.global.b32 	%r16, [%rd611];
+	cvt.f64.f32 	%rd26, %r14;
+	cvt.f64.f32 	%rd27, %r15;
+	cvt.f64.f32 	%rd28, %r16;
+	sub.rn.f64 	%rd29, %rd613, %rd26;
+	sub.rn.f64 	%rd30, %rd614, %rd27;
+	sub.rn.f64 	%rd31, %rd615, %rd28;
+	mul.rn.f64 	%rd182, %rd29, %rd29;
+	mul.rn.f64 	%rd183, %rd30, %rd30;
+	add.rn.f64 	%rd184, %rd182, %rd183;
+	mul.rn.f64 	%rd185, %rd31, %rd31;
+	add.rn.f64 	%rd186, %rd184, %rd185;
+	sqrt.rn.f64 	%rd32, %rd186;
+	setp.leu.f64 	%p9, %rd32, 0d3FD3333333333333;
+	@%p9 bra 	$L__BB13_14;
+	bra.uni 	$L__BB13_13;
+$L__BB13_13:                            // %bb18.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	mov.b64 	%rd187, 0d3FD3333333333333;
+	div.rn.f64 	%rd188, %rd187, %rd32;
+	mul.rn.f64 	%rd189, %rd29, %rd188;
+	add.rn.f64 	%rd613, %rd26, %rd189;
+	mul.rn.f64 	%rd190, %rd30, %rd188;
+	add.rn.f64 	%rd614, %rd27, %rd190;
+	mul.rn.f64 	%rd191, %rd31, %rd188;
+	add.rn.f64 	%rd615, %rd28, %rd191;
+$L__BB13_14:                            // %bb20.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	mov.b64 	%rd192, 0dBFF004189374BC6A;
+	add.rn.f64 	%rd193, %rd20, %rd192;
+	setp.geu.f32 	%p10, %r14, 0f00000000;
+	setp.geu.f64 	%p11, %rd193, %rd26;
+	cvt.rn.f32.f64 	%r90, %rd193;
+	cvt.f64.f32 	%rd194, %r90;
+	selp.f64 	%rd195, %rd26, %rd194, %p11;
+	selp.f64 	%rd196, %rd195, 0d0000000000000000, %p10;
+	max.f64 	%rd197, %rd196, 0d0000000000000000;
+	min.f64 	%rd198, %rd197, 0d41EFFFFFFFE00000;
+	cvt.rzi.u32.f64 	%r17, %rd198;
+	add.rn.f64 	%rd201, %rd21, %rd192;
+	setp.geu.f32 	%p12, %r15, 0f00000000;
+	setp.geu.f64 	%p13, %rd201, %rd27;
+	cvt.rn.f32.f64 	%r91, %rd201;
+	cvt.f64.f32 	%rd202, %r91;
+	selp.f64 	%rd203, %rd27, %rd202, %p13;
+	selp.f64 	%rd204, %rd203, 0d0000000000000000, %p12;
+	max.f64 	%rd205, %rd204, 0d0000000000000000;
+	min.f64 	%rd206, %rd205, 0d41EFFFFFFFE00000;
+	cvt.rzi.u32.f64 	%r19, %rd206;
+	add.rn.f64 	%rd209, %rd22, %rd192;
+	setp.geu.f32 	%p14, %r16, 0f00000000;
+	setp.geu.f64 	%p15, %rd209, %rd28;
+	cvt.rn.f32.f64 	%r92, %rd209;
+	cvt.f64.f32 	%rd210, %r92;
+	selp.f64 	%rd211, %rd28, %rd210, %p15;
+	selp.f64 	%rd212, %rd211, 0d0000000000000000, %p14;
+	max.f64 	%rd213, %rd212, 0d0000000000000000;
+	min.f64 	%rd214, %rd213, 0d41EFFFFFFFE00000;
+	cvt.rzi.u32.f64 	%r21, %rd214;
+	shr.u32 	%r93, %r21, 4;
+	mul.lo.s32 	%r23, %r93, %r66;
+	shr.u32 	%r24, %r19, 4;
+	add.s32 	%r94, %r23, %r24;
+	mul.lo.s32 	%r25, %r94, %r67;
+	shr.u32 	%r26, %r17, 4;
+	add.s32 	%r95, %r25, %r26;
+	mul.wide.u32 	%rd217, %r95, 4;
+	add.s64 	%rd218, %rd15, %rd217;
+	ld.global.b32 	%rd34, [%rd218];
+	setp.eq.b64 	%p16, %rd34, 4294967295;
+	mov.b16 	%rs49, 0;
+	shl.b32 	%r354, %r21, 8;
+	shl.b32 	%r355, %r19, 4;
+	and.b32 	%r356, %r17, 15;
+	@%p16 bra 	$L__BB13_16;
+	bra.uni 	$L__BB13_15;
+$L__BB13_15:                            // %bb2.i106.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r96, %r354, 3840;
+	and.b32 	%r97, %r355, 240;
+	or.b32 	%r98, %r97, %r356;
+	or.b32 	%r99, %r98, %r96;
+	shl.b64 	%rd219, %rd34, 12;
+	cvt.u64.u32 	%rd220, %r99;
+	add.s64 	%rd221, %rd16, %rd219;
+	add.s64 	%rd222, %rd221, %rd220;
+	ld.global.b8 	%rs49, [%rd222];
+$L__BB13_16:                            // %fibrs_kernels__finish__Pooled__get.exit123.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.eq.b16 	%p17, %rs49, 0;
+	mov.b64 	%rd616, 0d0000000000000000;
+	@%p17 bra 	$L__BB13_20;
+	bra.uni 	$L__BB13_17;
+$L__BB13_17:                            // %bb3.i.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd33, %r95;
+	shl.b64 	%rd223, %rd33, 2;
+	add.s64 	%rd224, %rd13, %rd223;
+	ld.global.b32 	%rd35, [%rd224];
+	setp.eq.b64 	%p18, %rd35, 4294967295;
+	mov.b16 	%rs50, 0;
+	@%p18 bra 	$L__BB13_19;
+	bra.uni 	$L__BB13_18;
+$L__BB13_18:                            // %bb2.i73.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r100, %r354, 3840;
+	and.b32 	%r101, %r355, 240;
+	or.b32 	%r102, %r101, %r356;
+	or.b32 	%r103, %r102, %r100;
+	shl.b64 	%rd225, %rd35, 12;
+	cvt.u64.u32 	%rd226, %r103;
+	add.s64 	%rd227, %rd14, %rd225;
+	add.s64 	%rd228, %rd227, %rd226;
+	ld.global.b8 	%rs50, [%rd228];
+$L__BB13_19:                            // %fibrs_kernels__finish__Pooled__get.exit90.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p19, %rs49, %rs50;
+	add.s16 	%rs1, %rs49, %rs50;
+	min.u16 	%rs2, %rs1, 255;
+	selp.b16 	%rs3, 0, %rs2, %p19;
+	cvt.rn.f64.u16 	%rd616, %rs3;
+$L__BB13_20:                            // %fibrs_kernels__finish__presence.exit.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	add.s32 	%r27, %r17, 1;
+	shr.u32 	%r28, %r27, 4;
+	add.s32 	%r104, %r25, %r28;
+	mul.wide.u32 	%rd229, %r104, 4;
+	add.s64 	%rd230, %rd15, %rd229;
+	ld.global.b32 	%rd37, [%rd230];
+	setp.eq.b64 	%p20, %rd37, 4294967295;
+	mov.b16 	%rs51, 0;
+	and.b32 	%r357, %r27, 15;
+	@%p20 bra 	$L__BB13_22;
+	bra.uni 	$L__BB13_21;
+$L__BB13_21:                            // %bb2.i39.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r105, %r354, 3840;
+	and.b32 	%r106, %r355, 240;
+	or.b32 	%r107, %r106, %r357;
+	or.b32 	%r108, %r107, %r105;
+	shl.b64 	%rd231, %rd37, 12;
+	cvt.u64.u32 	%rd232, %r108;
+	add.s64 	%rd233, %rd16, %rd231;
+	add.s64 	%rd234, %rd233, %rd232;
+	ld.global.b8 	%rs51, [%rd234];
+$L__BB13_22:                            // %fibrs_kernels__finish__Pooled__get.exit56.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.eq.b16 	%p21, %rs51, 0;
+	mov.b32 	%r369, 0f00000000;
+	@%p21 bra 	$L__BB13_26;
+	bra.uni 	$L__BB13_23;
+$L__BB13_23:                            // %bb3.i3.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd36, %r104;
+	shl.b64 	%rd235, %rd36, 2;
+	add.s64 	%rd236, %rd13, %rd235;
+	ld.global.b32 	%rd38, [%rd236];
+	setp.eq.b64 	%p22, %rd38, 4294967295;
+	mov.b16 	%rs52, 0;
+	@%p22 bra 	$L__BB13_25;
+	bra.uni 	$L__BB13_24;
+$L__BB13_24:                            // %bb2.i.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r109, %r354, 3840;
+	and.b32 	%r110, %r355, 240;
+	or.b32 	%r111, %r110, %r357;
+	or.b32 	%r112, %r111, %r109;
+	shl.b64 	%rd237, %rd38, 12;
+	cvt.u64.u32 	%rd238, %r112;
+	add.s64 	%rd239, %rd14, %rd237;
+	add.s64 	%rd240, %rd239, %rd238;
+	ld.global.b8 	%rs52, [%rd240];
+$L__BB13_25:                            // %fibrs_kernels__finish__Pooled__get.exit.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p23, %rs51, %rs52;
+	add.s16 	%rs4, %rs51, %rs52;
+	min.u16 	%rs5, %rs4, 255;
+	selp.b16 	%rs6, 0, %rs5, %p23;
+	cvt.rn.f32.u16 	%r369, %rs6;
+$L__BB13_26:                            // %_RNCNvNtCsi0DaIIAXpBr_13fibrs_kernels6finish15trilin_presences_0B5_.exit
+                                        //   in Loop: Header=BB13_9 Depth=2
+	add.s32 	%r29, %r19, 1;
+	shr.u32 	%r30, %r29, 4;
+	add.s32 	%r114, %r23, %r30;
+	mul.lo.s32 	%r31, %r114, %r67;
+	add.s32 	%r115, %r31, %r26;
+	mul.wide.u32 	%rd246, %r115, 4;
+	add.s64 	%rd247, %rd15, %rd246;
+	ld.global.b32 	%rd42, [%rd247];
+	setp.eq.b64 	%p24, %rd42, 4294967295;
+	mov.b16 	%rs53, 0;
+	shl.b32 	%r358, %r29, 4;
+	@%p24 bra 	$L__BB13_28;
+	bra.uni 	$L__BB13_27;
+$L__BB13_27:                            // %bb2.i106.i357
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r116, %r354, 3840;
+	and.b32 	%r117, %r358, 240;
+	or.b32 	%r118, %r116, %r356;
+	or.b32 	%r119, %r118, %r117;
+	shl.b64 	%rd248, %rd42, 12;
+	cvt.u64.u32 	%rd249, %r119;
+	add.s64 	%rd250, %rd16, %rd248;
+	add.s64 	%rd251, %rd250, %rd249;
+	ld.global.b8 	%rs53, [%rd251];
+$L__BB13_28:                            // %fibrs_kernels__finish__Pooled__get.exit123.i372
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.eq.b16 	%p25, %rs53, 0;
+	mov.b64 	%rd617, 0d0000000000000000;
+	@%p25 bra 	$L__BB13_32;
+	bra.uni 	$L__BB13_29;
+$L__BB13_29:                            // %bb3.i.i375
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd41, %r115;
+	shl.b64 	%rd252, %rd41, 2;
+	add.s64 	%rd253, %rd13, %rd252;
+	ld.global.b32 	%rd43, [%rd253];
+	setp.eq.b64 	%p26, %rd43, 4294967295;
+	mov.b16 	%rs54, 0;
+	@%p26 bra 	$L__BB13_31;
+	bra.uni 	$L__BB13_30;
+$L__BB13_30:                            // %bb2.i73.i389
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r120, %r354, 3840;
+	and.b32 	%r121, %r358, 240;
+	or.b32 	%r122, %r120, %r356;
+	or.b32 	%r123, %r122, %r121;
+	shl.b64 	%rd254, %rd43, 12;
+	cvt.u64.u32 	%rd255, %r123;
+	add.s64 	%rd256, %rd14, %rd254;
+	add.s64 	%rd257, %rd256, %rd255;
+	ld.global.b8 	%rs54, [%rd257];
+$L__BB13_31:                            // %fibrs_kernels__finish__Pooled__get.exit90.i404
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p27, %rs53, %rs54;
+	add.s16 	%rs7, %rs53, %rs54;
+	min.u16 	%rs8, %rs7, 255;
+	selp.b16 	%rs9, 0, %rs8, %p27;
+	cvt.rn.f64.u16 	%rd617, %rs9;
+$L__BB13_32:                            // %fibrs_kernels__finish__presence.exit.i409
+                                        //   in Loop: Header=BB13_9 Depth=2
+	add.s32 	%r124, %r31, %r28;
+	mul.wide.u32 	%rd258, %r124, 4;
+	add.s64 	%rd259, %rd15, %rd258;
+	ld.global.b32 	%rd45, [%rd259];
+	setp.eq.b64 	%p28, %rd45, 4294967295;
+	mov.b16 	%rs55, 0;
+	@%p28 bra 	$L__BB13_34;
+	bra.uni 	$L__BB13_33;
+$L__BB13_33:                            // %bb2.i39.i418
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r125, %r354, 3840;
+	and.b32 	%r126, %r358, 240;
+	or.b32 	%r127, %r125, %r357;
+	or.b32 	%r128, %r127, %r126;
+	shl.b64 	%rd260, %rd45, 12;
+	cvt.u64.u32 	%rd261, %r128;
+	add.s64 	%rd262, %rd16, %rd260;
+	add.s64 	%rd263, %rd262, %rd261;
+	ld.global.b8 	%rs55, [%rd263];
+$L__BB13_34:                            // %fibrs_kernels__finish__Pooled__get.exit56.i433
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.eq.b16 	%p29, %rs55, 0;
+	mov.b32 	%r370, 0f00000000;
+	@%p29 bra 	$L__BB13_38;
+	bra.uni 	$L__BB13_35;
+$L__BB13_35:                            // %bb3.i3.i436
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd44, %r124;
+	shl.b64 	%rd264, %rd44, 2;
+	add.s64 	%rd265, %rd13, %rd264;
+	ld.global.b32 	%rd46, [%rd265];
+	setp.eq.b64 	%p30, %rd46, 4294967295;
+	mov.b16 	%rs56, 0;
+	@%p30 bra 	$L__BB13_37;
+	bra.uni 	$L__BB13_36;
+$L__BB13_36:                            // %bb2.i.i450
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r129, %r354, 3840;
+	and.b32 	%r130, %r358, 240;
+	or.b32 	%r131, %r129, %r357;
+	or.b32 	%r132, %r131, %r130;
+	shl.b64 	%rd266, %rd46, 12;
+	cvt.u64.u32 	%rd267, %r132;
+	add.s64 	%rd268, %rd14, %rd266;
+	add.s64 	%rd269, %rd268, %rd267;
+	ld.global.b8 	%rs56, [%rd269];
+$L__BB13_37:                            // %fibrs_kernels__finish__Pooled__get.exit.i465
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p31, %rs55, %rs56;
+	add.s16 	%rs10, %rs55, %rs56;
+	min.u16 	%rs11, %rs10, 255;
+	selp.b16 	%rs12, 0, %rs11, %p31;
+	cvt.rn.f32.u16 	%r370, %rs12;
+$L__BB13_38:                            // %_RNCNvNtCsi0DaIIAXpBr_13fibrs_kernels6finish15trilin_presences_0B5_.exit481
+                                        //   in Loop: Header=BB13_9 Depth=2
+	add.s32 	%r32, %r21, 1;
+	shr.u32 	%r134, %r32, 4;
+	mul.lo.s32 	%r33, %r134, %r66;
+	add.s32 	%r135, %r33, %r24;
+	mul.lo.s32 	%r34, %r135, %r67;
+	add.s32 	%r136, %r34, %r26;
+	mul.wide.u32 	%rd274, %r136, 4;
+	add.s64 	%rd275, %rd15, %rd274;
+	ld.global.b32 	%rd49, [%rd275];
+	setp.eq.b64 	%p32, %rd49, 4294967295;
+	mov.b16 	%rs57, 0;
+	shl.b32 	%r359, %r32, 8;
+	@%p32 bra 	$L__BB13_40;
+	bra.uni 	$L__BB13_39;
+$L__BB13_39:                            // %bb2.i106.i513
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r137, %r359, 3840;
+	and.b32 	%r138, %r355, 240;
+	or.b32 	%r139, %r138, %r356;
+	or.b32 	%r140, %r139, %r137;
+	shl.b64 	%rd276, %rd49, 12;
+	cvt.u64.u32 	%rd277, %r140;
+	add.s64 	%rd278, %rd16, %rd276;
+	add.s64 	%rd279, %rd278, %rd277;
+	ld.global.b8 	%rs57, [%rd279];
+$L__BB13_40:                            // %fibrs_kernels__finish__Pooled__get.exit123.i528
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.eq.b16 	%p33, %rs57, 0;
+	mov.b64 	%rd618, 0d0000000000000000;
+	@%p33 bra 	$L__BB13_44;
+	bra.uni 	$L__BB13_41;
+$L__BB13_41:                            // %bb3.i.i531
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd48, %r136;
+	shl.b64 	%rd280, %rd48, 2;
+	add.s64 	%rd281, %rd13, %rd280;
+	ld.global.b32 	%rd50, [%rd281];
+	setp.eq.b64 	%p34, %rd50, 4294967295;
+	mov.b16 	%rs58, 0;
+	@%p34 bra 	$L__BB13_43;
+	bra.uni 	$L__BB13_42;
+$L__BB13_42:                            // %bb2.i73.i545
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r141, %r359, 3840;
+	and.b32 	%r142, %r355, 240;
+	or.b32 	%r143, %r142, %r356;
+	or.b32 	%r144, %r143, %r141;
+	shl.b64 	%rd282, %rd50, 12;
+	cvt.u64.u32 	%rd283, %r144;
+	add.s64 	%rd284, %rd14, %rd282;
+	add.s64 	%rd285, %rd284, %rd283;
+	ld.global.b8 	%rs58, [%rd285];
+$L__BB13_43:                            // %fibrs_kernels__finish__Pooled__get.exit90.i560
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p35, %rs57, %rs58;
+	add.s16 	%rs13, %rs57, %rs58;
+	min.u16 	%rs14, %rs13, 255;
+	selp.b16 	%rs15, 0, %rs14, %p35;
+	cvt.rn.f64.u16 	%rd618, %rs15;
+$L__BB13_44:                            // %fibrs_kernels__finish__presence.exit.i565
+                                        //   in Loop: Header=BB13_9 Depth=2
+	add.s32 	%r145, %r34, %r28;
+	mul.wide.u32 	%rd286, %r145, 4;
+	add.s64 	%rd287, %rd15, %rd286;
+	ld.global.b32 	%rd52, [%rd287];
+	setp.eq.b64 	%p36, %rd52, 4294967295;
+	mov.b16 	%rs59, 0;
+	@%p36 bra 	$L__BB13_46;
+	bra.uni 	$L__BB13_45;
+$L__BB13_45:                            // %bb2.i39.i574
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r146, %r359, 3840;
+	and.b32 	%r147, %r355, 240;
+	or.b32 	%r148, %r147, %r357;
+	or.b32 	%r149, %r148, %r146;
+	shl.b64 	%rd288, %rd52, 12;
+	cvt.u64.u32 	%rd289, %r149;
+	add.s64 	%rd290, %rd16, %rd288;
+	add.s64 	%rd291, %rd290, %rd289;
+	ld.global.b8 	%rs59, [%rd291];
+$L__BB13_46:                            // %fibrs_kernels__finish__Pooled__get.exit56.i589
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.eq.b16 	%p37, %rs59, 0;
+	mov.b32 	%r371, 0f00000000;
+	@%p37 bra 	$L__BB13_50;
+	bra.uni 	$L__BB13_47;
+$L__BB13_47:                            // %bb3.i3.i592
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd51, %r145;
+	shl.b64 	%rd292, %rd51, 2;
+	add.s64 	%rd293, %rd13, %rd292;
+	ld.global.b32 	%rd53, [%rd293];
+	setp.eq.b64 	%p38, %rd53, 4294967295;
+	mov.b16 	%rs60, 0;
+	@%p38 bra 	$L__BB13_49;
+	bra.uni 	$L__BB13_48;
+$L__BB13_48:                            // %bb2.i.i606
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r150, %r359, 3840;
+	and.b32 	%r151, %r355, 240;
+	or.b32 	%r152, %r151, %r357;
+	or.b32 	%r153, %r152, %r150;
+	shl.b64 	%rd294, %rd53, 12;
+	cvt.u64.u32 	%rd295, %r153;
+	add.s64 	%rd296, %rd14, %rd294;
+	add.s64 	%rd297, %rd296, %rd295;
+	ld.global.b8 	%rs60, [%rd297];
+$L__BB13_49:                            // %fibrs_kernels__finish__Pooled__get.exit.i621
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p39, %rs59, %rs60;
+	add.s16 	%rs16, %rs59, %rs60;
+	min.u16 	%rs17, %rs16, 255;
+	selp.b16 	%rs18, 0, %rs17, %p39;
+	cvt.rn.f32.u16 	%r371, %rs18;
+$L__BB13_50:                            // %_RNCNvNtCsi0DaIIAXpBr_13fibrs_kernels6finish15trilin_presences_0B5_.exit637
+                                        //   in Loop: Header=BB13_9 Depth=2
+	add.s32 	%r155, %r33, %r30;
+	mul.lo.s32 	%r35, %r155, %r67;
+	add.s32 	%r156, %r35, %r26;
+	mul.wide.u32 	%rd302, %r156, 4;
+	add.s64 	%rd303, %rd15, %rd302;
+	ld.global.b32 	%rd56, [%rd303];
+	setp.eq.b64 	%p40, %rd56, 4294967295;
+	mov.b16 	%rs61, 0;
+	@%p40 bra 	$L__BB13_52;
+	bra.uni 	$L__BB13_51;
+$L__BB13_51:                            // %bb2.i106.i669
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r157, %r359, 3840;
+	and.b32 	%r158, %r358, 240;
+	or.b32 	%r159, %r158, %r356;
+	or.b32 	%r160, %r159, %r157;
+	shl.b64 	%rd304, %rd56, 12;
+	cvt.u64.u32 	%rd305, %r160;
+	add.s64 	%rd306, %rd16, %rd304;
+	add.s64 	%rd307, %rd306, %rd305;
+	ld.global.b8 	%rs61, [%rd307];
+$L__BB13_52:                            // %fibrs_kernels__finish__Pooled__get.exit123.i684
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.eq.b16 	%p41, %rs61, 0;
+	mov.b64 	%rd619, 0d0000000000000000;
+	@%p41 bra 	$L__BB13_56;
+	bra.uni 	$L__BB13_53;
+$L__BB13_53:                            // %bb3.i.i687
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd55, %r156;
+	shl.b64 	%rd308, %rd55, 2;
+	add.s64 	%rd309, %rd13, %rd308;
+	ld.global.b32 	%rd57, [%rd309];
+	setp.eq.b64 	%p42, %rd57, 4294967295;
+	mov.b16 	%rs62, 0;
+	@%p42 bra 	$L__BB13_55;
+	bra.uni 	$L__BB13_54;
+$L__BB13_54:                            // %bb2.i73.i701
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r161, %r359, 3840;
+	and.b32 	%r162, %r358, 240;
+	or.b32 	%r163, %r162, %r356;
+	or.b32 	%r164, %r163, %r161;
+	shl.b64 	%rd310, %rd57, 12;
+	cvt.u64.u32 	%rd311, %r164;
+	add.s64 	%rd312, %rd14, %rd310;
+	add.s64 	%rd313, %rd312, %rd311;
+	ld.global.b8 	%rs62, [%rd313];
+$L__BB13_55:                            // %fibrs_kernels__finish__Pooled__get.exit90.i716
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p43, %rs61, %rs62;
+	add.s16 	%rs19, %rs61, %rs62;
+	min.u16 	%rs20, %rs19, 255;
+	selp.b16 	%rs21, 0, %rs20, %p43;
+	cvt.rn.f64.u16 	%rd619, %rs21;
+$L__BB13_56:                            // %fibrs_kernels__finish__presence.exit.i721
+                                        //   in Loop: Header=BB13_9 Depth=2
+	add.s32 	%r165, %r35, %r28;
+	mul.wide.u32 	%rd314, %r165, 4;
+	add.s64 	%rd315, %rd15, %rd314;
+	ld.global.b32 	%rd59, [%rd315];
+	setp.eq.b64 	%p44, %rd59, 4294967295;
+	mov.b16 	%rs63, 0;
+	@%p44 bra 	$L__BB13_58;
+	bra.uni 	$L__BB13_57;
+$L__BB13_57:                            // %bb2.i39.i730
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r166, %r359, 3840;
+	and.b32 	%r167, %r358, 240;
+	or.b32 	%r168, %r167, %r357;
+	or.b32 	%r169, %r168, %r166;
+	shl.b64 	%rd316, %rd59, 12;
+	cvt.u64.u32 	%rd317, %r169;
+	add.s64 	%rd318, %rd16, %rd316;
+	add.s64 	%rd319, %rd318, %rd317;
+	ld.global.b8 	%rs63, [%rd319];
+$L__BB13_58:                            // %fibrs_kernels__finish__Pooled__get.exit56.i745
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.eq.b16 	%p45, %rs63, 0;
+	mov.b32 	%r372, 0f00000000;
+	@%p45 bra 	$L__BB13_62;
+	bra.uni 	$L__BB13_59;
+$L__BB13_59:                            // %bb3.i3.i748
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd58, %r165;
+	shl.b64 	%rd320, %rd58, 2;
+	add.s64 	%rd321, %rd13, %rd320;
+	ld.global.b32 	%rd60, [%rd321];
+	setp.eq.b64 	%p46, %rd60, 4294967295;
+	mov.b16 	%rs64, 0;
+	@%p46 bra 	$L__BB13_61;
+	bra.uni 	$L__BB13_60;
+$L__BB13_60:                            // %bb2.i.i762
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r170, %r359, 3840;
+	and.b32 	%r171, %r358, 240;
+	or.b32 	%r172, %r171, %r357;
+	or.b32 	%r173, %r172, %r170;
+	shl.b64 	%rd322, %rd60, 12;
+	cvt.u64.u32 	%rd323, %r173;
+	add.s64 	%rd324, %rd14, %rd322;
+	add.s64 	%rd325, %rd324, %rd323;
+	ld.global.b8 	%rs64, [%rd325];
+$L__BB13_61:                            // %fibrs_kernels__finish__Pooled__get.exit.i777
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p47, %rs63, %rs64;
+	add.s16 	%rs22, %rs63, %rs64;
+	min.u16 	%rs23, %rs22, 255;
+	selp.b16 	%rs24, 0, %rs23, %p47;
+	cvt.rn.f32.u16 	%r372, %rs24;
+$L__BB13_62:                            // %_RNCNvNtCsi0DaIIAXpBr_13fibrs_kernels6finish15trilin_presences_0B5_.exit793
+                                        //   in Loop: Header=BB13_9 Depth=2
+	mov.b64 	%rd343, 0dBFF004189374BC6A;
+	add.rn.f64 	%rd344, %rd20, %rd343;
+	setp.geu.f64 	%p48, %rd613, 0d0000000000000000;
+	setp.leu.f64 	%p49, %rd613, %rd344;
+	cvt.rn.f32.f64 	%r175, %rd344;
+	cvt.f64.f32 	%rd345, %r175;
+	selp.f64 	%rd346, %rd613, %rd345, %p49;
+	selp.f64 	%rd347, %rd346, 0d0000000000000000, %p48;
+	max.f64 	%rd348, %rd347, 0d0000000000000000;
+	min.f64 	%rd349, %rd348, 0d41EFFFFFFFE00000;
+	cvt.rzi.u32.f64 	%r36, %rd349;
+	add.rn.f64 	%rd352, %rd21, %rd343;
+	setp.geu.f64 	%p50, %rd614, 0d0000000000000000;
+	setp.leu.f64 	%p51, %rd614, %rd352;
+	cvt.rn.f32.f64 	%r176, %rd352;
+	cvt.f64.f32 	%rd353, %r176;
+	selp.f64 	%rd354, %rd614, %rd353, %p51;
+	selp.f64 	%rd355, %rd354, 0d0000000000000000, %p50;
+	max.f64 	%rd356, %rd355, 0d0000000000000000;
+	min.f64 	%rd357, %rd356, 0d41EFFFFFFFE00000;
+	cvt.rzi.u32.f64 	%r38, %rd357;
+	add.rn.f64 	%rd360, %rd22, %rd343;
+	setp.geu.f64 	%p52, %rd615, 0d0000000000000000;
+	setp.leu.f64 	%p53, %rd615, %rd360;
+	cvt.rn.f32.f64 	%r177, %rd360;
+	cvt.f64.f32 	%rd361, %r177;
+	selp.f64 	%rd362, %rd615, %rd361, %p53;
+	selp.f64 	%rd363, %rd362, 0d0000000000000000, %p52;
+	max.f64 	%rd364, %rd363, 0d0000000000000000;
+	min.f64 	%rd365, %rd364, 0d41EFFFFFFFE00000;
+	cvt.rzi.u32.f64 	%r40, %rd365;
+	shr.u32 	%r178, %r40, 4;
+	mul.lo.s32 	%r42, %r178, %r66;
+	shr.u32 	%r43, %r38, 4;
+	add.s32 	%r179, %r42, %r43;
+	mul.lo.s32 	%r44, %r179, %r67;
+	shr.u32 	%r45, %r36, 4;
+	add.s32 	%r180, %r44, %r45;
+	mul.wide.u32 	%rd368, %r180, 4;
+	add.s64 	%rd369, %rd15, %rd368;
+	ld.global.b32 	%rd63, [%rd369];
+	setp.eq.b64 	%p54, %rd63, 4294967295;
+	mov.b16 	%rs65, 0;
+	shl.b32 	%r360, %r40, 8;
+	shl.b32 	%r361, %r38, 4;
+	and.b32 	%r362, %r36, 15;
+	@%p54 bra 	$L__BB13_64;
+	bra.uni 	$L__BB13_63;
+$L__BB13_63:                            // %bb2.i106.i825
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r181, %r360, 3840;
+	and.b32 	%r182, %r361, 240;
+	or.b32 	%r183, %r182, %r362;
+	or.b32 	%r184, %r183, %r181;
+	shl.b64 	%rd370, %rd63, 12;
+	cvt.u64.u32 	%rd371, %r184;
+	add.s64 	%rd372, %rd16, %rd370;
+	add.s64 	%rd373, %rd372, %rd371;
+	ld.global.b8 	%rs65, [%rd373];
+$L__BB13_64:                            // %fibrs_kernels__finish__Pooled__get.exit123.i840
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.eq.b16 	%p55, %rs65, 0;
+	mov.b64 	%rd620, 0d0000000000000000;
+	@%p55 bra 	$L__BB13_68;
+	bra.uni 	$L__BB13_65;
+$L__BB13_65:                            // %bb3.i.i843
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd62, %r180;
+	shl.b64 	%rd374, %rd62, 2;
+	add.s64 	%rd375, %rd13, %rd374;
+	ld.global.b32 	%rd64, [%rd375];
+	setp.eq.b64 	%p56, %rd64, 4294967295;
+	mov.b16 	%rs66, 0;
+	@%p56 bra 	$L__BB13_67;
+	bra.uni 	$L__BB13_66;
+$L__BB13_66:                            // %bb2.i73.i857
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r185, %r360, 3840;
+	and.b32 	%r186, %r361, 240;
+	or.b32 	%r187, %r186, %r362;
+	or.b32 	%r188, %r187, %r185;
+	shl.b64 	%rd376, %rd64, 12;
+	cvt.u64.u32 	%rd377, %r188;
+	add.s64 	%rd378, %rd14, %rd376;
+	add.s64 	%rd379, %rd378, %rd377;
+	ld.global.b8 	%rs66, [%rd379];
+$L__BB13_67:                            // %fibrs_kernels__finish__Pooled__get.exit90.i872
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p57, %rs65, %rs66;
+	add.s16 	%rs25, %rs65, %rs66;
+	min.u16 	%rs26, %rs25, 255;
+	selp.b16 	%rs27, 0, %rs26, %p57;
+	cvt.rn.f64.u16 	%rd620, %rs27;
+$L__BB13_68:                            // %fibrs_kernels__finish__presence.exit.i877
+                                        //   in Loop: Header=BB13_9 Depth=2
+	add.s32 	%r46, %r36, 1;
+	shr.u32 	%r47, %r46, 4;
+	add.s32 	%r189, %r44, %r47;
+	mul.wide.u32 	%rd380, %r189, 4;
+	add.s64 	%rd381, %rd15, %rd380;
+	ld.global.b32 	%rd66, [%rd381];
+	setp.eq.b64 	%p58, %rd66, 4294967295;
+	mov.b16 	%rs67, 0;
+	and.b32 	%r363, %r46, 15;
+	@%p58 bra 	$L__BB13_70;
+	bra.uni 	$L__BB13_69;
+$L__BB13_69:                            // %bb2.i39.i886
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r190, %r360, 3840;
+	and.b32 	%r191, %r361, 240;
+	or.b32 	%r192, %r191, %r363;
+	or.b32 	%r193, %r192, %r190;
+	shl.b64 	%rd382, %rd66, 12;
+	cvt.u64.u32 	%rd383, %r193;
+	add.s64 	%rd384, %rd16, %rd382;
+	add.s64 	%rd385, %rd384, %rd383;
+	ld.global.b8 	%rs67, [%rd385];
+$L__BB13_70:                            // %fibrs_kernels__finish__Pooled__get.exit56.i901
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.eq.b16 	%p59, %rs67, 0;
+	mov.b32 	%r373, 0f00000000;
+	@%p59 bra 	$L__BB13_74;
+	bra.uni 	$L__BB13_71;
+$L__BB13_71:                            // %bb3.i3.i904
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd65, %r189;
+	shl.b64 	%rd386, %rd65, 2;
+	add.s64 	%rd387, %rd13, %rd386;
+	ld.global.b32 	%rd67, [%rd387];
+	setp.eq.b64 	%p60, %rd67, 4294967295;
+	mov.b16 	%rs68, 0;
+	@%p60 bra 	$L__BB13_73;
+	bra.uni 	$L__BB13_72;
+$L__BB13_72:                            // %bb2.i.i918
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r194, %r360, 3840;
+	and.b32 	%r195, %r361, 240;
+	or.b32 	%r196, %r195, %r363;
+	or.b32 	%r197, %r196, %r194;
+	shl.b64 	%rd388, %rd67, 12;
+	cvt.u64.u32 	%rd389, %r197;
+	add.s64 	%rd390, %rd14, %rd388;
+	add.s64 	%rd391, %rd390, %rd389;
+	ld.global.b8 	%rs68, [%rd391];
+$L__BB13_73:                            // %fibrs_kernels__finish__Pooled__get.exit.i933
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p61, %rs67, %rs68;
+	add.s16 	%rs28, %rs67, %rs68;
+	min.u16 	%rs29, %rs28, 255;
+	selp.b16 	%rs30, 0, %rs29, %p61;
+	cvt.rn.f32.u16 	%r373, %rs30;
+$L__BB13_74:                            // %_RNCNvNtCsi0DaIIAXpBr_13fibrs_kernels6finish15trilin_presences_0B5_.exit949
+                                        //   in Loop: Header=BB13_9 Depth=2
+	add.s32 	%r48, %r38, 1;
+	shr.u32 	%r49, %r48, 4;
+	add.s32 	%r199, %r42, %r49;
+	mul.lo.s32 	%r50, %r199, %r67;
+	add.s32 	%r200, %r50, %r45;
+	mul.wide.u32 	%rd397, %r200, 4;
+	add.s64 	%rd398, %rd15, %rd397;
+	ld.global.b32 	%rd71, [%rd398];
+	setp.eq.b64 	%p62, %rd71, 4294967295;
+	mov.b16 	%rs69, 0;
+	shl.b32 	%r364, %r48, 4;
+	@%p62 bra 	$L__BB13_76;
+	bra.uni 	$L__BB13_75;
+$L__BB13_75:                            // %bb2.i106.i981
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r201, %r360, 3840;
+	and.b32 	%r202, %r364, 240;
+	or.b32 	%r203, %r201, %r362;
+	or.b32 	%r204, %r203, %r202;
+	shl.b64 	%rd399, %rd71, 12;
+	cvt.u64.u32 	%rd400, %r204;
+	add.s64 	%rd401, %rd16, %rd399;
+	add.s64 	%rd402, %rd401, %rd400;
+	ld.global.b8 	%rs69, [%rd402];
+$L__BB13_76:                            // %fibrs_kernels__finish__Pooled__get.exit123.i996
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.eq.b16 	%p63, %rs69, 0;
+	mov.b64 	%rd621, 0d0000000000000000;
+	@%p63 bra 	$L__BB13_80;
+	bra.uni 	$L__BB13_77;
+$L__BB13_77:                            // %bb3.i.i999
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd70, %r200;
+	shl.b64 	%rd403, %rd70, 2;
+	add.s64 	%rd404, %rd13, %rd403;
+	ld.global.b32 	%rd72, [%rd404];
+	setp.eq.b64 	%p64, %rd72, 4294967295;
+	mov.b16 	%rs70, 0;
+	@%p64 bra 	$L__BB13_79;
+	bra.uni 	$L__BB13_78;
+$L__BB13_78:                            // %bb2.i73.i1013
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r205, %r360, 3840;
+	and.b32 	%r206, %r364, 240;
+	or.b32 	%r207, %r205, %r362;
+	or.b32 	%r208, %r207, %r206;
+	shl.b64 	%rd405, %rd72, 12;
+	cvt.u64.u32 	%rd406, %r208;
+	add.s64 	%rd407, %rd14, %rd405;
+	add.s64 	%rd408, %rd407, %rd406;
+	ld.global.b8 	%rs70, [%rd408];
+$L__BB13_79:                            // %fibrs_kernels__finish__Pooled__get.exit90.i1028
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p65, %rs69, %rs70;
+	add.s16 	%rs31, %rs69, %rs70;
+	min.u16 	%rs32, %rs31, 255;
+	selp.b16 	%rs33, 0, %rs32, %p65;
+	cvt.rn.f64.u16 	%rd621, %rs33;
+$L__BB13_80:                            // %fibrs_kernels__finish__presence.exit.i1033
+                                        //   in Loop: Header=BB13_9 Depth=2
+	add.s32 	%r209, %r50, %r47;
+	mul.wide.u32 	%rd409, %r209, 4;
+	add.s64 	%rd410, %rd15, %rd409;
+	ld.global.b32 	%rd74, [%rd410];
+	setp.eq.b64 	%p66, %rd74, 4294967295;
+	mov.b16 	%rs71, 0;
+	@%p66 bra 	$L__BB13_82;
+	bra.uni 	$L__BB13_81;
+$L__BB13_81:                            // %bb2.i39.i1042
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r210, %r360, 3840;
+	and.b32 	%r211, %r364, 240;
+	or.b32 	%r212, %r210, %r363;
+	or.b32 	%r213, %r212, %r211;
+	shl.b64 	%rd411, %rd74, 12;
+	cvt.u64.u32 	%rd412, %r213;
+	add.s64 	%rd413, %rd16, %rd411;
+	add.s64 	%rd414, %rd413, %rd412;
+	ld.global.b8 	%rs71, [%rd414];
+$L__BB13_82:                            // %fibrs_kernels__finish__Pooled__get.exit56.i1057
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.eq.b16 	%p67, %rs71, 0;
+	mov.b32 	%r374, 0f00000000;
+	@%p67 bra 	$L__BB13_86;
+	bra.uni 	$L__BB13_83;
+$L__BB13_83:                            // %bb3.i3.i1060
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd73, %r209;
+	shl.b64 	%rd415, %rd73, 2;
+	add.s64 	%rd416, %rd13, %rd415;
+	ld.global.b32 	%rd75, [%rd416];
+	setp.eq.b64 	%p68, %rd75, 4294967295;
+	mov.b16 	%rs72, 0;
+	@%p68 bra 	$L__BB13_85;
+	bra.uni 	$L__BB13_84;
+$L__BB13_84:                            // %bb2.i.i1074
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r214, %r360, 3840;
+	and.b32 	%r215, %r364, 240;
+	or.b32 	%r216, %r214, %r363;
+	or.b32 	%r217, %r216, %r215;
+	shl.b64 	%rd417, %rd75, 12;
+	cvt.u64.u32 	%rd418, %r217;
+	add.s64 	%rd419, %rd14, %rd417;
+	add.s64 	%rd420, %rd419, %rd418;
+	ld.global.b8 	%rs72, [%rd420];
+$L__BB13_85:                            // %fibrs_kernels__finish__Pooled__get.exit.i1089
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p69, %rs71, %rs72;
+	add.s16 	%rs34, %rs71, %rs72;
+	min.u16 	%rs35, %rs34, 255;
+	selp.b16 	%rs36, 0, %rs35, %p69;
+	cvt.rn.f32.u16 	%r374, %rs36;
+$L__BB13_86:                            // %_RNCNvNtCsi0DaIIAXpBr_13fibrs_kernels6finish15trilin_presences_0B5_.exit1105
+                                        //   in Loop: Header=BB13_9 Depth=2
+	add.s32 	%r51, %r40, 1;
+	shr.u32 	%r219, %r51, 4;
+	mul.lo.s32 	%r52, %r219, %r66;
+	add.s32 	%r220, %r52, %r43;
+	mul.lo.s32 	%r53, %r220, %r67;
+	add.s32 	%r221, %r53, %r45;
+	mul.wide.u32 	%rd425, %r221, 4;
+	add.s64 	%rd426, %rd15, %rd425;
+	ld.global.b32 	%rd78, [%rd426];
+	setp.eq.b64 	%p70, %rd78, 4294967295;
+	mov.b16 	%rs73, 0;
+	shl.b32 	%r365, %r51, 8;
+	@%p70 bra 	$L__BB13_88;
+	bra.uni 	$L__BB13_87;
+$L__BB13_87:                            // %bb2.i106.i1137
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r222, %r365, 3840;
+	and.b32 	%r223, %r361, 240;
+	or.b32 	%r224, %r223, %r362;
+	or.b32 	%r225, %r224, %r222;
+	shl.b64 	%rd427, %rd78, 12;
+	cvt.u64.u32 	%rd428, %r225;
+	add.s64 	%rd429, %rd16, %rd427;
+	add.s64 	%rd430, %rd429, %rd428;
+	ld.global.b8 	%rs73, [%rd430];
+$L__BB13_88:                            // %fibrs_kernels__finish__Pooled__get.exit123.i1152
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.rn.f64.u32 	%rd199, %r17;
+	sub.rn.f64 	%rd200, %rd196, %rd199;
+	cvt.rn.f32.f64 	%r18, %rd200;
+	setp.eq.b16 	%p71, %rs73, 0;
+	mov.b64 	%rd622, 0d0000000000000000;
+	@%p71 bra 	$L__BB13_92;
+	bra.uni 	$L__BB13_89;
+$L__BB13_89:                            // %bb3.i.i1155
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd77, %r221;
+	shl.b64 	%rd431, %rd77, 2;
+	add.s64 	%rd432, %rd13, %rd431;
+	ld.global.b32 	%rd79, [%rd432];
+	setp.eq.b64 	%p72, %rd79, 4294967295;
+	mov.b16 	%rs74, 0;
+	@%p72 bra 	$L__BB13_91;
+	bra.uni 	$L__BB13_90;
+$L__BB13_90:                            // %bb2.i73.i1169
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r226, %r365, 3840;
+	and.b32 	%r227, %r361, 240;
+	or.b32 	%r228, %r227, %r362;
+	or.b32 	%r229, %r228, %r226;
+	shl.b64 	%rd433, %rd79, 12;
+	cvt.u64.u32 	%rd434, %r229;
+	add.s64 	%rd435, %rd14, %rd433;
+	add.s64 	%rd436, %rd435, %rd434;
+	ld.global.b8 	%rs74, [%rd436];
+$L__BB13_91:                            // %fibrs_kernels__finish__Pooled__get.exit90.i1184
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p73, %rs73, %rs74;
+	add.s16 	%rs37, %rs73, %rs74;
+	min.u16 	%rs38, %rs37, 255;
+	selp.b16 	%rs39, 0, %rs38, %p73;
+	cvt.rn.f64.u16 	%rd622, %rs39;
+$L__BB13_92:                            // %fibrs_kernels__finish__presence.exit.i1189
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.f64.f32 	%rd241, %r18;
+	neg.f64 	%rd39, %rd241;
+	add.s32 	%r230, %r53, %r47;
+	mul.wide.u32 	%rd437, %r230, 4;
+	add.s64 	%rd438, %rd15, %rd437;
+	ld.global.b32 	%rd81, [%rd438];
+	setp.eq.b64 	%p74, %rd81, 4294967295;
+	mov.b16 	%rs75, 0;
+	@%p74 bra 	$L__BB13_94;
+	bra.uni 	$L__BB13_93;
+$L__BB13_93:                            // %bb2.i39.i1198
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r231, %r365, 3840;
+	and.b32 	%r232, %r361, 240;
+	or.b32 	%r233, %r232, %r363;
+	or.b32 	%r234, %r233, %r231;
+	shl.b64 	%rd439, %rd81, 12;
+	cvt.u64.u32 	%rd440, %r234;
+	add.s64 	%rd441, %rd16, %rd439;
+	add.s64 	%rd442, %rd441, %rd440;
+	ld.global.b8 	%rs75, [%rd442];
+$L__BB13_94:                            // %fibrs_kernels__finish__Pooled__get.exit56.i1213
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.rn.f64.u32 	%rd207, %r19;
+	sub.rn.f64 	%rd208, %rd204, %rd207;
+	mov.b64 	%rd242, 0d3FF0000000000000;
+	sub.rn.f64 	%rd243, %rd242, %rd241;
+	mov.b64 	%rd270, 0d3FF0000000000000;
+	add.rn.f64 	%rd271, %rd270, %rd39;
+	mov.b64 	%rd298, 0d3FF0000000000000;
+	add.rn.f64 	%rd299, %rd298, %rd39;
+	mov.b64 	%rd326, 0d3FF0000000000000;
+	add.rn.f64 	%rd327, %rd326, %rd39;
+	setp.eq.b16 	%p75, %rs75, 0;
+	mov.b32 	%r375, 0f00000000;
+	@%p75 bra 	$L__BB13_98;
+	bra.uni 	$L__BB13_95;
+$L__BB13_95:                            // %bb3.i3.i1216
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd80, %r230;
+	shl.b64 	%rd443, %rd80, 2;
+	add.s64 	%rd444, %rd13, %rd443;
+	ld.global.b32 	%rd82, [%rd444];
+	setp.eq.b64 	%p76, %rd82, 4294967295;
+	mov.b16 	%rs76, 0;
+	@%p76 bra 	$L__BB13_97;
+	bra.uni 	$L__BB13_96;
+$L__BB13_96:                            // %bb2.i.i1230
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r235, %r365, 3840;
+	and.b32 	%r236, %r361, 240;
+	or.b32 	%r237, %r236, %r363;
+	or.b32 	%r238, %r237, %r235;
+	shl.b64 	%rd445, %rd82, 12;
+	cvt.u64.u32 	%rd446, %r238;
+	add.s64 	%rd447, %rd14, %rd445;
+	add.s64 	%rd448, %rd447, %rd446;
+	ld.global.b8 	%rs76, [%rd448];
+$L__BB13_97:                            // %fibrs_kernels__finish__Pooled__get.exit.i1245
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p77, %rs75, %rs76;
+	add.s16 	%rs40, %rs75, %rs76;
+	min.u16 	%rs41, %rs40, 255;
+	selp.b16 	%rs42, 0, %rs41, %p77;
+	cvt.rn.f32.u16 	%r375, %rs42;
+$L__BB13_98:                            // %_RNCNvNtCsi0DaIIAXpBr_13fibrs_kernels6finish15trilin_presences_0B5_.exit1261
+                                        //   in Loop: Header=BB13_9 Depth=2
+	mul.rn.f32 	%r113, %r18, %r369;
+	mul.rn.f32 	%r133, %r18, %r370;
+	mul.rn.f32 	%r154, %r18, %r371;
+	cvt.rn.f32.f64 	%r20, %rd208;
+	mul.rn.f32 	%r174, %r18, %r372;
+	mul.rn.f64 	%rd244, %rd243, %rd616;
+	mul.rn.f64 	%rd272, %rd271, %rd617;
+	mul.rn.f64 	%rd300, %rd299, %rd618;
+	mul.rn.f64 	%rd328, %rd327, %rd619;
+	add.s32 	%r240, %r52, %r49;
+	mul.lo.s32 	%r54, %r240, %r67;
+	add.s32 	%r241, %r54, %r45;
+	mul.wide.u32 	%rd453, %r241, 4;
+	add.s64 	%rd454, %rd15, %rd453;
+	ld.global.b32 	%rd85, [%rd454];
+	setp.eq.b64 	%p78, %rd85, 4294967295;
+	mov.b16 	%rs77, 0;
+	@%p78 bra 	$L__BB13_100;
+	bra.uni 	$L__BB13_99;
+$L__BB13_99:                            // %bb2.i106.i1293
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r242, %r365, 3840;
+	and.b32 	%r243, %r364, 240;
+	or.b32 	%r244, %r243, %r362;
+	or.b32 	%r245, %r244, %r242;
+	shl.b64 	%rd455, %rd85, 12;
+	cvt.u64.u32 	%rd456, %r245;
+	add.s64 	%rd457, %rd16, %rd455;
+	add.s64 	%rd458, %rd457, %rd456;
+	ld.global.b8 	%rs77, [%rd458];
+$L__BB13_100:                           // %fibrs_kernels__finish__Pooled__get.exit123.i1308
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.rn.f64.u32 	%rd215, %r21;
+	cvt.f64.f32 	%rd245, %r113;
+	cvt.f64.f32 	%rd273, %r133;
+	cvt.f64.f32 	%rd301, %r154;
+	cvt.f64.f32 	%rd329, %r174;
+	cvt.f64.f32 	%rd331, %r20;
+	sub.rn.f64 	%rd216, %rd212, %rd215;
+	add.rn.f64 	%rd40, %rd244, %rd245;
+	add.rn.f64 	%rd47, %rd272, %rd273;
+	add.rn.f64 	%rd54, %rd300, %rd301;
+	add.rn.f64 	%rd330, %rd328, %rd329;
+	sub.rn.f64 	%rd333, %rd326, %rd331;
+	setp.eq.b16 	%p79, %rs77, 0;
+	mov.b64 	%rd623, 0d0000000000000000;
+	@%p79 bra 	$L__BB13_104;
+	bra.uni 	$L__BB13_101;
+$L__BB13_101:                           // %bb3.i.i1311
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd84, %r241;
+	shl.b64 	%rd459, %rd84, 2;
+	add.s64 	%rd460, %rd13, %rd459;
+	ld.global.b32 	%rd86, [%rd460];
+	setp.eq.b64 	%p80, %rd86, 4294967295;
+	mov.b16 	%rs78, 0;
+	@%p80 bra 	$L__BB13_103;
+	bra.uni 	$L__BB13_102;
+$L__BB13_102:                           // %bb2.i73.i1325
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r246, %r365, 3840;
+	and.b32 	%r247, %r364, 240;
+	or.b32 	%r248, %r247, %r362;
+	or.b32 	%r249, %r248, %r246;
+	shl.b64 	%rd461, %rd86, 12;
+	cvt.u64.u32 	%rd462, %r249;
+	add.s64 	%rd463, %rd14, %rd461;
+	add.s64 	%rd464, %rd463, %rd462;
+	ld.global.b8 	%rs78, [%rd464];
+$L__BB13_103:                           // %fibrs_kernels__finish__Pooled__get.exit90.i1340
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p81, %rs77, %rs78;
+	add.s16 	%rs43, %rs77, %rs78;
+	min.u16 	%rs44, %rs43, 255;
+	selp.b16 	%rs45, 0, %rs44, %p81;
+	cvt.rn.f64.u16 	%rd623, %rs45;
+$L__BB13_104:                           // %fibrs_kernels__finish__presence.exit.i1345
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.rn.f32.f64 	%r22, %rd216;
+	mul.rn.f64 	%rd334, %rd333, %rd40;
+	mul.rn.f64 	%rd335, %rd331, %rd47;
+	mul.rn.f64 	%rd337, %rd333, %rd54;
+	mul.rn.f64 	%rd338, %rd331, %rd330;
+	add.s32 	%r250, %r54, %r47;
+	mul.wide.u32 	%rd465, %r250, 4;
+	add.s64 	%rd466, %rd15, %rd465;
+	ld.global.b32 	%rd88, [%rd466];
+	setp.eq.b64 	%p82, %rd88, 4294967295;
+	mov.b16 	%rs79, 0;
+	@%p82 bra 	$L__BB13_106;
+	bra.uni 	$L__BB13_105;
+$L__BB13_105:                           // %bb2.i39.i1354
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r251, %r365, 3840;
+	and.b32 	%r252, %r364, 240;
+	or.b32 	%r253, %r252, %r363;
+	or.b32 	%r254, %r253, %r251;
+	shl.b64 	%rd467, %rd88, 12;
+	cvt.u64.u32 	%rd468, %r254;
+	add.s64 	%rd469, %rd16, %rd467;
+	add.s64 	%rd470, %rd469, %rd468;
+	ld.global.b8 	%rs79, [%rd470];
+$L__BB13_106:                           // %fibrs_kernels__finish__Pooled__get.exit56.i1369
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.f64.f32 	%rd332, %r22;
+	add.rn.f64 	%rd336, %rd334, %rd335;
+	add.rn.f64 	%rd339, %rd337, %rd338;
+	sub.rn.f64 	%rd340, %rd326, %rd332;
+	setp.eq.b16 	%p83, %rs79, 0;
+	mov.b32 	%r376, 0f00000000;
+	@%p83 bra 	$L__BB13_110;
+	bra.uni 	$L__BB13_107;
+$L__BB13_107:                           // %bb3.i3.i1372
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.u64.u32 	%rd87, %r250;
+	shl.b64 	%rd471, %rd87, 2;
+	add.s64 	%rd472, %rd13, %rd471;
+	ld.global.b32 	%rd89, [%rd472];
+	setp.eq.b64 	%p84, %rd89, 4294967295;
+	mov.b16 	%rs80, 0;
+	@%p84 bra 	$L__BB13_109;
+	bra.uni 	$L__BB13_108;
+$L__BB13_108:                           // %bb2.i.i1386
+                                        //   in Loop: Header=BB13_9 Depth=2
+	and.b32 	%r255, %r365, 3840;
+	and.b32 	%r256, %r364, 240;
+	or.b32 	%r257, %r256, %r363;
+	or.b32 	%r258, %r257, %r255;
+	shl.b64 	%rd473, %rd89, 12;
+	cvt.u64.u32 	%rd474, %r258;
+	add.s64 	%rd475, %rd14, %rd473;
+	add.s64 	%rd476, %rd475, %rd474;
+	ld.global.b8 	%rs80, [%rd476];
+$L__BB13_109:                           // %fibrs_kernels__finish__Pooled__get.exit.i1401
+                                        //   in Loop: Header=BB13_9 Depth=2
+	setp.lt.u16 	%p85, %rs79, %rs80;
+	add.s16 	%rs46, %rs79, %rs80;
+	min.u16 	%rs47, %rs46, 255;
+	selp.b16 	%rs48, 0, %rs47, %p85;
+	cvt.rn.f32.u16 	%r376, %rs48;
+$L__BB13_110:                           // %_RNCNvNtCsi0DaIIAXpBr_13fibrs_kernels6finish15trilin_presences_0B5_.exit1417
+                                        //   in Loop: Header=BB13_9 Depth=2
+	mul.rn.f64 	%rd341, %rd340, %rd336;
+	mul.rn.f64 	%rd342, %rd332, %rd339;
+	add.rn.f64 	%rd61, %rd341, %rd342;
+	setp.ltu.f64 	%p86, %rd61, 0d4053200000000000;
+	@%p86 bra 	$L__BB13_113;
+	bra.uni 	$L__BB13_111;
+$L__BB13_111:                           // %bb23.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	cvt.rn.f64.u32 	%rd350, %r36;
+	sub.rn.f64 	%rd351, %rd347, %rd350;
+	cvt.rn.f32.f64 	%r37, %rd351;
+	cvt.f64.f32 	%rd392, %r37;
+	neg.f64 	%rd68, %rd392;
+	cvt.rn.f64.u32 	%rd358, %r38;
+	cvt.rn.f64.u32 	%rd366, %r40;
+	mov.b64 	%rd393, 0d3FF0000000000000;
+	sub.rn.f64 	%rd394, %rd393, %rd392;
+	mul.rn.f32 	%r198, %r37, %r373;
+	mov.b64 	%rd421, 0d3FF0000000000000;
+	add.rn.f64 	%rd422, %rd421, %rd68;
+	mul.rn.f32 	%r218, %r37, %r374;
+	mov.b64 	%rd449, 0d3FF0000000000000;
+	add.rn.f64 	%rd450, %rd449, %rd68;
+	sub.rn.f64 	%rd359, %rd355, %rd358;
+	sub.rn.f64 	%rd367, %rd363, %rd366;
+	mul.rn.f64 	%rd395, %rd394, %rd620;
+	cvt.f64.f32 	%rd396, %r198;
+	mul.rn.f64 	%rd423, %rd422, %rd621;
+	cvt.f64.f32 	%rd424, %r218;
+	mul.rn.f64 	%rd451, %rd450, %rd622;
+	cvt.rn.f32.f64 	%r39, %rd359;
+	cvt.rn.f32.f64 	%r41, %rd367;
+	add.rn.f64 	%rd69, %rd395, %rd396;
+	add.rn.f64 	%rd76, %rd423, %rd424;
+	mul.rn.f32 	%r239, %r37, %r375;
+	cvt.f64.f32 	%rd452, %r239;
+	add.rn.f64 	%rd83, %rd451, %rd452;
+	mov.b64 	%rd477, 0d3FF0000000000000;
+	add.rn.f64 	%rd478, %rd477, %rd68;
+	mul.rn.f64 	%rd479, %rd478, %rd623;
+	mul.rn.f32 	%r259, %r37, %r376;
+	cvt.f64.f32 	%rd480, %r259;
+	add.rn.f64 	%rd481, %rd479, %rd480;
+	cvt.f64.f32 	%rd482, %r39;
+	cvt.f64.f32 	%rd483, %r41;
+	sub.rn.f64 	%rd484, %rd477, %rd482;
+	mul.rn.f64 	%rd485, %rd484, %rd69;
+	mul.rn.f64 	%rd486, %rd482, %rd76;
+	add.rn.f64 	%rd487, %rd485, %rd486;
+	mul.rn.f64 	%rd488, %rd484, %rd83;
+	mul.rn.f64 	%rd489, %rd482, %rd481;
+	add.rn.f64 	%rd490, %rd488, %rd489;
+	sub.rn.f64 	%rd491, %rd477, %rd483;
+	mul.rn.f64 	%rd492, %rd491, %rd487;
+	mul.rn.f64 	%rd493, %rd483, %rd490;
+	add.rn.f64 	%rd90, %rd492, %rd493;
+	mov.b64 	%rd494, 0dC018000000000000;
+	add.rn.f64 	%rd495, %rd61, %rd494;
+	max.f64 	%rd496, %rd495, 0d4053400000000000;
+	setp.geu.f64 	%p87, %rd90, %rd496;
+	@%p87 bra 	$L__BB13_113;
+	bra.uni 	$L__BB13_112;
+$L__BB13_112:                           // %bb24.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	add.rn.f32 	%r260, %r14, %r8;
+	cvt.f64.f32 	%rd497, %r260;
+	mov.b64 	%rd498, 0d3FE0000000000000;
+	mul.rn.f64 	%rd613, %rd498, %rd497;
+	add.rn.f32 	%r261, %r15, %r9;
+	cvt.f64.f32 	%rd499, %r261;
+	mul.rn.f64 	%rd614, %rd498, %rd499;
+	add.rn.f32 	%r262, %r16, %r10;
+	cvt.f64.f32 	%rd500, %r262;
+	mul.rn.f64 	%rd615, %rd498, %rd500;
+$L__BB13_113:                           // %bb26.i
+                                        //   in Loop: Header=BB13_9 Depth=2
+	add.s64 	%rd612, %rd25, 12;
+	cvt.rn.f32.f64 	%r263, %rd613;
+	cvt.rn.f32.f64 	%r264, %rd614;
+	cvt.rn.f32.f64 	%r265, %rd615;
+	st.global.b32 	[%rd25+-4], %r263;
+	st.global.b32 	[%rd25], %r264;
+	st.global.b32 	[%rd25+4], %r265;
+	add.s32 	%r368, %r368, 1;
+	add.s32 	%r266, %r4, %r368;
+	add.s64 	%rd611, %rd611, 12;
+	setp.ne.b32 	%p88, %r266, 1;
+	@%p88 bra 	$L__BB13_9;
+	bra.uni 	$L__BB13_114;
+$L__BB13_114:                           // %bb3.i.bb27.i_crit_edge
+                                        //   in Loop: Header=BB13_6 Depth=1
+	add.s32 	%r367, %r367, 1;
+	setp.eq.b32 	%p89, %r367, 10;
+	@%p89 bra 	$L__BB13_7;
+	bra.uni 	$L__BB13_6;
+$L__BB13_115:                           // %bb30.i
+                                        // =>This Inner Loop Header: Depth=1
+	ld.global.b32 	%r267, [%rd624];
+	ld.global.b32 	%r268, [%rd624+4];
+	ld.global.b32 	%r269, [%rd624+8];
+	ld.global.b32 	%r270, [%rd624+-12];
+	ld.global.b32 	%r271, [%rd624+-8];
+	ld.global.b32 	%r272, [%rd624+-4];
+	sub.rn.f32 	%r273, %r267, %r270;
+	sub.rn.f32 	%r274, %r268, %r271;
+	sub.rn.f32 	%r275, %r269, %r272;
+	mul.rn.f32 	%r276, %r273, %r273;
+	mul.rn.f32 	%r277, %r274, %r274;
+	add.rn.f32 	%r278, %r276, %r277;
+	mul.rn.f32 	%r279, %r275, %r275;
+	add.rn.f32 	%r280, %r278, %r279;
+	sqrt.rn.f32 	%r281, %r280;
+	add.rn.f32 	%r378, %r378, %r281;
+	add.s32 	%r377, %r377, -1;
+	add.s64 	%rd624, %rd624, 12;
+	setp.ne.b32 	%p91, %r377, 0;
+	@%p91 bra 	$L__BB13_115;
+	bra.uni 	$L__BB13_116;
+$L__BB13_116:                           // %fibrs_kernels__finish__fit.exit
+	cvt.f64.f32 	%rd502, %r378;
+	div.rn.f64 	%rd503, %rd502, 0d3FE999999999999A;
+	mov.b64 	%rd504, 0d3FE0000000000000;
+	add.rn.f64 	%rd505, %rd503, %rd504;
+	setp.ltu.f64 	%p92, %rd505, 0dC3E0000000000000;
+	cvt.rzi.s64.f64 	%rd506, %rd505;
+	selp.b64 	%rd507, -9223372036854775808, %rd506, %p92;
+	setp.gt.f64 	%p93, %rd505, 0d43DFFFFFFFFFFFFF;
+	selp.b64 	%rd508, 9223372036854775807, %rd507, %p93;
+	setp.nan.f64 	%p94, %rd505, %rd505;
+	selp.b64 	%rd509, 0, %rd508, %p94;
+	add.s64 	%rd510, %rd509, 1;
+	max.s64 	%rd91, %rd510, 2;
+	shl.b64 	%rd511, %rd17, 2;
+	add.s64 	%rd512, %rd9, %rd511;
+	ld.global.b32 	%r282, [%rd512];
+	ld.global.b32 	%r283, [%rd512+4];
+	sub.s32 	%r284, %r283, %r282;
+	cvt.u64.u32 	%rd513, %r284;
+	setp.le.u64 	%p95, %rd91, %rd513;
+	@%p95 bra 	$L__BB13_118;
+	bra.uni 	$L__BB13_117;
+$L__BB13_117:                           // %bb12
+	add.s64 	%rd598, %rd10, %rd511;
+	st.global.b32 	[%rd598], 0;
+	atom.relaxed.gpu.global.or.b32 	%r353, [%rd11], 2;
+	bra.uni 	$L__BB13_127;
+$L__BB13_118:                           // %bb17
+	cvt.u64.u32 	%rd92, %r282;
+	cvt.u32.u64 	%r55, %rd91;
+	mad.lo.s64 	%rd93, %rd92, 12, %rd12;
+	ld.global.b32 	%r285, [%rd19];
+	ld.global.b32 	%r286, [%rd19+4];
+	ld.global.b32 	%r287, [%rd19+8];
+	st.global.b32 	[%rd93], %r285;
+	st.global.b32 	[%rd93+4], %r286;
+	st.global.b32 	[%rd93+8], %r287;
+	add.s32 	%r56, %r55, -1;
+	mul.wide.u32 	%rd514, %r3, 12;
+	add.s64 	%rd515, %rd19, %rd514;
+	ld.global.b32 	%r288, [%rd515];
+	ld.global.b32 	%r289, [%rd515+4];
+	ld.global.b32 	%r290, [%rd515+8];
+	mul.wide.u32 	%rd516, %r56, 12;
+	add.s64 	%rd517, %rd93, %rd516;
+	st.global.b32 	[%rd517], %r288;
+	st.global.b32 	[%rd517+4], %r289;
+	st.global.b32 	[%rd517+8], %r290;
+	setp.lt.u32 	%p96, %r56, 2;
+	@%p96 bra 	$L__BB13_126;
+	bra.uni 	$L__BB13_119;
+$L__BB13_119:                           // %bb3.i28.lr.ph
+	cvt.u64.u32 	%rd518, %r65;
+	add.s64 	%rd519, %rd518, -1;
+	cvt.rn.f32.s64 	%r57, %rd519;
+	cvt.f64.f32 	%rd94, %r57;
+	cvt.u64.u32 	%rd520, %r64;
+	add.s64 	%rd521, %rd520, -1;
+	cvt.rn.f32.s64 	%r58, %rd521;
+	cvt.f64.f32 	%rd95, %r58;
+	cvt.u64.u32 	%rd522, %r63;
+	add.s64 	%rd523, %rd522, -1;
+	cvt.rn.f32.s64 	%r59, %rd523;
+	cvt.f64.f32 	%rd96, %r59;
+	ld.global.b32 	%r291, [%rd19+12];
+	ld.global.b32 	%r292, [%rd19+16];
+	ld.global.b32 	%r293, [%rd19+20];
+	ld.global.b32 	%r294, [%rd19];
+	ld.global.b32 	%r295, [%rd19+4];
+	ld.global.b32 	%r296, [%rd19+8];
+	sub.rn.f32 	%r297, %r291, %r294;
+	sub.rn.f32 	%r298, %r292, %r295;
+	sub.rn.f32 	%r299, %r293, %r296;
+	mul.rn.f32 	%r300, %r297, %r297;
+	mul.rn.f32 	%r301, %r298, %r298;
+	add.rn.f32 	%r302, %r300, %r301;
+	mul.rn.f32 	%r303, %r299, %r299;
+	add.rn.f32 	%r304, %r302, %r303;
+	sqrt.rn.f32 	%r305, %r304;
+	mov.b32 	%r379, 0f00000000;
+	add.rn.f32 	%r381, %r379, %r305;
+	cvt.rn.f32.u32 	%r60, %r56;
+	mad.lo.s64 	%rd524, %rd18, 12, %rd4;
+	add.s64 	%rd97, %rd524, 8;
+	mov.b32 	%r382, 0;
+	mov.b32 	%r380, 1;
+$L__BB13_120:                           // %bb3.i28
+                                        // =>This Loop Header: Depth=1
+                                        //     Child Loop BB13_123 Depth 2
+	cvt.rn.f32.u32 	%r306, %r380;
+	div.rn.f32 	%r307, %r306, %r60;
+	mul.rn.f32 	%r308, %r307, %r378;
+	add.s32 	%r383, %r382, 2;
+	setp.ge.u32 	%p97, %r383, %r2;
+	setp.geu.f32 	%p98, %r381, %r308;
+	or.pred 	%p99, %p97, %p98;
+	@%p99 bra 	$L__BB13_122;
+	bra.uni 	$L__BB13_121;
+$L__BB13_121:                           // %bb7.i.preheader
+                                        //   in Loop: Header=BB13_120 Depth=1
+	mul.wide.u32 	%rd525, %r383, 12;
+	add.s64 	%rd625, %rd97, %rd525;
+	bra.uni 	$L__BB13_123;
+$L__BB13_122:                           // %bb3.i28.bb11.i_crit_edge
+                                        //   in Loop: Header=BB13_120 Depth=1
+	mul.wide.u32 	%rd626, %r382, 12;
+	bra.uni 	$L__BB13_125;
+$L__BB13_123:                           // %bb7.i
+                                        //   Parent Loop BB13_120 Depth=1
+                                        // =>  This Inner Loop Header: Depth=2
+	mov.b32 	%r61, %r382;
+	mov.b32 	%r379, %r381;
+	add.s32 	%r382, %r61, 1;
+	ld.global.b32 	%r309, [%rd625+-8];
+	ld.global.b32 	%r310, [%rd625+-4];
+	ld.global.b32 	%r311, [%rd625];
+	mul.wide.u32 	%rd626, %r382, 12;
+	add.s64 	%rd526, %rd19, %rd626;
+	ld.global.b32 	%r312, [%rd526];
+	ld.global.b32 	%r313, [%rd526+4];
+	ld.global.b32 	%r314, [%rd526+8];
+	sub.rn.f32 	%r315, %r309, %r312;
+	sub.rn.f32 	%r316, %r310, %r313;
+	sub.rn.f32 	%r317, %r311, %r314;
+	mul.rn.f32 	%r318, %r315, %r315;
+	mul.rn.f32 	%r319, %r316, %r316;
+	add.rn.f32 	%r320, %r318, %r319;
+	mul.rn.f32 	%r321, %r317, %r317;
+	add.rn.f32 	%r322, %r320, %r321;
+	sqrt.rn.f32 	%r323, %r322;
+	add.rn.f32 	%r381, %r379, %r323;
+	add.s32 	%r324, %r61, 3;
+	setp.lt.u32 	%p100, %r324, %r2;
+	setp.lt.f32 	%p101, %r381, %r308;
+	add.s64 	%rd625, %rd625, 12;
+	and.pred 	%p102, %p100, %p101;
+	@%p102 bra 	$L__BB13_123;
+	bra.uni 	$L__BB13_124;
+$L__BB13_124:                           // %bb11.i.loopexit
+                                        //   in Loop: Header=BB13_120 Depth=1
+	add.s32 	%r383, %r382, 2;
+$L__BB13_125:                           // %bb11.i
+                                        //   in Loop: Header=BB13_120 Depth=1
+	sub.rn.f32 	%r325, %r381, %r379;
+	sub.rn.f32 	%r326, %r308, %r379;
+	setp.lt.f32 	%p103, %r325, 0f358637BD;
+	selp.f32 	%r327, 0f358637BD, %r325, %p103;
+	div.rn.f32 	%r328, %r326, %r327;
+	mul.rn.f32 	%r329, %r328, %r328;
+	mul.rn.f32 	%r330, %r329, %r328;
+	cvt.f64.f32 	%rd527, %r328;
+	cvt.f64.f32 	%rd528, %r329;
+	cvt.f64.f32 	%rd529, %r330;
+	max.u32 	%r331, %r382, 1;
+	add.s32 	%r332, %r331, -1;
+	min.u32 	%r333, %r383, %r3;
+	mov.b64 	%rd530, 0dBFE0000000000000;
+	mul.rn.f64 	%rd531, %rd530, %rd529;
+	add.rn.f64 	%rd532, %rd531, %rd528;
+	mov.b64 	%rd533, 0d3FE0000000000000;
+	mul.rn.f64 	%rd534, %rd533, %rd527;
+	sub.rn.f64 	%rd535, %rd532, %rd534;
+	mov.b64 	%rd536, 0d3FF8000000000000;
+	mul.rn.f64 	%rd537, %rd536, %rd529;
+	mov.b64 	%rd538, 0d4004000000000000;
+	mul.rn.f64 	%rd539, %rd538, %rd528;
+	sub.rn.f64 	%rd540, %rd537, %rd539;
+	mov.b64 	%rd541, 0d3FF0000000000000;
+	add.rn.f64 	%rd542, %rd540, %rd541;
+	mov.b64 	%rd543, 0dBFF8000000000000;
+	mul.rn.f64 	%rd544, %rd543, %rd529;
+	mov.b64 	%rd545, 0d4000000000000000;
+	mul.rn.f64 	%rd546, %rd545, %rd528;
+	add.rn.f64 	%rd547, %rd544, %rd546;
+	add.rn.f64 	%rd548, %rd547, %rd534;
+	mul.rn.f64 	%rd549, %rd533, %rd529;
+	mul.rn.f64 	%rd550, %rd533, %rd528;
+	sub.rn.f64 	%rd551, %rd549, %rd550;
+	mul.wide.u32 	%rd552, %r332, 12;
+	add.s64 	%rd553, %rd19, %rd552;
+	ld.global.b32 	%r334, [%rd553];
+	ld.global.b32 	%r335, [%rd553+4];
+	ld.global.b32 	%r336, [%rd553+8];
+	add.s64 	%rd554, %rd19, %rd626;
+	ld.global.b32 	%r337, [%rd554];
+	ld.global.b32 	%r338, [%rd554+4];
+	ld.global.b32 	%r339, [%rd554+8];
+	add.s32 	%r340, %r382, 1;
+	mul.wide.u32 	%rd555, %r340, 12;
+	add.s64 	%rd556, %rd19, %rd555;
+	ld.global.b32 	%r341, [%rd556];
+	ld.global.b32 	%r342, [%rd556+4];
+	ld.global.b32 	%r343, [%rd556+8];
+	mul.wide.u32 	%rd557, %r333, 12;
+	add.s64 	%rd558, %rd19, %rd557;
+	ld.global.b32 	%r344, [%rd558];
+	ld.global.b32 	%r345, [%rd558+4];
+	ld.global.b32 	%r346, [%rd558+8];
+	cvt.f64.f32 	%rd559, %r334;
+	mul.rn.f64 	%rd560, %rd535, %rd559;
+	cvt.f64.f32 	%rd561, %r337;
+	mul.rn.f64 	%rd562, %rd542, %rd561;
+	add.rn.f64 	%rd563, %rd560, %rd562;
+	cvt.f64.f32 	%rd564, %r341;
+	mul.rn.f64 	%rd565, %rd548, %rd564;
+	add.rn.f64 	%rd566, %rd563, %rd565;
+	cvt.f64.f32 	%rd567, %r344;
+	mul.rn.f64 	%rd568, %rd551, %rd567;
+	add.rn.f64 	%rd569, %rd566, %rd568;
+	setp.lt.f64 	%p104, %rd569, 0d0000000000000000;
+	selp.f64 	%rd570, 0d0000000000000000, %rd569, %p104;
+	setp.gt.f64 	%p105, %rd570, %rd94;
+	cvt.rn.f32.f64 	%r347, %rd570;
+	selp.f32 	%r348, %r57, %r347, %p105;
+	cvt.f64.f32 	%rd571, %r335;
+	mul.rn.f64 	%rd572, %rd535, %rd571;
+	cvt.f64.f32 	%rd573, %r338;
+	mul.rn.f64 	%rd574, %rd542, %rd573;
+	add.rn.f64 	%rd575, %rd572, %rd574;
+	cvt.f64.f32 	%rd576, %r342;
+	mul.rn.f64 	%rd577, %rd548, %rd576;
+	add.rn.f64 	%rd578, %rd575, %rd577;
+	cvt.f64.f32 	%rd579, %r345;
+	mul.rn.f64 	%rd580, %rd551, %rd579;
+	add.rn.f64 	%rd581, %rd578, %rd580;
+	setp.lt.f64 	%p106, %rd581, 0d0000000000000000;
+	selp.f64 	%rd582, 0d0000000000000000, %rd581, %p106;
+	setp.gt.f64 	%p107, %rd582, %rd95;
+	cvt.rn.f32.f64 	%r349, %rd582;
+	selp.f32 	%r350, %r58, %r349, %p107;
+	cvt.f64.f32 	%rd583, %r336;
+	mul.rn.f64 	%rd584, %rd535, %rd583;
+	cvt.f64.f32 	%rd585, %r339;
+	mul.rn.f64 	%rd586, %rd542, %rd585;
+	add.rn.f64 	%rd587, %rd584, %rd586;
+	cvt.f64.f32 	%rd588, %r343;
+	mul.rn.f64 	%rd589, %rd548, %rd588;
+	add.rn.f64 	%rd590, %rd587, %rd589;
+	cvt.f64.f32 	%rd591, %r346;
+	mul.rn.f64 	%rd592, %rd551, %rd591;
+	add.rn.f64 	%rd593, %rd590, %rd592;
+	setp.lt.f64 	%p108, %rd593, 0d0000000000000000;
+	selp.f64 	%rd594, 0d0000000000000000, %rd593, %p108;
+	setp.gt.f64 	%p109, %rd594, %rd96;
+	cvt.rn.f32.f64 	%r351, %rd594;
+	selp.f32 	%r352, %r59, %r351, %p109;
+	mul.wide.u32 	%rd595, %r380, 12;
+	add.s64 	%rd596, %rd93, %rd595;
+	st.global.b32 	[%rd596], %r348;
+	st.global.b32 	[%rd596+4], %r350;
+	st.global.b32 	[%rd596+8], %r352;
+	add.s32 	%r380, %r380, 1;
+	setp.ne.b32 	%p110, %r380, %r56;
+	@%p110 bra 	$L__BB13_120;
+	bra.uni 	$L__BB13_126;
+$L__BB13_126:                           // %fibrs_kernels__finish__evaluate.exit
+	add.s64 	%rd597, %rd10, %rd511;
+	st.global.b32 	[%rd597], %r55;
+$L__BB13_127:                           // %bb20
+	ret;
+                                        // -- End function
+}
