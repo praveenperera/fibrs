@@ -4,6 +4,16 @@
 
 ### What's new
 
+- **Faster seed catalogue.** Each family's seed catalogue (priority split, descending-centrality argsort, sort by
+  1024³ region) is built on the `--threads` pool:
+  - the split and gathers keep their order;
+  - the partitions NumPy's quicksort sets aside are sorted in parallel, which gives its exact order, equal keys
+    included;
+  - the stable sort by region is now a counting sort.
+
+  On the dense PHerc0358 window z02304–02816, the catalogues of its 22 million V and 21 million H seeds took
+  about 10 CPU-s on one thread, most of the 12 s the seed stage took. The tracing order, and so the `.afv`, is
+  unchanged.
 - **H's centrality runs during V's walk.** When the GPU computes centrality, the H family's centrality and seeds
   now run while the V family walks on the CPU, instead of after it. The run holds H's centrality and seed list
   while V walks. The `.afv` is unchanged. With centrality on the CPU, the two still run one after the other.
