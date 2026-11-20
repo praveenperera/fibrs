@@ -9,6 +9,7 @@ mod finish;
 mod gpu;
 mod input;
 mod kernels;
+mod lookahead;
 mod predict;
 mod produce;
 mod pyfmt;

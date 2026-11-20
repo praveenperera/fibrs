@@ -471,14 +471,42 @@ impl Coverage {
     /// Whether a voxel has been marked at all
     #[inline]
     pub fn is_covered(&self, reads: &mut ReadSet, z: i64, y: i64, x: i64) -> bool {
-        self.read(reads, z, y, x) != UNCOVERED
+        Probe::Covered.outcome(self.read(reads, z, y, x, Probe::Covered))
     }
 
     #[inline(always)]
-    fn read(&self, reads: &mut ReadSet, z: i64, y: i64, x: i64) -> u16 {
+    fn read(&self, reads: &mut ReadSet, z: i64, y: i64, x: i64, probe: Probe) -> u16 {
         let at = self.0.place(z as usize, y as usize, x as usize);
         reads.push(at.slot());
+        let seen = self.0.get(at);
+        if let Some(checks) = &mut reads.checks {
+            checks.push(Check { at, seen, probe });
+        }
+        seen
+    }
+
+    /// The value at a place
+    #[inline(always)]
+    pub fn get(&self, at: Place) -> u16 {
         self.0.get(at)
+    }
+
+    /// The place of brick slot `slot`'s voxel `offset`, if both lie in the volume
+    pub fn place_at(&self, slot: usize, offset: u16) -> Option<Place> {
+        self.0.place_at(slot, offset)
+    }
+
+    /// Whether every check still reads the outcome it read: then a seed traced with those checks traces the
+    /// same way against the coverage as it is now
+    ///
+    /// Coverage only ever goes from uncovered to one direction to covered twice, so each probe's outcome changes
+    /// at most once, from false to true. A check that holds now therefore held at every point since it was read,
+    /// which is what lets a result checked against the live coverage stand for one traced at any commit between
+    pub fn holds(&self, checks: &[Check]) -> bool {
+        checks.iter().all(|c| {
+            let now = self.0.get(c.at);
+            now == c.seen || c.probe.outcome(now) == c.probe.outcome(c.seen)
+        })
     }
 
     /// Bytes held by allocated bricks
@@ -497,15 +525,8 @@ impl Coverage {
         if ix < 0 || ix >= w || iy < 0 || iy >= h || iz < 0 || iz >= d {
             return false;
         }
-        let c = self.read(reads, iz, iy, ix);
-        if c == UNCOVERED {
-            return false;
-        }
-        if c == COVERED_TWICE {
-            return true;
-        }
-        let [ux, uy, uz] = decode_packed(c);
-        (ux * tx + uy * ty + uz * tz).abs() > 0.86
+        let probe = Probe::SameDir([tx, ty, tz]);
+        probe.outcome(self.read(reads, iz, iy, ix, probe))
     }
 
     /// The voxels `mark_curve_coverage` (core.py:527, `core_r = 2.05`) would update for one curve, in its order
@@ -582,36 +603,104 @@ impl Coverage {
     ///
     /// When called a second time on the same coverage
     pub fn writer(&self) -> CoverageWriter<'_> {
-        CoverageWriter { vol: self.0.writer(), written: vec![0; WRITTEN_SLOTS].into_boxed_slice() }
+        CoverageWriter { vol: self.0.writer(), written: vec![0; WRITTEN_SLOTS].into_boxed_slice(), changes: None }
     }
 }
 
-/// The brick slots a seed's tracing read from the coverage, in read order
+/// The brick slots a seed's tracing read from the coverage, in read order, and optionally each read itself
 ///
 /// A slot read again right after itself is kept once; steps mostly stay in one brick, so the set stays short
 #[derive(Default)]
-pub struct ReadSet(Vec<usize>);
+pub struct ReadSet {
+    slots: Vec<usize>,
+    checks: Option<Vec<Check>>,
+}
 
 impl ReadSet {
+    /// A read set that also records every read as a [`Check`], for comparing tracers read by read
+    pub fn recording() -> Self {
+        Self { slots: Vec::new(), checks: Some(Vec::new()) }
+    }
+
     #[inline(always)]
-    fn push(&mut self, slot: usize) {
-        if self.0.last() != Some(&slot) {
-            self.0.push(slot);
+    pub(crate) fn push(&mut self, slot: usize) {
+        if self.slots.last() != Some(&slot) {
+            self.slots.push(slot);
         }
     }
 
     pub fn slots(&self) -> &[usize] {
-        &self.0
+        &self.slots
     }
+
+    /// The reads recorded since the last clear, when recording
+    pub fn checks(&self) -> Option<&[Check]> {
+        self.checks.as_deref()
+    }
+
+    fn clear(&mut self) {
+        self.slots.clear();
+        if let Some(checks) = &mut self.checks {
+            checks.clear();
+        }
+    }
+}
+
+/// What a coverage read asked of the voxel it read
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Probe {
+    /// `is_covered`: whether the voxel was marked at all
+    Covered,
+    /// `is_covered_same_dir` with this tangent: covered twice, or once along a direction within acos(0.86) of it
+    SameDir([f64; 3]),
+}
+
+impl Probe {
+    /// The probe's answer for coverage value `c`
+    #[inline(always)]
+    pub fn outcome(self, c: u16) -> bool {
+        match self {
+            Probe::Covered => c != UNCOVERED,
+            Probe::SameDir([tx, ty, tz]) => {
+                if c == UNCOVERED {
+                    return false;
+                }
+                if c == COVERED_TWICE {
+                    return true;
+                }
+                let [ux, uy, uz] = decode_packed(c);
+                (ux * tx + uy * ty + uz * tz).abs() > 0.86
+            }
+        }
+    }
+}
+
+/// One coverage read of a seed's tracing: where, what it asked and the value it read
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Check {
+    pub at: Place,
+    pub seen: u16,
+    pub probe: Probe,
 }
 
 /// One voxel update of [`Coverage::mark_list`]: the encoded direction of the marking point and its tangent's
 /// index in [`Traced::tans`]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mark {
     at: Place,
     dir: u16,
     tan: u32,
+}
+
+impl Mark {
+    /// A mark of `at` along encoded direction `dir` by the point whose tangent is `tans[tan]` of its seed
+    pub fn new(at: Place, dir: u16, tan: u32) -> Self {
+        Self { at, dir, tan }
+    }
+
+    pub fn at(&self) -> Place {
+        self.at
+    }
 }
 
 /// The `written` table's size, as a power of two
@@ -627,6 +716,16 @@ const WRITTEN_SLOTS: usize = 1 << WRITTEN_BITS;
 pub struct CoverageWriter<'c> {
     vol: SharedVolWriter<'c>,
     written: Box<[u32]>,
+    /// Every voxel change since the last [`CoverageWriter::take_changes`], when a copy of the coverage elsewhere
+    /// follows this one
+    changes: Option<Vec<Change>>,
+}
+
+/// One voxel of the coverage set to a new value
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Change {
+    pub at: Place,
+    pub value: u16,
 }
 
 impl CoverageWriter<'_> {
@@ -634,6 +733,18 @@ impl CoverageWriter<'_> {
     fn entry(slot: usize) -> usize {
         // Fibonacci hashing spreads neighbouring slots over the table
         ((slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - WRITTEN_BITS)) as usize
+    }
+
+    /// Keep every change from now on, for [`CoverageWriter::take_changes`]
+    pub fn log_changes(&mut self) {
+        self.changes.get_or_insert_with(Vec::new);
+    }
+
+    /// Move the changes logged since the last call into `to`
+    pub fn take_changes(&mut self, to: &mut Vec<Change>) {
+        if let Some(changes) = &mut self.changes {
+            to.append(changes);
+        }
     }
 
     /// Whether a seed that read `reads` while the first `committed` seeds were committed may have read a value a
@@ -662,6 +773,9 @@ impl CoverageWriter<'_> {
             };
             self.vol.set(m.at, value);
             self.written[Self::entry(m.at.slot())] = stamp;
+            if let Some(changes) = &mut self.changes {
+                changes.push(Change { at: m.at, value });
+            }
         }
     }
 }
@@ -734,7 +848,7 @@ impl Traced {
         self.curves.clear();
         self.marks.clear();
         self.tans.clear();
-        self.reads.0.clear();
+        self.reads.clear();
     }
 
     /// Drop a result that will not be committed, keeping no more room than [`Traced::trim`] does
@@ -1239,6 +1353,34 @@ pub fn evaluate_curve(smoothed: &[[f32; 3]], n_out: usize, shape: [usize; 3]) ->
         }
     }
     out
+}
+
+/// Helpers for tests of other modules that need the coverage's internals
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::lookahead::{RawCheck, RawMark};
+
+    /// Set each voxel `changes` names, as the committer of another coverage did, keeping `writer`'s a copy of it
+    pub fn copy(writer: &mut CoverageWriter, changes: &[Change]) {
+        for c in changes {
+            writer.vol.set(c.at, c.value);
+        }
+    }
+
+    /// A recorded read as a device reports it
+    pub fn raw_check(c: &Check) -> RawCheck {
+        let same_dir = match c.probe {
+            Probe::Covered => None,
+            Probe::SameDir(t) => Some(t),
+        };
+        RawCheck { slot: c.at.slot() as u32, offset: c.at.offset(), seen: c.seen, same_dir }
+    }
+
+    /// A mark as a device reports it
+    pub fn raw_mark(m: &Mark) -> RawMark {
+        RawMark { slot: m.at.slot() as u32, offset: m.at.offset(), dir: m.dir, tan: m.tan }
+    }
 }
 
 #[cfg(test)]

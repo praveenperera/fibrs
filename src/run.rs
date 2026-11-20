@@ -30,6 +30,7 @@ use crate::gpu::{AxesCounts, Gpu, Stages};
 use crate::input::Predictions;
 use crate::kernels::{Coverage, DirField, DirForm, Directions, Fields, RawCurve, SplitDirs};
 use crate::log;
+use crate::lookahead::AheadStats;
 use crate::produce::{Flow, Producer, Speculation, Stats};
 use crate::stage1::{Fused, Separate};
 use crate::vol::{EDGE, Shape, Vol};
@@ -1159,9 +1160,14 @@ fn trace_family<D: DirField>(
         if !batch.is_empty() {
             let _ = tx.send(batch);
         }
-        let Stats { seeds, window, retraced, committer } = stats;
+        let Stats { seeds, window, retraced, committer, ahead } = stats;
         let share = 100.0 * retraced as f64 / seeds.max(1) as f64;
         log!("{label} window {window}: {retraced} seeds traced again ({share:.3}%), {committer} on the committer");
+        if let Some(AheadStats { traced, used, stale, given_back }) = ahead {
+            log!(
+                "{label} GPU: traced {traced} seeds ahead, {used} results used, {stale} stale, {given_back} given back"
+            );
+        }
         debug_mem(label, &[("coverage", cov.resident_bytes()), ("cache", cache.bytes()), ("catalogue", 12 * total)]);
         Ok(count)
     };

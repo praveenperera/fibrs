@@ -331,6 +331,12 @@ impl Place {
     pub fn slot(self) -> usize {
         self.slot
     }
+
+    /// The voxel's offset in its brick, `vol.rs`'s brick layout
+    #[inline(always)]
+    pub fn offset(self) -> u16 {
+        self.offset
+    }
 }
 
 impl SharedVol {
@@ -353,6 +359,11 @@ impl SharedVol {
     pub fn place(&self, z: usize, y: usize, x: usize) -> Place {
         debug_assert!(z < self.shape[0] && y < self.shape[1] && x < self.shape[2]);
         Place { slot: brick_index(self.grid, z, y, x), offset: offset(z, y, x) as u16 }
+    }
+
+    /// The place of brick slot `slot`'s voxel `offset`, if both lie in the volume
+    pub fn place_at(&self, slot: usize, offset: u16) -> Option<Place> {
+        (slot < self.bricks.len() && (offset as usize) < BRICK).then_some(Place { slot, offset })
     }
 
     /// The value at a place

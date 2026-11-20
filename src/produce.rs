@@ -22,6 +22,7 @@ use color_eyre::eyre::{Result, bail};
 
 use crate::fields::Catalogue;
 use crate::kernels::{Coverage, Fields, Grid, RawCurve, Scratch, Traced, trace_seed};
+use crate::lookahead::{Ahead, AheadStats, Device, Pace};
 
 /// Seeds traced ahead of the commit point
 ///
@@ -65,6 +66,8 @@ pub struct Stats {
     pub retraced: usize,
     /// Seeds no other thread had started when they reached the commit point, so the committer traced them
     pub committer: usize,
+    /// What a device tracing far ahead contributed, when one did
+    pub ahead: Option<AheadStats>,
 }
 
 /// Whether the producer goes on after a seed's curves are handed over
@@ -104,7 +107,15 @@ impl<'a, P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Producer<'a, P, C, D> {
             panicked: AtomicBool::new(false),
             committer: OnceLock::new(),
             scratch: Mutex::new(Vec::new()),
+            ahead: None,
         })
+    }
+
+    /// Let `device` trace seeds far ahead of the commit point; tracing threads use its results whose coverage
+    /// reads still hold ([`crate::lookahead`])
+    pub fn with_device(mut self, device: &'a mut dyn Device, pace: Pace) -> Self {
+        self.ahead = Some((Ahead::default(), Mutex::new(device), pace));
+        self
     }
 
     /// Commit every seed in order on the calling thread, handing each seed's accepted curves to `deliver`
@@ -120,16 +131,28 @@ impl<'a, P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Producer<'a, P, C, D> {
             bail!("a producer runs once");
         }
         let max_helpers = pool.current_num_threads();
-        pool.in_place_scope(|scope| {
-            let result = self.commit_all(&mut deliver, || {
-                if self.helpers.load(Ordering::Relaxed) < max_helpers && self.claimable() {
-                    self.helpers.fetch_add(1, Ordering::Relaxed);
-                    scope.spawn(|_| self.help());
-                }
-            });
-            // helpers still tracing ahead finish their seed and see no more to claim
-            self.stop.store(true, Ordering::Relaxed);
-            result
+        std::thread::scope(|threads| {
+            if let Some((ahead, device, pace)) = &self.ahead {
+                threads.spawn(move || {
+                    let mut device = device.lock().expect("device lock");
+                    let total = self.cat.coords.len();
+                    // the device only ever saves the CPU work: when it fails the CPU traces every seed it would have
+                    if let Err(e) = ahead.drive(&mut **device, total, &self.committed, &self.stop, *pace) {
+                        crate::log!("The GPU stopped tracing ahead, so the CPU traces the rest: {e:#}");
+                    }
+                });
+            }
+            pool.in_place_scope(|scope| {
+                let result = self.commit_all(&mut deliver, || {
+                    if self.helpers.load(Ordering::Relaxed) < max_helpers && self.claimable() {
+                        self.helpers.fetch_add(1, Ordering::Relaxed);
+                        scope.spawn(|_| self.help());
+                    }
+                });
+                // helpers still tracing ahead finish their seed and see no more to claim, and the device stops
+                self.stop.store(true, Ordering::Relaxed);
+                result
+            })
         })
     }
 }
@@ -158,6 +181,8 @@ pub struct Producer<'a, P, C, D> {
     committer: OnceLock<Thread>,
     /// Tracing buffers of helpers that have returned, a few MiB each, for the next helpers
     scratch: Mutex<Vec<Scratch>>,
+    /// A device tracing far ahead, its results and its thread's pacing
+    ahead: Option<(Ahead, Mutex<&'a mut dyn Device>, Pace)>,
 }
 
 /// One seed traced ahead
@@ -216,6 +241,11 @@ impl<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Producer<'_, P, C, D> {
     }
 
     fn trace(&self, i: usize, scratch: &mut Scratch, out: &mut Traced) -> Result<()> {
+        if let Some((ahead, ..)) = &self.ahead
+            && ahead.fill(self.cov, i, out)
+        {
+            return Ok(());
+        }
         trace_seed(self.fields, self.cov, scratch, self.cat.coords[i], self.primary(i), out)
     }
 
@@ -326,6 +356,9 @@ impl<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Producer<'_, P, C, D> {
         let mut scratch = Scratch::default();
         let mut own = Traced::default();
         let mut stats = Stats { seeds: total, window: self.window, ..Stats::default() };
+        if self.ahead.is_some() {
+            writer.log_changes();
+        }
         top_up();
         for i in 0..total {
             let traced = match self.ready(i)? {
@@ -353,24 +386,35 @@ impl<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Producer<'_, P, C, D> {
                 }
             };
             writer.apply(i as u32, traced);
+            if let Some((ahead, ..)) = &self.ahead
+                && !traced.marks.is_empty()
+            {
+                ahead.send_changes(|to| writer.take_changes(to));
+            }
             let flow = deliver(i, &mut traced.curves)?;
             traced.trim();
             // release: publishes the marks just applied and hands the slot back
             self.committed.store(i + 1, Ordering::Release);
             if let Flow::Stop = flow {
-                return Ok(stats);
+                break;
             }
             top_up();
         }
+        stats.ahead = self.ahead.as_ref().map(|(ahead, ..)| ahead.stats());
         Ok(stats)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::ops::Range;
+
     use super::*;
     use crate::fields::{Presence, catalogue, centrality};
-    use crate::kernels::{encode_dir, pack_dir};
+    use crate::kernels::test_support::{copy, raw_check, raw_mark};
+    use crate::kernels::{Change, CoverageWriter, ReadSet, encode_dir, pack_dir};
+    use crate::lookahead::{ChunkOut, SeedOut, Status};
     use crate::stage1::Separate;
     use crate::vol::Vol;
 
@@ -486,5 +530,103 @@ mod tests {
         let (curves, stats) = speculative(&fields, &cat, Speculation { window: usize::MAX, retrace_all: false });
         assert!(curves == expected, "window usize::MAX: {} curves, {} expected", curves.len(), expected.len());
         assert_eq!(stats.window, seeds);
+    }
+
+    /// A device that traces each chunk on the CPU when it launches, against a copy of the coverage holding only the
+    /// changes sent before then, as a GPU reads its lagging copy
+    struct CpuDevice<'f, P, C, D> {
+        fields: &'f Fields<'f, P, C, D>,
+        cat: &'f Catalogue,
+        mirror: &'static Coverage,
+        writer: Moved<CoverageWriter<'static>>,
+        done: VecDeque<ChunkOut>,
+    }
+
+    /// A value moved to the thread that drives the device and used only there
+    struct Moved<T>(T);
+
+    // SAFETY: the copy's writer is made on the test thread and from then on used only by the thread driving the
+    // device; nothing else holds a pointer into the bricks it allocates
+    unsafe impl<T> Send for Moved<T> {}
+
+    impl<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Device for CpuDevice<'_, P, C, D> {
+        fn update(&mut self, changes: &[Change]) -> Result<()> {
+            copy(&mut self.writer.0, changes);
+            Ok(())
+        }
+
+        fn launch(&mut self, seeds: Range<usize>) -> Result<()> {
+            let (mut scratch, mut traced) =
+                (Scratch::default(), Traced { reads: ReadSet::recording(), ..Traced::default() });
+            let mut out = ChunkOut { seeds: seeds.clone(), ..ChunkOut::default() };
+            for i in seeds {
+                let r = (0..self.cat.starts.len() - 1).find(|&r| i < self.cat.starts[r + 1]).expect("a region");
+                let primary = i < self.cat.starts[r] + self.cat.primary[r];
+                trace_seed(self.fields, self.mirror, &mut scratch, self.cat.coords[i], primary, &mut traced)?;
+                let at = |n: usize| n as u32;
+                let (c0, k0, t0, m0) = (out.checks.len(), out.curves.len(), out.tans.len(), out.marks.len());
+                out.checks.extend(traced.reads.checks().expect("recording").iter().map(raw_check));
+                for c in &traced.curves {
+                    let p0 = out.pts.len();
+                    out.pts.extend_from_slice(&c.pts);
+                    out.curves.push(at(p0)..at(out.pts.len()));
+                }
+                out.tans.extend_from_slice(&traced.tans);
+                out.marks.extend(traced.marks.iter().map(raw_mark));
+                out.results.push(SeedOut {
+                    status: Status::Done,
+                    checks: at(c0)..at(out.checks.len()),
+                    curves: at(k0)..at(out.curves.len()),
+                    tans: at(t0)..at(out.tans.len()),
+                    marks: at(m0)..at(out.marks.len()),
+                });
+            }
+            self.done.push_back(out);
+            Ok(())
+        }
+
+        fn collect(&mut self) -> Result<Option<ChunkOut>> {
+            Ok(self.done.pop_front())
+        }
+
+        fn in_flight(&self) -> usize {
+            self.done.len()
+        }
+    }
+
+    #[test]
+    fn results_traced_ahead_on_a_device_commit_the_serial_curves() {
+        let (tracing, dirs) = fibres();
+        let pres = Presence::new(&tracing, 1);
+        let fam = centrality::<Separate, _>(&pres, &dirs);
+        let cat = catalogue(&fam.seeds, &fam.cent);
+        let fields = Fields { pres: &pres, cent: &fam.cent, dirs: &dirs };
+        let expected = serial(&fields, &cat);
+
+        let mirror: &'static Coverage = Box::leak(Box::new(Coverage::new(SHAPE)));
+        let mut device =
+            CpuDevice { fields: &fields, cat: &cat, mirror, writer: Moved(mirror.writer()), done: VecDeque::new() };
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let cov = Coverage::new(SHAPE);
+        let spec = Speculation { window: WINDOW, retrace_all: false };
+        let pace = Pace { chunk: 64, depth: 2, reach: 1 << 10 };
+        let producer = Producer::new(&fields, &cov, &cat, spec).unwrap().with_device(&mut device, pace);
+        let device_traced = || producer.ahead.as_ref().map_or(0, |(ahead, ..)| ahead.stats().traced);
+        let mut curves = Vec::new();
+        let stats = producer
+            .run(&pool, |i, out| {
+                // the device's first chunk is traced against the empty coverage before any commit, so those of its
+                // seeds that read a voxel an earlier seed marks read another value than the serial tracer did
+                while i == 0 && device_traced() == 0 {
+                    std::thread::yield_now();
+                }
+                curves.extend(out.drain(..).map(|c| c.pts));
+                Ok(Flow::Continue)
+            })
+            .unwrap();
+        assert!(curves == expected, "{} curves, {} expected", curves.len(), expected.len());
+        let ahead = stats.ahead.expect("a device traced ahead");
+        assert!(ahead.used > 0, "no device result was used: {ahead:?}");
+        assert!(ahead.stale > 0, "no device result was stale, so the check was never exercised: {ahead:?}");
     }
 }
