@@ -194,8 +194,9 @@ impl<T: Voxel> Vol<T> {
     /// Fill bricks in parallel, each given as its slot (C order over the brick grid) and its voxels in brick order;
     /// a brick that would hold only the default is not allocated, as in [`Vol::set_brick`]
     ///
-    /// Each slot may be filled once and must still read as the default, as in [`Vol::fill_brick_rows`]: a slot
-    /// given again keeps its last brick, and the earlier one stays allocated until the volume is dropped
+    /// Each slot may be filled once and must still read as the default, as in [`Vol::fill_brick_rows`]. A slot given
+    /// twice is a caller error: debug builds panic when both bricks hold a non-default voxel, and an all-default
+    /// brick is skipped before the slot is checked
     #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
     pub fn set_bricks<'a, I>(&mut self, bricks: I)
     where

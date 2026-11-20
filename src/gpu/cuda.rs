@@ -321,6 +321,8 @@ impl Gpu {
             }
         }
 
+        // the slots' pinned buffers are no longer needed, so they are freed before the seeds are joined
+        drop(slots);
         let mut seeds = unit_seeds.concat();
         // the catalogue reads seeds in C order over the whole volume; indices are unique, so any sort agrees
         seeds.sort_unstable();
@@ -472,10 +474,12 @@ impl<'v> Plan<'v> {
 
     /// The unit's room, given the family's own pooled prediction `own`
     ///
-    /// Presence is 0 wherever `own` is, and centrality is 0 below presence 64, so only the output bricks where `own`
-    /// has a payload can hold a nonzero value and be packed: a sparse unit pins room for those alone
+    /// Centrality is 0 below presence 64, and presence is 0 unless `own` is at least the other family's value, so
+    /// it reaches 64 only where `own` is at least 32: only the output bricks with such a voxel can hold a nonzero
+    /// value and be packed, and a sparse or faint unit pins room for those alone
     fn room(&self, own: &Vol<u8>) -> Room {
-        let out = self.meta.bricks.iter().filter(|&&b| own.brick_at(b).is_some()).count();
+        let out =
+            self.meta.bricks.iter().filter(|&&b| own.brick_at(b).is_some_and(|v| v.iter().any(|&p| p >= 32))).count();
         Room { pool: self.pool.payloads.len(), out }
     }
 }
