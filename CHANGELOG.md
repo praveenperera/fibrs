@@ -13,6 +13,17 @@
   each family. If the GPU fails while finishing, `--device auto` finishes the rest of the family on the CPU and
   `--device cuda` stops the run, as in the other GPU stages. `--device cpu` finishes on the CPU as before.
 
+- **Faster seed catalogue.** Each family's seed catalogue (priority split, descending-centrality argsort, sort by
+  1024³ region) is built on the `--threads` pool:
+  - the split and gathers keep their order;
+  - the partitions NumPy's quicksort sets aside are sorted in parallel, which gives its exact order, equal keys
+    included;
+  - the stable sort by region is now a counting sort.
+
+  On the dense PHerc0358 window z02304–02816, the catalogues of its 22 million V and 21 million H seeds took
+  about 10 CPU-s on one thread, most of the 12 s the seed stage took. The tracing order, and so the `.afv`, is
+  unchanged.
+
 ## [0.3.1] - 2026-11-19
 
 fibrs 0.3.1 traces dense data faster: threads that finishing leaves idle trace seeds ahead, and the binary
