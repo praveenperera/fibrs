@@ -15,16 +15,12 @@ pub const MAX_CAP: u32 = 1024;
 /// Room for accepted spans per survivor: each has at least 8 of at most `2 * cap + 1` points and neighbours share
 /// one, so `(2 * cap + 1) / 7 + 1` is enough for any cap up to [`MAX_CAP`]
 pub const SPAN_CAP: u32 = (2 * MAX_CAP + 1) / 7 + 1;
-/// u32 per point in the mark masks: one bit per voxel of the 7³ box `mark_point` visits
-pub const MASK_WORDS: u32 = 343u32.div_ceil(32);
-/// u32 per seed result: status (0 done, 1 back to the CPU), then the start and end of its checks, curves, tans
-/// and marks
-pub const RESULT_WORDS: usize = 9;
+/// u32 per seed result: status (0 done, 1 back to the CPU), then the start and end of its checks, curves and tans
+pub const RESULT_WORDS: usize = 7;
 /// Slots of the totals array
-pub const TOTALS: usize = 8;
+pub const TOTALS: usize = 5;
 pub const T_CHECKS: usize = 0;
 pub const T_PTS: usize = 1;
 pub const T_CURVES: usize = 2;
-pub const T_MARKS: usize = 3;
-pub const T_SURV: usize = 4;
-pub const T_SEEDS: usize = 5;
+pub const T_SURV: usize = 3;
+pub const T_SEEDS: usize = 4;

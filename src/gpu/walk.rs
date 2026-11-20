@@ -25,14 +25,13 @@ pub struct Caps {
     /// Accepted points (and tangents)
     pub pts: u32,
     pub curves: u32,
-    pub marks: u32,
 }
 
 impl Default for Caps {
-    /// Room for a dense chunk: on a dense PHerc0358 crop, 64K seeds had about 7K past the start, 230K checks, 60K
-    /// accepted points and 3M marks
+    /// Room for a dense chunk: on a dense PHerc0358 crop, 64K seeds had about 7K past the start, 230K checks and
+    /// 60K accepted points
     fn default() -> Self {
-        Self { survivors: 12 << 10, checks: 2 << 20, pts: 1 << 20, curves: 256 << 10, marks: 16 << 20 }
+        Self { survivors: 12 << 10, checks: 2 << 20, pts: 1 << 20, curves: 256 << 10 }
     }
 }
 

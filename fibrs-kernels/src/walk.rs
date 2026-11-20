@@ -39,17 +39,11 @@ pub const SAME_DIR: u8 = 1;
 const UNCOVERED: u16 = 0;
 const COVERED_TWICE: u16 = 1;
 
-/// `mark_curve_coverage`'s `core_r ** 2` in float32, as `Coverage::mark_list` computes it
-pub const CORE_R2: f64 = (2.05f64 * 2.05) as f32 as f64;
-
 /// The ring `recenter_normal_plane` samples, in its order
 pub const RING_U1: [f32; 13] =
     [0.0, 0.55, 0.0, -0.55, 0.0, 1.15, 0.81317, 0.0, -0.81317, -1.15, -0.81317, 0.0, 0.81317];
 pub const RING_U2: [f32; 13] =
     [0.0, 0.0, 0.55, 0.0, -0.55, 0.0, 0.81317, 1.15, 0.81317, 0.0, -0.81317, -1.15, -0.81317];
-
-/// Most voxels one point marks: the 7³ box around it
-pub const MARK_BOX: u32 = 343;
 
 /// The read-only fields one family traces over, all of shape [`Fields::dims`]
 pub trait Fields {
@@ -57,8 +51,6 @@ pub trait Fields {
     fn dims(&self) -> [i32; 3];
     /// Presence at the eight corners of the in-bounds cell whose lowest corner is `z, y, x`, `[z][y][x]` flattened
     fn pres_corners(&self, z: i32, y: i32, x: i32) -> [u8; 8];
-    /// Centrality at an in-bounds voxel
-    fn cent(&self, z: i32, y: i32, x: i32) -> u16;
     /// Centrality at the eight corners of an in-bounds cell, as [`Fields::pres_corners`]
     fn cent_corners(&self, z: i32, y: i32, x: i32) -> [u16; 8];
     /// Packed direction bytes `nx << 8 | ny` at an in-bounds voxel
@@ -846,80 +838,4 @@ fn keep<O: Ops, C: Curve>(cv: &C, a: u32, b: u32, req_len: f64) -> bool {
         j += 1;
     }
     (arc_len as f64) >= req_len
-}
-
-/// `encode_dir` (`kernels::encode_dir`) of a float32 tangent, packed as `nx << 8 | ny`
-#[inline(always)]
-pub fn encode_dir<O: Ops>(t: [f32; 3]) -> u16 {
-    let [mut ux, mut uy, uz] = t;
-    if (uz as f64) < 0.0 {
-        ux = -ux;
-        uy = -uy;
-    }
-    let q = |v: f32| py_min(py_max(O::add(O::mul(v as f64, 127.0), 128.5), 1.0), 255.0) as i32 as u8;
-    (q(ux) as u16) << 8 | q(uy) as u16
-}
-
-/// `Coverage::mark_list` for one point `p` with tangent `t`: `emit(k, z, y, x)` for each voxel it marks, in its
-/// z, y, x order, `k` being the voxel's index in the point's 7³ box
-#[inline(always)]
-pub fn mark_point<O: Ops, F: Fields, E: FnMut(u32, i32, i32, i32)>(f: &F, p: [f32; 3], t: [f32; 3], mut emit: E) {
-    let [d, h, w] = f.dims();
-    let [px, py, pz] = f64x3(p);
-    let tv = f64x3(t);
-    let c0 = trilin_u16::<O, F>(f, px, py, pz);
-    let ix0 = O::add(px, 0.5) as i32;
-    let iy0 = O::add(py, 0.5) as i32;
-    let iz0 = O::add(pz, 0.5) as i32;
-    let mut dz = 0;
-    while dz < 7 {
-        let zz = iz0 - 3 + dz;
-        if zz >= 0 && zz < d {
-            let mut dy = 0;
-            while dy < 7 {
-                let yy = iy0 - 3 + dy;
-                if yy >= 0 && yy < h {
-                    let mut dx = 0;
-                    while dx < 7 {
-                        let xx = ix0 - 3 + dx;
-                        let k = ((dz * 7 + dy) * 7 + dx) as u32;
-                        if xx >= 0 && xx < w && marks::<O, F>(f, [px, py, pz], tv, c0, [xx, yy, zz]) {
-                            emit(k, zz, yy, xx);
-                        }
-                        dx += 1;
-                    }
-                }
-                dy += 1;
-            }
-        }
-        dz += 1;
-    }
-}
-
-/// Whether the point `p` (x, y, z, with tangent `t` and centrality `c0`) marks the in-bounds voxel `v` (x, y, z)
-#[inline(always)]
-fn marks<O: Ops, F: Fields>(f: &F, p: [f64; 3], t: [f64; 3], c0: f64, v: [i32; 3]) -> bool {
-    let [xx, yy, zz] = v;
-    let (xf, yf, zf) = (xx as f64, yy as f64, zz as f64);
-    let vv = [sub::<O>(xf, p[0]), sub::<O>(yf, p[1]), sub::<O>(zf, p[2])];
-    let par = dot::<O>(vv, t);
-    if abs(par) > 0.9 {
-        return false;
-    }
-    let perp2 = sub::<O>(dot::<O>(vv, vv), O::mul(par, par));
-    if perp2 > 3.5 * 3.5 {
-        return false;
-    }
-    let u = dir_at(f, zz, yy, xx);
-    if abs(dot::<O>(u, t)) <= 0.85 {
-        return false;
-    }
-    if perp2 <= CORE_R2 {
-        return true;
-    }
-    let cq = O::mul32(f.cent(zz, yy, xx) as f32, 0.01f32) as f64;
-    let mix = |a: f64, b: f64, pa: f64, vb: f64| O::add(O::mul(a, pa), O::mul(b, vb));
-    let cm1 = trilin_u16::<O, F>(f, mix(0.6, 0.4, p[0], xf), mix(0.6, 0.4, p[1], yf), mix(0.6, 0.4, p[2], zf));
-    let cm2 = trilin_u16::<O, F>(f, mix(0.35, 0.65, p[0], xf), mix(0.35, 0.65, p[1], yf), mix(0.35, 0.65, p[2], zf));
-    O::add(c0, 2.0) >= cm1 && O::add(cm1, 3.0) >= cm2 && O::add(cm2, 3.0) >= cq
 }

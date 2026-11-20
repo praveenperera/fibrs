@@ -27,7 +27,7 @@ use super::{Gpu, NO_BRICK, fit_host, pinned};
 use crate::fields::{Catalogue, Presence};
 use crate::gpu::walk::{CHUNK, Caps, IN_FLIGHT, STEP_CAP};
 use crate::kernels::{Change, DirField, decode_packed};
-use crate::lookahead::{ChunkOut, Device, RawCheck, RawMark, SeedOut, Status};
+use crate::lookahead::{ChunkOut, Device, RawCheck, SeedOut, Status};
 use crate::vol::{BRICK, Vol};
 
 // the host reads only part of the kernels' layout
@@ -36,8 +36,8 @@ use crate::vol::{BRICK, Vol};
 mod layout;
 
 use layout::{
-    CHECK_WORDS, CU_WORDS, MASK_WORDS, MAX_CAP, PREFIX_CHECKS, RESULT_WORDS, SPAN_CAP, SURV_WORDS, T_CHECKS, T_CURVES,
-    T_MARKS, T_PTS, T_SEEDS, TOTALS,
+    CHECK_WORDS, CU_WORDS, MAX_CAP, PREFIX_CHECKS, RESULT_WORDS, SPAN_CAP, SURV_WORDS, T_CHECKS, T_CURVES, T_PTS,
+    T_SEEDS, TOTALS,
 };
 
 /// Coverage bricks per device allocation of the mirror: 32 MiB
@@ -59,13 +59,11 @@ fn slot_bytes(caps: &Caps) -> usize {
         + 2 * STEP_CAP as usize * CHECK_WORDS * 8
         + width * 8
         + SPAN_CAP as usize * 4;
-    let per_pt = 2 * 12 + 4 + MASK_WORDS as usize * 4 + 4;
     CHUNK * per_seed
         + surv * per_surv
         + caps.checks as usize * CHECK_WORDS * 8
-        + caps.pts as usize * per_pt
+        + caps.pts as usize * 2 * 12
         + caps.curves as usize * 8
-        + caps.marks as usize * 12
 }
 
 /// A device pointer, as the kernels take it
@@ -172,10 +170,6 @@ struct ChunkSlot {
     out_pts: CudaSlice<f32>,
     out_tans: CudaSlice<f32>,
     out_curves: CudaSlice<u32>,
-    pt_tan: CudaSlice<u32>,
-    masks: CudaSlice<u32>,
-    counts: CudaSlice<u32>,
-    out_marks: CudaSlice<u32>,
     results: CudaSlice<u32>,
     host_totals: PinnedHostSlice<u32>,
     host_results: PinnedHostSlice<u32>,
@@ -183,7 +177,6 @@ struct ChunkSlot {
     host_pts: PinnedHostSlice<f32>,
     host_tans: PinnedHostSlice<f32>,
     host_curves: PinnedHostSlice<u32>,
-    host_marks: PinnedHostSlice<u32>,
 }
 
 impl ChunkSlot {
@@ -191,8 +184,7 @@ impl ChunkSlot {
         let stream = gpu.ctx.new_stream()?;
         let width = (2 * STEP_CAP + 1) as usize;
         let surv = caps.survivors as usize;
-        let (checks, pts, curves, marks) =
-            (caps.checks as usize, caps.pts as usize, caps.curves as usize, caps.marks as usize);
+        let (checks, pts, curves) = (caps.checks as usize, caps.pts as usize, caps.curves as usize);
         let z = |n: usize| -> Result<CudaSlice<u32>> { Ok(stream.alloc_zeros::<u32>(n.max(1))?) };
         Ok(Self {
             state: z(CHUNK)?,
@@ -214,10 +206,6 @@ impl ChunkSlot {
             out_pts: stream.alloc_zeros(pts.max(1) * 3)?,
             out_tans: stream.alloc_zeros(pts.max(1) * 3)?,
             out_curves: z(curves * 2)?,
-            pt_tan: z(pts)?,
-            masks: z(pts * MASK_WORDS as usize)?,
-            counts: z(pts)?,
-            out_marks: z(marks * 3)?,
             results: z(CHUNK * RESULT_WORDS)?,
             host_totals: pinned(&gpu.ctx, TOTALS, 0)?,
             host_results: pinned(&gpu.ctx, CHUNK * RESULT_WORDS, 0)?,
@@ -225,7 +213,6 @@ impl ChunkSlot {
             host_pts: pinned(&gpu.ctx, 1, 0)?,
             host_tans: pinned(&gpu.ctx, 1, 0)?,
             host_curves: pinned(&gpu.ctx, 1, 0)?,
-            host_marks: pinned(&gpu.ctx, 1, 0)?,
             stream,
         })
     }
@@ -401,9 +388,6 @@ fn grid(n: usize, block: u32) -> Result<LaunchConfig> {
     Ok(LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 })
 }
 
-/// Blocks of the launches whose threads stride over a count only the device knows
-const STRIDE_BLOCKS: u32 = 1024;
-
 impl Walk<'_> {
     /// Device bytes the walk holds now, its coverage mirror included
     pub fn device_bytes(&self) -> usize {
@@ -532,10 +516,7 @@ impl Walk<'_> {
         let (stack, cum, spans) = (p(&slot.stack), raw(&slot.cum, &st), p(&slot.spans));
         let (out_checks, out_pts, out_tans) =
             (raw(&slot.out_checks, &st), raw(&slot.out_pts, &st), raw(&slot.out_tans, &st));
-        let (out_curves, pt_tan, masks, counts) =
-            (p(&slot.out_curves), p(&slot.pt_tan), p(&slot.masks), p(&slot.counts));
-        let (out_marks, results) = (p(&slot.out_marks), p(&slot.results));
-        let stride = LaunchConfig { grid_dim: (STRIDE_BLOCKS, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+        let (out_curves, results) = (p(&slot.out_curves), p(&slot.results));
         let one_block = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 };
         let surv = c.survivors as usize;
         // SAFETY: every launch passes its kernel's params in the PTX's order (checked when the device opened); each
@@ -637,48 +618,7 @@ impl Walk<'_> {
                 .arg(&out_pts)
                 .arg(&out_tans)
                 .arg(&out_curves)
-                .arg(&pt_tan)
                 .launch(grid(n, 128)?)?;
-            st.launch_builder(&k.walk.mask)
-                .arg(&d)
-                .arg(&h)
-                .arg(&w)
-                .arg(&gy)
-                .arg(&gx)
-                .arg(&pres_t)
-                .arg(&pres_p)
-                .arg(&cent_t)
-                .arg(&cent_p)
-                .arg(&dir_t)
-                .arg(&dir_p)
-                .arg(&decode)
-                .arg(&ring)
-                .arg(&totals)
-                .arg(&c.pts)
-                .arg(&out_pts)
-                .arg(&out_tans)
-                .arg(&masks)
-                .arg(&counts)
-                .launch(stride)?;
-            st.launch_builder(&k.walk.scan)
-                .arg(&counts)
-                .arg(&at(T_PTS))
-                .arg(&c.pts)
-                .arg(&at(T_MARKS))
-                .launch(one_block)?;
-            st.launch_builder(&k.walk.marks)
-                .arg(&gy)
-                .arg(&gx)
-                .arg(&totals)
-                .arg(&c.pts)
-                .arg(&c.marks)
-                .arg(&out_pts)
-                .arg(&out_tans)
-                .arg(&pt_tan)
-                .arg(&masks)
-                .arg(&counts)
-                .arg(&out_marks)
-                .launch(stride)?;
             st.launch_builder(&k.walk.results)
                 .arg(&n32)
                 .arg(&state)
@@ -686,12 +626,10 @@ impl Walk<'_> {
                 .arg(&n_checks)
                 .arg(&n_pts)
                 .arg(&n_curves)
-                .arg(&counts)
                 .arg(&totals)
                 .arg(&c.checks)
                 .arg(&c.pts)
                 .arg(&c.curves)
-                .arg(&c.marks)
                 .arg(&results)
                 .launch(grid(n, 256)?)?;
         }
@@ -719,13 +657,11 @@ impl Walk<'_> {
         let n_checks = t[T_CHECKS].min(c.checks) as usize;
         let n_pts = t[T_PTS].min(c.pts) as usize;
         let n_curves = t[T_CURVES].min(c.curves) as usize;
-        let n_marks = t[T_MARKS].min(c.marks) as usize;
         let words = n * RESULT_WORDS;
         fit_host(&st, &mut slot.host_checks, n_checks * CHECK_WORDS, 0)?;
         fit_host(&st, &mut slot.host_pts, n_pts * 3, 0)?;
         fit_host(&st, &mut slot.host_tans, n_pts * 3, 0)?;
         fit_host(&st, &mut slot.host_curves, n_curves * 2, 0)?;
-        fit_host(&st, &mut slot.host_marks, n_marks * 3, 0)?;
         st.memcpy_dtoh(&slot.results.slice(..words), &mut slot.host_results.as_mut_slice()?[..words])?;
         if n_checks > 0 {
             let w = n_checks * CHECK_WORDS;
@@ -741,9 +677,6 @@ impl Walk<'_> {
                 &mut slot.host_curves.as_mut_slice()?[..n_curves * 2],
             )?;
         }
-        if n_marks > 0 {
-            st.memcpy_dtoh(&slot.out_marks.slice(..n_marks * 3), &mut slot.host_marks.as_mut_slice()?[..n_marks * 3])?;
-        }
         st.synchronize().wrap_err("copy the GPU walk's results back")?;
 
         let results = slot.host_results.as_slice()?[..words]
@@ -755,7 +688,8 @@ impl Walk<'_> {
                 checks: r[1]..r[2],
                 curves: r[3]..r[4],
                 tans: r[5]..r[6],
-                marks: r[7]..r[8],
+                // the host marks the coverage from the points when it uses a result
+                marks: 0..0,
             })
             .collect();
         let checks = slot.host_checks.as_slice()?[..n_checks * CHECK_WORDS]
@@ -774,13 +708,7 @@ impl Walk<'_> {
         let tans = xyz(&slot.host_tans.as_slice()?[..n_pts * 3]);
         let curves =
             slot.host_curves.as_slice()?[..n_curves * 2].as_chunks::<2>().0.iter().map(|r| r[0]..r[1]).collect();
-        let marks = slot.host_marks.as_slice()?[..n_marks * 3]
-            .as_chunks::<3>()
-            .0
-            .par_iter()
-            .map(|r| RawMark { slot: r[0], offset: r[1] as u16, dir: (r[1] >> 16) as u16, tan: r[2] })
-            .collect();
-        Ok(ChunkOut { seeds, results, checks, pts, tans, curves, marks })
+        Ok(ChunkOut { seeds, results, checks, pts, tans, curves, marks: Vec::new() })
     }
 }
 
