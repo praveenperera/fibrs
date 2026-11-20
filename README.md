@@ -33,7 +33,8 @@ stops with "cannot find numpy's OpenBLAS" once the tracing predictions are loade
 directory's `run.json`. Activate the numpy environment, or set `FIBRS_LAPACK` to the library's full path (on
 Linux, the `libscipy_openblas64_*.so` file in its `site-packages/numpy.libs`; fibrs does not expand a `*`), and run
 the same command again with `--resume`, through the same binary: an activated environment's `fibrs` can come first
-on `PATH`, and a run resumes only with the version that started it. `pip install fibrs` into the numpy environment needs none of this.
+on `PATH`, and a run resumes only with the version that started it. `pip install fibrs` into the numpy
+environment needs none of this.
 
 ## Use
 
@@ -186,8 +187,7 @@ On dense bands, fibrs's speed also depends on how it reads the predictions and a
 each decoded chunk its own mapping spent 40% of its CPU time in the kernel.
 
 Tracing seeds ahead on idle threads (0.3.1, measured with glibc malloc, before mimalloc became the allocator) takes
-that crop at `--threads 8` from 0.2.0's 47–55 s to 41–43 s,
-in two pairs of runs pinned to the same eight cores on a busy machine: tracing V from 12.0–15.4 s to 8.5–9.9 s and H
+that crop at `--threads 8` from 0.2.0's 47–55 s to 41–43 s, in two pairs of runs pinned to the same eight cores on a busy machine: tracing V from 12.0–15.4 s to 8.5–9.9 s and H
 from 8.7–10.2 s to 6.2–6.4 s. The `.afv` is the same, and the peak is 2.6 GiB for both.
 
 On whole bands with `--device cpu`, each pair of builds run back to back on the same busy machine, it took
