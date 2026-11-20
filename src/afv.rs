@@ -5,7 +5,7 @@
 //! little-endian float64 blocks and the R*Tree rows. Only the per-run uuid and SQLite's page layout
 //! differ, so outputs are compared table by table rather than by file hash
 
-use std::fs::{self, File};
+use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -160,7 +160,8 @@ where
     let temporary = mkstemp(&parent)?;
     let _guard = TempGuard(temporary.clone());
     let summary = write_db(curves, &temporary, opt)?;
-    File::open(&temporary)?.sync_all()?;
+    // opened for writing, since Windows flushes a file only through a handle that may write it
+    fs::OpenOptions::new().write(true).open(&temporary)?.sync_all()?;
     // a hard link publishes the complete file without overwriting a path that another process may
     // have created while tracing was running
     fs::hard_link(&temporary, destination).map_err(|e| eyre!("{}: {e}", destination.display()))?;
