@@ -14,8 +14,8 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use color_eyre::eyre::{Result, WrapErr, bail, ensure};
-use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut, sys};
+use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut, sys};
 use libloading::Library;
 
 use super::Pending;
@@ -115,6 +115,20 @@ pub struct Decoded {
     pub status: Status,
     /// Bytes it decoded
     pub size: usize,
+}
+
+/// The device memory [`NvComp::decompress`] works in, set aside once by [`NvComp::workspace`] for every batch up to
+/// a size, so a batch allocates none: memory another process takes after setup cannot fail a decode
+pub struct Workspace {
+    /// Most frames a batch may hold
+    frames: usize,
+    /// nvCOMP's scratch space, sized for the largest batch
+    temp: CudaSlice<u8>,
+    /// The four per-frame arrays nvCOMP reads, `frames` 64-bit words each: input pointers, output pointers,
+    /// input sizes and output sizes; a batch of `n` frames uses the first `n` of each
+    table: CudaSlice<u64>,
+    statuses: CudaSlice<i32>,
+    sizes: CudaSlice<usize>,
 }
 
 /// nvCOMP's batched zstd decoder, loaded from a shared library
@@ -219,15 +233,27 @@ impl NvComp {
         unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned()
     }
 
-    /// Device scratch space in bytes [`NvComp::decompress`] allocates for a batch of `frames` frames, none
-    /// decoding to more than `max_out` bytes and all to at most `total_out`, so a caller can set it aside
-    pub fn temp_bytes(
-        &self,
-        stream: &Arc<CudaStream>,
-        frames: usize,
-        max_out: usize,
-        total_out: usize,
-    ) -> Result<usize> {
+    /// Set aside on `stream` the device memory [`NvComp::decompress`] needs for any batch of up to `frames`
+    /// frames, none decoding to more than `max_out` bytes
+    pub fn workspace(&self, stream: &Arc<CudaStream>, frames: usize, max_out: usize) -> Result<Workspace> {
+        ensure!(frames > 0, "an nvCOMP workspace holds at least one frame");
+        let total_out = frames.checked_mul(max_out).ok_or_else(|| eyre!("{frames} frames of {max_out} bytes"))?;
+        let temp_bytes = self.temp_bytes(stream, frames, max_out, total_out)?;
+        // SAFETY: nvCOMP only uses the scratch space as scratch, so it needs no initial value
+        let mut temp = unsafe { stream.alloc::<u8>(temp_bytes.max(1)) }.wrap_err("allocate nvCOMP's scratch space")?;
+        let (temp_ptr, temp_guard) = temp.device_ptr_mut(stream);
+        let aligned = (temp_ptr as usize).is_multiple_of(self.alignments.temp.max(1));
+        drop(temp_guard);
+        ensure!(aligned, "nvCOMP's scratch space is misaligned");
+        let table = stream.alloc_zeros::<u64>(4 * frames).wrap_err("allocate nvCOMP's frame tables")?;
+        let statuses = stream.alloc_zeros::<i32>(frames).wrap_err("allocate nvCOMP's frame tables")?;
+        let sizes = stream.alloc_zeros::<usize>(frames).wrap_err("allocate nvCOMP's frame tables")?;
+        Ok(Workspace { frames, temp, table, statuses, sizes })
+    }
+
+    /// Device scratch space in bytes nvCOMP needs for a batch of `frames` frames, none decoding to more than
+    /// `max_out` bytes and all to at most `total_out`
+    fn temp_bytes(&self, stream: &Arc<CudaStream>, frames: usize, max_out: usize, total_out: usize) -> Result<usize> {
         // nvCOMP's statically linked CUDA runtime works in the context current on the calling thread
         stream.context().bind_to_thread()?;
         let mut temp_bytes = 0usize;
@@ -237,10 +263,11 @@ impl NvComp {
         Ok(temp_bytes)
     }
 
-    /// Decode a batch of zstd frames held in `input` into `output` on `stream`, waiting for it to finish, and
-    /// report each frame's status and decoded size, in the order of `frames`
+    /// Decode a batch of zstd frames held in `input` into `output` on `stream`, working in `workspace`, waiting
+    /// for it to finish, and report each frame's status and decoded size, in the order of `frames`
     ///
-    /// The ranges are checked against the buffers and nvCOMP's alignments, and the outputs must not overlap. A
+    /// The batch must fit the workspace: no more frames than it holds, and scratch space no larger than it set
+    /// aside. The ranges are checked against the buffers and nvCOMP's alignments, and the outputs must not overlap. A
     /// frame that decodes to more than its output is reported with an error status, not written past it; one
     /// that decodes to less reports the smaller size, so callers compare `size` with the output's length
     ///
@@ -252,6 +279,7 @@ impl NvComp {
     pub unsafe fn decompress<I, O>(
         &self,
         stream: &Arc<CudaStream>,
+        workspace: &mut Workspace,
         input: &I,
         output: &mut O,
         frames: &[Frame],
@@ -264,24 +292,28 @@ impl NvComp {
             return Ok(Vec::new());
         }
         let ctx = stream.context();
+        let same = |s: &Arc<CudaStream>| s.context().cu_ctx() == ctx.cu_ctx();
         ensure!(
-            input.stream().context().cu_ctx() == ctx.cu_ctx() && output.stream().context().cu_ctx() == ctx.cu_ctx(),
+            same(input.stream()) && same(output.stream()) && same(workspace.temp.stream()),
             "nvCOMP's buffers and stream belong to different CUDA contexts"
         );
         check_frames(frames, input.len(), output.len())?;
         let n = frames.len();
         let max_out = frames.iter().map(|f| f.output.len()).max().unwrap_or(0);
         let total_out: usize = frames.iter().map(|f| f.output.len()).sum();
-
-        let temp_bytes = self.temp_bytes(stream, n, max_out, total_out)?;
-        // SAFETY: nvCOMP only uses the scratch space as scratch, so it needs no initial value
-        let mut temp = unsafe { stream.alloc::<u8>(temp_bytes.max(1)) }?;
-        let mut statuses = stream.alloc_zeros::<i32>(n)?;
-        let mut sizes = stream.alloc_zeros::<usize>(n)?;
+        ensure!(n <= workspace.frames, "{n} frames exceed the {} nvCOMP's workspace holds", workspace.frames);
+        // the workspace was sized for its largest batch; asked again, since nvCOMP does not document that a smaller
+        // batch needs no more
+        let needed = self.temp_bytes(stream, n, max_out, total_out)?;
+        let Workspace { temp, table: table_dev, statuses, sizes, .. } = workspace;
+        ensure!(
+            needed <= temp.len(),
+            "{n} frames need {needed} bytes of nvCOMP scratch, {} were set aside",
+            temp.len()
+        );
 
         let (in_base, in_guard) = input.device_ptr(stream);
         let (out_base, out_guard) = output.device_ptr_mut(stream);
-        let (temp_ptr, temp_guard) = temp.device_ptr_mut(stream);
         let align = self.alignments;
         let aligned = frames.iter().all(|f| {
             (in_base as usize + f.input.start).is_multiple_of(align.input.max(1))
@@ -293,7 +325,6 @@ impl NvComp {
             align.input,
             align.output
         );
-        ensure!((temp_ptr as usize).is_multiple_of(align.temp.max(1)), "nvCOMP's scratch space is misaligned");
 
         // the four per-frame arrays nvCOMP reads, in one upload: input pointers, output pointers, input sizes and
         // output sizes, each a 64-bit word per frame
@@ -304,20 +335,28 @@ impl NvComp {
         table.extend(frames.iter().map(|f| f.output.len() as u64));
         let mut status_host = vec![0i32; n];
         let mut size_host = vec![0usize; n];
-        // after the host memory the copies read and write and the device buffers the decode uses, so an early
-        // return waits for them before any is freed
+        // after the host memory the copies read and write, so an early return waits for them before it is freed;
+        // the device buffers are the caller's and the workspace's, which outlive the call, and cudarc orders their
+        // freeing after the work queued on them
         let pending = Pending(stream);
-        let table = stream.clone_htod(&table)?;
-        let (table_ptr, table_guard) = table.device_ptr(stream);
+        stream.memcpy_htod(&table, &mut table_dev.slice_mut(..4 * n))?;
+        // a frame nvCOMP leaves unwritten reports 0 bytes, never the size a previous batch's frame decoded to
+        stream.memset_zeros(&mut statuses.slice_mut(..n))?;
+        stream.memset_zeros(&mut sizes.slice_mut(..n))?;
+        let temp_bytes = temp.len();
+        let (temp_ptr, temp_guard) = temp.device_ptr_mut(stream);
+        let (table_ptr, table_guard) = table_dev.device_ptr(stream);
         let word = |k: u64| (table_ptr + k * 8 * n as u64) as *const c_void;
         let (status_ptr, status_guard) = statuses.device_ptr_mut(stream);
         let (sizes_ptr, sizes_guard) = sizes.device_ptr_mut(stream);
         // nvCOMP's statically linked CUDA runtime works in the context current on the calling thread
         ctx.bind_to_thread()?;
-        // SAFETY: every device array holds `n` entries of the type nvCOMP reads or writes there, and its pointers
-        // address ranges `check_frames` held inside the input and the disjoint outputs, aligned as nvCOMP asked;
-        // the frames are well formed by the caller's contract. The guards above order these buffers' other work on
-        // `stream` around the decode, and `pending` waits for the stream before any of them can be freed
+        // SAFETY: the table holds `n` words of each kind at a stride of `n`, the status and size arrays at least `n`
+        // entries of the type nvCOMP writes there, and the scratch space at least what nvCOMP asked for this batch,
+        // aligned as it asked when the workspace was set aside; the table's pointers address ranges `check_frames`
+        // held inside the input and the disjoint outputs, aligned as nvCOMP asked, and the frames are well formed
+        // by the caller's contract. The guards above order these buffers' other work on `stream` around the decode,
+        // and `pending` waits for the stream before the host memory the copies use is freed
         let status = unsafe {
             (self.decompress)(
                 word(0).cast(),
@@ -336,8 +375,8 @@ impl NvComp {
         drop((in_guard, out_guard, temp_guard, table_guard, status_guard, sizes_guard));
         // `pending` waits, on this early return, for whatever the call managed to enqueue
         ensure!(status.is_success(), "nvCOMP's zstd decoder failed to launch: {}", self.status_string(status));
-        stream.memcpy_dtoh(&statuses, &mut status_host)?;
-        stream.memcpy_dtoh(&sizes, &mut size_host)?;
+        stream.memcpy_dtoh(&statuses.slice(..n), &mut status_host)?;
+        stream.memcpy_dtoh(&sizes.slice(..n), &mut size_host)?;
         pending.wait("decode with nvCOMP")?;
         Ok(status_host
             .into_iter()
@@ -445,8 +484,9 @@ mod tests {
         let stream = ctx.new_stream().unwrap();
         let input = stream.clone_htod(&bytes[..]).unwrap();
         let mut output = stream.alloc_zeros::<u8>(2 * channel).unwrap();
+        let mut workspace = nvcomp.workspace(&stream, frames.len(), block).unwrap();
         // SAFETY: each input range is a frame `zstd_frame_fits` accepted, uploaded unchanged
-        let decoded = unsafe { nvcomp.decompress(&stream, &input, &mut output, &frames) }.unwrap();
+        let decoded = unsafe { nvcomp.decompress(&stream, &mut workspace, &input, &mut output, &frames) }.unwrap();
         for (f, d) in frames.iter().zip(&decoded) {
             assert!(d.status.is_success(), "{:?}: {}", f, nvcomp.status_string(d.status));
             assert_eq!(d.size, block, "{f:?}");

@@ -22,7 +22,7 @@ use cudarc::driver::{
 use rayon::ThreadPool;
 use rayon::prelude::*;
 
-use super::nvcomp::{Frame, NvComp};
+use super::nvcomp::{Frame, NvComp, Workspace};
 use super::{BLOCK, Gpu, NO_BRICK, Pending, drain, fit, grid_1d, pinned};
 use crate::arena::BufferPool;
 use crate::finish::{NativeCache, SlabLayout, valid_runs};
@@ -59,11 +59,8 @@ const ERR_CAPACITY: u32 = 2;
 /// about 1 MiB, more than most batches miss; a batch that misses more makes more calls, and a chunk larger than it
 /// is decoded on the CPU
 const PACKED_BYTES: usize = 128 << 20;
-/// Most zstd frames, two a slab, one nvCOMP call decodes, which bounds the scratch space set aside for it
+/// Most zstd frames, two a slab, one nvCOMP call decodes, which bounds the workspace set aside for it
 const MAX_FRAMES: usize = 4096;
-/// Device bytes `NvComp::decompress` allocates for each frame beside its scratch space: four 64-bit table words, a
-/// decoded size and a status
-const FRAME_TABLE_BYTES: usize = 4 * 8 + 8 + 4;
 
 /// Finishes batches of one family's raw curves on the GPU: the pooled predictions and the native slab cache on
 /// the device, and the buffers each batch reuses
@@ -726,8 +723,8 @@ impl SlabCache {
         Self::new(gpu, stream, layout, reserve, most, None)
     }
 
-    /// A cache as [`slab_slots`] sizes it from the device memory free now, leaving room for its table, `reserve`
-    /// bytes for a batch's buffers and what `decoder` allocates for each call, and holding at most `most` bytes
+    /// A cache as [`slab_slots`] sizes it from the device memory free now, leaving room for its table and
+    /// `reserve` bytes for a batch's buffers, and holding at most `most` bytes
     fn new(
         gpu: &Gpu,
         stream: &Arc<CudaStream>,
@@ -738,9 +735,8 @@ impl SlabCache {
     ) -> Result<Self> {
         let (free, _) = gpu.ctx.mem_get_info()?;
         let bytes = layout.slab_bytes();
-        // the decoder's compressed buffer is already allocated, so `free` leaves it out
-        let scratch = decoder.as_ref().map_or(0, |d| d.scratch);
-        let slots = slab_slots(free, reserve.saturating_add(scratch), most, bytes, layout.len());
+        // the decoder's buffers are already allocated, so `free` leaves them out
+        let slots = slab_slots(free, reserve, most, bytes, layout.len());
         ensure!(slots > 0, "{} MiB free on the GPU leave no room for native slabs", free >> 20);
         // the pool first, so a failed allocation leaves no copy queued
         let pool = stream.alloc_zeros::<u8>(slots * bytes).wrap_err("allocate GPU memory")?;
@@ -958,7 +954,9 @@ impl SlabCache {
         // SAFETY: each frame's input is a zstd frame `plane_blocks` passed through `zstd_frame_fits` for its
         // output's length, uploaded unchanged with its chunk above, and the outputs are the distinct channel halves
         // of distinct slots
-        let decoded = unsafe { decoder.nvcomp.decompress(stream, &decoder.packed, &mut self.pool, &round.frames) }?;
+        let decoded = unsafe {
+            decoder.nvcomp.decompress(stream, &mut decoder.workspace, &decoder.packed, &mut self.pool, &round.frames)
+        }?;
 
         let mut failed = vec![false; round.slabs.len()];
         for ((frame, d), &owner) in round.frames.iter().zip(&decoded).zip(&round.owner) {
@@ -1018,22 +1016,22 @@ impl SlabCache {
     }
 }
 
-/// nvCOMP and the device memory its decodes read: a buffer for one call's compressed chunks, and the scratch space
-/// and tables each call allocates, which the slab cache's sizing leaves free
+/// nvCOMP and the device memory its decodes use, all allocated before the slab cache is sized: a buffer for one
+/// call's compressed chunks, and the workspace every call reuses, so no call allocates
 struct GpuDecoder {
     nvcomp: Arc<NvComp>,
     /// The compressed chunks of one call, back to back
     packed: CudaSlice<u8>,
-    /// Device bytes each call allocates beside `packed`, at most
-    scratch: usize,
+    workspace: Workspace,
 }
 
 impl GpuDecoder {
     fn new(stream: &Arc<CudaStream>, nvcomp: Arc<NvComp>, layout: SlabLayout) -> Result<Self> {
-        let half = layout.slab_bytes() / 2;
-        let temp = nvcomp.temp_bytes(stream, MAX_FRAMES, half, MAX_FRAMES * half)?;
+        // `SlabCache::stage_chunk` decodes a round before it passes `MAX_FRAMES` frames, and each frame is one
+        // channel of a slab, decoded into its half of the slot
+        let workspace = nvcomp.workspace(stream, MAX_FRAMES, layout.slab_bytes() / 2)?;
         let packed = stream.alloc_zeros::<u8>(PACKED_BYTES).wrap_err("allocate GPU memory")?;
-        Ok(Self { nvcomp, packed, scratch: temp + MAX_FRAMES * FRAME_TABLE_BYTES })
+        Ok(Self { nvcomp, packed, workspace })
     }
 }
 
