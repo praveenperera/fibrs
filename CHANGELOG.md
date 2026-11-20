@@ -16,6 +16,12 @@
   The centrality and seeds are unchanged. On a dense PHerc0358 window on an RTX 5090, V and H centrality take
   19.1 s together instead of 20.9 s (mean of two runs each), about 1% of the whole run.
 
+- **Faster GPU centrality and seed tests.** Before the float64 work, the GPU now lists the voxels that need it:
+  those with presence enough for centrality, then those that pass the seed test's cheap checks. The float64 work
+  then runs on full warps instead of mostly idle ones. The centrality and seeds are unchanged. On a dense PHerc0358
+  window on an RTX 5090, the V centrality kernels take 1.3 s instead of 8.3 s, and V and H centrality take 7.0 s
+  together instead of 15.7 s (mean of two runs each).
+
 - **Trace finishing on the GPU.** When a run uses the GPU, finishing (cutting each traced curve where the
   predictions disagree, then smoothing, resampling and re-checking each piece) runs there too. It gives the CPU's
   pieces bit for bit, so the `.afv` is unchanged, whatever rounding the run started with. Both pooled predictions
