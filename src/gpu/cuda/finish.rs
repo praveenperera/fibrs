@@ -14,13 +14,12 @@ use std::sync::Arc;
 
 use color_eyre::eyre::{Result, WrapErr, ensure, eyre};
 use cudarc::driver::{
-    CudaEvent, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchArgs, LaunchConfig, PinnedHostSlice,
-    PushKernelArg, result, sys,
+    CudaEvent, CudaFunction, CudaSlice, CudaStream, LaunchArgs, LaunchConfig, PinnedHostSlice, PushKernelArg, sys,
 };
 use rayon::ThreadPool;
 use rayon::prelude::*;
 
-use super::{BLOCK, Gpu, NO_BRICK, fit, grid_1d, pinned};
+use super::{BLOCK, Gpu, NO_BRICK, Pending, drain, fit, grid_1d, pinned};
 use crate::finish::{NativeCache, SlabLayout, valid_runs};
 use crate::gpu::{CpuReason, Finished, Pieces};
 use crate::kernels::{MIN_FIT_POINTS, RawCurve};
@@ -263,45 +262,6 @@ impl GpuFinisher {
         out.err = err[0];
         Ok(out)
     }
-}
-
-/// Waits, when dropped, for the work queued on a stream, so host memory its copies read or write outlives them
-/// when an error returns early: cudarc does not track plain host slices, and the driver may read pageable memory
-/// after an asynchronous copy returns. Locals drop in reverse order, so it guards the memory declared before it.
-/// It waits through [`drain`], so an error cudarc stored cannot skip the wait
-struct Pending<'a>(&'a CudaStream);
-
-impl Pending<'_> {
-    /// Wait for the queued work, saying on failure that it was `what`
-    fn wait(self, what: &'static str) -> Result<()> {
-        let stream = self.0;
-        // waited for here, so the drop has nothing left to wait for
-        std::mem::forget(self);
-        drain(stream).wrap_err(what)
-    }
-}
-
-impl Drop for Pending<'_> {
-    fn drop(&mut self) {
-        // a failed wait means the context is broken, and freeing then is all that is left to do
-        let _ = drain(self.0);
-    }
-}
-
-/// Wait for everything queued on `stream`, then return any error cudarc stored before, as
-/// `CudaStream::synchronize` would; every wait that keeps host memory alive for a copy goes through here
-///
-/// `CudaStream::synchronize` returns a stored error, such as a failed record of a copy's tracking event after the
-/// copy was queued, before it reaches the driver, so it could return while that copy still reads memory about to
-/// be freed. This waits through the driver first, whatever is stored
-fn drain(stream: &CudaStream) -> Result<(), DriverError> {
-    let ctx = stream.context();
-    // SAFETY: the context and stream handles are live for as long as `stream` is borrowed, and neither call frees
-    // or changes them; the stream is still waited for when making its context current fails
-    let (bound, waited) =
-        unsafe { (result::ctx::set_current(ctx.cu_ctx()), result::stream::synchronize(stream.cu_stream())) };
-    ctx.check_err()?;
-    bound.and(waited)
 }
 
 /// The reason in a kernel's `err` word, if it set one
