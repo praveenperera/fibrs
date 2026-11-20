@@ -4,8 +4,8 @@
 //!
 //! The core is the kernels' own source, included here as `eigen.rs` is in `axes.rs`, and runs in plain Rust
 //! arithmetic, which never contracts, so a seed it traces like the CPU here is the device's computation too. The
-//! host side is composed as the kernels compose it: the start, both halves into one path slot, the spans, and
-//! each accepted point's marks
+//! host side is composed as the kernels compose it: the start, both halves into one path slot and the spans. A
+//! result's coverage marks are the CPU's own `mark_list` over its accepted points, so they need no parity
 
 // the core's unroll hint is the device's; the host needs none
 macro_rules! unroll_full {
@@ -17,7 +17,7 @@ macro_rules! unroll_full {
 mod shared;
 
 use crate::kernels::{self, Coverage, Grid, test_support};
-use crate::lookahead::{RawCheck, RawMark};
+use crate::lookahead::RawCheck;
 use crate::vol::{EDGE, SHIFT};
 use shared::{Curve, Fields, HALF, Ops, Path, Reads};
 
@@ -70,10 +70,6 @@ impl<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Fields for HostFields<'_, P, C, D>
 
     fn pres_corners(&self, z: i32, y: i32, x: i32) -> [u8; 8] {
         self.f.pres.corners(z as i64, y as i64, x as i64)
-    }
-
-    fn cent(&self, z: i32, y: i32, x: i32) -> u16 {
-        self.f.cent.at(z as i64, y as i64, x as i64)
     }
 
     fn cent_corners(&self, z: i32, y: i32, x: i32) -> [u16; 8] {
@@ -200,7 +196,6 @@ struct Outcome {
     checks: Vec<RawCheck>,
     curves: Vec<Vec<[f32; 3]>>,
     tans: Vec<[f32; 3]>,
-    marks: Vec<RawMark>,
 }
 
 /// The brick slot and offset of voxel `z, y, x` in a volume of `dims`, as `vol::Place` has them
@@ -222,14 +217,8 @@ fn trace<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
 ) -> Outcome {
     let hf = HostFields { f };
     let mut r = HostReads { cov, dims: hf.dims(), checks: Vec::new() };
-    let mut out = Outcome {
-        status: Status::Done,
-        survived: false,
-        checks: Vec::new(),
-        curves: Vec::new(),
-        tans: Vec::new(),
-        marks: Vec::new(),
-    };
+    let mut out =
+        Outcome { status: Status::Done, survived: false, checks: Vec::new(), curves: Vec::new(), tans: Vec::new() };
     let Some((c, u)) = shared::prefix::<Plain, _, _>(&hf, &mut r, seed, primary) else {
         out.checks = r.checks;
         return out;
@@ -262,17 +251,8 @@ fn trace<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>>(
         return out;
     }
     let (pts, tans) = (&slot.pts[range.clone()], &slot.tans[range]);
-    let dims = hf.dims();
     for &(a, b) in &cv.spans {
         let (a, b) = (a as usize, b as usize);
-        for k in a..b {
-            let dir = shared::encode_dir::<Plain>(tans[k]);
-            let tan = (out.tans.len() + k - a) as u32;
-            shared::mark_point::<Plain, _, _>(&hf, pts[k], tans[k], |_, z, y, x| {
-                let (s, o) = place(dims, z, y, x);
-                out.marks.push(RawMark { slot: s as u32, offset: o, dir, tan });
-            });
-        }
         out.tans.extend_from_slice(&tans[a..b]);
         out.curves.push(pts[a..b].to_vec());
     }
@@ -287,7 +267,7 @@ mod tests {
 
     use super::*;
     use crate::fields::{Catalogue, Presence, Seed, catalogue, centrality};
-    use crate::kernels::test_support::{self, raw_check, raw_mark};
+    use crate::kernels::test_support::{self, raw_check};
     use crate::kernels::{Scratch, Traced, encode_dir, pack_dir, trace_seed};
     use crate::stage1::Separate;
     use crate::vol::Vol;
@@ -302,7 +282,8 @@ mod tests {
         cpu: usize,
         survivors: usize,
         curves: usize,
-        marks: usize,
+        /// Accepted points
+        tans: usize,
         checks: usize,
     }
 
@@ -339,10 +320,6 @@ mod tests {
         assert_eq!(got.tans.len(), want.tans.len(), "seed {i}: tangent count");
         let tan_bits = |t: &[[f32; 3]]| t.iter().flat_map(|q| q.map(f32::to_bits)).collect::<Vec<_>>();
         assert_eq!(tan_bits(&got.tans), tan_bits(&want.tans), "seed {i}: tangents");
-        assert_eq!(got.marks.len(), want.marks.len(), "seed {i}: mark count");
-        for (k, (g, m)) in got.marks.iter().zip(&want.marks).enumerate() {
-            assert_eq!(*g, raw_mark(m), "seed {i}: mark {k}");
-        }
     }
 
     /// Whether seed `i` of `cat` is primary: the first `primary[r]` seeds of its region
@@ -377,7 +354,7 @@ mod tests {
             }
             tally.survivors += full.survived as usize;
             tally.curves += full.curves.len();
-            tally.marks += full.marks.len();
+            tally.tans += full.tans.len();
             tally.checks += full.checks.len();
             if cpu.is_ok() {
                 writer.apply(i as u32, &traced);
@@ -428,7 +405,7 @@ mod tests {
         let tally = parity(&fields, &cat);
         eprintln!("fixture, {} seeds: {tally:?}", cat.coords.len());
         assert!(tally.curves >= 100, "the fixture should accept many curves: {tally:?}");
-        assert!(tally.marks > 10_000, "too few marks to test: {tally:?}");
+        assert!(tally.tans > 1000, "too few accepted points to test: {tally:?}");
     }
 
     /// One family's fields and catalogue from a run's `FIBRS_DEBUG_FIELDS` dumps
@@ -530,7 +507,8 @@ mod tests {
             cpu: usize,
             /// Of those, seeds the core traces at the device's step cap, so a chunk's buffers ran out
             overflow: usize,
-            marks: usize,
+            /// Accepted points of the seeds the device traced
+            pts: usize,
         }
 
         fn span(r: &Range<u32>) -> Range<usize> {
@@ -550,7 +528,6 @@ mod tests {
                 checks: out.checks[span(&r.checks)].to_vec(),
                 curves: out.curves[span(&r.curves)].iter().map(|c| out.pts[span(c)].to_vec()).collect(),
                 tans: out.tans[span(&r.tans)].to_vec(),
-                marks: out.marks[span(&r.marks)].to_vec(),
             }
         }
 
@@ -629,7 +606,7 @@ mod tests {
                         let cpu = trace_seed(&f, &cov, &mut scratch, seed, primary, &mut traced);
                         compare(i, &got, &cpu, &traced);
                         tally.done += 1;
-                        tally.marks += got.marks.len();
+                        tally.pts += got.tans.len();
                     }
                 }
                 assert_eq!(seen, group.end, "every launched chunk came back");
@@ -654,7 +631,7 @@ mod tests {
         }
 
         /// Room small enough that the fixture's chunks run out of it
-        const TIGHT: Caps = Caps { survivors: 48, checks: 2048, pts: 1024, curves: 32, marks: 32 << 10 };
+        const TIGHT: Caps = Caps { survivors: 48, checks: 2048, pts: 1024, curves: 32 };
 
         #[test]
         #[ignore = "needs a CUDA device"]
@@ -667,7 +644,7 @@ mod tests {
             let t = gpu_parity(&gpu, &tracing, &pres, &fam.cent, &dirs, &cat, 512, Caps::default(), false).unwrap();
             eprintln!("fixture: {t:?}");
             assert_eq!(t.overflow, 0, "the default caps hold the fixture's chunks: {t:?}");
-            assert!(t.done > 8000 && t.marks > 10_000, "too little traced on the device: {t:?}");
+            assert!(t.done > 8000 && t.pts > 1000, "too little traced on the device: {t:?}");
             let t = gpu_parity(&gpu, &tracing, &pres, &fam.cent, &dirs, &cat, 512, TIGHT, true).unwrap();
             eprintln!("fixture, tight caps: {t:?}");
             assert!(t.overflow > 0, "tight caps should overflow: {t:?}");
@@ -676,7 +653,9 @@ mod tests {
 
         /// Both families of a crop's dumps (`load`), the presence given to the device as an own prediction over an
         /// empty other, which `Presence` combines back to the same values
-        fn gpu_crop(dir: &str, chunk: usize) {
+        /// `full_caps` asserts that no chunk ran out of room: true of a small crop, while a dense crop's chunks
+        /// traced against coverage a few chunks behind can fill a buffer, which only sends seeds back to the CPU
+        fn gpu_crop(dir: &str, chunk: usize, full_caps: bool) {
             let gpu = open();
             let work = FsPath::new(dir).join("work");
             let shape = crop_shape(FsPath::new(dir));
@@ -687,7 +666,11 @@ mod tests {
                     gpu_parity(&gpu, &tracing, &tracing[0], &cent, &dirs, &cat, chunk, Caps::default(), family == 2)
                         .unwrap();
                 eprintln!("{dir} family {family}: {t:?}");
-                assert_eq!(t.overflow, 0, "family {family}: the default caps hold the crop's chunks: {t:?}");
+                assert!(
+                    !full_caps || t.overflow == 0,
+                    "family {family}: the default caps hold the crop's chunks: {t:?}"
+                );
+                assert!(t.done > t.seeds / 4, "family {family}: too few seeds traced on the device: {t:?}");
             }
         }
 
@@ -695,14 +678,14 @@ mod tests {
         #[ignore = "needs a CUDA device and a crop's field dumps"]
         fn gpu_traces_crop_micro_as_the_cpu_does() {
             let dir = std::env::var("FIBRS_WALK_MICRO").unwrap_or("/build/fibrs-prof/walk-dumps/crop-micro".into());
-            gpu_crop(&dir, 2048);
+            gpu_crop(&dir, 2048, true);
         }
 
         #[test]
         #[ignore = "needs a CUDA device and a crop's field dumps"]
         fn gpu_traces_crop_256_as_the_cpu_does() {
             let dir = std::env::var("FIBRS_WALK_CROP").unwrap_or("/build/fibrs-prof/walk-dumps/crop-z2304-256".into());
-            gpu_crop(&dir, CHUNK);
+            gpu_crop(&dir, CHUNK / 2, false);
         }
 
         /// The larger crop's V family in chunks of 16K, 32K and 64K seeds, each launched with the coverage the
@@ -718,15 +701,8 @@ mod tests {
             let tracing = [pres, Vol::new(shape, 0u8)];
             let f = kernels::Fields { pres: &tracing[0], cent: &cent, dirs: &dirs };
             let n = cat.coords.len();
-            let wide = Caps { survivors: 32 << 10, checks: 4 << 20, pts: 2 << 20, curves: 256 << 10, marks: 32 << 20 };
-            let runs = [
-                (CHUNK / 4, Caps::default()),
-                (CHUNK / 2, Caps::default()),
-                (CHUNK, Caps::default()),
-                (CHUNK / 2, wide),
-            ];
-            for (size, caps) in runs {
-                let mut walk: gw::Walk = gpu.walk_with(&tracing, 1, &cent, &dirs, &cat, kernels::ring(), caps).unwrap();
+            for size in [CHUNK / 4, CHUNK / 2, CHUNK] {
+                let mut walk: gw::Walk = gpu.walk(&tracing, 1, &cent, &dirs, &cat, kernels::ring()).unwrap();
                 let bytes = walk.device_bytes() as f64 / (1u64 << 30) as f64;
                 // one warm-up chunk for the driver's JIT and first-touch costs
                 walk.launch(0..size.min(n)).unwrap();
@@ -752,18 +728,17 @@ mod tests {
                     let out = walk.collect().unwrap().unwrap();
                     let ms = t.elapsed().as_secs_f64() * 1e3;
                     let back = out.results.iter().filter(|r| r.status == lookahead::Status::Cpu).count();
-                    let marks = out.marks.len();
+                    let pts = out.pts.len();
                     eprintln!(
-                        "chunk {size} at {start}: {ms:.1} ms, {back} to the CPU, {marks} marks, {} changes",
+                        "chunk {size} at {start}: {ms:.1} ms, {back} to the CPU, {pts} accepted points, {} changes",
                         changes.len()
                     );
                     (cpu, total, worst) = (cpu + back, total + ms, worst.max(ms));
                 }
                 let chunks = n.div_ceil(size);
                 eprintln!(
-                    "chunk {size}, {} survivors: {n} seeds, {:.0} seeds/s, {:.1} ms a chunk (slowest {worst:.1}), \
-                     {:.2}% to the CPU, {bytes:.2} GiB on the device",
-                    caps.survivors,
+                    "chunk {size}: {n} seeds, {:.0} seeds/s, {:.1} ms a chunk (slowest {worst:.1}), {:.2}% to the CPU, \
+                     {bytes:.2} GiB on the device",
                     n as f64 / (total / 1e3),
                     total / chunks as f64,
                     100.0 * cpu as f64 / n as f64

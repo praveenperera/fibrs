@@ -11,11 +11,10 @@
 //! [`fb_walk_trace`] (thread per survivor: both halves into the survivor's path slot), [`fb_walk_spans`] (thread
 //! per survivor: `valid_curve_spans` and the length filter), [`fb_walk_scan`] over the per-seed counts (checks,
 //! accepted points, curves), [`fb_walk_gather`] (thread per seed: checks, points, tangents and curves copied out
-//! in seed order), [`fb_walk_mask`] (thread per accepted point: which voxels of its 7³ box it marks), a scan of
-//! the mark counts, [`fb_walk_marks`] (thread per point: the marks in `mark_list`'s order) and
-//! [`fb_walk_results`] (thread per seed: its ranges, or `Cpu` when it has to be traced on the CPU). Outputs that
+//! in seed order) and [`fb_walk_results`] (thread per seed: its ranges, or `Cpu` when it has to be traced on the CPU). Outputs that
 //! would overflow their buffers send the seeds that reach past them back to the CPU, which by the scans' order is
-//! a suffix of the chunk
+//! a suffix of the chunk. Marks are left to the host, which runs `mark_list` on a result's accepted points when it
+//! uses the result: most results traced ahead are never used, and their marks would outweigh everything else
 
 use core::ptr::{read_volatile, write_volatile};
 
@@ -24,13 +23,13 @@ use cuda_device::float::{
     add_rn_f32, add_rn_f64, div_rn_f32, div_rn_f64, mul_rn_f32, mul_rn_f64, sqrt_rn_f32, sqrt_rn_f64,
 };
 use cuda_device::shared::SharedArray;
-use cuda_device::thread::{blockDim_x, blockIdx_x, gridDim_x, sync_threads, threadIdx_x};
+use cuda_device::thread::{blockDim_x, blockIdx_x, sync_threads, threadIdx_x};
 use cuda_device::kernel;
 
 use crate::walk::{self, Curve, Fields, Ops, Path, Reads, SpansFail};
 use crate::walk_layout::{
-    CHECK_WORDS, CU_WORDS, MASK_WORDS, PREFIX_CHECKS, RESULT_WORDS, SPAN_CAP, SURV_WORDS, T_CHECKS, T_CURVES, T_MARKS,
-    T_PTS, T_SEEDS, T_SURV,
+    CHECK_WORDS, CU_WORDS, PREFIX_CHECKS, RESULT_WORDS, SPAN_CAP, SURV_WORDS, T_CHECKS, T_CURVES, T_PTS, T_SEEDS,
+    T_SURV,
 };
 use crate::{BRICK, MASK, NO_BRICK, SHIFT};
 
@@ -199,11 +198,6 @@ impl Fields for Vols {
     #[inline(always)]
     fn pres_corners(&self, z: i32, y: i32, x: i32) -> [u8; 8] {
         unsafe { self.pres.corners(&self.g, z, y, x) }
-    }
-
-    #[inline(always)]
-    fn cent(&self, z: i32, y: i32, x: i32) -> u16 {
-        unsafe { self.cent.get(&self.g, z, y, x) }
     }
 
     #[inline(always)]
@@ -663,8 +657,7 @@ pub unsafe fn fb_walk_scan(data: *mut u32, count_at: *const u32, cap: u32, total
 }
 
 /// Copy each seed's checks, accepted points, tangents and curves out in seed order, from the scanned offsets in
-/// `n_checks`, `n_pts` and `n_curves`; nothing past a buffer's cap is written. Each accepted point also gets its
-/// index among the seed's accepted tangents (`pt_tan`), for the marks
+/// `n_checks`, `n_pts` and `n_curves`; nothing past a buffer's cap is written
 ///
 /// Grid: x over the chunk's seeds
 #[kernel]
@@ -689,7 +682,6 @@ pub unsafe fn fb_walk_gather(
     out_pts: *mut f32,
     out_tans: *mut f32,
     out_curves: *mut u32,
-    pt_tan: *mut u32,
 ) {
     let s = thread_1d();
     if s >= n {
@@ -731,7 +723,6 @@ pub unsafe fn fb_walk_gather(
     let base = i * width + (cap - nb) as usize;
     let mut p_out = unsafe { *n_pts.add(s as usize) };
     let mut cv_out = unsafe { *n_curves.add(s as usize) };
-    let mut tan = 0u32;
     let accepted = unsafe { *len.add(4) };
     let mut k = 0;
     while k < accepted {
@@ -755,128 +746,16 @@ pub unsafe fn fb_walk_gather(
                     *out_tans.add(to) = *path_tans.add(from);
                     *out_tans.add(to + 1) = *path_tans.add(from + 1);
                     *out_tans.add(to + 2) = *path_tans.add(from + 2);
-                    *pt_tan.add(p_out as usize) = tan;
                 }
             }
             p_out += 1;
-            tan += 1;
             j += 1;
         }
         k += 1;
     }
 }
 
-/// Each accepted point's 7³ mark mask ([`MASK_WORDS`] per point, bit `k` for the box voxel `k` of
-/// `walk::mark_point`) and its number of marks in `counts`, for the first `min(totals[pts], pts_cap)` points
-///
-/// Grid: x over blocks, threads striding over the points
-#[kernel]
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn fb_walk_mask(
-    d: u32,
-    h: u32,
-    w: u32,
-    gy: u32,
-    gx: u32,
-    pres_table: *const u32,
-    pres_pool: *const u8,
-    cent_table: *const u32,
-    cent_pool: *const u16,
-    dir_table: *const u32,
-    dir_pool: *const u16,
-    decode: *const f64,
-    ring: *const f64,
-    totals: *const u32,
-    pts_cap: u32,
-    out_pts: *const f32,
-    out_tans: *const f32,
-    masks: *mut u32,
-    counts: *mut u32,
-) {
-    let f = unsafe { vols(d, h, w, gy, gx, pres_table, pres_pool, cent_table, cent_pool, dir_table, dir_pool, decode, ring) };
-    let n = min_u32(unsafe { *totals.add(T_PTS) }, pts_cap);
-    let mut i = thread_1d();
-    while i < n {
-        let at = i as usize * 3;
-        let p = unsafe { [*out_pts.add(at), *out_pts.add(at + 1), *out_pts.add(at + 2)] };
-        let t = unsafe { [*out_tans.add(at), *out_tans.add(at + 1), *out_tans.add(at + 2)] };
-        let m = unsafe { masks.add(i as usize * MASK_WORDS as usize) };
-        let mut wd = 0;
-        while wd < MASK_WORDS {
-            unsafe { *m.add(wd as usize) = 0 };
-            wd += 1;
-        }
-        walk::mark_point::<Rn, Vols, _>(&f, p, t, |k, _, _, _| unsafe { *m.add((k >> 5) as usize) |= 1 << (k & 31) });
-        let mut count = 0;
-        let mut wd = 0;
-        while wd < MASK_WORDS {
-            count += unsafe { *m.add(wd as usize) }.count_ones();
-            wd += 1;
-        }
-        unsafe { *counts.add(i as usize) = count };
-        i += gridDim_x() * blockDim_x();
-    }
-}
-
-/// Each point's marks from its mask, at its scanned offset in `counts`, in `mark_list`'s z, y, x order: three
-/// u32 per mark, the brick, `offset | dir << 16` and the tangent's index among the seed's accepted tangents;
-/// nothing past `mark_cap` is written
-///
-/// Grid: x over blocks, threads striding over the points
-#[kernel]
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn fb_walk_marks(
-    gy: u32,
-    gx: u32,
-    totals: *const u32,
-    pts_cap: u32,
-    mark_cap: u32,
-    out_pts: *const f32,
-    out_tans: *const f32,
-    pt_tan: *const u32,
-    masks: *const u32,
-    counts: *const u32,
-    out_marks: *mut u32,
-) {
-    let g = Geom { dims: [0; 3], gy, gx };
-    let n = min_u32(unsafe { *totals.add(T_PTS) }, pts_cap);
-    let mut i = thread_1d();
-    while i < n {
-        let at = i as usize * 3;
-        let p = unsafe { [*out_pts.add(at), *out_pts.add(at + 1), *out_pts.add(at + 2)] };
-        let t = unsafe { [*out_tans.add(at), *out_tans.add(at + 1), *out_tans.add(at + 2)] };
-        let dir = walk::encode_dir::<Rn>(t) as u32;
-        let tan = unsafe { *pt_tan.add(i as usize) };
-        // the box's corner, as `mark_point` places it
-        let x0 = Rn::add(p[0] as f64, 0.5) as i32 - 3;
-        let y0 = Rn::add(p[1] as f64, 0.5) as i32 - 3;
-        let z0 = Rn::add(p[2] as f64, 0.5) as i32 - 3;
-        let mut out = unsafe { *counts.add(i as usize) };
-        let m = unsafe { masks.add(i as usize * MASK_WORDS as usize) };
-        let mut wd = 0;
-        while wd < MASK_WORDS {
-            let mut bits = unsafe { *m.add(wd as usize) };
-            while bits != 0 {
-                let k = wd * 32 + bits.trailing_zeros();
-                bits &= bits - 1;
-                let (zz, yy, xx) = (z0 + (k / 49) as i32, y0 + (k / 7 % 7) as i32, x0 + (k % 7) as i32);
-                if out < mark_cap {
-                    let rec = unsafe { out_marks.add(out as usize * 3) };
-                    unsafe {
-                        *rec = g.brick(zz, yy, xx);
-                        *rec.add(1) = Geom::offset(zz, yy, xx) | dir << 16;
-                        *rec.add(2) = tan;
-                    }
-                }
-                out += 1;
-            }
-            wd += 1;
-        }
-        i += gridDim_x() * blockDim_x();
-    }
-}
-
-/// Each seed's result: `[status, checks, curves, tans, marks]` as status 0 (done) or 1 (back to the CPU) and four
+/// Each seed's result: `[status, checks, curves, tans]` as status 0 (done) or 1 (back to the CPU) and three
 /// start, end pairs into the chunk's outputs (tans and points share their indices); a seed whose outputs reach
 /// past a buffer's cap goes back to the CPU, and a seed back to the CPU has empty ranges
 ///
@@ -890,12 +769,10 @@ pub unsafe fn fb_walk_results(
     n_checks: *const u32,
     n_pts: *const u32,
     n_curves: *const u32,
-    mark_at: *const u32,
     totals: *const u32,
     check_cap: u32,
     pts_cap: u32,
     curve_cap: u32,
-    mark_cap: u32,
     results: *mut u32,
 ) {
     let s = thread_1d();
@@ -911,12 +788,9 @@ pub unsafe fn fb_walk_results(
     let (c0, c1) = (unsafe { *n_checks.add(s as usize) }, end(n_checks, T_CHECKS));
     let (p0, p1) = (unsafe { *n_pts.add(s as usize) }, end(n_pts, T_PTS));
     let (v0, v1) = (unsafe { *n_curves.add(s as usize) }, end(n_curves, T_CURVES));
-    let scanned = min_u32(unsafe { *totals.add(T_PTS) }, pts_cap);
-    let mark = |p: u32| if p < scanned { unsafe { *mark_at.add(p as usize) } } else { unsafe { *totals.add(T_MARKS) } };
     let fits = c1 <= check_cap && p1 <= pts_cap && v1 <= curve_cap;
-    let (m0, m1) = if fits { (mark(p0), mark(p1)) } else { (0, 0) };
-    let done = !cpu_early && fits && m1 <= mark_cap;
-    let words = if done { [0, c0, c1, v0, v1, p0, p1, m0, m1] } else { [1, 0, 0, 0, 0, 0, 0, 0, 0] };
+    let done = !cpu_early && fits;
+    let words = if done { [0, c0, c1, v0, v1, p0, p1] } else { [1, 0, 0, 0, 0, 0, 0] };
     let mut k = 0;
     while k < RESULT_WORDS {
         unroll_full!();

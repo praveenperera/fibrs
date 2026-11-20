@@ -71,7 +71,7 @@ use Param::{Ptr, U32};
 
 /// Each kernel's PTX params, in the order every launch here and in `axes.rs` passes them; checked against the
 /// embedded PTX when the device opens, so a stale PTX fails there instead of launching with mismatched arguments
-const KERNELS: [(&str, &[Param]); 22] = [
+const KERNELS: [(&str, &[Param]); 20] = [
     ("fb_gather", &[Ptr, Ptr, Ptr, U32, U32, U32, U32, U32, U32, U32, Ptr, Ptr, Ptr]),
     ("fb_centrality", &[Ptr, Ptr, Ptr, Ptr, Ptr, Ptr]),
     ("fb_seeds", &[Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, U32, Ptr, Ptr, Ptr, U32, Ptr]),
@@ -99,11 +99,9 @@ const KERNELS: [(&str, &[Param]); 22] = [
     ("fb_walk_scan", &[Ptr, Ptr, U32, Ptr]),
     (
         "fb_walk_gather",
-        &[U32, U32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, U32, U32, Ptr, Ptr, Ptr, Ptr, Ptr],
+        &[U32, U32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, U32, U32, Ptr, Ptr, Ptr, Ptr],
     ),
-    ("fb_walk_mask", &[U32, U32, U32, U32, U32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, Ptr, Ptr, Ptr, Ptr]),
-    ("fb_walk_marks", &[U32, U32, Ptr, U32, U32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr]),
-    ("fb_walk_results", &[U32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, U32, U32, U32, Ptr]),
+    ("fb_walk_results", &[U32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, U32, U32, U32, Ptr]),
     ("fb_walk_cov_bricks", &[Ptr, Ptr, U32]),
     ("fb_walk_cov_set", &[Ptr, Ptr, U32]),
 ];
@@ -155,8 +153,6 @@ struct WalkKernels {
     spans: CudaFunction,
     scan: CudaFunction,
     gather: CudaFunction,
-    mask: CudaFunction,
-    marks: CudaFunction,
     results: CudaFunction,
     cov_bricks: CudaFunction,
     cov_set: CudaFunction,
@@ -264,8 +260,6 @@ impl Gpu {
                 spans: function("fb_walk_spans")?,
                 scan: function("fb_walk_scan")?,
                 gather: function("fb_walk_gather")?,
-                mask: function("fb_walk_mask")?,
-                marks: function("fb_walk_marks")?,
                 results: function("fb_walk_results")?,
                 cov_bricks: function("fb_walk_cov_bricks")?,
                 cov_set: function("fb_walk_cov_set")?,
