@@ -13,9 +13,9 @@ fn run(exe: &Path, args: &[&str]) -> Output {
     let mut command = Command::new(exe);
 
     // other mimalloc settings from the caller's environment, such as one that skips the exit report, would change
-    // what the run prints
+    // what the run prints; mimalloc reads their names in any case
     for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("MIMALLOC_") {
+        if name.to_string_lossy().to_ascii_uppercase().starts_with("MIMALLOC_") {
             command.env_remove(name);
         }
     }
