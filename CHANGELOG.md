@@ -19,7 +19,9 @@
   time from `FIBRS_NVCOMP` (the library's full path), else from the Python environment fibrs is installed into or
   the active one, and logs once whether slabs decode on the GPU or why they decode on the CPU. A slab nvCOMP
   cannot decode as Blosc stored it is decoded on the CPU, as are the slabs of arrays decoded a whole chunk at a
-  time.
+  time. nvCOMP trusts the prediction files, so a corrupt but well-formed chunk may give wrong output instead of an
+  error; `FIBRS_NVCOMP=off` decodes every slab on the CPU. When the decoder's buffers leave too little GPU memory
+  for the slab cache, finishing stays on the GPU and decodes slabs on the CPU.
 
 - **Faster seed catalogue.** Each family's seed catalogue (priority split, descending-centrality argsort, sort by
   1024³ region) is built on the `--threads` pool:

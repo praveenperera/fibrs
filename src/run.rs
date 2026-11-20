@@ -127,7 +127,10 @@ pub struct Args {
     /// Where the direction field and centrality run (tracing always runs on the CPU): auto uses an NVIDIA GPU when
     /// one is usable and the CPU otherwise, cpu never uses the GPU, and cuda fails without one. A GPU run writes the
     /// original's --device cuda output, whose centrality can differ from its cpu output by a rounding. A resumed
-    /// run keeps the rounding it started with, so one started on the CPU keeps centrality there
+    /// run keeps the rounding it started with, so one started on the CPU keeps centrality there. A GPU run also
+    /// finishes curves there, decoding prediction slabs with nvCOMP when it loads; nvCOMP trusts the prediction
+    /// files, so a corrupt but well-formed chunk may give wrong output instead of an error. FIBRS_NVCOMP=off
+    /// decodes the slabs on the CPU instead
     #[arg(long, value_enum, default_value = "auto")]
     pub device: Device,
     /// Visible CUDA device index for the GPU; without it, the first usable visible GPU

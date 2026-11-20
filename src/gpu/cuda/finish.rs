@@ -83,7 +83,7 @@ impl Gpu {
     /// A finisher of family `family` (1 = V, 2 = H) that reads `tracing` and native predictions laid out as
     /// `layout`, for batches of about `batch_points` raw points at most; uploads both pooled predictions and sizes
     /// the slab cache from the device memory free after them, less what such a batch's buffers and nvCOMP's decodes
-    /// take
+    /// take, or decodes slabs on the CPU when those leave no room for a cache
     ///
     /// The first finisher loads nvCOMP and logs whether native slabs decode on the GPU or on the CPU; a run reads
     /// one native array, so every later finisher's layout is the first's and shares that choice
@@ -130,10 +130,8 @@ impl Gpu {
         let stream = self.ctx.new_stream()?;
         let mut staging = Staging::new(&stream, layout.slab_bytes())?;
         let tracing = Tracing::upload(&stream, &mut staging, tracing)?;
-        // allocated before the slab cache is sized, so the free memory it is sized from leaves this out
-        let decoder = nvcomp.map(|nvcomp| GpuDecoder::new(&stream, nvcomp, layout)).transpose()?;
         let reserve = batch_points.saturating_mul(BATCH_BYTES_PER_POINT);
-        let slabs = SlabCache::new(self, &stream, layout, reserve, cache_bytes, decoder)?;
+        let slabs = SlabCache::open(self, &stream, layout, reserve, cache_bytes, nvcomp)?;
         let bufs = Buffers::new(&stream)?;
         let kernels = [self.k.fs_segments.clone(), self.k.fs_fit.clone()];
         Ok(GpuFinisher { kernels, stream, family: family as u32, tracing, slabs, staging, bufs })
@@ -700,6 +698,34 @@ struct SlabCache {
 }
 
 impl SlabCache {
+    /// A cache as [`SlabCache::new`] makes it, decoding with `nvcomp` when given and its decoder and a cache both
+    /// fit, else decoding on the CPU; logs why when it falls back
+    ///
+    /// The decoder is optional, so its buffers must not cost a cache that fits without them: with about a GiB free
+    /// after the pooled predictions, they can leave too little for one, which would move finishing off the GPU
+    fn open(
+        gpu: &Gpu,
+        stream: &Arc<CudaStream>,
+        layout: SlabLayout,
+        reserve: usize,
+        most: usize,
+        nvcomp: Option<Arc<NvComp>>,
+    ) -> Result<Self> {
+        let Some(nvcomp) = nvcomp else { return Self::new(gpu, stream, layout, reserve, most, None) };
+        // allocated before the slab cache is sized, so the free memory it is sized from leaves this out
+        let with_decoder = GpuDecoder::new(stream, nvcomp, layout)
+            .and_then(|decoder| Self::new(gpu, stream, layout, reserve, most, Some(decoder)));
+        let e = match with_decoder {
+            Ok(cache) => return Ok(cache),
+            Err(e) => e,
+        };
+        log!("Native slabs for finishing decode on the CPU: nvCOMP's buffers and a slab cache do not fit ({e:#})");
+        // the decoder's buffers are freed on the stream, and return to the free memory the cache is sized from
+        // only once it is drained
+        drain(stream).wrap_err("free nvCOMP's buffers")?;
+        Self::new(gpu, stream, layout, reserve, most, None)
+    }
+
     /// A cache as [`slab_slots`] sizes it from the device memory free now, leaving room for its table, `reserve`
     /// bytes for a batch's buffers and what `decoder` allocates for each call, and holding at most `most` bytes
     fn new(

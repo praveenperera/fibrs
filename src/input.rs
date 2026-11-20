@@ -712,18 +712,19 @@ const BLOSC_ZSTD_FORMAT: u8 = 4;
 /// is. `None` for anything else: a frame c-blosc would refuse, another codec, bit shuffle, byte shuffle of wider
 /// items, split blocks, a range that is not one block per channel, or a zstd frame [`zstd_frame_fits`] refuses
 fn frame_channel_blocks(bytes: &[u8], channel: usize, start: usize, len: usize) -> Option<[BlockSource; 2]> {
-    let header = bytes.get(..16)?;
-    let word = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().expect("4 bytes")) as usize;
-    let (flags, typesize, nbytes, blocksize, cbytes) = (header[2], header[3] as usize, word(4), word(8), word(12));
+    // the header check c-blosc makes, so a frame [`Predictions::decode_planes`] refuses, such as one with bytes
+    // past its recorded length, is refused here too, and the header's compressed size is the frame's length
+    let FrameInfo { nbytes, typesize, blocksize } = blosc_frame_info(bytes).ok()?;
+    let (version, flags, cbytes) = (bytes[0], bytes[2], bytes.len());
     let shuffled = flags & BLOSC_SHUFFLE != 0 && typesize > 1;
-    if header[0] != 2 || flags & (BLOSC_FUTURE | BLOSC_BITSHUFFLE) != 0 || shuffled || typesize == 0 {
+    if version != 2 || flags & (BLOSC_FUTURE | BLOSC_BITSHUFFLE) != 0 || shuffled || typesize == 0 {
         return None;
     }
     // a frame of another size would put one channel's bytes where the other's are read
-    if nbytes != 2 * channel || cbytes > bytes.len() || len == 0 || start + len > channel {
+    if nbytes != 2 * channel || len == 0 || start + len > channel {
         return None;
     }
-    let frame = &bytes[..cbytes];
+    let frame = bytes;
     let starts = [start, channel + start];
     if flags & BLOSC_MEMCPYED != 0 {
         // the decoded bytes follow the header as they are
@@ -1206,6 +1207,38 @@ mod tests {
         };
         dictionary[range.start + 4] |= 0x01;
         assert!(refused(&dictionary, 0, block));
+    }
+
+    /// A chunk file with a byte past its Blosc frame is refused by both decoders: c-blosc's header check refuses it
+    /// for the CPU, and the GPU's block sources check the same header, so neither decodes a file the other refuses
+    #[test]
+    fn a_frame_with_trailing_bytes_is_refused_by_both_decoders() {
+        let edge = 16;
+        let data = two_channels(8 * edge * edge, 2);
+        let frame = blosc_frame(&data, 1, 8 * edge * edge);
+        let dir = std::env::temp_dir().join(format!("fibrs-trailing-byte-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("0.0.0.0"), &frame).unwrap();
+        fs::write(dir.join("0.0.0.1"), [&frame[..], &[0]].concat()).unwrap();
+        let meta = serde_json::json!({
+            "zarr_format": 2, "shape": [2, edge, edge, 2 * edge], "chunks": [2, edge, edge, edge],
+            "dtype": "|u1", "fill_value": 0, "order": "C", "filters": null, "dimension_separator": ".",
+            "compressor": {"id": "blosc", "cname": "zstd", "clevel": 3, "shuffle": 1, "blocksize": 0},
+        });
+        fs::write(dir.join(".zarray"), meta.to_string()).unwrap();
+        let p = Predictions::open(&dir, None, "VH").unwrap();
+        let pool = BufferPool::new(1 << 20);
+        let mut out = vec![0u8; 2 * 8 * edge * edge];
+
+        let whole = p.packed_chunk_in([0, 0, 0], &pool).unwrap();
+        p.decode_planes(&whole, 0..8, &mut out).unwrap();
+        assert!(p.plane_blocks(&whole, 0..8).is_some(), "the frame as Blosc wrote it gives block sources");
+
+        let trailing = p.packed_chunk_in([0, 0, 1], &pool).unwrap();
+        assert!(p.decode_planes(&trailing, 0..8, &mut out).is_err());
+        assert!(p.plane_blocks(&trailing, 0..8).is_none(), "the GPU accepts a frame the CPU refuses");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The header check takes exactly one dictionary-free frame of the expected size, and nothing shorter or longer

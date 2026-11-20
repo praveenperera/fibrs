@@ -132,9 +132,11 @@ pub struct NvComp {
 impl NvComp {
     /// Load nvCOMP from the first place that has it: `FIBRS_NVCOMP` (a path to `libnvcomp.so.6`, and then the only
     /// place tried), the `nvidia-libnvcomp-cu12` wheel in the venv this executable was started from, the one in
-    /// `$VIRTUAL_ENV`, then the dynamic loader's search path
+    /// `$VIRTUAL_ENV`, then the dynamic loader's search path. `FIBRS_NVCOMP=off`, in any case, loads none
     pub fn open() -> Result<Self> {
         if let Some(path) = std::env::var_os("FIBRS_NVCOMP") {
+            // nvCOMP trusts its input, so this is how a run that doubts its prediction files decodes them on the CPU
+            ensure!(!path.eq_ignore_ascii_case("off"), "FIBRS_NVCOMP is off");
             return Self::load(Path::new(&path));
         }
         let wheels = site_packages().into_iter().map(|site| site.join(WHEEL_DIR).join(SONAME));
