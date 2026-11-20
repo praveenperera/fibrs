@@ -16,7 +16,9 @@ mod produce;
 mod pyenv;
 mod pyfmt;
 mod run;
+mod seams;
 mod stage1;
+mod tiles;
 mod vol;
 
 use std::ffi::OsString;

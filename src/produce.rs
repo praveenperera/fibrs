@@ -369,7 +369,7 @@ impl<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Producer<'_, P, C, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fields::{Presence, catalogue, centrality};
+    use crate::fields::{Presence, RegionFrame, catalogue, centrality};
     use crate::kernels::{encode_dir, pack_dir};
     use crate::stage1::Separate;
     use crate::vol::Vol;
@@ -458,7 +458,7 @@ mod tests {
         let (tracing, dirs) = fibres();
         let pres = Presence::new(&tracing, 1);
         let fam = centrality::<Separate, _>(&pres, &dirs);
-        let cat = catalogue(&fam.seeds, &fam.cent);
+        let cat = catalogue(&fam.seeds, &fam.cent, RegionFrame::whole(fam.cent.shape()));
         let fields = Fields { pres: &pres, cent: &fam.cent, dirs: &dirs };
         let expected = serial(&fields, &cat);
         assert!(expected.len() >= 100, "the fixture should accept many curves, not {}", expected.len());

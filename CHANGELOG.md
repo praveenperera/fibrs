@@ -4,6 +4,14 @@
 
 ### What's new
 
+- **Tiled tracing.** `--tiles-yx NY NX` traces a window as NY × NX tiles in Y and X, one at a time, so the run's
+  peak memory is about its densest tile's instead of the whole window's. Each tile is traced from its core plus
+  `--tile-halo` native voxels (default 256) of its neighbours. Core edges and the halo are whole units of 256 native
+  voxels for prediction zarrs. Each tile's fibres are cut to its core and joined across the seams by the rule the
+  v2-run pipeline uses for its Z bands: cut ends of the same family at most 1.5 voxels apart, shortest first, never
+  into a loop. A `--tiles-yx 1 1` run writes the untiled run's `.afv`. Without `--tiles-yx`, runs, their output and
+  their `run.json` are unchanged. See [Tiled tracing](README.md#tiled-tracing).
+
 - **The tracer runs without transparent huge pages.** On Linux with glibc the tracer's mimalloc no longer asks for
   transparent huge pages, and asks Linux to disable them for its process and any child process it starts, unless
   `MIMALLOC_ALLOW_THP=1` is set. On a host with THP set to `madvise`, most of those requests fell back to small
