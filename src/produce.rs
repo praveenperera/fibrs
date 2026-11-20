@@ -67,6 +67,104 @@ pub struct Stats {
     pub committer: usize,
 }
 
+/// Committer region timers and slowdown injection, for the parallel-commit ceiling (measurement branch only)
+///
+/// `FIBRS_ABL_REGION=wait|own|stale|retrace|apply|deliver|serial` and `FIBRS_ABL_K=k` make the committer busy-wait
+/// `k` times each matching region's own duration right after it, so the output is unchanged. `serial` matches
+/// stale, retrace, apply and deliver together. The regions' totals are logged at the end of each family
+mod abl {
+    use std::arch::x86_64::_rdtsc;
+
+    use crate::log;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    pub const REGIONS: [&str; 7] = ["wait", "own", "stale", "retrace", "apply", "deliver", "top_up"];
+    pub const WAIT: usize = 0;
+    pub const OWN: usize = 1;
+    pub const STALE: usize = 2;
+    pub const RETRACE: usize = 3;
+    pub const APPLY: usize = 4;
+    pub const DELIVER: usize = 5;
+    pub const TOP_UP: usize = 6;
+
+    /// Which regions are inflated, and by how much
+    struct Inject {
+        mask: u32,
+        k: f64,
+    }
+
+    fn inject() -> &'static Inject {
+        static I: OnceLock<Inject> = OnceLock::new();
+        I.get_or_init(|| {
+            let region = std::env::var("FIBRS_ABL_REGION").unwrap_or_default();
+            let k = std::env::var("FIBRS_ABL_K").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            let mask = match region.as_str() {
+                "" => 0,
+                "serial" => 1 << STALE | 1 << RETRACE | 1 << APPLY | 1 << DELIVER,
+                r => 1 << REGIONS.iter().position(|&n| n == r).expect("FIBRS_ABL_REGION names a region"),
+            };
+            Inject { mask, k }
+        })
+    }
+
+    pub struct Prof {
+        ticks: [u64; 7],
+        injected: u64,
+        t: u64,
+        start_tsc: u64,
+        start: Instant,
+    }
+
+    impl Prof {
+        pub fn new() -> Self {
+            // SAFETY: rdtsc has no preconditions on x86_64
+            let t = unsafe { _rdtsc() };
+            Self { ticks: [0; 7], injected: 0, t, start_tsc: t, start: Instant::now() }
+        }
+
+        /// Ends the current region as `r` and starts the next
+        #[inline(always)]
+        pub fn lap(&mut self, r: usize) {
+            // SAFETY: as above
+            let now = unsafe { _rdtsc() };
+            let dt = now - self.t;
+            self.ticks[r] += dt;
+            let inj = inject();
+            if inj.mask & (1 << r) != 0 && inj.k > 0.0 {
+                let until = now + (dt as f64 * inj.k) as u64;
+                // SAFETY: as above
+                while unsafe { _rdtsc() } < until {
+                    std::hint::spin_loop();
+                }
+                // SAFETY: as above
+                let end = unsafe { _rdtsc() };
+                self.injected += end - now;
+                self.t = end;
+                return;
+            }
+            self.t = now;
+        }
+
+        pub fn report(&self, seeds: usize) {
+            // SAFETY: as above
+            let total_tsc = unsafe { _rdtsc() } - self.start_tsc;
+            let wall = self.start.elapsed().as_secs_f64();
+            let per_s = total_tsc as f64 / wall;
+            let mut parts = String::new();
+            for (n, t) in REGIONS.iter().zip(self.ticks) {
+                parts += &format!(" {n}={:.3}", t as f64 / per_s);
+            }
+            let inj = inject();
+            log!(
+                "committer regions (s, {seeds} seeds, wall {wall:.3}):{parts} injected={:.3} k={}",
+                self.injected as f64 / per_s,
+                inj.k
+            );
+        }
+    }
+}
+
 /// Whether the producer goes on after a seed's curves are handed over
 pub enum Flow {
     Continue,
@@ -327,23 +425,30 @@ impl<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Producer<'_, P, C, D> {
         let mut own = Traced::default();
         let mut stats = Stats { seeds: total, window: self.window, ..Stats::default() };
         top_up();
+        let mut prof = abl::Prof::new();
         for i in 0..total {
-            let traced = match self.ready(i)? {
+            let ready = self.ready(i)?;
+            prof.lap(abl::WAIT);
+            let traced = match ready {
                 Ready::Claimed => {
                     stats.committer += 1;
                     self.trace(i, &mut scratch, &mut own)?;
+                    prof.lap(abl::OWN);
                     &mut own
                 }
                 Ready::Ahead => {
                     // SAFETY: the helper published the slot's result, and the slot is claimed again only after
                     // the release of `committed` below
                     let ahead = unsafe { &mut *self.slots[i % self.window].ahead.get() };
-                    if self.retrace_all || writer.stale(&ahead.traced.reads, ahead.committed as u32) {
+                    let stale = self.retrace_all || writer.stale(&ahead.traced.reads, ahead.committed as u32);
+                    prof.lap(abl::STALE);
+                    if stale {
                         stats.retraced += 1;
                         // the slot is traced into again only after its next claim; until then it would hold this
                         // seed's curves and room for marks beyond what a kept result may
                         ahead.traced.discard();
                         self.trace(i, &mut scratch, &mut own)?;
+                        prof.lap(abl::RETRACE);
                         &mut own
                     } else {
                         // nothing it read has changed since, so this is the serial result, an error included
@@ -353,15 +458,21 @@ impl<P: Grid<u8>, C: Grid<u16>, D: Grid<u16>> Producer<'_, P, C, D> {
                 }
             };
             writer.apply(i as u32, traced);
+            prof.lap(abl::APPLY);
             let flow = deliver(i, &mut traced.curves)?;
             traced.trim();
+            // an injected delay lands before the release, as a slower deliver would
+            prof.lap(abl::DELIVER);
             // release: publishes the marks just applied and hands the slot back
             self.committed.store(i + 1, Ordering::Release);
             if let Flow::Stop = flow {
+                prof.report(i + 1);
                 return Ok(stats);
             }
             top_up();
+            prof.lap(abl::TOP_UP);
         }
+        prof.report(total);
         Ok(stats)
     }
 }
