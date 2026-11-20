@@ -76,8 +76,9 @@ report the corruption.
 
 nvCOMP is not part of fibrs: it is NVIDIA's own PyPI package, `nvidia-libnvcomp-cu12` (version 6, under NVIDIA's
 licence), which the `gpu-zstd` extra installs. With `FIBRS_NVCOMP=on` (in any case), fibrs loads that wheel from
-the environment fibrs is installed into or the active one (`$VIRTUAL_ENV`), and run from Python (`python -m fibrs`
-or `fibrs.run`) from that Python's environment, venv or not, then tries the system's library path. Unset or `off`,
+the environment fibrs is installed into or the active one (`$VIRTUAL_ENV`), then tries the system's library path.
+Run from Python (`python -m fibrs` or `fibrs.run`), it loads only the wheel in that Python's environment, venv or
+not, when there is one, so a wheel whose library fails to load leaves slabs on the CPU. Unset or `off`,
 nvCOMP is never loaded, whether or not the wheel is installed. The log says once whether slabs decode on the GPU, or
 why they decode on the CPU. Even with nvCOMP, a slab whose chunk it cannot decode as Blosc stored it (its Blosc
 blocks are not one slab of one channel each, or a zstd frame fails fibrs's checks) is decoded on the CPU, as is
