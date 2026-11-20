@@ -8,8 +8,8 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use color_eyre::eyre::{Result, eyre};
@@ -59,6 +59,25 @@ pub struct FeedPlan {
 pub struct TileFeed {
     rx: Option<Receiver<Result<Item>>>,
     thread: Option<JoinHandle<()>>,
+    /// Batch buffers handed back by the consumer
+    batches: Arc<Spare>,
+}
+
+/// Buffers handed back for reuse. A tile is 2 MiB and a batch several, and a fresh one each time meant zeroing
+/// it or growing it by copies, and faulting its pages in; the buffers in flight are bounded, so the list is too
+#[derive(Default)]
+struct Spare(Mutex<Vec<Vec<u8>>>);
+
+impl Spare {
+    fn take(&self) -> Option<Vec<u8>> {
+        self.0.lock().ok()?.pop()
+    }
+
+    fn give(&self, buf: Vec<u8>) {
+        if let Ok(mut spare) = self.0.lock() {
+            spare.push(buf);
+        }
+    }
 }
 
 /// Batches and column ends queued ahead of the GPU
@@ -75,13 +94,22 @@ impl TileFeed {
             .thread_name(|i| format!("fibrs-predict-read-{i}"))
             .build()?;
         let (tx, rx) = sync_channel(DEPTH);
-        let thread = std::thread::Builder::new().name("fibrs-predict-feed".into()).spawn(move || {
-            let result = feed(&plan, &pool, &tx);
-            if let Err(e) = result {
-                let _ = tx.send(Err(e));
+        let batches = Arc::new(Spare::default());
+        let thread = std::thread::Builder::new().name("fibrs-predict-feed".into()).spawn({
+            let batches = batches.clone();
+            move || {
+                let result = feed(&plan, &pool, &tx, &batches);
+                if let Err(e) = result {
+                    let _ = tx.send(Err(e));
+                }
             }
         })?;
-        Ok(Self { rx: Some(rx), thread: Some(thread) })
+        Ok(Self { rx: Some(rx), thread: Some(thread), batches })
+    }
+
+    /// Hands a batch's buffer back once its tiles are used, for a later batch to fill
+    pub fn recycle(&self, data: Vec<u8>) {
+        self.batches.give(data);
     }
 
     /// The next item, in order
@@ -108,8 +136,16 @@ impl Drop for TileFeed {
 /// A tile's read in flight, or `None` for a tile skipped unread
 type Pending = (usize, Origin, Option<Receiver<Result<Vec<u8>>>>);
 
-/// The feed thread: returns when every column is fed or the consumer has gone
-fn feed(plan: &FeedPlan, pool: &rayon::ThreadPool, tx: &SyncSender<Result<Item>>) -> Result<()> {
+/// The feed thread: returns when every column is fed or the consumer has gone. Batch buffers come back through
+/// `batches`, and tile buffers to the readers once their tile is copied into a batch
+fn feed(plan: &FeedPlan, pool: &rayon::ThreadPool, tx: &SyncSender<Result<Item>>, batches: &Spare) -> Result<()> {
+    let tiles = Arc::new(Spare::default());
+    let fresh_batch = || {
+        let mut data = batches.take().unwrap_or_default();
+        data.clear();
+        data.reserve(plan.batch * TILE_VOXELS);
+        data
+    };
     // tiles of every column in one ordered stream, `lookahead` reads in flight
     let lookahead = 4 * plan.readers;
     let mut order = plan.columns.iter().flat_map(|(ci, tiles)| tiles.iter().map(move |t| (*ci, *t))).peekable();
@@ -117,14 +153,14 @@ fn feed(plan: &FeedPlan, pool: &rayon::ThreadPool, tx: &SyncSender<Result<Item>>
     let mut seen = 0usize;
     let mut air = 0usize;
     let mut origins = Vec::new();
-    let mut data = Vec::new();
+    let mut data = fresh_batch();
     let mut column = plan.columns.iter().map(|(ci, tiles)| (*ci, tiles.len()));
     let (mut ci, mut ends) = column.next().ok_or_else(|| eyre!("no columns"))?;
 
     loop {
         while window.len() < lookahead {
             let Some((c, t)) = order.next() else { break };
-            window.push_back((c, t, read(plan, pool, t)));
+            window.push_back((c, t, read(plan, pool, t, &tiles)));
         }
         let Some((c, t, rx)) = window.pop_front() else { break };
         debug_assert_eq!(c, ci);
@@ -134,12 +170,21 @@ fn feed(plan: &FeedPlan, pool: &rayon::ThreadPool, tx: &SyncSender<Result<Item>>
             Some(raw) if matches!(plan.rule, Rule::Villa(_)) || raw.iter().any(|&v| v != 0) => {
                 origins.push(t);
                 data.extend_from_slice(&raw);
+                tiles.give(raw);
             }
-            _ => air += 1,
+            Some(raw) => {
+                air += 1;
+                tiles.give(raw);
+            }
+            None => air += 1,
         }
 
         if origins.len() == plan.batch || (seen == ends && !origins.is_empty()) {
-            let batch = Batch { col: ci, origins: std::mem::take(&mut origins), data: std::mem::take(&mut data) };
+            let batch = Batch {
+                col: ci,
+                origins: std::mem::take(&mut origins),
+                data: std::mem::replace(&mut data, fresh_batch()),
+            };
             if tx.send(Ok(Item::Batch(batch))).is_err() {
                 return Ok(());
             }
@@ -158,8 +203,8 @@ fn feed(plan: &FeedPlan, pool: &rayon::ThreadPool, tx: &SyncSender<Result<Item>>
     Ok(())
 }
 
-/// Starts reading tile `t` on the pool, unless the rule skips it unread
-fn read(plan: &FeedPlan, pool: &rayon::ThreadPool, t: Origin) -> Option<Receiver<Result<Vec<u8>>>> {
+/// Starts reading tile `t` on the pool into a spare buffer, unless the rule skips it unread
+fn read(plan: &FeedPlan, pool: &rayon::ThreadPool, t: Origin, tiles: &Arc<Spare>) -> Option<Receiver<Result<Vec<u8>>>> {
     if let Rule::Villa(sel) = &plan.rule
         && !sel.tile_runs(t)
     {
@@ -169,8 +214,10 @@ fn read(plan: &FeedPlan, pool: &rayon::ThreadPool, t: Origin) -> Option<Receiver
     let (tx, rx) = sync_channel(1);
     let (ct, z0, z1) = (plan.ct.clone(), plan.z0, plan.z1);
     let path = plan.ct_path.clone();
+    let tiles = tiles.clone();
     pool.spawn(move || {
-        let mut out = vec![0u8; TILE_VOXELS];
+        // read_tile writes every byte, so a spare buffer's old tile does not matter
+        let mut out = tiles.take().unwrap_or_else(|| vec![0u8; TILE_VOXELS]);
         let r =
             read_tile(&ct, z0, z1, t, &mut out).map(|()| out).map_err(|e| e.wrap_err(format!("{}", path.display())));
         let _ = tx.send(r);

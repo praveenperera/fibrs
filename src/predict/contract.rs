@@ -6,6 +6,7 @@
 //! are the band reference's functions (fibrs 0.2's Python `fibrs.predict.contract`), ported so band mode cannot
 //! drift from it in tiling, air skipping or provenance
 
+use std::cell::RefCell;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -114,13 +115,28 @@ pub fn read_tile(ct: &Ct, z0: usize, z1: usize, origin: Origin, out: &mut [u8]) 
     let lo = origin.map(|p| p as i64 - BORDER as i64);
     let a = [0, 1, 2].map(|i| lo[i].max(0) as usize);
     let b = [0, 1, 2].map(|i| ((lo[i] + TILE as i64) as usize).min(shape[i]));
-    let raw = ct.read([a[0] + z0, a[1], a[2]], [b[0] + z0, b[1], b[2]])?;
+    let (lo_ct, hi_ct) = ([a[0] + z0, a[1], a[2]], [b[0] + z0, b[1], b[2]]);
     if (0..3).all(|i| lo[i] >= 0 && b[i] - a[i] == TILE) {
-        out.copy_from_slice(&raw);
-        return Ok(());
+        return ct.read_into(lo_ct, hi_ct, out);
     }
 
+    // a tile at the volume's edge reads the smaller box into the reader thread's scratch, then reflects it
     let len = [0, 1, 2].map(|i| b[i] - a[i]);
+    EDGE_BOX.with_borrow_mut(|raw| {
+        raw.resize(len.iter().product(), 0);
+        ct.read_into(lo_ct, hi_ct, raw)?;
+        reflect_into(raw, lo, a, len, out);
+        Ok(())
+    })
+}
+
+thread_local! {
+    /// The box an edge tile reads, kept per reader thread
+    static EDGE_BOX: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The tile at `lo` from `raw`, the box of `len` voxels at `a`, reflected where the tile leaves the volume
+fn reflect_into(raw: &[u8], lo: [i64; 3], a: [usize; 3], len: [usize; 3], out: &mut [u8]) {
     // per axis, the read voxel each tile voxel takes
     let map = |axis: usize| -> Vec<usize> {
         (0..TILE as i64).map(|t| reflect(lo[axis] + t - a[axis] as i64, len[axis])).collect()
@@ -135,7 +151,6 @@ pub fn read_tile(ct: &Ct, z0: usize, z1: usize, origin: Origin, out: &mut [u8]) 
             }
         }
     }
-    Ok(())
 }
 
 /// sha256 of a file, hex
