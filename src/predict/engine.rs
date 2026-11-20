@@ -251,15 +251,22 @@ mod libs {
     const PIP: [(&[&str], &str); 2] =
         [(&["libcublasLt.so.12", "libcublas.so.12"], "nvidia/cublas/lib"), (&["libcudnn.so.9"], "nvidia/cudnn/lib")];
 
-    /// (pip files, dependencies first; their directory under site-packages). NVRTC too, which cuDNN's Windows wheel
-    /// depends on for its runtime-compiled engines: volkit's `dll::pin` takes NVRTC only from a copy already loaded
-    /// or from the system's trusted places, so without this the venv's copy would go unused
+    /// (pip files, dependencies first; their directory under site-packages)
     #[cfg(windows)]
-    const PIP: [(&[&str], &str); 3] = [
-        (&["cublasLt64_12.dll", "cublas64_12.dll"], "nvidia/cublas/bin"),
-        (&["nvrtc64_120_0.dll"], "nvidia/cuda_nvrtc/bin"),
-        (&["cudnn64_9.dll"], "nvidia/cudnn/bin"),
-    ];
+    const PIP: [(&[&str], &str); 2] =
+        [(&["cublasLt64_12.dll", "cublas64_12.dll"], "nvidia/cublas/bin"), (&["cudnn64_9.dll"], "nvidia/cudnn/bin")];
+
+    /// Pip files loaded, before [`PIP`]'s, from the site chosen for cuDNN and cuBLAS when it has them, but never
+    /// the reason a site is chosen
+    #[cfg(unix)]
+    const COMPANIONS: [(&[&str], &str); 0] = [];
+
+    /// Pip files loaded, before [`PIP`]'s, from the site chosen for cuDNN and cuBLAS when it has them, but never
+    /// the reason a site is chosen: NVRTC, which cuDNN's runtime-compiled engines use and the cuDNN and cuBLAS
+    /// Windows wheels bring. volkit's `dll::pin` takes NVRTC only from a copy already loaded or from the system's
+    /// trusted places, so without this the venv's copy would go unused
+    #[cfg(windows)]
+    const COMPANIONS: [(&[&str], &str); 1] = [(&["nvrtc64_120_0.dll"], "nvidia/cuda_nvrtc/bin")];
 
     /// The site-packages directories of the environment this binary is installed in: the one whose
     /// `fibrs-*.dist-info` installed it first, when a prefix holds several Python versions, so a binary installed
@@ -346,7 +353,7 @@ mod libs {
             .or_else(|| sites.iter().find(|s| PIP.iter().all(|&p| holds(s, p))))
             .or_else(|| sites.iter().find(any));
         let Some(site) = site else { return };
-        for (files, sub) in PIP {
+        for (files, sub) in COMPANIONS.into_iter().chain(PIP) {
             if !holds(site, (files, sub)) {
                 continue;
             }

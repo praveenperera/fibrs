@@ -1040,14 +1040,27 @@ fn debug_mem(stage: &str, parts: &[(&str, usize)]) {
     log!("mem {stage}: {} GiB; rss {:.2} GiB", parts.join(", "), gib(rss_bytes().unwrap_or(0)));
 }
 
-/// The process's resident set, from procfs; other systems have no procfs, and their debug logs show zero
+/// The process's resident set, from procfs; macOS has no procfs, and its debug logs show zero
 #[cfg(target_os = "linux")]
 fn rss_bytes() -> Option<usize> {
     let pages = fs::read_to_string("/proc/self/statm").ok()?.split_whitespace().nth(1)?.parse::<usize>().ok()?;
     Some(pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// The process's resident set: its working set, as Windows counts it
+#[cfg(windows)]
+fn rss_bytes() -> Option<usize> {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: the call writes at most `size` bytes into `counters`, a struct of that size
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) };
+    (ok != 0).then_some(counters.WorkingSetSize)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn rss_bytes() -> Option<usize> {
     None
 }

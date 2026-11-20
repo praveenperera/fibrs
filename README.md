@@ -101,7 +101,9 @@ nvCOMP is not part of fibrs: it is NVIDIA's own PyPI package, `nvidia-libnvcomp-
 licence), which the `gpu-zstd` extra installs. With `FIBRS_NVCOMP=on` (in any case), fibrs loads that wheel from
 the environment fibrs is installed into or the active one (`$VIRTUAL_ENV`), then tries the system's library path.
 On Windows that last search covers only the executable's directory and System32, since fibrs takes the current
-directory and `PATH` out of the DLL search, so point `FIBRS_NVCOMP` at a standalone nvCOMP's DLL.
+directory and `PATH` out of the DLL search, so point `FIBRS_NVCOMP` at a standalone nvCOMP's DLL. NVIDIA's Windows
+nvCOMP needs the Visual C++ runtime (`vcruntime140.dll`, `msvcp140.dll`), which `fibrs.exe` itself does not; without
+it, slabs stay on the CPU and the log says nvCOMP did not load.
 Run from Python (`python -m fibrs` or `fibrs.run`), it loads only the wheel in that Python's environment, venv or
 not, when there is one, so a wheel whose library fails to load leaves slabs on the CPU. Unset or `off`,
 nvCOMP is never loaded, whether or not the wheel is installed. The log says once whether slabs decode on the GPU, or
@@ -129,7 +131,8 @@ scripts/install-dropin.sh --restore VENV  # put the original back
 
 BINARY defaults to the `fibrs` in the archive the script came from, then to the one on `PATH`. On Windows, run it
 from Git Bash: `VENV\Scripts\avf-spline-generator.exe` becomes a copy of `fibrs.exe`, and the original is kept as
-`avf-spline-generator.reference.exe`.
+`avf-spline-generator.reference.exe`. A caller there that builds the path itself names it with `.exe`
+(`Path(sys.executable).parent / "avf-spline-generator.exe"`).
 The original entry is kept as `avf-spline-generator.reference`, and `NOTICE` and `licenses/` are copied to
 `VENV/share/fibrs`. Callers that run `Path(sys.executable).parent / "avf-spline-generator"`
 need no other change. Run as `avf-spline-generator`, `--version` prints `0.2.0`, the release it stands in for; run
@@ -411,7 +414,8 @@ took 52.6 s and 65.9 s with `--device cuda`, against 35.3 s and 59.3 s with `--d
   hundreds of times a second, and on Linux mapping and unmapping memory takes a lock that every page fault in
   the process waits for, so a mapping per decode and per brick stalled the tracing threads. Other allocations
   of 1 MiB or more have their own mapping on Linux, so freed memory does not stay resident. `FIBRS_DEBUG_MEM=1`
-  logs each stage's field sizes and resident memory.
+  logs each stage's field sizes and resident memory (the working set on Windows; zero on macOS, which the log
+  cannot read it from).
 - The work directory holds `run.json` (with a `native` key, so neither tool resumes the other's
   directory, and only the fibrs version that started it resumes it) and one finished curve file per
   family. An interrupted family is traced again from its first

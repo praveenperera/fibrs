@@ -71,8 +71,9 @@ pub unsafe fn open_library(path: &Path) -> Result<Library, libloading::Error> {
 }
 
 /// Opens the DLL at `path`, resolving the DLLs it imports from its own directory, then the executable's and
-/// System32, since the binary takes the current directory and `PATH` out of the search at startup. A bare name is
-/// found in the executable's directory or System32, or reuses a DLL of that name already loaded
+/// System32, since the binary takes the current directory and `PATH` out of the search at startup. A relative path
+/// is taken from the current directory, as it names a file there; a bare name is found in the executable's
+/// directory or System32, or reuses a DLL of that name already loaded
 ///
 /// # Safety
 ///
@@ -82,10 +83,14 @@ pub unsafe fn open_library(path: &Path) -> Result<Library, libloading::Error> {
     use libloading::os::windows::{LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR};
 
     // the DLL's own directory can only be searched for a full path; with a bare name the flag is an error
-    if !path.is_absolute() {
+    let bare = path.parent().is_none_or(|p| p.as_os_str().is_empty()) && !path.has_root();
+    if bare {
         return unsafe { Library::new(path) };
     }
 
+    // the restricted search would look for a relative path under its own directories, not the current one; a path
+    // with no absolute form (an empty one) is left for the load to refuse
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
-    unsafe { libloading::os::windows::Library::load_with_flags(path, flags) }.map(Library::from)
+    unsafe { libloading::os::windows::Library::load_with_flags(&path, flags) }.map(Library::from)
 }
