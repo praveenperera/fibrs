@@ -70,7 +70,8 @@ pub struct ColumnOut {
 pub trait Engine {
     fn begin(&mut self, shape: [usize; 3], y0: usize, x0: usize) -> Result<()>;
     fn add(&mut self, tiles: &[u8], origins: &[Origin]) -> Result<()>;
-    fn finish(&mut self, quantize: bool) -> Result<ColumnOut>;
+    /// Ends the column, its outputs written into `reuse`, an earlier column's buffers, or fresh ones
+    fn finish(&mut self, quantize: bool, reuse: (Vec<u8>, Vec<u8>)) -> Result<ColumnOut>;
 }
 
 /// What the run needs to know about the opened engine
@@ -141,8 +142,8 @@ mod native {
             self.0.add(tiles, origins).map(drop)
         }
 
-        fn finish(&mut self, quantize: bool) -> Result<ColumnOut> {
-            let out = self.0.finish(quantize)?;
+        fn finish(&mut self, quantize: bool, (semantic, tracing): (Vec<u8>, Vec<u8>)) -> Result<ColumnOut> {
+            let out = self.0.finish_into(quantize, semantic, tracing)?;
             Ok(ColumnOut { semantic: out.semantic, tracing: out.tracing, uncovered: out.uncovered })
         }
     }

@@ -309,6 +309,8 @@ pub struct ColumnWriter {
     tx: Option<SyncSender<Finished>>,
     thread: Option<JoinHandle<()>>,
     err: Arc<Mutex<Option<color_eyre::Report>>>,
+    /// Written columns' output buffers, for the engine to fill again
+    spent: Arc<Mutex<Vec<(Vec<u8>, Vec<u8>)>>>,
 }
 
 /// The band reference's record key order, so the records read the same
@@ -324,6 +326,8 @@ impl ColumnWriter {
         let (tx, rx) = sync_channel::<Finished>(2);
         let err = Arc::new(Mutex::new(None));
         let slot = err.clone();
+        let spent = Arc::new(Mutex::new(Vec::new()));
+        let give = spent.clone();
         let thread = std::thread::Builder::new().name("fibrs-predict-writer".into()).spawn(move || {
             let mut failed = false;
             let mut bufs = ChunkBufs::default();
@@ -332,15 +336,28 @@ impl ColumnWriter {
                 if failed {
                     continue;
                 }
-                if let Err(e) = write_column(&output, &progress, job, &mut bufs) {
-                    failed = true;
-                    if let Ok(mut s) = slot.lock() {
-                        *s = Some(e);
+                match write_column(&output, &progress, job, &mut bufs) {
+                    Ok(Some(done)) => {
+                        if let Ok(mut spent) = give.lock() {
+                            spent.push(done);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        failed = true;
+                        if let Ok(mut s) = slot.lock() {
+                            *s = Some(e);
+                        }
                     }
                 }
             }
         })?;
-        Ok(Self { tx: Some(tx), thread: Some(thread), err })
+        Ok(Self { tx: Some(tx), thread: Some(thread), err, spent })
+    }
+
+    /// A written column's output buffers, or empty ones while none is written yet
+    pub fn spare(&self) -> (Vec<u8>, Vec<u8>) {
+        self.spent.lock().ok().and_then(|mut s| s.pop()).unwrap_or_default()
     }
 
     fn raise(&self) -> Result<()> {
@@ -373,7 +390,13 @@ impl Drop for ColumnWriter {
     }
 }
 
-fn write_column(output: &Output, progress: &Path, job: Finished, bufs: &mut ChunkBufs) -> Result<()> {
+/// Writes one column and its progress record, and gives back its output buffers
+fn write_column(
+    output: &Output,
+    progress: &Path,
+    job: Finished,
+    bufs: &mut ChunkBufs,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
     let [y0, y1, x0, x1] = job.col;
     let (h, w) = (y1 - y0, x1 - x0);
     if let (Some(sem), Some(tra)) = (&job.sem, &job.tra) {
@@ -390,7 +413,7 @@ fn write_column(output: &Output, progress: &Path, job: Finished, bufs: &mut Chun
     let mut f = fs::OpenOptions::new().create(true).append(true).open(progress)?;
     f.write_all(format!("{line}\n").as_bytes())?;
     println!("{line}");
-    Ok(())
+    Ok(job.sem.zip(job.tra))
 }
 
 #[cfg(test)]
