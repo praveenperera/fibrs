@@ -144,6 +144,12 @@ pub struct Args {
     /// Compressed-mode tracing cache; minimum 16 MiB (default: 1024)
     #[arg(long, default_value_t = 1024)]
     pub field_cache_mib: i64,
+    /// Experimental: also trace seeds on the GPU, ahead of the seed being committed, when the direction field and
+    /// centrality run there. The `.afv` is the same either way: the CPU checks each GPU result against the coverage
+    /// committed since the GPU read it and traces the seed itself when it no longer holds. It takes more memory: on
+    /// a dense window the run's peak was about 4 GiB higher
+    #[arg(long)]
+    pub gpu_walk: bool,
     /// Print the version and exit
     #[arg(long)]
     version: bool,
@@ -571,7 +577,8 @@ pub fn run(args: Args) -> Result<Summary> {
     };
 
     let tracing_needed = families.iter().any(|&f| !family_complete(&work, f));
-    let cent = CentralityDevice::choose(args.device, args.cuda_device.map(|d| d as usize), started_on, tracing_needed)?;
+    let index = args.cuda_device.map(|d| d as usize);
+    let cent = CentralityDevice::choose(args.device, index, started_on, tracing_needed, args.gpu_walk)?;
     if saved.is_none() {
         config["device"] = json!(cent.rounding.name());
         save_json(&manifest, &config)?;
@@ -970,6 +977,8 @@ struct CentralityDevice {
     gpu: Option<Gpu>,
     /// Whether a GPU failure mid-run ends the run (`--device cuda`) instead of moving to the CPU
     strict: bool,
+    /// Whether the GPU traces seeds ahead of the CPU's commit (`--gpu-walk`)
+    walk: bool,
 }
 
 impl CentralityDevice {
@@ -983,12 +992,13 @@ impl CentralityDevice {
         index: Option<usize>,
         started_on: Option<Rounding>,
         tracing_needed: bool,
+        walk: bool,
     ) -> Result<Self> {
         let strict = device == Device::Cuda;
-        let cpu = |rounding| Self { rounding, gpu: None, strict };
+        let cpu = |rounding| Self { rounding, gpu: None, strict, walk };
         let on_gpu = |gpu: Gpu| {
             log!("Direction field and centrality on {} (--device cpu to use the CPU)", gpu.name());
-            Self { rounding: Rounding::Cuda, gpu: Some(gpu), strict }
+            Self { rounding: Rounding::Cuda, gpu: Some(gpu), strict, walk }
         };
         let open = || Gpu::open(index, Stages::DirectionFieldAndCentrality);
         let chosen = match (started_on, device) {
@@ -1001,7 +1011,7 @@ impl CentralityDevice {
                         "Direction field on {}, centrality on the CPU this run started on (--device cpu to use the CPU)",
                         gpu.name()
                     );
-                    Self { rounding: Rounding::Cpu, gpu: Some(gpu), strict }
+                    Self { rounding: Rounding::Cpu, gpu: Some(gpu), strict, walk }
                 }
                 Err(e) => {
                     log!("Direction field and centrality on the CPU: no usable GPU ({e:#})");
@@ -1045,10 +1055,11 @@ impl CentralityDevice {
         }
     }
 
-    /// The GPU's walk of one family's seeds ahead of the CPU's commit (`lookahead.rs`), when the run has a GPU
+    /// The GPU's walk of one family's seeds ahead of the CPU's commit (`lookahead.rs`), when the run has a GPU and
+    /// `--gpu-walk`
     ///
     /// The `.afv` is the CPU's either way, so a GPU that cannot hold the family leaves the CPU to trace alone, even
-    /// under `--device cuda`. `FIBRS_DEBUG_GPU_WALK=0` keeps the walk on the CPU, for comparing the two
+    /// under `--device cuda`
     fn walk<'g, D: DirField>(
         &'g self,
         tracing: &[Vol<u8>; 2],
@@ -1059,11 +1070,15 @@ impl CentralityDevice {
         label: &str,
     ) -> Option<Walk<'g>> {
         let gpu = self.gpu.as_ref()?;
-        if std::env::var_os("FIBRS_DEBUG_GPU_WALK").is_some_and(|v| v == "0") {
+        if !self.walk {
             return None;
         }
         match gpu.walk(tracing, family, cent, dirs, cat, ring()) {
-            Ok(walk) => Some(walk),
+            Ok(walk) => {
+                let gib = walk.device_bytes() as f64 / (1u64 << 30) as f64;
+                log!("{label} GPU walk: {gib:.2} GiB on the device");
+                Some(walk)
+            }
             Err(e) => {
                 log!("{label} walk on the CPU only: the GPU cannot trace ahead ({e:#})");
                 None

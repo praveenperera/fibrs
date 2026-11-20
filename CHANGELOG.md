@@ -4,6 +4,12 @@
 
 ### What's new
 
+- **`--gpu-walk` traces seeds on the GPU too (experimental, opt-in).** With the direction field and centrality on the GPU, the GPU
+  traces chunks of each family's seeds ahead of the seed being committed and records every coverage read. The CPU
+  uses a result only when all of its reads still hold on the coverage committed since, and traces the seed itself
+  otherwise, so the `.afv` is the same with or without the flag. It is off by default and takes more memory: on the dense
+  PHerc0358 window z02304–02816 at `--threads 8`, the run reached 27.5 GiB before it had traced the V family,
+  against 23.8 GiB at the end of V without the flag.
 - **Trace finishing on the GPU.** When a run uses the GPU, finishing (cutting each traced curve where the
   predictions disagree, then smoothing, resampling and re-checking each piece) runs there too. It gives the CPU's
   pieces bit for bit, so the `.afv` is unchanged, whatever rounding the run started with. Both pooled predictions

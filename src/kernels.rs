@@ -706,13 +706,6 @@ pub struct Mark {
     tan: u32,
 }
 
-impl Mark {
-    /// A mark of `at` along encoded direction `dir` by the point whose tangent is `tans[tan]` of its seed
-    pub fn new(at: Place, dir: u16, tan: u32) -> Self {
-        Self { at, dir, tan }
-    }
-}
-
 /// The `written` table's size, as a power of two
 const WRITTEN_BITS: u32 = 16;
 const WRITTEN_SLOTS: usize = 1 << WRITTEN_BITS;

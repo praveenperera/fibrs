@@ -12,8 +12,8 @@
 //! predictions and a cache of native slabs on the device across a family's batches of curves (`finish.rs`)
 
 mod axes;
-pub(super) mod walk;
 mod finish;
+pub(super) mod walk;
 
 use std::sync::Arc;
 

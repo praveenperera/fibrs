@@ -68,6 +68,15 @@ cannot finish, for example one that reads more slabs than its cache holds, is fi
 each family the log counts the slabs uploaded and the batches the CPU finished. If the GPU fails while finishing,
 `--device auto` finishes the rest of the family on the CPU and `--device cuda` stops the run.
 
+`--gpu-walk` (experimental) also traces seeds on the GPU when the direction field and centrality run there. The GPU traces chunks
+of a family's seeds ahead of the seed being committed, against a copy of the coverage that lags the committed one,
+and records each coverage voxel each seed read. The CPU uses a GPU result only if every read still gives the same
+outcome on the coverage committed since, and traces the seed itself otherwise, so the `.afv` is the same with or
+without the flag. Seeds whose traces would overflow the GPU's buffers or run past its step limit go back to the CPU.
+It is off by default and takes more memory: on the dense PHerc0358 window z02304–02816 at `--threads 8`, the run
+reached 27.5 GiB before it had traced the V family, against 23.8 GiB at the end of V without the flag. At the end of each family the log counts the seeds the GPU traced, the results the
+CPU used and the ones it traced again.
+
 `fibrs.run([...])` runs it from Python and returns the exit status.
 
 `--threads N` sets the threads that trace and finish curves. Threads that finishing leaves idle trace seeds ahead of
@@ -251,6 +260,7 @@ took 52.6 s and 65.9 s with `--device cuda`, against 35.3 s and 59.3 s with `--d
 - `--storage` and `--field-cache-mib` are validated, and `--storage` is recorded in `run.json` as the
   original records it, but neither selects anything. The chunk cache is bounded by `--native-cache-mib`
   plus `--field-cache-mib`.
+- `--gpu-walk` is the port's own option; the original has no counterpart.
 - `--device` defaults to `auto` (the GPU when one is usable) where the original defaults to `cpu`. On the GPU
   the port writes what the original writes with `--device cuda`, whose centrality kernels round some multiply-adds
   as one fused operation, so its output can differ from the original's `--device cpu` output; pass `--device cpu`
