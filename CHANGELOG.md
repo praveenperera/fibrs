@@ -4,6 +4,17 @@
 
 ### What's new
 
+- **Faster seed catalogue.** Each family's seed catalogue (priority split, descending-centrality argsort, sort by
+  1024³ region) is built on the `--threads` pool:
+  - the split and gathers keep their order;
+  - the partitions NumPy's quicksort sets aside are sorted in parallel, which gives its exact order, equal keys
+    included;
+  - the stable sort by region is now a counting sort.
+
+  On the dense PHerc0358 window z02304–02816, the catalogues of its 22 million V and 21 million H seeds took
+  about 10 CPU-s on one thread, most of the 12 s the seed stage took. The tracing order, and so the `.afv`, is
+  unchanged.
+
 - **Faster tracing on dense data.** Idle threads trace up to 256 seeds ahead of the commit point instead of 64. On
   the dense PHerc0358 window z02304–02816 at `--threads 8`, two runs of each put both families' tracing at 97 and
   103 s against 109 and 114 s, with 0.13% of seeds traced again instead of 0.04%. Peak RSS was 23.0–23.4 GiB against
