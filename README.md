@@ -69,16 +69,16 @@ cached, by where they were decoded, and the batches the CPU finished. If the GPU
 `--device auto` finishes the rest of the family on the CPU and `--device cuda` stops the run.
 
 By default the slabs are decoded on the CPU, with c-blosc's checks. Decoding them on the GPU with NVIDIA's nvCOMP is
-opt-in, with the same output on sound files: run `pip install "fibrs[gpu-zstd]"`, or set `FIBRS_NVCOMP=on` or
-to the path of a `libnvcomp.so.6`. GPU slab decoding trusts the prediction files: on a corrupt chunk nvCOMP's
-behaviour is undefined, so it may give wrong output or a CUDA fault where the CPU decoder would report the
-corruption. `FIBRS_NVCOMP=off` (in any case) turns it off even with the extra installed.
+opt-in, with the same output on sound files: run `pip install "fibrs[gpu-zstd]"` and set `FIBRS_NVCOMP=on`, or
+set `FIBRS_NVCOMP` to the path of a `libnvcomp.so.6`. GPU slab decoding trusts the prediction files: on a corrupt
+chunk nvCOMP's behaviour is undefined, so it may give wrong output or a CUDA fault where the CPU decoder would
+report the corruption.
 
 nvCOMP is not part of fibrs: it is NVIDIA's own PyPI package, `nvidia-libnvcomp-cu12` (version 6, under NVIDIA's
-licence), which the `gpu-zstd` extra installs. With `FIBRS_NVCOMP` unset, fibrs loads that wheel from the
-environment fibrs is installed into or the active one (`$VIRTUAL_ENV`), and run from Python (`python -m fibrs` or
-`fibrs.run`) from that Python's environment, venv or not; a system copy of nvCOMP alone does not turn GPU decoding
-on. `FIBRS_NVCOMP=on` also tries the system's library path. The log says once whether slabs decode on the GPU, or
+licence), which the `gpu-zstd` extra installs. With `FIBRS_NVCOMP=on` (in any case), fibrs loads that wheel from
+the environment fibrs is installed into or the active one (`$VIRTUAL_ENV`), and run from Python (`python -m fibrs`
+or `fibrs.run`) from that Python's environment, venv or not, then tries the system's library path. Unset or `off`,
+nvCOMP is never loaded, whether or not the wheel is installed. The log says once whether slabs decode on the GPU, or
 why they decode on the CPU. Even with nvCOMP, a slab whose chunk it cannot decode as Blosc stored it (its Blosc
 blocks are not one slab of one channel each, or a zstd frame fails fibrs's checks) is decoded on the CPU, as is
 every slab of an array decoded a whole chunk at a time, and when nvCOMP's buffers would leave too little GPU memory

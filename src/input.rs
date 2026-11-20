@@ -714,6 +714,8 @@ const BLOSC_FUTURE: u8 = 0x08;
 const BLOSC_DONT_SPLIT: u8 = 0x10;
 /// The compressor format in the flags' top three bits
 const BLOSC_ZSTD_FORMAT: u8 = 4;
+/// c-blosc's `BLOSC_ZSTD_VERSION_FORMAT`, the one zstd codec version it decodes
+const BLOSC_ZSTD_VERSION_FORMAT: u8 = 1;
 
 /// Where bytes `start..start + len` of both channels of a frame holding two channels of `channel` bytes each are,
 /// in stored order, when each is a whole block a zstd decoder or a copy reproduces with nothing left to undo
@@ -745,8 +747,9 @@ fn frame_channel_blocks(bytes: &[u8], channel: usize, start: usize, len: usize) 
 
     // one block per channel, so the channels' blocks are blocks `start / len` and `(channel + start) / len`, and
     // the last block is never a short one
-    if flags >> 5 != BLOSC_ZSTD_FORMAT || blocksize != len || !start.is_multiple_of(len) || !channel.is_multiple_of(len)
-    {
+    // c-blosc's `blosc_d` refuses a zstd frame of another codec version (byte 1) before decoding a block
+    let zstd = flags >> 5 == BLOSC_ZSTD_FORMAT && bytes[1] == BLOSC_ZSTD_VERSION_FORMAT;
+    if !zstd || blocksize != len || !start.is_multiple_of(len) || !channel.is_multiple_of(len) {
         return None;
     }
     let split = flags & BLOSC_DONT_SPLIT == 0 && typesize <= 16 && blocksize / typesize >= 128;
@@ -1248,8 +1251,11 @@ mod tests {
         fs::write(dir.join("0.0.0.2"), &stored).unwrap();
         fs::write(dir.join("0.0.0.3"), with_blocksize(0)).unwrap();
         fs::write(dir.join("0.0.0.4"), with_blocksize(data.len() as u32 + 1)).unwrap();
+        let mut codec = frame.clone();
+        codec[1] = 2;
+        fs::write(dir.join("0.0.0.5"), &codec).unwrap();
         let meta = serde_json::json!({
-            "zarr_format": 2, "shape": [2, edge, edge, 5 * edge], "chunks": [2, edge, edge, edge],
+            "zarr_format": 2, "shape": [2, edge, edge, 6 * edge], "chunks": [2, edge, edge, edge],
             "dtype": "|u1", "fill_value": 0, "order": "C", "filters": null, "dimension_separator": ".",
             "compressor": {"id": "blosc", "cname": "zstd", "clevel": 3, "shuffle": 1, "blocksize": 0},
         });
@@ -1266,7 +1272,12 @@ mod tests {
         p.decode_planes(&as_stored, 0..8, &mut out).unwrap();
         assert!(p.plane_blocks(&as_stored, 0..8).is_some(), "the stored frame as Blosc wrote it gives block sources");
 
-        for (x, what) in [(1, "trailing byte"), (3, "0-byte blocks"), (4, "blocks larger than the frame")] {
+        for (x, what) in [
+            (1, "trailing byte"),
+            (3, "0-byte blocks"),
+            (4, "blocks larger than the frame"),
+            (5, "zstd codec version 2"),
+        ] {
             let bad = p.packed_chunk_in([0, 0, x], &pool).unwrap();
             assert!(p.decode_planes(&bad, 0..8, &mut out).is_err(), "the CPU decodes a frame with {what}");
             assert!(p.plane_blocks(&bad, 0..8).is_none(), "the GPU accepts a frame with {what} the CPU refuses");

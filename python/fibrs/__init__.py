@@ -8,9 +8,8 @@ The native binary is found through ``FIBRS_BIN``, then ``bin/fibrs`` next to thi
 then the environment's scripts directory (where the wheel installs it), then ``PATH``. When ``FIBRS_LAPACK`` is
 unset, the OpenBLAS that supplies the binary's ``dsyevd`` is numpy's bundled copy (Linux), else the
 ``scipy-openblas64`` package's (macOS, whose numpy wheels link Accelerate). GPU slab decoding with nvCOMP is
-opt-in: when ``FIBRS_NVCOMP`` is unset and the ``fibrs[gpu-zstd]`` extra put the ``nvidia-libnvcomp-cu12`` wheel in
-this Python's environment, the binary decodes slabs on the GPU with that wheel's nvCOMP; ``FIBRS_NVCOMP=off`` keeps
-them on the CPU
+opt-in: with ``FIBRS_NVCOMP=on``, the binary is pointed at the ``nvidia-libnvcomp-cu12`` wheel the
+``fibrs[gpu-zstd]`` extra put in this Python's environment, when there is one; unset, slabs decode on the CPU
 """
 
 from __future__ import annotations
@@ -46,16 +45,18 @@ def binary() -> str:
 
 def _environment() -> dict[str, str]:
     env = dict(os.environ)
-    # each library is found only when its variable is unset; one not found here the binary looks for next to its
-    # own path and in $VIRTUAL_ENV, which miss an environment that is not a venv. Installing the gpu-zstd extra is
-    # the opt-in to GPU slab decoding, so its wheel is passed on as FIBRS_NVCOMP; without the wheel the variable
-    # stays unset and slabs decode on the CPU
-    for name, find in (("FIBRS_LAPACK", _openblas), ("FIBRS_NVCOMP", _nvcomp)):
-        if name in env:
-            continue
-        lib = find()
+    # a library not found here the binary looks for next to its own path and in $VIRTUAL_ENV, which miss an
+    # environment that is not a venv
+    if "FIBRS_LAPACK" not in env:
+        lib = _openblas()
         if lib:
-            env[name] = lib
+            env["FIBRS_LAPACK"] = lib
+    # only FIBRS_NVCOMP=on opts in to GPU slab decoding, since the wheel can be another package's dependency; this
+    # environment's wheel then stands in for the binary's own search
+    if env.get("FIBRS_NVCOMP", "").lower() == "on":
+        lib = _nvcomp()
+        if lib:
+            env["FIBRS_NVCOMP"] = lib
     return env
 
 

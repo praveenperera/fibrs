@@ -36,9 +36,9 @@ predict = [
   "nvidia-cudnn-cu12>=9.1,<10; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "nvidia-cublas-cu12>=12.1,<13; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
-# nvCOMP 6: installing this extra opts in to decoding prediction slabs on the GPU in trace finishing, which loads it
-# from this environment's site-packages; without it, or with FIBRS_NVCOMP=off, they decode on the CPU with c-blosc's
-# checks. nvCOMP's behaviour on a corrupt chunk is undefined. Linux x86-64 only, like the GPU engine
+# nvCOMP 6 for decoding prediction slabs on the GPU in trace finishing, which a run opts in to with FIBRS_NVCOMP=on;
+# otherwise they decode on the CPU with c-blosc's checks. nvCOMP's behaviour on a corrupt chunk is undefined.
+# Linux x86-64 only, like the GPU engine
 gpu-zstd = ["nvidia-libnvcomp-cu12>=6,<7; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
 [project.urls]

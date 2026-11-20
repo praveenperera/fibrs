@@ -146,13 +146,14 @@ pub struct NvComp {
 /// Where `FIBRS_NVCOMP` lets [`NvComp::open`] look for nvCOMP
 ///
 /// GPU decoding is opt-in because nvCOMP's behaviour on a corrupt but well-formed frame is undefined, where the
-/// CPU decoder reports it: installing the `fibrs[gpu-zstd]` extra, or setting the variable, is the opt-in, and a
-/// system copy of nvCOMP alone never turns it on
+/// CPU decoder reports it. Setting the variable is the only opt-in: the `nvidia-libnvcomp-cu12` wheel can arrive
+/// as another package's dependency, so neither it nor a system copy of nvCOMP turns GPU decoding on
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Choice {
-    /// Unset: only the `nvidia-libnvcomp-cu12` wheel in this executable's venv or `$VIRTUAL_ENV`
-    Wheel,
-    /// `on`, in any case: the wheel, then the dynamic loader's search path
+    /// Unset: nvCOMP is not loaded and slabs decode on the CPU
+    Unset,
+    /// `on`, in any case: the wheel in this executable's venv or `$VIRTUAL_ENV`, then the dynamic loader's
+    /// search path
     On,
     /// `off`, in any case: never load nvCOMP, so every slab keeps c-blosc's checks
     Off,
@@ -163,7 +164,7 @@ enum Choice {
 impl Choice {
     /// The choice a `FIBRS_NVCOMP` value (`None` when unset) makes
     fn parse(value: Option<&OsStr>) -> Self {
-        let Some(value) = value else { return Self::Wheel };
+        let Some(value) = value else { return Self::Unset };
         if value.eq_ignore_ascii_case("on") {
             return Self::On;
         }
@@ -175,26 +176,21 @@ impl Choice {
 }
 
 impl NvComp {
-    /// Load nvCOMP as `FIBRS_NVCOMP` allows, which keeps it off unless the run opts in. Unset, only the
-    /// `nvidia-libnvcomp-cu12` wheel (the `fibrs[gpu-zstd]` extra) in the venv this executable was started from or
-    /// in `$VIRTUAL_ENV` is tried; `on`, in any case, tries those wheels and then the dynamic loader's search path;
-    /// `off`, in any case, loads none; any other value is a path to `libnvcomp.so.6`, the only place then tried
+    /// Load nvCOMP as `FIBRS_NVCOMP` allows, which keeps it off unless the run opts in. Unset or `off`, in any
+    /// case, loads none; `on`, in any case, tries the `nvidia-libnvcomp-cu12` wheel (the `fibrs[gpu-zstd]` extra)
+    /// in the venv this executable was started from and in `$VIRTUAL_ENV`, then the dynamic loader's search path;
+    /// any other value is a path to `libnvcomp.so.6`, the only place then tried
     pub fn open() -> Result<Self> {
         let wheels =
             || site_packages().into_iter().map(|site| site.join(WHEEL_DIR).join(SONAME)).filter(|p| p.is_file());
         let paths: Vec<PathBuf> = match Choice::parse(std::env::var_os("FIBRS_NVCOMP").as_deref()) {
+            // the default: GPU decoding was never asked for, so say how to ask
+            Choice::Unset => bail!("GPU slab decoding with nvCOMP is opt-in; set FIBRS_NVCOMP=on"),
             // nvCOMP trusts its input, so this is how a run that doubts its prediction files decodes them on the CPU
             Choice::Off => bail!("FIBRS_NVCOMP is off"),
             Choice::Path(path) => return Self::load(&path),
             Choice::On => wheels().chain([PathBuf::from(SONAME)]).collect(),
-            Choice::Wheel => wheels().collect(),
         };
-        // the default run without the extra: GPU decoding was never asked for, so say how to ask
-        ensure!(
-            !paths.is_empty(),
-            "GPU slab decoding with nvCOMP is opt-in; install fibrs[gpu-zstd], or set FIBRS_NVCOMP=on or to a \
-             libnvcomp.so.6 path"
-        );
         let mut reasons = Vec::new();
         for path in paths {
             match Self::load(&path) {
@@ -457,7 +453,7 @@ mod tests {
     #[test]
     fn fibrs_nvcomp_values_parse() {
         let parse = |value: &str| Choice::parse(Some(OsStr::new(value)));
-        assert_eq!(Choice::parse(None), Choice::Wheel);
+        assert_eq!(Choice::parse(None), Choice::Unset);
         assert_eq!(parse("on"), Choice::On);
         assert_eq!(parse("ON"), Choice::On);
         assert_eq!(parse("Off"), Choice::Off);

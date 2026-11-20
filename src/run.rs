@@ -129,9 +129,9 @@ pub struct Args {
     /// original's --device cuda output, whose centrality can differ from its cpu output by a rounding. A resumed
     /// run keeps the rounding it started with, so one started on the CPU keeps centrality there. A GPU run also
     /// finishes curves there; its prediction slabs decode on the CPU with c-blosc's checks unless GPU decoding
-    /// with nvCOMP is opted in to (install fibrs[gpu-zstd], or set FIBRS_NVCOMP=on or to a libnvcomp.so.6 path).
-    /// On a corrupt chunk nvCOMP's behaviour is undefined: it may give wrong output or a CUDA fault.
-    /// FIBRS_NVCOMP=off turns it off even with the extra installed
+    /// with nvCOMP is opted in to (FIBRS_NVCOMP=on, with fibrs[gpu-zstd] installed, or FIBRS_NVCOMP set to a
+    /// libnvcomp.so.6 path). On a corrupt chunk nvCOMP's behaviour is undefined: it may give wrong output or a
+    /// CUDA fault
     #[arg(long, value_enum, default_value = "auto")]
     pub device: Device,
     /// Visible CUDA device index for the GPU; without it, the first usable visible GPU

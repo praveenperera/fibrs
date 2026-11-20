@@ -14,11 +14,11 @@
   `--device cuda` stops the run, as in the other GPU stages. `--device cpu` finishes on the CPU as before.
 - **Opt-in GPU decoding of prediction slabs with nvCOMP.** With NVIDIA's nvCOMP 6, the native slabs GPU
   finishing reads go to the GPU still compressed and are decoded there, with the same output on sound files. It is
-  off by default, so slabs decode on the CPU with c-blosc's checks; opt in by installing the new
-  `fibrs[gpu-zstd]` extra, or by setting `FIBRS_NVCOMP=on` (which also tries the system's library path) or to a
+  off by default, so slabs decode on the CPU with c-blosc's checks; opt in with `FIBRS_NVCOMP=on`, which loads
+  the nvCOMP the new `fibrs[gpu-zstd]` extra installs (or the system's), or with `FIBRS_NVCOMP` set to a
   `libnvcomp.so.6` path. GPU slab decoding trusts the prediction files: on a corrupt chunk nvCOMP's behaviour is
   undefined, so it may give wrong output or a CUDA fault where the CPU decoder would report the corruption.
-  `FIBRS_NVCOMP=off` turns it off even with the extra installed. nvCOMP is never bundled: it is NVIDIA's own PyPI
+  Installing the extra alone does not turn it on. nvCOMP is never bundled: it is NVIDIA's own PyPI
   package, `nvidia-libnvcomp-cu12`, under NVIDIA's licence, and the log says once whether slabs decode on the GPU
   or why they decode on the CPU. A slab nvCOMP cannot decode as Blosc stored it is decoded on the CPU, as are the
   slabs of arrays decoded a whole chunk at a time, and when the decoder's buffers leave too little GPU memory for
