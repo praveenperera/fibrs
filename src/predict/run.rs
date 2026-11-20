@@ -607,7 +607,11 @@ fn columns(
                 Item::ColumnEnd { col: ci, .. } => bail!("tile feed out of order: column {ci} while running {i}"),
             }
         };
-        let mut out = engine.finish(run > 0, writer.spare())?;
+        // an all-air column quantizes nothing and the engine drops whatever buffers it is given, so only a
+        // column that ran tiles takes a written column's pair, which the next populated column would otherwise lose
+        let quantize = run > 0;
+        let reuse = if quantize { writer.spare() } else { Default::default() };
+        let mut out = engine.finish(quantize, reuse)?;
         if let (Some(sel), Some(sem), Some(tra)) = (&p.selection, &mut out.semantic, &mut out.tracing) {
             sel.mask_column(*col, sem, tra);
         }
