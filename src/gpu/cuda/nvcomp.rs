@@ -183,7 +183,9 @@ impl Choice {
 impl NvComp {
     /// Load nvCOMP as `FIBRS_NVCOMP` allows, which keeps it off unless the run opts in. Unset or `off`, in any
     /// case, loads none; `on`, in any case, tries the `nvidia-libnvcomp-cu12` wheel (the `fibrs[gpu-zstd]` extra)
-    /// in the venv this executable was started from and in `$VIRTUAL_ENV`, then the dynamic loader's search path;
+    /// in the venv this executable was started from and in `$VIRTUAL_ENV`, then the dynamic loader's search path
+    /// (on Windows only the executable's directory and System32, as `main` takes the current directory and `PATH`
+    /// out of the DLL search);
     /// any other value is a path to `libnvcomp.so.6` (`nvcomp64_6.dll` on Windows), the only place then tried
     pub fn open() -> Result<Self> {
         let wheels =

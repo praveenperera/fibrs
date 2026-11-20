@@ -80,7 +80,8 @@ for site in "${sites[@]}"; do
   openblas=$(compgen -G "$site/numpy.libs/libscipy_openblas64_*.so" ||
     compgen -G "$site/numpy.libs/libscipy_openblas64_*.dll" ||
     compgen -G "$site/scipy_openblas64/lib/libscipy_openblas64_*.dylib" ||
-    compgen -G "$site/scipy_openblas64/lib/libscipy_openblas64_*.so" || true)
+    compgen -G "$site/scipy_openblas64/lib/libscipy_openblas64_*.so" ||
+    compgen -G "$site/scipy_openblas64/lib/libscipy_openblas64_*.dll" || true)
   [[ -z $openblas ]] || break
 done
 [[ -n $openblas ]] ||

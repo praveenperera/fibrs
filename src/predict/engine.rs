@@ -238,8 +238,8 @@ mod native {
 /// On Windows the wheels keep the DLLs in `nvidia/*/bin` under `<prefix>\Lib\site-packages`, beside
 /// `<prefix>\Scripts\fibrs.exe`. Each is loaded by full path, which resolves its imports from its own directory
 /// (so `cublas64_12.dll` binds the `cublasLt64_12.dll` beside it), and Windows reuses a loaded DLL for a load by
-/// the same name: volkit's `dll::pin` then takes these copies, and cuDNN's sublibraries from beside
-/// `cudnn64_9.dll`, before cudarc opens anything
+/// the same name: volkit's `dll::pin` then takes these copies, cuDNN's sublibraries from beside `cudnn64_9.dll`
+/// and NVRTC's builtins from beside the pip `nvrtc64_120_0.dll`, before cudarc opens anything
 #[cfg(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64"))]
 mod libs {
     use std::cmp::Reverse;
@@ -251,10 +251,15 @@ mod libs {
     const PIP: [(&[&str], &str); 2] =
         [(&["libcublasLt.so.12", "libcublas.so.12"], "nvidia/cublas/lib"), (&["libcudnn.so.9"], "nvidia/cudnn/lib")];
 
-    /// (pip files, dependencies first; their directory under site-packages)
+    /// (pip files, dependencies first; their directory under site-packages). NVRTC too, which cuDNN's Windows wheel
+    /// depends on for its runtime-compiled engines: volkit's `dll::pin` takes NVRTC only from a copy already loaded
+    /// or from the system's trusted places, so without this the venv's copy would go unused
     #[cfg(windows)]
-    const PIP: [(&[&str], &str); 2] =
-        [(&["cublasLt64_12.dll", "cublas64_12.dll"], "nvidia/cublas/bin"), (&["cudnn64_9.dll"], "nvidia/cudnn/bin")];
+    const PIP: [(&[&str], &str); 3] = [
+        (&["cublasLt64_12.dll", "cublas64_12.dll"], "nvidia/cublas/bin"),
+        (&["nvrtc64_120_0.dll"], "nvidia/cuda_nvrtc/bin"),
+        (&["cudnn64_9.dll"], "nvidia/cudnn/bin"),
+    ];
 
     /// The site-packages directories of the environment this binary is installed in: the one whose
     /// `fibrs-*.dist-info` installed it first, when a prefix holds several Python versions, so a binary installed
