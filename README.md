@@ -123,6 +123,8 @@ fibrs --predictions P --array semantic --tracing-predictions P --tracing-array t
 
 - **Tiles.** The Y and X extent is split into NY × NX tile cores. Each tile is traced from its core plus up to
   `--tile-halo` native voxels (default 256) of its neighbours on each side, clipped to the input. Z is not tiled.
+  With more than one tile the halo must be at least 1, since a tile traced from its core alone stops short of its
+  seams and no fibre would be joined across them.
 - **Alignment.** Core edges and the halo are whole units of A native voxels: the least common multiple of the
   native array's chunk edge, twice the tracing array's chunk edge, and 256 (twice the centrality pass's 128-voxel
   tile, whose edges change centrality). NPY input counts as 64-voxel chunks. For prediction zarrs with 128³ native
@@ -132,9 +134,9 @@ fibrs --predictions P --array semantic --tracing-predictions P --tracing-array t
   pooling and centrality grids, so that away from the seams a tile can trace as the whole window does. Seeds are
   ordered by the window's 1024-voxel regions, not the tile's.
 - **Seams.** Each tile's fibres are cut to its core. Where a fibre leaves the core through a face shared with another
-  tile, the point where it crosses the face is added. The cut ends on the two sides of each face are joined when
-  they are of the same family and at most 1.5 native voxels apart: shortest first, each end once, and never into a
-  loop. Pieces under two points are dropped. This is the rule the v2-run pipeline uses to join its Z bands. Near a
+  tile, the point where it crosses the face is added. The cut ends on the two sides of each face, from tiles that
+  share that face (not tiles meeting only at a corner), are joined when they are of the same family and at most 1.5
+  native voxels apart: shortest first, each end once, and never into a loop. Pieces under two points are dropped. This is the rule the v2-run pipeline uses to join its Z bands. Near a
   seam the output can differ from an untiled run: a fibre traced from each side whose cut ends land more than 1.5
   voxels apart stays split, and a tile sees its neighbours' data only as far as the halo reaches. A step of a fibre
   that cuts across a tile corner, with no point in the tile it passes through, gives that tile the piece between

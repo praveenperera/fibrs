@@ -84,6 +84,10 @@ impl Tiling {
         if grid.contains(&0) {
             bail!("--tiles-yx needs at least one tile along each axis");
         }
+        // a tile traced from its core alone stops short of its seams, so no fibre would reach a face to be joined
+        if halo == 0 && grid != [1, 1] {
+            bail!("--tile-halo 0 leaves no fibre reaching a seam; give at least 1 (rounded up to {align})");
+        }
         let mut edges = [Vec::new(), Vec::new()];
         for (a, axis) in ["Y", "X"].into_iter().enumerate() {
             let n = grid[a];
@@ -330,13 +334,15 @@ mod tests {
         assert!(Tiling::new([2, 1], 256, 256, [511, 600]).is_err());
         assert!(Tiling::new([0, 1], 256, 256, [600, 600]).is_err());
         assert!(Tiling::new([1_000_000_000, 1], 256, 256, [640, 640]).is_err());
+        assert!(Tiling::new([1, 2], 0, 256, [600, 600]).is_err());
+        assert!(Tiling::new([1, 1], 0, 256, [600, 600]).is_ok());
     }
 
     /// The core box is open where the core meets the window's edge, and the interior faces are the core edges
     /// between tiles, both with the window's origin added
     #[test]
     fn core_boxes_and_faces_are_in_export_coordinates() {
-        let tiling = Tiling::new([2, 2], 0, 256, [600, 700]).unwrap();
+        let tiling = Tiling::new([2, 2], 1, 256, [600, 700]).unwrap();
         let origin = [1000, 2000, 3000];
         let tiles = tiling.tiles();
         let first = tiling.core_box(&tiles[0], origin);
