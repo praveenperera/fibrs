@@ -123,11 +123,12 @@ The tracer allocates through mimalloc. On Linux with glibc and on macOS, `fibrs 
 system allocator; elsewhere it keeps mimalloc. `cargo build --release --no-default-features` builds a binary that
 uses the system allocator throughout.
 On Linux with glibc the tracer runs mimalloc without transparent huge pages (THP); `MIMALLOC_ALLOW_THP=1` turns them
-back on. With THP set to `madvise` (both `enabled` and `defrag`), most of mimalloc's requests for huge pages fall
-back to small pages after the kernel has tried to compact memory. On a dense 1024-plane window of PHerc0358 with
-`--device cuda --threads 8`, turning THP off took the tracer from 114–134 s to about 103 s, with the same `.afv` and
-less than half the kernel time. A host with THP set to `never` is unaffected; one set to `always` has not been
-measured.
+back on. mimalloc turns THP off for the tracer's whole process with `prctl(PR_SET_THP_DISABLE)`, and any child
+process the tracer starts inherits that setting. With THP set to `madvise` (both `enabled` and `defrag`), most of
+mimalloc's requests for huge pages fall back to small pages after the kernel has tried to compact memory. On a dense
+1024-plane window of PHerc0358 with `--device cuda --threads 8`, turning THP off took the tracer from 114–134 s to
+about 103 s, with the same `.afv` and less than half the kernel time. A host with THP set to `never` is unaffected;
+one set to `always` has not been measured.
 The wheel is built with maturin from
 `pyproject.toml` (`maturin build --release`; the published Linux wheel uses `--zig --compatibility
 manylinux_2_28`, and the macOS wheel `MACOSX_DEPLOYMENT_TARGET=11.0`).
