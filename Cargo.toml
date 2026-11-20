@@ -53,3 +53,7 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 [profile.release]
 debug = 1
 codegen-units = 4
+
+# bench only: volkit PR #1 head 700a747 until volkit 0.1.2 is published
+[patch.crates-io]
+volkit = { path = "/build/fibrs-alloc/wt/volkit-700a747/volkit" }
