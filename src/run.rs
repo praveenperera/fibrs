@@ -781,8 +781,12 @@ impl Families<'_, '_, '_> {
             // the GPU computes the next family's centrality while this one walks on the CPU; on the CPU the two
             // would only share the same threads, so they run one after the other
             prepared = if self.cent.overlaps() {
+                // a thread spawned here is outside the run's pool, so the centrality upload and the catalogue
+                // would run their parallel parts on rayon's global pool, one thread per core: give them a pool
+                // of --threads instead
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(self.threads).build()?;
                 std::thread::scope(|scope| {
-                    let next = scope.spawn(|| prepare(following));
+                    let next = scope.spawn(|| pool.install(|| prepare(following)));
                     let walked = walk(prepared);
                     let next = next.join().map_err(|_| eyre!("centrality thread panicked"))?;
                     walked.and(next)
