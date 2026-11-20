@@ -888,8 +888,8 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::arena::BufferPool;
     use crate::fields::Presence;
+    use crate::finish::CachePools;
     use crate::finish::test_support::store_with;
     use crate::finish::{FinishCtx, NativeSampler};
     use crate::gpu::Stages;
@@ -1173,8 +1173,8 @@ mod tests {
         let blocks = [("finish-sliced", 8 * edge * edge), ("finish-whole", 2 * edge * edge * edge)];
         for (name, blocksize) in blocks {
             let (dir, pred) = store_with(name, native, edge, |_| blocksize, value);
-            let buffers = BufferPool::new(1 << 20);
-            let cache = NativeCache::new(&pred, 64 << 20, &buffers);
+            let pools = CachePools::new();
+            let cache = NativeCache::new(&pred, 64 << 20, &pools);
             let layout = cache.layout();
             let per_batch = batch.chunks(BATCH).map(|b| list_slabs(&layout, b).len()).max().unwrap();
             let all = list_slabs(&layout, &batch).len();
