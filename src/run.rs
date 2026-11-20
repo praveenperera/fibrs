@@ -850,7 +850,17 @@ impl ToLe for u16 {
 /// freed bytes stay resident beside the new ones: on a 0826 band the H family peaked 1.7 GiB above V with the
 /// same fields
 fn release_freed() {
-    // SAFETY: malloc_trim only returns free pages to the kernel; it touches no live allocation
+    // mimalloc keeps a freed large block in its arena and purges it only after a delay, on a later allocation or
+    // free; a forced collect purges every arena's free pages now. Small blocks freed on other threads stay in those
+    // threads' pages, but the stages' fields and tile buffers are large blocks
+    // SAFETY: mi_collect only returns free pages to the kernel; it touches no live allocation
+    #[cfg(feature = "mimalloc")]
+    unsafe {
+        libmimalloc_sys::mi_collect(true);
+    }
+
+    // SAFETY: malloc_trim only returns free pages to the kernel; it touches no live allocation. Without mimalloc
+    // it covers every allocation; with it, the ones C libraries such as OpenBLAS make through glibc
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::malloc_trim(0);

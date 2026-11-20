@@ -28,6 +28,8 @@ memmap2 = "0.9"
 # the global allocator (the default `mimalloc` feature): glibc malloc maps and unmaps large blocks while holding
 # mmap_lock, which stalls every tracing thread's page faults on dense windows
 mimalloc = { version = "0.1.52", optional = true }
+# mi_collect, to hand the pages a stage freed back to the system (glibc's malloc_trim cannot reach mimalloc's)
+libmimalloc-sys = { version = "0.1.49", optional = true, features = ["extended"] }
 rayon = "1.12"
 rusqlite = { version = "0.40", features = ["bundled"] }
 # float_roundtrip parses each JSON number to the f64 Python reads, so a value written and read back compares equal
@@ -46,6 +48,7 @@ cudarc = { version = "0.19.10", default-features = false, features = ["std", "dr
 [features]
 # `--no-default-features` builds with the system allocator
 default = ["mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [profile.release]
 debug = 1
