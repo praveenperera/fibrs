@@ -11,6 +11,9 @@
   v2-run pipeline uses for its Z bands: cut ends of the same family at most 1.5 voxels apart, shortest first, never
   into a loop. A `--tiles-yx 1 1` run writes the untiled run's `.afv`. Without `--tiles-yx`, runs, their output and
   their `run.json` are unchanged. See [Tiled tracing](README.md#tiled-tracing).
+- **Install with cargo.** fibrs is on crates.io from 0.4.0: `cargo binstall fibrs` installs the release's prebuilt
+  CLI binary on Linux x86-64 and Apple silicon, and `cargo install fibrs --locked` builds it from source. See
+  [With cargo](README.md#with-cargo).
 
 - **`fibrs predict` reuses its buffers across a run.** Readers read each tile into a recycled buffer, the engine
   hands batches back already sized for the next one, and the writer keeps one chunk buffer and one compress buffer
