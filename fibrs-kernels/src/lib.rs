@@ -39,6 +39,9 @@
 //! cap, its spans failed or a buffer ran out. The host marks the coverage from a result's points itself. Every coverage read is recorded with the value it
 //! saw, so the host can check a result against the coverage it has committed since. Float64 and float32
 //! operations carry explicit rounding modes, as the CPU tracer's plain Rust arithmetic never contracts
+//!
+//! The `fs_*` kernels ([`finish`]) finish traced curves: segment validation against the pooled and native
+//! predictions, then each valid piece's smoothing and resampling, bit for bit as the CPU's `FinishCtx::finish`
 
 #![no_std]
 #![allow(clippy::missing_safety_doc)]
@@ -49,6 +52,7 @@ use cuda_device::kernel;
 use cuda_device::thread::{__unroll_config, blockDim_x, blockIdx_x, blockIdx_y, threadIdx_x};
 
 pub mod eigen;
+pub mod finish;
 
 /// Full unrolling of the loop whose body it starts, for the walk core shared with the host (which defines it as
 /// nothing)

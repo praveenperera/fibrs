@@ -1272,13 +1272,16 @@ pub fn valid_curve_spans(pts: &[[f32; 3]], seed_index: i64) -> Result<Vec<(usize
     Ok(spans)
 }
 
+/// Fewest points `fit_curve` smooths and resamples; a shorter curve is finished as it was traced
+pub const MIN_FIT_POINTS: usize = 4;
+
 /// `fit_and_resample_splines` (core.py:590) for one curve with `target_step = 0.8`, `smooth_iters = 10`,
 /// `max_dev = 0.3` and `min_final_len = 0`: the smoothed points and the resampled count (0 when the
 /// curve has fewer than 4 points)
 pub fn fit_curve<P: Grid<u8>>(pts: &[[f32; 3]], pres: &P) -> (Vec<[f32; 3]>, usize) {
     const MAX_DEV: f64 = 0.3;
     let m = pts.len();
-    if m < 4 {
+    if m < MIN_FIT_POINTS {
         return (pts.to_vec(), 0);
     }
     let mut buf = pts.to_vec();

@@ -232,21 +232,20 @@ pub struct Catalogue {
 
 /// `prepare_seeds` (prepare.py:162): priority 2 then 1, each in descending centrality (reversed
 /// unstable argsort), then a stable sort by region
+///
+/// Each step runs on the pool and gives exactly the serial result: the splits and gathers keep their order,
+/// the argsort sorts disjoint partitions in parallel, and the stable sort by region is a counting sort
 pub fn catalogue(seeds: &[Seed], cent: &Vol<u16>) -> Catalogue {
     let shape = cent.shape();
-    let mut by_priority: [Vec<[i32; 3]>; 2] = [Vec::new(), Vec::new()];
-    for &seed in seeds {
-        let v = seed.priority();
-        if v == 2 || v == 1 {
-            by_priority[(v == 1) as usize].push(seed.coords(shape));
-        }
-    }
+    let of_priority =
+        |p: u8| -> Vec<[i32; 3]> { seeds.par_iter().filter(|s| s.priority() == p).map(|s| s.coords(shape)).collect() };
+    let by_priority = [of_priority(2), of_priority(1)];
     let n_primary = by_priority[0].len();
     let mut ordered = Vec::with_capacity(n_primary + by_priority[1].len());
     for raw in &by_priority {
-        let values: Vec<u16> = raw.iter().map(|c| cent.get(c[0] as usize, c[1] as usize, c[2] as usize)).collect();
+        let values: Vec<u16> = raw.par_iter().map(|c| cent.get(c[0] as usize, c[1] as usize, c[2] as usize)).collect();
         let order = argsort_u16(&values);
-        ordered.extend(order.iter().rev().map(|&i| raw[i]));
+        ordered.par_extend(order.par_iter().rev().map(|&i| raw[i]));
     }
     const REGION: usize = 1024;
     let grid = shape.map(|n| n.div_ceil(REGION));
@@ -254,7 +253,7 @@ pub fn catalogue(seeds: &[Seed], cent: &Vol<u16>) -> Catalogue {
         let r = c.map(|v| v as usize / REGION);
         (r[0] * grid[1] + r[1]) * grid[2] + r[2]
     };
-    let keys: Vec<usize> = ordered.iter().map(key).collect();
+    let keys: Vec<usize> = ordered.par_iter().map(key).collect();
     let n_regions = grid.iter().product();
     let mut counts = vec![0usize; n_regions];
     let mut primary = vec![0usize; n_regions];
@@ -264,12 +263,94 @@ pub fn catalogue(seeds: &[Seed], cent: &Vol<u16>) -> Catalogue {
             primary[k] += 1;
         }
     }
-    let mut idx: Vec<usize> = (0..ordered.len()).collect();
-    idx.sort_by_key(|&i| keys[i]);
-    let coords = idx.iter().map(|&i| ordered[i]).collect();
     let mut starts = vec![0usize; n_regions + 1];
     for r in 0..n_regions {
         starts[r + 1] = starts[r] + counts[r];
     }
+    // a counting sort by region, which keeps each region's seeds in their order as the stable sort did
+    let mut next = starts.clone();
+    let mut coords = vec![[0i32; 3]; ordered.len()];
+    for (c, &k) in ordered.iter().zip(&keys) {
+        coords[next[k]] = *c;
+        next[k] += 1;
+    }
     Catalogue { coords, starts, primary }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pyfmt::tests::serial_argsort_u16;
+
+    /// The catalogue as it was built on one thread, the reference for [`catalogue`]
+    fn serial_catalogue(seeds: &[Seed], cent: &Vol<u16>) -> Catalogue {
+        let shape = cent.shape();
+        let mut by_priority: [Vec<[i32; 3]>; 2] = [Vec::new(), Vec::new()];
+        for &seed in seeds {
+            let v = seed.priority();
+            if v == 2 || v == 1 {
+                by_priority[(v == 1) as usize].push(seed.coords(shape));
+            }
+        }
+        let n_primary = by_priority[0].len();
+        let mut ordered = Vec::with_capacity(n_primary + by_priority[1].len());
+        for raw in &by_priority {
+            let values: Vec<u16> = raw.iter().map(|c| cent.get(c[0] as usize, c[1] as usize, c[2] as usize)).collect();
+            let order = serial_argsort_u16(&values);
+            ordered.extend(order.iter().rev().map(|&i| raw[i]));
+        }
+        const REGION: usize = 1024;
+        let grid = shape.map(|n| n.div_ceil(REGION));
+        let key = |c: &[i32; 3]| {
+            let r = c.map(|v| v as usize / REGION);
+            (r[0] * grid[1] + r[1]) * grid[2] + r[2]
+        };
+        let keys: Vec<usize> = ordered.iter().map(key).collect();
+        let n_regions = grid.iter().product();
+        let mut counts = vec![0usize; n_regions];
+        let mut primary = vec![0usize; n_regions];
+        for (i, &k) in keys.iter().enumerate() {
+            counts[k] += 1;
+            if i < n_primary {
+                primary[k] += 1;
+            }
+        }
+        let mut idx: Vec<usize> = (0..ordered.len()).collect();
+        idx.sort_by_key(|&i| keys[i]);
+        let coords = idx.iter().map(|&i| ordered[i]).collect();
+        let mut starts = vec![0usize; n_regions + 1];
+        for r in 0..n_regions {
+            starts[r + 1] = starts[r] + counts[r];
+        }
+        Catalogue { coords, starts, primary }
+    }
+
+    /// The pooled catalogue is the serial one: the same seeds in the same order, regions and primary counts,
+    /// with many equal centralities and seeds in every region of a 2 × 2 grid
+    #[test]
+    fn pooled_catalogue_is_the_serial_one() {
+        let shape = [8, 1500, 1100];
+        let mut cent = Vol::new(shape, 0u16);
+        let mut state = 11u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let voxels = shape.iter().product::<usize>();
+        let seeds: Vec<Seed> = (0..300_000)
+            .map(|_| {
+                let index = next() % voxels;
+                let [z, y, x] = [index / (shape[1] * shape[2]), index / shape[2] % shape[1], index % shape[2]];
+                cent.set(z, y, x, (next() % 50) as u16);
+                Seed::from_raw(((index as u64) << 8) | (next() % 3) as u64)
+            })
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let pooled = pool.install(|| catalogue(&seeds, &cent));
+        let serial = serial_catalogue(&seeds, &cent);
+        assert!(pooled.coords == serial.coords);
+        assert_eq!(pooled.starts, serial.starts);
+        assert_eq!(pooled.primary, serial.primary);
+        assert!(pooled.starts.windows(2).all(|w| w[1] > w[0]), "every region should hold seeds: {:?}", pooled.starts);
+    }
 }

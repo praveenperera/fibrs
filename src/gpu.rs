@@ -1,7 +1,7 @@
-//! `--device cuda`: the direction field, centrality and ridge seeds on an NVIDIA GPU, centrality and seeds as the
-//! reference's `--device cuda` computes them
+//! `--device cuda`: the direction field, centrality, ridge seeds and trace finishing on an NVIDIA GPU, centrality
+//! and seeds as the reference's `--device cuda` computes them
 //!
-//! The direction field is bit for bit the CPU's (`cuda/axes.rs`). For centrality, the reference's CUDA kernels
+//! The direction field and finishing are bit for bit the CPU's (`cuda/axes.rs`, `cuda/finish.rs`). For centrality, the reference's CUDA kernels
 //! round some multiply-adds as one `fma` where its CPU kernel rounds the product and the sum apart (see
 //! `stage1.rs`), so this path gives the reference's CUDA output, not its CPU output. The
 //! kernels (`fibrs-kernels/`) are built to PTX ahead of time and embedded; at run time the NVIDIA driver loads
@@ -10,15 +10,13 @@
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod cuda;
-// the producer drives the walk; until it does, only the tests reach it
-#[cfg_attr(not(test), allow(dead_code, unused_imports))]
 pub mod walk;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub use cuda::Gpu;
+pub use cuda::{Gpu, GpuFinisher};
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-pub use unsupported::Gpu;
+pub use unsupported::{Gpu, GpuFinisher};
 
 /// The stages a run gives the GPU, which set how much free memory [`Gpu::open`] looks for when it picks a device
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,19 +34,69 @@ pub struct AxesCounts {
     pub fallback: usize,
 }
 
+/// One curve's finished pieces, in order
+pub type Pieces = Vec<Vec<[f32; 3]>>;
+
+/// What [`GpuFinisher::finish`] made of a batch of raw curves
+#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+pub enum Finished {
+    /// Every curve's pieces, in batch order, equal to `FinishCtx::finish`'s
+    Pieces(Vec<Pieces>),
+    /// The GPU handed the batch back for the CPU to finish
+    OnCpu(CpuReason),
+}
+
+/// Why the GPU handed a batch of raw curves back for the CPU to finish
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+pub enum CpuReason {
+    /// The batch can read more native slabs than the GPU's slab cache holds
+    Slabs,
+    /// A sample read a native slab the host had not listed for the batch
+    Unlisted,
+    /// A fitted piece outgrew the room the host gave it
+    Capacity,
+    /// A native slab the batch could read failed to decode; the CPU reads only the slabs it needs, and reports the
+    /// error if it needs that one
+    Decode,
+}
+
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 mod unsupported {
     use color_eyre::eyre::{Result, bail};
 
-    use super::{AxesCounts, Stages};
+    use super::{AxesCounts, Finished, Stages};
     use crate::axes::Lapack;
     use crate::fields::{Catalogue, FamilyFields};
+    use crate::finish::{NativeCache, SlabLayout};
     use crate::gpu::walk::{Caps, Walk};
-    use crate::kernels::DirField;
+    use crate::kernels::{DirField, RawCurve};
     use crate::vol::Vol;
 
     /// No GPU backend on this platform; [`Gpu::open`] always fails, so no value exists
     pub enum Gpu {}
+
+    /// No GPU backend on this platform, so no finisher exists either
+    pub enum GpuFinisher {}
+
+    impl GpuFinisher {
+        pub fn slots(&self) -> usize {
+            match *self {}
+        }
+
+        pub fn uploaded(&self) -> u64 {
+            match *self {}
+        }
+
+        pub fn finish(
+            &mut self,
+            _pool: &rayon::ThreadPool,
+            _cache: &NativeCache,
+            _batch: &[RawCurve],
+        ) -> Result<Finished> {
+            match *self {}
+        }
+    }
 
     impl Gpu {
         pub fn open(_device: Option<usize>, _stages: Stages) -> Result<Self> {
@@ -100,6 +148,16 @@ mod unsupported {
             _ring: &[f64; 13],
             _caps: Caps,
         ) -> Result<Walk<'_>> {
+            match *self {}
+        }
+
+        pub fn finisher(
+            &self,
+            _tracing: &[Vol<u8>; 2],
+            _family: usize,
+            _layout: SlabLayout,
+            _batch_points: usize,
+        ) -> Result<GpuFinisher> {
             match *self {}
         }
     }

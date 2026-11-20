@@ -1,101 +1,111 @@
 ptxas info    : 328 bytes gmem, 64 bytes cmem[4]
-ptxas info    : Compiling entry function 'fb_ax_tensor_y' for 'sm_80'
-ptxas info    : Function properties for fb_ax_tensor_y
+ptxas info    : Compiling entry function 'fs_fit' for 'sm_80'
+ptxas info    : Function properties for fs_fit
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 62 registers, used 0 barriers, 392 bytes cmem[0], 56 bytes cmem[2]
-ptxas info    : Compile time = 23.182 ms
-ptxas info    : Compiling entry function 'fb_ax_gather' for 'sm_80'
-ptxas info    : Function properties for fb_ax_gather
+ptxas info    : Used 96 registers, used 0 barriers, 488 bytes cmem[0], 48 bytes cmem[2]
+ptxas info    : Compile time = 63.379 ms
+ptxas info    : Compiling entry function 'fs_segments' for 'sm_80'
+ptxas info    : Function properties for fs_segments
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 26 registers, used 0 barriers, 432 bytes cmem[0]
-ptxas info    : Compile time = 3.853 ms
-ptxas info    : Compiling entry function 'fb_ax_tensor_z' for 'sm_80'
-ptxas info    : Function properties for fb_ax_tensor_z
-    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 72 registers, used 0 barriers, 392 bytes cmem[0], 56 bytes cmem[2]
-ptxas info    : Compile time = 11.969 ms
-ptxas info    : Compiling entry function 'fb_ax_grad' for 'sm_80'
-ptxas info    : Function properties for fb_ax_grad
-    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 25 registers, used 0 barriers, 392 bytes cmem[0]
-ptxas info    : Compile time = 3.625 ms
-ptxas info    : Compiling entry function 'fb_slots' for 'sm_80'
-ptxas info    : Function properties for fb_slots
-    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 16 registers, used 0 barriers, 392 bytes cmem[0]
-ptxas info    : Compile time = 1.067 ms
-ptxas info    : Compiling entry function 'fb_ax_eigen' for 'sm_80'
-ptxas info    : Function properties for fb_ax_eigen
-    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 168 registers, used 0 barriers, 440 bytes cmem[0], 72 bytes cmem[2]
-ptxas info    : Compile time = 59.948 ms
-ptxas info    : Compiling entry function 'fb_pack' for 'sm_80'
-ptxas info    : Function properties for fb_pack
-    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 9 registers, used 0 barriers, 384 bytes cmem[0]
-ptxas info    : Compile time = 1.152 ms
-ptxas info    : Compiling entry function 'fb_seeds' for 'sm_80'
-ptxas info    : Function properties for fb_seeds
-    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 80 registers, used 0 barriers, 448 bytes cmem[0], 48 bytes cmem[2]
-ptxas info    : Compile time = 17.969 ms
-ptxas info    : Compiling entry function 'fb_ax_smooth0' for 'sm_80'
-ptxas info    : Function properties for fb_ax_smooth0
-    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 32 registers, used 0 barriers, 400 bytes cmem[0], 40 bytes cmem[2]
-ptxas info    : Compile time = 4.185 ms
-ptxas info    : Compiling entry function 'fb_ax_smooth' for 'sm_80'
-ptxas info    : Function properties for fb_ax_smooth
-    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 32 registers, used 0 barriers, 392 bytes cmem[0], 40 bytes cmem[2]
-ptxas info    : Compile time = 5.320 ms
-ptxas info    : Compiling entry function 'fb_centrality' for 'sm_80'
-ptxas info    : Function properties for fb_centrality
-    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 127 registers, used 0 barriers, 400 bytes cmem[0], 40 bytes cmem[2]
-ptxas info    : Compile time = 16.676 ms
-ptxas info    : Compiling entry function 'fb_gather' for 'sm_80'
-ptxas info    : Function properties for fb_gather
-    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 22 registers, used 0 barriers, 432 bytes cmem[0]
-ptxas info    : Compile time = 3.143 ms
+ptxas info    : Used 80 registers, used 0 barriers, 536 bytes cmem[0], 16 bytes cmem[2]
+ptxas info    : Compile time = 23.214 ms
 ptxas info    : Compiling entry function 'fb_walk_scan' for 'sm_80'
 ptxas info    : Function properties for fb_walk_scan
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 32 registers, used 1 barriers, 4096 bytes smem, 384 bytes cmem[0]
-ptxas info    : Compile time = 7.341 ms
+ptxas info    : Compile time = 7.086 ms
 ptxas info    : Compiling entry function 'fb_walk_gather' for 'sm_80'
 ptxas info    : Function properties for fb_walk_gather
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 32 registers, used 0 barriers, 488 bytes cmem[0]
-ptxas info    : Compile time = 3.786 ms
+ptxas info    : Compile time = 3.993 ms
 ptxas info    : Compiling entry function 'fb_walk_spans' for 'sm_80'
 ptxas info    : Function properties for fb_walk_spans
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 56 registers, used 0 barriers, 456 bytes cmem[0], 40 bytes cmem[2]
-ptxas info    : Compile time = 18.455 ms
+ptxas info    : Compile time = 17.537 ms
 ptxas info    : Compiling entry function 'fb_walk_results' for 'sm_80'
 ptxas info    : Function properties for fb_walk_results
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 22 registers, used 0 barriers, 432 bytes cmem[0]
-ptxas info    : Compile time = 1.600 ms
+ptxas info    : Compile time = 1.510 ms
 ptxas info    : Compiling entry function 'fb_walk_cov_set' for 'sm_80'
 ptxas info    : Function properties for fb_walk_cov_set
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 14 registers, used 0 barriers, 372 bytes cmem[0]
-ptxas info    : Compile time = 1.365 ms
+ptxas info    : Compile time = 1.337 ms
 ptxas info    : Compiling entry function 'fb_walk_cov_bricks' for 'sm_80'
 ptxas info    : Function properties for fb_walk_cov_bricks
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 12 registers, used 0 barriers, 372 bytes cmem[0]
-ptxas info    : Compile time = 0.531 ms
+ptxas info    : Compile time = 0.534 ms
 ptxas info    : Compiling entry function 'fb_walk_seeds' for 'sm_80'
 ptxas info    : Function properties for fb_walk_seeds
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 96 registers, used 0 barriers, 520 bytes cmem[0], 120 bytes cmem[2]
-ptxas info    : Compile time = 136.826 ms
+ptxas info    : Compile time = 131.582 ms
 ptxas info    : Compiling entry function 'fb_walk_trace' for 'sm_80'
 ptxas info    : Function properties for fb_walk_trace
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 160 registers, used 0 barriers, 504 bytes cmem[0], 176 bytes cmem[2]
-ptxas info    : Compile time = 243.356 ms
+ptxas info    : Compile time = 232.214 ms
+ptxas info    : Compiling entry function 'fb_ax_tensor_y' for 'sm_80'
+ptxas info    : Function properties for fb_ax_tensor_y
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 62 registers, used 0 barriers, 392 bytes cmem[0], 56 bytes cmem[2]
+ptxas info    : Compile time = 6.069 ms
+ptxas info    : Compiling entry function 'fb_ax_gather' for 'sm_80'
+ptxas info    : Function properties for fb_ax_gather
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 26 registers, used 0 barriers, 432 bytes cmem[0]
+ptxas info    : Compile time = 2.695 ms
+ptxas info    : Compiling entry function 'fb_ax_tensor_z' for 'sm_80'
+ptxas info    : Function properties for fb_ax_tensor_z
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 72 registers, used 0 barriers, 392 bytes cmem[0], 56 bytes cmem[2]
+ptxas info    : Compile time = 8.563 ms
+ptxas info    : Compiling entry function 'fb_ax_grad' for 'sm_80'
+ptxas info    : Function properties for fb_ax_grad
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 25 registers, used 0 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 2.839 ms
+ptxas info    : Compiling entry function 'fb_slots' for 'sm_80'
+ptxas info    : Function properties for fb_slots
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 16 registers, used 0 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 0.902 ms
+ptxas info    : Compiling entry function 'fb_ax_eigen' for 'sm_80'
+ptxas info    : Function properties for fb_ax_eigen
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 0 barriers, 440 bytes cmem[0], 72 bytes cmem[2]
+ptxas info    : Compile time = 54.869 ms
+ptxas info    : Compiling entry function 'fb_pack' for 'sm_80'
+ptxas info    : Function properties for fb_pack
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 9 registers, used 0 barriers, 384 bytes cmem[0]
+ptxas info    : Compile time = 0.796 ms
+ptxas info    : Compiling entry function 'fb_seeds' for 'sm_80'
+ptxas info    : Function properties for fb_seeds
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 0 barriers, 448 bytes cmem[0], 48 bytes cmem[2]
+ptxas info    : Compile time = 17.232 ms
+ptxas info    : Compiling entry function 'fb_ax_smooth0' for 'sm_80'
+ptxas info    : Function properties for fb_ax_smooth0
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, used 0 barriers, 400 bytes cmem[0], 40 bytes cmem[2]
+ptxas info    : Compile time = 4.064 ms
+ptxas info    : Compiling entry function 'fb_ax_smooth' for 'sm_80'
+ptxas info    : Function properties for fb_ax_smooth
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, used 0 barriers, 392 bytes cmem[0], 40 bytes cmem[2]
+ptxas info    : Compile time = 5.167 ms
+ptxas info    : Compiling entry function 'fb_centrality' for 'sm_80'
+ptxas info    : Function properties for fb_centrality
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 127 registers, used 0 barriers, 400 bytes cmem[0], 40 bytes cmem[2]
+ptxas info    : Compile time = 16.164 ms
+ptxas info    : Compiling entry function 'fb_gather' for 'sm_80'
+ptxas info    : Function properties for fb_gather
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 22 registers, used 0 barriers, 432 bytes cmem[0]
+ptxas info    : Compile time = 2.799 ms
