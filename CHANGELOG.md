@@ -4,6 +4,15 @@
 
 ### What's new
 
+- **Trace finishing on the GPU.** When a run uses the GPU, finishing (cutting each traced curve where the
+  predictions disagree, then smoothing, resampling and re-checking each piece) runs there too. It gives the CPU's
+  pieces bit for bit, so the `.afv` is unchanged, whatever rounding the run started with. Both pooled predictions
+  and a cache of native prediction slabs, up to 8 GiB, stay on the GPU while a family is finished; the slabs are
+  still decoded on the CPU. A batch of curves the GPU cannot finish, for example one that reads more slabs than
+  its cache holds, is finished on the CPU, and the log counts those batches and the slabs uploaded at the end of
+  each family. If the GPU fails while finishing, `--device auto` finishes the rest of the family on the CPU and
+  `--device cuda` stops the run, as in the other GPU stages. `--device cpu` finishes on the CPU as before.
+
 - **Faster seed catalogue.** Each family's seed catalogue (priority split, descending-centrality argsort, sort by
   1024³ region) is built on the `--threads` pool:
   - the split and gathers keep their order;
@@ -14,6 +23,18 @@
   On the dense PHerc0358 window z02304–02816, the catalogues of its 22 million V and 21 million H seeds took
   about 10 CPU-s on one thread, most of the 12 s the seed stage took. The tracing order, and so the `.afv`, is
   unchanged.
+
+- **Less memory work while finishing curves.** Native prediction slabs are decoded straight into their buffers
+  instead of into zero-filled ones, and chunk files are read the same way. Compressed chunks get a buffer pool of
+  their own. In the one pool they shared with decoded slabs, a chunk read found no buffer to reuse one time in
+  five, and freed slabs were dropped instead of being kept for the next decode. On
+  the dense PHerc0358 window z02304–02816 at `--threads 8`, the zero-filling took about 34 CPU-s and the page
+  faults of fresh buffers about 35 CPU-s, 14% of the finishing threads' time. The `.afv` is unchanged.
+
+- **Faster tracing on dense data.** Idle threads trace up to 256 seeds ahead of the commit point instead of 64. On
+  the dense PHerc0358 window z02304–02816 at `--threads 8`, two runs of each put both families' tracing at 97 and
+  103 s against 109 and 114 s, with 0.13% of seeds traced again instead of 0.04%. Peak RSS was 23.0–23.4 GiB against
+  23.0–23.1 GiB, and the `.afv` is identical.
 
 ## [0.3.1] - 2026-11-19
 

@@ -25,11 +25,11 @@ use crate::kernels::{Coverage, Fields, Grid, RawCurve, Scratch, Traced, trace_se
 
 /// Seeds traced ahead of the commit point
 ///
-/// A seed traced ahead is traced again when a seed committed meanwhile changed a brick it read: on a dense
-/// PHerc0358 crop 0.01% of seeds were at 64, 0.04% at 256 and 0.15% at 1024. A larger window gave the idle threads
-/// no more to do there: 256 traced as fast as 64 and 1024 was slower, with more traced again and each seed's
-/// result held longer
-pub const WINDOW: usize = 64;
+/// A seed traced ahead is traced again when a seed committed meanwhile changed a brick it read. On the dense
+/// PHerc0358 window z02304–02816 at `--threads 8`, 0.04% of seeds were traced again at 64, 0.13% at 256 and 0.38%
+/// at 1024. Two runs of each put both families' tracing at 109 and 114 s at 64, 97 and 103 s at 256, and 109 and
+/// 101 s at 1024: at 64 the helpers waited on a full window, and at 1024 more seeds were traced again
+pub const WINDOW: usize = 256;
 
 /// How the producer traces ahead
 #[derive(Clone, Copy, Debug)]
