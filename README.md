@@ -87,8 +87,9 @@ cargo test --release
 ```
 
 It builds on Linux and macOS with Rust 1.100 or later, the first stable release with the allocator API it uses.
-The tracer allocates through mimalloc and `fibrs predict` through the system allocator;
-`cargo build --release --no-default-features` builds a binary that uses the system allocator throughout.
+The tracer allocates through mimalloc. On Linux with glibc and on macOS, `fibrs predict` allocates through the
+system allocator; elsewhere it keeps mimalloc. `cargo build --release --no-default-features` builds a binary that
+uses the system allocator throughout.
 The wheel is built with maturin from
 `pyproject.toml` (`maturin build --release`; the published Linux wheel uses `--zig --compatibility
 manylinux_2_28`, and the macOS wheel `MACOSX_DEPLOYMENT_TARGET=11.0`).
