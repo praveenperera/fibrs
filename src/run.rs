@@ -1449,8 +1449,9 @@ impl EarlyExport<'_> {
         std::thread::scope(|scope| {
             let writer = scope.spawn(|| self.write(export, rx));
             let mut sent = 0;
+            let early = std::env::var("FIBRS_DEBUG_EARLY_EXPORT").as_deref() != Ok("0");
             let hand_over = |sent: &mut usize| {
-                while *sent < self.families.len() && family_complete(self.work, self.families[*sent]) {
+                while early && *sent < self.families.len() && family_complete(self.work, self.families[*sent]) {
                     // a writer that failed has dropped its end; its error comes back from the join
                     let _ = tx.send(self.families[*sent]);
                     *sent += 1;

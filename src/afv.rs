@@ -14,6 +14,12 @@ use rayon::prelude::*;
 use rusqlite::{Connection, params};
 use serde_json::{Map, Value, json};
 
+macro_rules! dlog {
+    ($($arg:tt)*) => {
+        eprintln!("{} {}", crate::clock(), format_args!($($arg)*))
+    };
+}
+
 use crate::pyfmt::{np_sum_f64, py_json};
 
 const SCHEMA: &str = "
@@ -186,6 +192,9 @@ impl AfvExport {
         I: IntoIterator<Item = Result<(usize, Vec<[f32; 3]>)>>,
         I::IntoIter: Send,
     {
+        let t_all = std::time::Instant::now();
+        let mut t_insert = 0.0f64;
+        let mut t_wait = 0.0f64;
         let Self { db, geometry, summary: s, .. } = self;
         let mut fiber = db.prepare_cached("INSERT INTO fibers VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")?;
         let mut block = db.prepare_cached("INSERT INTO blocks VALUES(?,?,?,?)")?;
@@ -232,20 +241,41 @@ impl AfvExport {
             let first = s.fiber_count + fibers.len() as i64 + 1;
             let mut prepared = None;
             // the pool makes the next batch's rows while this thread inserts this batch's
+            let mut ins = 0.0f64;
+            let t_scope = std::time::Instant::now();
             let inserted = rayon::in_place_scope(|scope| {
                 scope.spawn(|_| prepared = Some(geometry.next_rows(&mut curves, first)));
-                insert(fibers, s)
+                let t = std::time::Instant::now();
+                let r = insert(fibers, s);
+                ins = t.elapsed().as_secs_f64();
+                r
             });
+            t_insert += ins;
+            t_wait += t_scope.elapsed().as_secs_f64() - ins;
             inserted?;
             next = prepared.expect("the spawned batch has finished");
         }
+        dlog!(
+            "DIAG append: {:.2} s (insert {:.2} s, waiting on rows {:.2} s), fibres so far {}, {}",
+            t_all.elapsed().as_secs_f64(),
+            t_insert,
+            t_wait,
+            s.fiber_count,
+            io_mib()
+        );
         Ok(())
     }
 
     /// Index the fibres, store the totals, commit, check the file and publish it at the destination
     pub fn finish(self) -> Result<Summary> {
         let Self { db, temporary, destination, summary: s, .. } = self;
+        let lap = |what: &str, t: &mut std::time::Instant| {
+            dlog!("DIAG finish {what}: {:.2} s ({})", t.elapsed().as_secs_f64(), io_mib());
+            *t = std::time::Instant::now();
+        };
+        let mut t = std::time::Instant::now();
         db.execute_batch("CREATE INDEX fibers_length ON fibers(length DESC,id)")?;
+        lap("index", &mut t);
         {
             let mut meta = db.prepare("INSERT OR REPLACE INTO metadata VALUES(?,?)")?;
             let rows = [
@@ -258,10 +288,15 @@ impl AfvExport {
                 meta.execute(params![k, py_json(&v)])?;
             }
         }
+        lap("metadata", &mut t);
         db.execute_batch("COMMIT")?;
+        lap("commit", &mut t);
         check(&db)?;
+        lap("check", &mut t);
         db.close().map_err(|(_, e)| e)?;
+        lap("close", &mut t);
         File::open(&temporary.0)?.sync_all()?;
+        lap("sync", &mut t);
         // a hard link publishes the complete file without overwriting a path that another process may
         // have created while tracing was running
         fs::hard_link(&temporary.0, &destination).map_err(|e| eyre!("{}: {e}", destination.display()))?;
@@ -460,16 +495,31 @@ fn fiber_rows(count: i64, k: Kept) -> FiberRows {
     FiberRows { label, point_count: q.len(), length, bounds: bounds(&q), annotation: py_json(&annotation), blocks }
 }
 
+// this process's storage reads and writes so far, in MiB, from /proc/self/io
+fn io_mib() -> String {
+    let text = fs::read_to_string("/proc/self/io").unwrap_or_default();
+    let field = |name: &str| {
+        text.lines().find_map(|l| l.strip_prefix(name)).and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) >> 20
+    };
+    format!("read {} MiB, written {} MiB", field("read_bytes:"), field("write_bytes:"))
+}
+
 fn check(db: &Connection) -> Result<()> {
+    let t = std::time::Instant::now();
     let integrity: Vec<String> =
         db.prepare("PRAGMA integrity_check")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
     if integrity != ["ok"] {
         bail!("AFV integrity check failed");
     }
+    dlog!("DIAG check integrity: {:.2} s ({})", t.elapsed().as_secs_f64(), io_mib());
+    let t = std::time::Instant::now();
     if db.prepare("PRAGMA foreign_key_check")?.query([])?.next()?.is_some() {
         bail!("AFV contains invalid block references");
     }
+    dlog!("DIAG check foreign keys: {:.2} s", t.elapsed().as_secs_f64());
+    let t = std::time::Instant::now();
     let rtree: String = db.query_row("SELECT rtreecheck('block_bounds')", [], |r| r.get(0))?;
+    dlog!("DIAG check rtree: {:.2} s ({})", t.elapsed().as_secs_f64(), io_mib());
     if rtree != "ok" {
         bail!("AFV spatial index check failed");
     }
