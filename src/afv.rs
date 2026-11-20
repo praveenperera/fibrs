@@ -193,9 +193,15 @@ fn metadata(opt: &ExportOptions) -> Result<Vec<(&'static str, Value)>> {
 /// Curves prepared at a time: the pool makes one batch's rows while the calling thread inserts the batch before
 const EXPORT_BATCH: usize = 4096;
 
-/// SQLite's page cache for the export, in KiB (a negative `cache_size`): a dense window's file is over 1 GiB, and with
-/// a smaller cache the inserts and the closing checks read evicted pages back from the file
-const EXPORT_CACHE_KIB: i64 = 1 << 20;
+/// Points prepared at a time: a batch ends once it holds this many, even before [`EXPORT_BATCH`] curves, so the two
+/// batches in flight hold under about 100 MiB of input, native points and block bytes, plus one fibre, however
+/// long the fibres are
+const EXPORT_BATCH_POINTS: usize = 1 << 20;
+
+/// SQLite's page cache for the export, in KiB (a negative `cache_size`): with 32 MiB, SQLite read evicted pages
+/// back from a dense window's file of over 1.5 GiB, and a cache of the whole file would add that much to the
+/// export's memory
+const EXPORT_CACHE_KIB: i64 = 256 << 10;
 
 /// One fibre's rows, made before the fibre is inserted
 struct FiberRows {
@@ -215,18 +221,23 @@ struct Batch {
 }
 
 impl Batch {
-    fn read(curves: &mut impl Iterator<Item = Result<(usize, Vec<[f32; 3]>)>>) -> Self {
+    /// The next batch, or `None` once the input has nothing left
+    fn read(curves: &mut impl Iterator<Item = Result<(usize, Vec<[f32; 3]>)>>) -> Option<Self> {
         let mut out = Vec::with_capacity(EXPORT_BATCH);
+        let mut points = 0;
         for item in curves.by_ref() {
             match item {
-                Ok(curve) => out.push(curve),
-                Err(e) => return Self { curves: out, error: Some(e) },
+                Ok(curve) => {
+                    points += curve.1.len();
+                    out.push(curve);
+                }
+                Err(e) => return Some(Self { curves: out, error: Some(e) }),
             }
-            if out.len() == EXPORT_BATCH {
+            if out.len() == EXPORT_BATCH || points >= EXPORT_BATCH_POINTS {
                 break;
             }
         }
-        Self { curves: out, error: None }
+        (!out.is_empty()).then_some(Self { curves: out, error: None })
     }
 }
 
@@ -274,6 +285,16 @@ impl Geometry {
             other => bail!("Invalid family {other}"),
         };
         Ok(Some(Kept { label, q, length, mm }))
+    }
+
+    /// The rows of the input's next batch, numbered from `first`, or `None` once the input has nothing left. A
+    /// batch can have no rows when all its fibres are too short; that does not end the input
+    fn next_rows(
+        &self,
+        curves: &mut impl Iterator<Item = Result<(usize, Vec<[f32; 3]>)>>,
+        first: i64,
+    ) -> Result<Option<Vec<FiberRows>>> {
+        Batch::read(curves).map(|batch| self.rows(batch, first)).transpose()
     }
 
     /// The rows of a batch's fibres, numbered from `first`; the batch's first error, in input order, ends it as
@@ -377,14 +398,13 @@ where
             Ok(())
         };
         let mut curves = curves.into_iter();
-        let mut next = geometry.rows(Batch::read(&mut curves), 1)?;
-        while !next.is_empty() {
-            let rows = std::mem::take(&mut next);
+        let mut next = geometry.next_rows(&mut curves, 1)?;
+        while let Some(rows) = next {
             let first = s.fiber_count + rows.len() as i64 + 1;
             let mut prepared = None;
             // the pool makes the next batch's rows while this thread inserts this batch's
             let inserted = rayon::in_place_scope(|scope| {
-                scope.spawn(|_| prepared = Some(geometry.rows(Batch::read(&mut curves), first)));
+                scope.spawn(|_| prepared = Some(geometry.next_rows(&mut curves, first)));
                 insert(rows, &mut s)
             });
             inserted?;
@@ -486,6 +506,45 @@ mod tests {
             .query_row("SELECT count(*) FROM blocks WHERE fiber_id NOT IN (SELECT id FROM fibers)", [], |r| r.get(0))
             .unwrap();
         assert_eq!(blocks, 0);
+        let _ = fs::remove_dir_all(out.parent().unwrap());
+    }
+
+    /// A curve too short for the minimum length, two points 0.1 voxel apart
+    fn short(i: usize) -> (usize, Vec<[f32; 3]>) {
+        (1, vec![[0.0, 1.0 + i as f32, 1.0], [0.1, 1.0 + i as f32, 1.0]])
+    }
+
+    /// A whole batch of fibres too short to keep, first or in the middle, is followed by the rest of the input, and
+    /// an input error after it still fails the export
+    #[test]
+    fn a_batch_of_only_short_fibres_does_not_end_the_export() {
+        let mut curves: Vec<Result<(usize, Vec<[f32; 3]>)>> = (0..EXPORT_BATCH).map(|i| Ok(short(i))).collect();
+        curves.push(Ok(curve(EXPORT_BATCH + 1)));
+        let (out, summary) = export(curves, "short");
+        let summary = summary.unwrap();
+        assert_eq!((summary.fiber_count, summary.block_count), (1, 1));
+        let db = Connection::open(&out).unwrap();
+        let min_y: f64 = db.query_row("SELECT min_y FROM fibers WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(min_y, 2.0 * (2.0 + EXPORT_BATCH as f64) + 0.5);
+        let _ = fs::remove_dir_all(out.parent().unwrap());
+
+        // a middle batch of only short fibres, between batches with fibres kept
+        let mut curves: Vec<Result<(usize, Vec<[f32; 3]>)>> = (0..EXPORT_BATCH).map(|i| Ok(curve(i))).collect();
+        curves.extend((0..EXPORT_BATCH).map(|i| Ok(short(i))));
+        curves.push(Ok(curve(EXPORT_BATCH + 1)));
+        let first: i64 = (0..EXPORT_BATCH).filter(|i| !i.is_multiple_of(7)).count() as i64;
+        let (out, summary) = export(curves, "short-middle");
+        assert_eq!(summary.unwrap().fiber_count, first + 1);
+        let db = Connection::open(&out).unwrap();
+        let last: f64 = db.query_row("SELECT min_y FROM fibers WHERE id = ?", [first + 1], |r| r.get(0)).unwrap();
+        assert_eq!(last, 2.0 * (2.0 + EXPORT_BATCH as f64) + 0.5);
+        let _ = fs::remove_dir_all(out.parent().unwrap());
+
+        let mut curves: Vec<Result<(usize, Vec<[f32; 3]>)>> = (0..EXPORT_BATCH).map(|i| Ok(short(i))).collect();
+        curves.push(Err(eyre!("reading failed")));
+        let (out, result) = export(curves, "short-error");
+        assert_eq!(result.unwrap_err().to_string(), "reading failed");
+        assert!(!out.exists());
         let _ = fs::remove_dir_all(out.parent().unwrap());
     }
 
