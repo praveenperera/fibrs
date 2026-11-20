@@ -16,14 +16,52 @@ mod out;
 mod run;
 mod villa;
 
-use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::ffi::OsString;
 
 pub use run::main;
 
 /// Whether `argv` asks for `fibrs predict`. Run as the drop-in `avf-spline-generator`, the binary keeps the
 /// reference CLI, which has no subcommands
 pub fn requested(argv: &[OsString]) -> bool {
-    let dropin = argv.first().and_then(|a| Path::new(a).file_name()) == Some(OsStr::new("avf-spline-generator"));
-    !dropin && argv.get(1).is_some_and(|a| a == "predict")
+    let Some(arg0) = argv.first() else { return false };
+    requested_bytes(arg0.as_encoded_bytes(), argv.get(1).map(|a| a.as_encoded_bytes()))
+}
+
+/// [`requested`] on the raw bytes of the first two arguments, for the global allocator, which decides before
+/// `std::env::args` can be collected
+pub fn requested_bytes(arg0: &[u8], arg1: Option<&[u8]>) -> bool {
+    // the last component of the path, as `Path::file_name` takes it: trailing `/` and `.` components skipped
+    let name = arg0.split(|&b| b == b'/').rev().find(|c| !c.is_empty() && *c != b".");
+    let dropin = name == Some(b"avf-spline-generator".as_slice());
+    !dropin && arg1 == Some(b"predict".as_slice())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    use super::requested_bytes;
+
+    /// The allocator's check takes the drop-in name as `Path::file_name` does, so it agrees with the dispatch in
+    /// `main` on every command line
+    #[test]
+    fn requested_bytes_names_the_dropin_as_path_does() {
+        let cases: [(&str, Option<&str>, bool); 8] = [
+            ("fibrs", Some("predict"), true),
+            ("/venv/bin/fibrs", Some("predict"), true),
+            ("fibrs", Some("trace"), false),
+            ("fibrs", None, false),
+            ("avf-spline-generator", Some("predict"), false),
+            ("/opt/avf-spline-generator/.", Some("predict"), false),
+            ("/opt/avf-spline-generator//", Some("predict"), false),
+            ("/opt/avf-spline-generator/..", Some("predict"), true),
+        ];
+
+        for (arg0, arg1, want) in cases {
+            let dropin = Path::new(arg0).file_name() == Some(OsStr::new("avf-spline-generator"));
+            assert_eq!(!dropin && arg1 == Some("predict"), want, "{arg0} {arg1:?}");
+            assert_eq!(requested_bytes(arg0.as_bytes(), arg1.map(str::as_bytes)), want, "{arg0} {arg1:?}");
+        }
+    }
 }

@@ -595,7 +595,7 @@ pub fn run(args: Args) -> Result<Summary> {
         coordinate_space: args.coordinate_space.as_deref(),
     };
     let curves = families.iter().flat_map(|&f| CurveReader::open(&work, f).unwrap_or_else(CurveReader::failed));
-    let summary = export_afv(curves, &args.output, &opt)?;
+    let summary = pool.install(|| export_afv(curves, &args.output, &opt))?;
     log!("Export: {:.1} s", started.elapsed().as_secs_f64());
     log!("Wrote {} fibres ({} points) to {}", summary.fiber_count, summary.point_count, output.display());
     Ok(summary)

@@ -4,6 +4,18 @@
 
 ### What's new
 
+- **Fewer GPU stalls in centrality.** The GPU waits less on the host between units of tiles:
+  - each stream's page-locked buffers are sized once per family, for the largest unit it runs, instead of being
+    regrown mid-stage, which made the GPU finish the other stream's work first. A sparse or faint unit pins room
+    only for the output bricks where its family's predictions are strong enough to give centrality;
+  - each unit's seeds come back as a list of their own, joined once at the end, instead of being appended to one
+    list that kept growing;
+  - a unit's inputs are built while the GPU still runs the units before it, and its centrality is installed on
+    the `--threads` pool once the next unit on its stream is queued.
+
+  The centrality and seeds are unchanged. On a dense PHerc0358 window on an RTX 5090, V and H centrality take
+  19.1 s together instead of 20.9 s (mean of two runs each), about 1% of the whole run.
+
 - **Trace finishing on the GPU.** When a run uses the GPU, finishing (cutting each traced curve where the
   predictions disagree, then smoothing, resampling and re-checking each piece) runs there too. It gives the CPU's
   pieces bit for bit, so the `.afv` is unchanged, whatever rounding the run started with. Both pooled predictions
@@ -35,6 +47,12 @@
   about 10 CPU-s on one thread, most of the 12 s the seed stage took. The tracing order, and so the `.afv`, is
   unchanged.
 
+- **`fibrs predict` allocates through the system allocator again.** Under mimalloc, which 0.3.1 made the
+  allocator, the predictor zeroed the large buffers it reused, copied growing vectors that glibc malloc remaps, and
+  faulted fresh pages in. That doubled its kernel time, and on nine columns of a PHerc0826 band a run took 42–43 s
+  instead of 0.3.0's 37–39 s, with the same forward pass. With the system allocator the same run takes 37.1–37.2 s
+  again. The tracer keeps mimalloc. The predictions are unchanged.
+
 - **Less memory work while finishing curves.** Native prediction slabs are decoded straight into their buffers
   instead of into zero-filled ones, and chunk files are read the same way. Compressed chunks get a buffer pool of
   their own. In the one pool they shared with decoded slabs, a chunk read found no buffer to reuse one time in
@@ -46,6 +64,14 @@
   the dense PHerc0358 window z02304–02816 at `--threads 8`, two runs of each put both families' tracing at 97 and
   103 s against 109 and 114 s, with 0.13% of seeds traced again instead of 0.04%. Peak RSS was 23.0–23.4 GiB against
   23.0–23.1 GiB, and the `.afv` is identical.
+
+- **Faster export.** The `.afv` export makes each batch of fibres' rows (annotations with Python's float repr, point
+  blocks, bounds) on the `--threads` pool while the batch before it is inserted, in order, on one thread. SQLite
+  also gets a 256 MiB page cache instead of 32 MiB and holds its lock for the whole export. A batch ends at 4,096
+  fibres, or at the fibre that brings it to about a million points, so only its last fibre can take it further. On
+  the dense PHerc0358 window z02304–02816 the export took 16 s on one thread. About a third of that was formatting
+  rows, and a fifth was SQLite reading evicted pages back from the file of over 1.5 GiB. Fibre numbering, every
+  table and the first error in input order are unchanged.
 
 ## [0.3.1] - 2026-11-19
 
