@@ -191,6 +191,41 @@ impl<T: Voxel> Vol<T> {
         self.brick_mut(b).copy_from_slice(data);
     }
 
+    /// Fill bricks in parallel, each given as its slot (C order over the brick grid) and its voxels in brick order;
+    /// a brick that would hold only the default is not allocated, as in [`Vol::set_brick`]
+    ///
+    /// Each slot may be filled once and must still read as the default, as in [`Vol::fill_brick_rows`]. A slot given
+    /// twice is a caller error: debug builds panic when both bricks hold a non-default voxel, and an all-default
+    /// brick is skipped before the slot is checked
+    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    pub fn set_bricks<'a, I>(&mut self, bricks: I)
+    where
+        I: IndexedParallelIterator<Item = (usize, &'a [T; BRICK])>,
+    {
+        let default = self.default;
+        let store = &self.store;
+        // each writer copies into bricks from its own run of the store, so the slots are the only shared state,
+        // and they are set below on this thread
+        let filled: Vec<Option<(usize, Brick<T>)>> = bricks
+            .map_init(
+                || store.run(),
+                |run, (bi, data)| {
+                    if data.iter().all(|&v| v == default) {
+                        return None;
+                    }
+                    let ptr = run.alloc();
+                    // SAFETY: the store handed this brick to this writer alone, and it lives as long as the volume
+                    unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), BRICK) }.copy_from_slice(data);
+                    Some((bi, Brick(ptr)))
+                },
+            )
+            .collect();
+        for (bi, b) in filled.into_iter().flatten() {
+            debug_assert!(self.bricks[bi].is_none(), "brick {bi} is filled a second time");
+            self.bricks[bi] = Some(b);
+        }
+    }
+
     /// Bytes held by allocated bricks
     pub fn resident_bytes(&self) -> usize {
         self.bricks.iter().filter(|b| b.is_some()).count() * BRICK * std::mem::size_of::<T>()
@@ -426,6 +461,25 @@ mod tests {
         let block: Vec<u8> = (0..3 * 4 * 5).map(|i| i as u8).collect();
         v.write_block([30, 31, 28], [3, 4, 5], &block);
         assert_eq!(v.read_block([30, 31, 28], [3, 4, 5]), block);
+    }
+
+    /// The parallel install leaves a volume as one `set_brick` per brick would: the values read back, and an
+    /// all-default brick stays unallocated
+    #[test]
+    fn set_bricks_matches_set_brick() {
+        let shape = [40, 70, 33];
+        let data: Vec<[u16; BRICK]> = (0..6u16).map(|k| std::array::from_fn(|i| (i as u16 % 7) * k)).collect();
+        let slots = [0, 5, 17, 23, 31, 44];
+        let mut one = Vol::new(shape, 0u16);
+        for (&bi, d) in slots.iter().zip(&data) {
+            one.set_brick(bi, d);
+        }
+
+        let mut all = Vol::new(shape, 0u16);
+        all.set_bricks(slots.par_iter().copied().zip(&data));
+        assert_eq!(all.read_block([0; 3], shape), one.read_block([0; 3], shape));
+        // brick 0 holds only zeros, so five of the six are allocated
+        assert_eq!((all.resident_bytes(), one.resident_bytes()), (5 * BRICK * 2, 5 * BRICK * 2));
     }
 
     #[test]
