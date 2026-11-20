@@ -12,11 +12,25 @@
   into a loop. A `--tiles-yx 1 1` run writes the untiled run's `.afv`. Without `--tiles-yx`, runs, their output and
   their `run.json` are unchanged. See [Tiled tracing](README.md#tiled-tracing).
 
+- **`fibrs predict` reuses its buffers across a run.** Readers read each tile into a recycled buffer, the engine
+  hands batches back already sized for the next one, and the writer keeps one chunk buffer and one compress buffer
+  for the whole run, overwriting a chunk a column covers completely instead of zeroing it first. Once a column is
+  on disk its semantic and tracing vectors go back to the engine, which downloads the next column into them with
+  volkit's `finish_into`, so this needs volkit 0.1.2. The predictions are unchanged, and each chunk is still
+  compressed with numcodecs' destination size, so the chunk files stay byte for byte as numcodecs writes them.
+
 ### Fixes
 
 - **`fibrs --version` prints fibrs' version.** Run as `fibrs` or `python -m fibrs`, `--version` now prints fibrs'
   own version; it printed `0.2.0`, the version of `avf-spline-generator` it reproduces, on every release. Run as the
   drop-in `avf-spline-generator`, it still prints `0.2.0`. `fibrs predict --version` is unchanged.
+
+### Upgrading
+
+- 0.4.1 doesn't resume a tracer work directory that 0.4.0 started, finished or not, so a `--resume` that only
+  writes the `.afv` again needs 0.4.0 too. Finish a run with the binary that started it, or start a new work
+  directory. A `fibrs predict` output that 0.4.0 started, in band or villa mode, is refused on resume as well, as
+  it is by any other binary; finish it with 0.4.0 or write a new `--out`.
 
 ## [0.4.0] - 2026-11-20
 
