@@ -8,10 +8,13 @@
 //! The volumes arrive as the host's 16³ bricks: one pool of brick payloads and, per volume, a table from each
 //! brick of a box of the brick grid to its slot in the pool, or [`NO_BRICK`] where every voxel reads as the
 //! volume's default. Per tile, [`fb_gather`] writes the tile's region (the reference's 128³ tile with its 8-voxel
-//! halo) densely, [`fb_centrality`] computes centrality over it, and [`fb_seeds`] tests the tile core for seeds,
-//! appends them to a list, copies the core's centrality out in brick order and flags the bricks holding a nonzero
-//! value. [`fb_slots`] and [`fb_pack`] then pack the flagged bricks densely, so the host downloads only those:
-//! most of a band's centrality is zero. Coordinates and clamps are local to the region, as in the reference.
+//! halo) densely, [`fb_cent_list`] lists the band voxels with presence enough for centrality and zeroes the rest,
+//! [`fb_centrality`] computes centrality at the listed voxels, [`fb_seeds`] copies the core's centrality out in
+//! brick order, flags the bricks holding a nonzero value and lists the core voxels that pass the seed test's cheap
+//! checks, and [`fb_seed_test`] tests those for seeds and appends them to a list. Listing first keeps the float64
+//! work on full warps: most voxels fail the cheap checks. [`fb_slots`] and [`fb_pack`] then pack the flagged
+//! bricks densely, so the host downloads only those: most of a band's centrality is zero. Coordinates and clamps
+//! are local to the region, as in the reference.
 //!
 //! The arithmetic is the reference's CUDA rounding, operation by operation: every float64 multiply, add and
 //! multiply-add is an explicit round-to-nearest instruction (`mul.rn`, `add.rn`, `fma.rn`), which neither LLVM
@@ -320,30 +323,116 @@ pub unsafe fn fb_gather(
     }
 }
 
-/// Centrality over each tile's band, the voxels within 3 of its core, which are all the seed test reads
-/// (`centrality_kernel`, cuda.py:103); voxels below presence 64 get 0
+/// A tile's band, the region voxels within 3 of its core, which are all the seed test reads: origin and extent
+#[derive(Clone, Copy)]
+struct Band {
+    lo: [i32; 3],
+    ext: [i32; 3],
+}
+
+impl Band {
+    #[inline(always)]
+    fn of(t: &Tile) -> Self {
+        let lo = [0, 1, 2].map(|a| (t.off[a] - 3).max(0));
+        let ext = [0, 1, 2].map(|a| (t.off[a] + t.core[a] + 3).min(t.dims[a]) - lo[a]);
+        Band { lo, ext }
+    }
+
+    /// Voxels in the band
+    #[inline(always)]
+    fn len(&self) -> u32 {
+        self.ext[0] as u32 * self.ext[1] as u32 * self.ext[2] as u32
+    }
+
+    /// Region coordinates of the band voxel with band-local index `i`
+    #[inline(always)]
+    fn voxel(&self, i: u32) -> (i32, i32, i32) {
+        let (eh, ew) = (self.ext[1] as u32, self.ext[2] as u32);
+        let bz = i / (eh * ew);
+        let by = i / ew - bz * eh;
+        let bx = i - (bz * eh + by) * ew;
+        (self.lo[0] + bz as i32, self.lo[1] + by as i32, self.lo[2] + bx as i32)
+    }
+}
+
+/// Split each tile's band by presence: voxels below 64, whose centrality is 0, get it written here, and the rest
+/// are listed for [`fb_centrality`], so its float64 work runs on full warps. `list[t·cap + k]` is the band-local
+/// index of tile `t`'s `k`th listed voxel, in no particular order, and `count[t]` (zeroed by the host) ends as the
+/// number listed; `cap` is at least every tile's band size, so a list cannot overflow
 ///
 /// Grid: x over band voxels in blocks, y over tiles
 #[kernel]
-pub unsafe fn fb_centrality(desc: *const u32, pres: *const u8, nx: *const u8, ny: *const u8, dirs: *const f64, cent: *mut u16) {
-    let t = unsafe { tile(desc, blockIdx_y()) };
-    let lo = [0, 1, 2].map(|a| (t.off[a] - 3).max(0));
-    let ext = [0, 1, 2].map(|a| (t.off[a] + t.core[a] + 3).min(t.dims[a]) - lo[a]);
+pub unsafe fn fb_cent_list(
+    desc: *const u32,
+    pres: *const u8,
+    cap: u32,
+    cent: *mut u16,
+    count: *mut u32,
+    list: *mut u32,
+) {
+    let ti = blockIdx_y();
+    let t = unsafe { tile(desc, ti) };
+    let band = Band::of(&t);
     let i = blockIdx_x() * blockDim_x() + threadIdx_x();
-    let (eh, ew) = (ext[1] as u32, ext[2] as u32);
-    if i >= ext[0] as u32 * eh * ew {
+    if i >= band.len() {
         return;
     }
-    let bz = i / (eh * ew);
-    let by = i / ew - bz * eh;
-    let bx = i - (bz * eh + by) * ew;
-    let (z, y, x) = (lo[0] + bz as i32, lo[1] + by as i32, lo[2] + bx as i32);
+    let (z, y, x) = band.voxel(i);
+    let c = t.idx(z, y, x);
+    // the same test as `centrality_at`'s early return, which then never fires
+    if (unsafe { *pres.add(c) } as f32) < 64.0 {
+        unsafe { *cent.add(c) = 0 };
+        return;
+    }
+    // SAFETY: `count` holds one u32 per tile the host zeroed; device-scope relaxed atomics only hand out distinct
+    // slots
+    let k = unsafe { DeviceAtomicU32::from_ptr(count.add(ti as usize)).fetch_add(1, AtomicOrdering::Relaxed) };
+    if k >= cap {
+        return;
+    }
+    unsafe { *list.add(ti as usize * cap as usize + k as usize) = i };
+}
+
+/// Centrality at each voxel [`fb_cent_list`] listed in its tile's band (`centrality_kernel`, cuda.py:103)
+///
+/// Grid: x over list entries (`cap`) in blocks, y over tiles
+#[kernel]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn fb_centrality(
+    desc: *const u32,
+    pres: *const u8,
+    nx: *const u8,
+    ny: *const u8,
+    dirs: *const f64,
+    cap: u32,
+    count: *const u32,
+    list: *const u32,
+    cent: *mut u16,
+) {
+    let ti = blockIdx_y();
+    let k = blockIdx_x() * blockDim_x() + threadIdx_x();
+    // past `cap` an entry was counted but not written
+    if k >= cap || k >= unsafe { *count.add(ti as usize) } {
+        return;
+    }
+    let t = unsafe { tile(desc, ti) };
+    let i = unsafe { *list.add(ti as usize * cap as usize + k as usize) };
+    let (z, y, x) = Band::of(&t).voxel(i);
     let v = unsafe { centrality_at(&t, pres, nx, ny, dirs, z, y, x) };
     unsafe { *cent.add(t.idx(z, y, x)) = v };
 }
 
 #[inline(always)]
-unsafe fn centrality_at(t: &Tile, pres: *const u8, nx: *const u8, ny: *const u8, dirs: *const f64, z: i32, y: i32, x: i32) -> u16 {
+unsafe fn centrality_at(
+    t: &Tile,
+    pres: *const u8,
+    nx: *const u8,
+    ny: *const u8,
+    dirs: *const f64,
+    z: i32,
+    y: i32,
+    x: i32,
+) -> u16 {
     let c = t.idx(z, y, x);
     let p0 = unsafe { *pres.add(c) } as f32;
     if p0 < 64.0 {
@@ -380,11 +469,12 @@ unsafe fn centrality_at(t: &Tile, pres: *const u8, nx: *const u8, ny: *const u8,
     py_min(py_max(mad(add(p_par, c_sum), 100.0, 0.5), 0.0), 65535.0) as u16
 }
 
-/// Seeds of each tile's core (`seed_kernel`, cuda.py:157, seed stride 2), appended to `seeds` as
-/// `global C-order index << 8 | priority` through `count` (entries past `cap` are counted, not written, and the
-/// host fails the run); also copies the core's centrality to `out` in brick order (`ceil(core / 16)` bricks per
-/// axis from the tile's `out` element, 4096 elements each) and sets `flags[brick]` for each of those bricks
-/// holding a nonzero value
+/// Copies each tile core's centrality to `out` in brick order (`ceil(core / 16)` bricks per axis from the tile's
+/// `out` element, 4096 elements each), sets `flags[brick]` for each of those bricks holding a nonzero value, and
+/// lists the core voxels that pass the seed test's cheap first checks (interior, presence at least 79, even
+/// `x + y + z`) for [`fb_seed_test`]: `list[t·cap + k]` is the core-local index `(cz·ch + cy)·cw + cx` of tile
+/// `t`'s `k`th candidate, in no particular order, and `count[t]` (zeroed by the host) ends as the number listed.
+/// `cap` is at least every tile's even voxels, half its core rounded up, so a list cannot overflow
 ///
 /// Grid: x over core voxels in blocks, y over tiles
 #[kernel]
@@ -392,27 +482,21 @@ unsafe fn centrality_at(t: &Tile, pres: *const u8, nx: *const u8, ny: *const u8,
 pub unsafe fn fb_seeds(
     desc: *const u32,
     pres: *const u8,
-    nx: *const u8,
-    ny: *const u8,
-    dirs: *const f64,
     cent: *const u16,
-    shape_h: u32,
-    shape_w: u32,
     out: *mut u16,
     flags: *mut u32,
-    seeds: *mut u64,
     cap: u32,
     count: *mut u32,
+    list: *mut u32,
 ) {
-    let t = unsafe { tile(desc, blockIdx_y()) };
+    let ti = blockIdx_y();
+    let t = unsafe { tile(desc, ti) };
     let (ch, cw) = (t.core[1] as u32, t.core[2] as u32);
     let i = blockIdx_x() * blockDim_x() + threadIdx_x();
     if i >= t.core[0] as u32 * ch * cw {
         return;
     }
-    let cz = i / (ch * cw);
-    let cy = i / cw - cz * ch;
-    let cx = i - (cz * ch + cy) * cw;
+    let (cz, cy, cx) = t.core_voxel(i);
     let (z, y, x) = (t.off[0] + cz as i32, t.off[1] + cy as i32, t.off[2] + cx as i32);
     let c = unsafe { *cent.add(t.idx(z, y, x)) };
     let (nby, nbx) = ((ch + MASK) >> SHIFT, (cw + MASK) >> SHIFT);
@@ -429,15 +513,61 @@ pub unsafe fn fb_seeds(
     if !interior {
         return;
     }
+    // `seed_at`'s early return, which it repeats for the listed voxels
+    if unsafe { *pres.add(t.idx(z, y, x)) } < 79 || (x + y + z) & 1 != 0 {
+        return;
+    }
+    // SAFETY: `count` holds one u32 per tile the host zeroed; device-scope relaxed atomics only hand out distinct
+    // slots
+    let k = unsafe { DeviceAtomicU32::from_ptr(count.add(ti as usize)).fetch_add(1, AtomicOrdering::Relaxed) };
+    if k >= cap {
+        return;
+    }
+    unsafe { *list.add(ti as usize * cap as usize + k as usize) = i };
+}
+
+/// Seeds among the voxels [`fb_seeds`] listed in each tile's core (`seed_kernel`, cuda.py:157, seed stride 2),
+/// appended to `seeds` as `global C-order index << 8 | priority` through `seed_count` (entries past `seed_cap` are
+/// counted, not written, and the host fails the run), in no particular order
+///
+/// Grid: x over list entries (`cap`) in blocks, y over tiles
+#[kernel]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn fb_seed_test(
+    desc: *const u32,
+    pres: *const u8,
+    nx: *const u8,
+    ny: *const u8,
+    dirs: *const f64,
+    cent: *const u16,
+    shape_h: u32,
+    shape_w: u32,
+    cap: u32,
+    count: *const u32,
+    list: *const u32,
+    seeds: *mut u64,
+    seed_cap: u32,
+    seed_count: *mut u32,
+) {
+    let ti = blockIdx_y();
+    let k = blockIdx_x() * blockDim_x() + threadIdx_x();
+    // past `cap` an entry was counted but not written
+    if k >= cap || k >= unsafe { *count.add(ti as usize) } {
+        return;
+    }
+    let t = unsafe { tile(desc, ti) };
+    let local = unsafe { *list.add(ti as usize * cap as usize + k as usize) };
+    let (cz, cy, cx) = t.core_voxel(local);
+    let (z, y, x) = (t.off[0] + cz as i32, t.off[1] + cy as i32, t.off[2] + cx as i32);
     let s = unsafe { seed_at(&t, pres, nx, ny, dirs, cent, z, y, x) };
     if s == 0 {
         return;
     }
     let (gz, gy, gx) = ((t.lo[0] + z as u32) as u64, (t.lo[1] + y as u32) as u64, (t.lo[2] + x as u32) as u64);
     let index = (gz * shape_h as u64 + gy) * shape_w as u64 + gx;
-    // SAFETY: `count` is one u32 the host zeroed; device-scope relaxed atomics only hand out distinct slots
-    let slot = unsafe { DeviceAtomicU32::from_ptr(count).fetch_add(1, AtomicOrdering::Relaxed) };
-    if slot < cap {
+    // SAFETY: `seed_count` is one u32 the host zeroed; device-scope relaxed atomics only hand out distinct slots
+    let slot = unsafe { DeviceAtomicU32::from_ptr(seed_count).fetch_add(1, AtomicOrdering::Relaxed) };
+    if slot < seed_cap {
         unsafe { *seeds.add(slot as usize) = index << 8 | s as u64 };
     }
 }
