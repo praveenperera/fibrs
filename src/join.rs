@@ -70,16 +70,16 @@ impl Args {
     /// a bad path fails before the join rather than after it
     fn check_outputs(&self) -> Result<()> {
         let new = |flag: &str, p: &Path| -> Result<PathBuf> {
-            // a link counts as a file, even one that names nothing
-            if fs::symlink_metadata(p).is_ok() {
-                bail!("{flag} {} already exists", p.display());
-            }
-            // judged on the text as given, since Path drops a trailing separator or `.` that the final write would
-            // then trip on
+            // judged on the text as given, and first, since Path and Windows both drop a trailing separator or `.`
+            // that the final write would then trip on
             let text = p.as_os_str().to_string_lossy();
             let last = text.rsplit(std::path::is_separator).next().unwrap_or_default();
             let name = p.file_name().filter(|_| !matches!(last, "" | "." | ".."));
             let name = name.ok_or_else(|| eyre!("{flag} {} is not a file path", p.display()))?;
+            // a link counts as a file, even one that names nothing
+            if fs::symlink_metadata(p).is_ok() {
+                bail!("{flag} {} already exists", p.display());
+            }
             let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
             // the directory by its real path, so two names for one file are caught
             let real = fs::canonicalize(dir).map_err(|e| eyre!("{flag} {}: {e}", dir.display()))?;
