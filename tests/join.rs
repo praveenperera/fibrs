@@ -219,6 +219,9 @@ fn outputs_that_would_replace_a_file_are_refused() {
     assert!(join(&out, &dir.join("reports")).contains("already exists"));
     assert!(join(&out, &dir.join("missing").join("scroll.json")).contains("missing"));
     assert!(join(&out, &dir.join("bands.json").join("scroll.json")).contains("is not a directory"));
+    for name in ["bands.json/.", "scroll.json/"] {
+        assert!(join(&out, &dir.join(name)).contains("is not a file path"), "{name}");
+    }
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(&dir, dir.join("alias")).unwrap();
