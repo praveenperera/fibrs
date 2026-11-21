@@ -162,8 +162,8 @@ impl Drop for BufferPool {
 ///
 /// # Safety
 ///
-/// Every bit pattern, and in particular all zero bits, must be a valid value of the type, and all zero bits must
-/// be [`Voxel::ZERO`]: a [`BrickStore`] hands out zeroed or partly written mappings as slices of the type
+/// Every bit pattern, all zeros included, must be valid, and all zeros must be [`Voxel::ZERO`]: a [`BrickStore`]
+/// hands out fresh mappings as slices of the type. Its size must be a power of two, so each segment starts on a page
 pub unsafe trait Voxel: Copy + PartialEq + Send + Sync + 'static {
     const ZERO: Self;
 }
