@@ -21,7 +21,7 @@ from 114–134 s to about 103 s.
   `join.py` rule. A manifest lists each band's `.afv`, core planes and window planes, plus the output's coordinate
   space, source path and provenance. Fibres and joined chains of zero length are dropped and counted. On
   PHerc1545's 42 bands it writes the same `.afv` as `join.py` in half the time. See
-  [Joining Z bands](README.md#joining-z-bands).
+  [Joining Z bands](README.md#join-z-bands).
 - **The tracer runs without transparent huge pages.** On Linux with glibc the tracer's mimalloc no longer asks for
   transparent huge pages, and asks Linux to disable them for its process and any child process it starts, unless
   `MIMALLOC_ALLOW_THP=1` is set. On a host with THP set to `madvise`, most of those requests fell back to small
@@ -56,7 +56,7 @@ fibrs' own version.
   their `run.json` are unchanged. See [Tiled tracing](README.md#tiled-tracing).
 - **Install with cargo.** fibrs is on crates.io from 0.4.0: `cargo binstall fibrs` installs the release's prebuilt
   CLI binary on Linux x86-64 and Apple silicon, and `cargo install fibrs --locked` builds it from source. See
-  [With cargo](README.md#with-cargo).
+  [With cargo](docs/install.md#cargo).
 - **`fibrs predict` reuses its buffers across a run.** Readers read each tile into a recycled buffer, the engine
   hands batches back already sized for the next one, and the writer keeps one chunk buffer and one compress buffer
   for the whole run, overwriting a chunk a column covers completely instead of zeroing it first. Once a column is
