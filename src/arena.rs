@@ -162,8 +162,8 @@ impl Drop for BufferPool {
 ///
 /// # Safety
 ///
-/// Every bit pattern, all zeros included, must be valid, and all zeros must be [`Voxel::ZERO`]: a [`BrickStore`]
-/// hands out fresh mappings as slices of the type. Its size must be a power of two, so each segment starts on a page
+/// Every bit pattern, and in particular all zero bits, must be a valid value of the type, and all zero bits must
+/// be [`Voxel::ZERO`]: a [`BrickStore`] hands out zeroed or partly written mappings as slices of the type
 pub unsafe trait Voxel: Copy + PartialEq + Send + Sync + 'static {
     const ZERO: Self;
 }
@@ -246,6 +246,9 @@ impl<T: Voxel, const N: usize> BrickStore<T, N> {
     ///
     /// When `max_bricks` ids do not fit in 32 bits. Taking more bricks than the store was sized for panics too
     pub fn new(default: T, max_bricks: usize) -> Self {
+        // a brick of a power-of-two size divides the page and the segment, so every segment the store opens starts on
+        // a page, as `open` needs
+        const { assert!((N * size_of::<T>()).is_power_of_two(), "a brick's size must be a power of two") };
         let bytes = N * size_of::<T>();
         // runs in flight hold up to RUN_BRICKS ids each that they may not use, so the range has room for that many
         // more bricks than the volume can hold, for up to RUN_SLACK runs at once
