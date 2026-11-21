@@ -1,6 +1,11 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.1] - 2026-11-20
+
+fibrs 0.4.1 can trace a wide window as Y-X tiles, so a run's peak memory follows its densest tile instead of the
+whole window, and a run without `--tiles-yx` writes the same `.afv` as before. fibrs installs with cargo from
+crates.io, `fibrs predict` reuses its buffers across a run with unchanged predictions, and `fibrs --version` prints
+fibrs' own version.
 
 ### What's new
 
@@ -424,6 +429,7 @@ The first release.
   Python module, and a CLI archive for each with `scripts/install-dropin.sh`
 - `--version` prints `0.2.0`, the original's version, as a drop-in has to
 
+[0.4.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.1
 [0.4.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.0
 [0.3.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.3.1
 [0.3.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.3.0
