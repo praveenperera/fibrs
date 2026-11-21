@@ -213,7 +213,8 @@ from, `[z0, z1)`:
 - **Bands.** A relative `afv` path is taken from the manifest's directory. Bands may be listed in any order; their
   cores must not overlap. Each trace must be complete, traced from its window's first plane (`tracing.origin_xyz`),
   with every point inside its window, `z0 <= z < z1`, and every band must be traced in the same volume (voxel size
-  and shape), which the output takes. Cut ends are joined across a plane only where one core ends and the next begins.
+  and shape, and the same scan wherever a band or the manifest names one), which the output takes. Cut ends are
+  joined across a plane only where one core ends and the next begins.
 - **Cut and join.** A fibre is cut to its band's core `z0 <= z < z1`; where it leaves through a plane shared with the
   next core, the point where it crosses the plane is added. Cut ends on the two sides of a plane are joined when they
   are of the same family and at most `--radius` native voxels apart (default 1.5): shortest first, each end once,
@@ -224,7 +225,7 @@ from, `[z0, z1)`:
   The metadata is the public sets' for a whole volume (origin 0): the coordinate space first in the frame, the
   source path in the root and the manifest's `provenance` under its own key. `--stats` writes the counts per family
   (`uncut`, `cut_runs`, `cut_ends`, `joins`, `chains`, `zero_length_dropped`, `fibres`), the manifest's coordinate
-  space and the file's totals. The output and the stats must be two files, neither of them an input.
+  space and the file's totals. The output and the stats must be two files in existing directories, neither of them an input.
 - **Memory.** The join holds one family's pieces that end on a plane, plus up to three bands' fibres of that family:
   the band being cut, the next one, read ahead on its own thread, and the one after it being read.
 - **Speed.** On PHerc1545's 42 bands (34.6 GiB), `fibrs join` writes the same fibres, blocks and metadata as

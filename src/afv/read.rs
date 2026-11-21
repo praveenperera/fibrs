@@ -12,7 +12,7 @@ use crate::seams::Point;
 const POINT_BYTES: usize = 24;
 
 /// What a trace's metadata says about the volume it was traced in
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
     /// The voxel size in µm (`vc_open_data_source_original_resolution`)
     pub voxel_um: f64,
@@ -20,6 +20,8 @@ pub struct Frame {
     pub volume_shape: [i64; 3],
     /// The native coordinate of the traced window's first voxel, x, y, z (`tracing.origin_xyz`)
     pub origin_xyz: [i64; 3],
+    /// The scan the volume is, when the trace names it (`vc_open_data_coordinate_space`)
+    pub coordinate_space: Option<String>,
 }
 
 /// An open, complete `.afv`
@@ -65,7 +67,8 @@ impl AfvReader {
         };
         let volume_shape = triple(&frame["coordinate_base_shape_zyx"], "frame.coordinate_base_shape_zyx")?;
         let origin_xyz = triple(&tracing["origin_xyz"], "tracing.origin_xyz")?;
-        Ok(Frame { voxel_um, volume_shape, origin_xyz })
+        let coordinate_space = frame["vc_open_data_coordinate_space"].as_str().map(str::to_owned);
+        Ok(Frame { voxel_um, volume_shape, origin_xyz, coordinate_space })
     }
 
     /// Every fibre of `family` ("V" or "H") in id order, as native x, y, z points

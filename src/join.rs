@@ -154,9 +154,15 @@ impl Manifest {
     /// That the output and the stats are two files, and neither is the manifest or a band's trace, which writing
     /// them would replace
     fn check_outputs(&self, args: &Args) -> Result<()> {
-        // an existing file by its real path, so a link to an input is caught too; a new one by its absolute path
-        let key = |p: &Path| {
-            fs::canonicalize(p).or_else(|_| std::path::absolute(p)).map_err(|e| eyre!("{}: {e}", p.display()))
+        // an existing file by its real path, so a link to an input is caught too; a file still to be written by its
+        // directory's real path, which must exist, so a missing directory fails before the join rather than after
+        let key = |p: &Path| -> Result<PathBuf> {
+            if let Ok(real) = fs::canonicalize(p) {
+                return Ok(real);
+            }
+            let name = p.file_name().ok_or_else(|| eyre!("{} is not a file path", p.display()))?;
+            let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            Ok(fs::canonicalize(dir).map_err(|e| eyre!("{}: {e}", dir.display()))?.join(name))
         };
         let inputs = std::iter::once(&args.manifest).chain(self.bands.iter().map(|b| &b.afv));
         let inputs = inputs.map(|p| key(p)).collect::<Result<Vec<_>>>()?;
@@ -172,6 +178,31 @@ impl Manifest {
         }
         if stats.as_ref() == Some(&output) {
             bail!("--stats and --output are the same file, {}", output.display());
+        }
+
+        Ok(())
+    }
+
+    /// That every band was traced in one volume: the same voxel size and shape, and the same scan wherever a band or
+    /// the manifest names it
+    fn check_volume(&self, frames: &[Frame]) -> Result<()> {
+        let frame = &frames[0];
+        let bands = self.bands.iter().zip(frames);
+        if let Some((b, f)) =
+            bands.clone().find(|(_, f)| (f.voxel_um, f.volume_shape) != (frame.voxel_um, frame.volume_shape))
+        {
+            bail!("{} was traced in another volume: {f:?}, not {frame:?}", b.afv.display());
+        }
+
+        // bands traced without --coordinate-space name no scan, so only the named ones are compared
+        let mut scan = self.coordinate_space.as_deref();
+        for (b, space) in bands.filter_map(|(b, f)| f.coordinate_space.as_deref().map(|s| (b, s))) {
+            match scan {
+                Some(expected) if expected != space => {
+                    bail!("{} was traced in {space}, not {expected}", b.afv.display())
+                }
+                _ => scan = Some(space),
+            }
         }
 
         Ok(())
@@ -276,15 +307,8 @@ fn run(args: &Args) -> Result<()> {
     let manifest = Manifest::read(&args.manifest)?;
     manifest.check_outputs(args)?;
     let frames = manifest.bands.iter().map(Band::check).collect::<Result<Vec<_>>>()?;
-    let frame = frames[0];
-    if let Some((b, f)) = manifest
-        .bands
-        .iter()
-        .zip(&frames)
-        .find(|(_, f)| (f.voxel_um, f.volume_shape) != (frame.voxel_um, frame.volume_shape))
-    {
-        bail!("{} was traced in another volume: {f:?}, not {frame:?}", b.afv.display());
-    }
+    manifest.check_volume(&frames)?;
+    let frame = &frames[0];
     let interior = manifest.interior();
     log!("Joining {} bands across {} planes into {}", manifest.bands.len(), interior.len(), args.output.display());
 

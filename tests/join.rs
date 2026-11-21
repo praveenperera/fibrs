@@ -205,5 +205,39 @@ fn stats_that_would_replace_the_output_or_an_input_are_refused() {
     assert!(join(&out, &dir.join("low.afv")).contains("is one of the join's inputs"));
     assert!(join(&manifest, &dir.join("scroll.json")).contains("is one of the join's inputs"));
     assert!(fs::read_to_string(&manifest).unwrap().contains("low.afv"));
+    // a missing directory fails before the join, not after the output is written
+    assert!(join(&out, &dir.join("missing").join("scroll.json")).contains("missing"));
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&dir, dir.join("alias")).unwrap();
+        assert!(join(&out, &dir.join("alias").join("scroll.afv")).contains("--stats and --output are the same file"));
+    }
+    assert!(!out.exists());
+}
+
+#[test]
+fn bands_traced_in_different_scans_are_refused() {
+    let dir = scratch("two-scans");
+    band(&dir.join("low.afv"), 0, &[("V", line(5.0, &[6.0, 8.0]))]);
+    band(&dir.join("high.afv"), 4, &[("V", line(5.0, &[12.0, 14.0]))]);
+    for (name, scan) in [("low.afv", "PHerc0000/20250101000000"), ("high.afv", "PHerc0001/20250101000000")] {
+        let db = Connection::open(dir.join(name)).unwrap();
+        let named =
+            "UPDATE metadata SET value = json_set(value, '$.vc_open_data_coordinate_space', ?) WHERE key = 'frame'";
+        db.execute(named, [scan]).unwrap();
+    }
+    let manifest = json!({"bands": [
+        {"afv": "low.afv", "core_z": [0, 10], "window_z": [0, 16]},
+        {"afv": "high.afv", "core_z": [10, 20], "window_z": [4, 20]},
+    ]});
+    fs::write(dir.join("bands.json"), manifest.to_string()).unwrap();
+    let (manifest, out) = (dir.join("bands.json"), dir.join("scroll.afv"));
+    let run = fibrs(&["join", "--manifest", manifest.to_str().unwrap(), "--output", out.to_str().unwrap()]);
+    assert!(!run.status.success());
+    assert!(
+        text(&run).contains("was traced in PHerc0001/20250101000000, not PHerc0000/20250101000000"),
+        "{}",
+        text(&run)
+    );
     assert!(!out.exists());
 }
