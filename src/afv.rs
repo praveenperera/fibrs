@@ -5,7 +5,8 @@
 //! little-endian float64 blocks and the R*Tree rows. Only the per-run uuid and SQLite's page layout
 //! differ, so outputs are compared table by table rather than by file hash
 
-use std::fs::{self, File};
+use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -70,18 +71,12 @@ pub struct Summary {
     pub block_count: i64,
 }
 
-/// Fill `buf` (at most 256 bytes) from the kernel's random source
-///
-/// `getentropy` rather than `getrandom`, since macOS has only the former; glibc has had both since 2.25
+/// Fill `buf` from the operating system's random source, as Python's `os.urandom` does
 fn fill_random(buf: &mut [u8]) -> Result<()> {
-    // SAFETY: the pointer and length describe `buf`, which getentropy fills in full or not at all
-    if unsafe { libc::getentropy(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
-        bail!("getentropy failed: {}", std::io::Error::last_os_error());
-    }
-    Ok(())
+    getrandom::fill(buf).map_err(|e| eyre!("could not read the system's random source: {e}"))
 }
 
-/// A random version 4 UUID in canonical form, from the kernel's random source
+/// A random version 4 UUID in canonical form, from the system's random source
 fn uuid4() -> Result<String> {
     let mut b = [0u8; 16];
     fill_random(&mut b)?;
@@ -99,7 +94,12 @@ fn mkstemp(parent: &Path) -> Result<PathBuf> {
         const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789_";
         let name: String = b.iter().map(|v| ALPHABET[*v as usize % ALPHABET.len()] as char).collect();
         let path = parent.join(format!(".afv-{name}.partial"));
-        match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // owner-only, as mkstemp creates it; Windows files take their directory's access list instead
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&path) {
             Ok(_) => return Ok(path),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.into()),
@@ -130,12 +130,25 @@ impl Drop for TempGuard {
     }
 }
 
-/// Write `curves` (family 1 = V or 2 = H, tracing-space float32 x, y, z points) to `destination`
+/// One fibre for the export: its family (1 = V, 2 = H) and native float64 x, y, z points
+pub type Curve = (usize, Vec<[f64; 3]>);
+
+/// A finished curve's tracing-space float32 x, y, z points as native float64 coordinates,
+/// `points.astype("<f8") * 2 + 0.5 + origin`
+///
+/// `origin` is the native coordinate of the traced volume's first voxel: the crop origin, plus a tile's offset in
+/// the crop when a crop is traced in tiles
+pub fn tracing_to_native(points: &[[f32; 3]], origin: [f64; 3]) -> Vec<[f64; 3]> {
+    points.iter().map(|p| [0, 1, 2].map(|a| p[a] as f64 * 2.0 + 0.5 + origin[a])).collect()
+}
+
+/// Write `curves` (family 1 = V or 2 = H, native float64 x, y, z points from [`tracing_to_native`]) to
+/// `destination`
 ///
 /// Fibres are prepared on the current rayon pool while the calling thread inserts them in order
 pub fn export_afv<I>(curves: I, destination: &Path, opt: &ExportOptions) -> Result<Summary>
 where
-    I: IntoIterator<Item = Result<(usize, Vec<[f32; 3]>)>>,
+    I: IntoIterator<Item = Result<Curve>>,
     I::IntoIter: Send,
 {
     if destination.exists() {
@@ -147,7 +160,8 @@ where
     let temporary = mkstemp(&parent)?;
     let _guard = TempGuard(temporary.clone());
     let summary = write_db(curves, &temporary, opt)?;
-    File::open(&temporary)?.sync_all()?;
+    // opened for writing, since Windows flushes a file only through a handle that may write it
+    fs::OpenOptions::new().write(true).open(&temporary)?.sync_all()?;
     // a hard link publishes the complete file without overwriting a path that another process may
     // have created while tracing was running
     fs::hard_link(&temporary, destination).map_err(|e| eyre!("{}: {e}", destination.display()))?;
@@ -216,7 +230,7 @@ struct FiberRows {
 
 /// A batch of curves read from the input, and the input's error after them, if reading stopped on one
 struct Batch {
-    curves: Vec<(usize, Vec<[f32; 3]>)>,
+    curves: Vec<Curve>,
     error: Option<color_eyre::Report>,
 }
 
@@ -229,7 +243,7 @@ struct Rows {
 
 impl Batch {
     /// The next batch, or `None` once the input has nothing left
-    fn read(curves: &mut impl Iterator<Item = Result<(usize, Vec<[f32; 3]>)>>) -> Option<Self> {
+    fn read(curves: &mut impl Iterator<Item = Result<Curve>>) -> Option<Self> {
         let mut out = Vec::with_capacity(EXPORT_BATCH);
         let mut points = 0;
         for item in curves.by_ref() {
@@ -250,7 +264,6 @@ impl Batch {
 
 /// What the export computes from the options for every fibre
 struct Geometry {
-    origin: [f64; 3],
     limit: [f64; 3],
     voxel_um: f64,
     minimum_mm: f64,
@@ -265,10 +278,7 @@ struct Kept {
 }
 
 impl Geometry {
-    fn kept(&self, family: usize, points: &[[f32; 3]]) -> Result<Option<Kept>> {
-        // points.astype("<f8") * 2 + 0.5 + origin
-        let q: Vec<[f64; 3]> =
-            points.iter().map(|p| [0, 1, 2].map(|a| p[a] as f64 * 2.0 + 0.5 + self.origin[a])).collect();
+    fn kept(&self, family: usize, q: Vec<[f64; 3]>) -> Result<Option<Kept>> {
         let bad = q.iter().any(|p| (0..3).any(|a| !p[a].is_finite() || p[a] < 0.0 || p[a] >= self.limit[a]));
         if q.len() < 2 || bad {
             bail!("Spline contains invalid native coordinates");
@@ -296,13 +306,13 @@ impl Geometry {
 
     /// The rows of the input's next batch, numbered from `first`, or `None` once the input has nothing left. A
     /// batch can have no rows when all its fibres are too short; that does not end the input
-    fn next_rows(&self, curves: &mut impl Iterator<Item = Result<(usize, Vec<[f32; 3]>)>>, first: i64) -> Option<Rows> {
+    fn next_rows(&self, curves: &mut impl Iterator<Item = Result<Curve>>, first: i64) -> Option<Rows> {
         Batch::read(curves).map(|batch| self.rows(batch, first))
     }
 
     /// The rows of a batch's fibres, numbered from `first`, up to the batch's first error in input order
     fn rows(&self, batch: Batch, first: i64) -> Rows {
-        let kept: Vec<Result<Option<Kept>>> = batch.curves.par_iter().map(|(f, p)| self.kept(*f, p)).collect();
+        let kept: Vec<Result<Option<Kept>>> = batch.curves.into_par_iter().map(|(f, q)| self.kept(f, q)).collect();
         let mut numbered = Vec::with_capacity(kept.len());
         let mut error = batch.error;
         for k in kept {
@@ -347,7 +357,7 @@ fn fiber_rows(count: i64, k: Kept) -> FiberRows {
 
 fn write_db<I>(curves: I, path: &Path, opt: &ExportOptions) -> Result<Summary>
 where
-    I: IntoIterator<Item = Result<(usize, Vec<[f32; 3]>)>>,
+    I: IntoIterator<Item = Result<Curve>>,
     I::IntoIter: Send,
 {
     let mut db = Connection::open(path)?;
@@ -364,7 +374,6 @@ where
         }
     }
     let geometry = Geometry {
-        origin: opt.origin_xyz.map(|v| v as f64),
         limit: [opt.volume_shape[2], opt.volume_shape[1], opt.volume_shape[0]].map(|v| v as f64),
         voxel_um: opt.voxel_um,
         minimum_mm: opt.minimum_mm.value(),
@@ -480,7 +489,13 @@ mod tests {
         (1 + i % 2, vec![[0.0, 1.0 + i as f32, 1.0], [len, 1.0 + i as f32, 1.0]])
     }
 
+    /// A tracing-space curve as the export takes it, at [`options`]'s zero origin
+    fn native((family, points): (usize, Vec<[f32; 3]>)) -> Curve {
+        (family, tracing_to_native(&points, [0.0; 3]))
+    }
+
     fn export(curves: Vec<Result<(usize, Vec<[f32; 3]>)>>, name: &str) -> (PathBuf, Result<Summary>) {
+        let curves: Vec<Result<Curve>> = curves.into_iter().map(|c| c.map(native)).collect();
         let dir = std::env::temp_dir().join(format!("fibrs-afv-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let out = dir.join("out.afv");
@@ -582,7 +597,7 @@ mod tests {
         let mut i = 0;
         let curves = std::iter::from_fn(move || {
             i += 1;
-            (i != 2).then(|| Ok(curve(i)))
+            (i != 2).then(|| Ok(native(curve(i))))
         })
         .take(3);
         let dir = std::env::temp_dir().join(format!("fibrs-afv-none-{}", std::process::id()));

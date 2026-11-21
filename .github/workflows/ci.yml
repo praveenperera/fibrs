@@ -1,5 +1,5 @@
-# Formatting, clippy and the tests on Linux x86_64 and macOS arm64. package.yml builds and installs the wheels and
-# CLI archives
+# Formatting, clippy and the tests on Linux x86_64, macOS arm64 and Windows x86_64. package.yml builds and installs
+# the wheels and CLI archives
 
 name: CI
 
@@ -27,7 +27,8 @@ env:
 jobs:
   rust:
     name: Rust (${{ matrix.name }})
-    timeout-minutes: 30
+    # MSVC links the test binaries more slowly
+    timeout-minutes: ${{ matrix.os == 'windows-2025' && 45 || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -36,6 +37,9 @@ jobs:
             os: ubuntu-24.04
           - name: macOS arm64
             os: macos-26
+          # MSVC; CUDA loads at run time, so the build needs no toolkit
+          - name: Windows x86_64
+            os: windows-2025
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -61,8 +65,27 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      # the unit tests, every reader fixture in tests/fixtures/readers, and fibrs predict's plans, resume and
-      # argument checks against the Python reference's (tests/predict.rs)
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      # the tracer tests (tests/tile.rs) call dsyevd from numpy's OpenBLAS; scipy-openblas64 is the same build as a
+      # wheel of its own, for Linux, macOS and Windows alike (pyproject.toml). A Windows venv keeps its python in
+      # Scripts, and the path is written with / so that Git Bash and the binary both read it
+      - name: Install numpy's OpenBLAS
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv="${RUNNER_TEMP//\\//}/lapack"
+          uv venv -q "$venv"
+          python="$venv/bin/python"
+          if [ "$RUNNER_OS" = Windows ]; then python="$venv/Scripts/python.exe"; fi
+          uv pip install -q --python "$python" scipy-openblas64==0.3.31.188.0
+          lib="$(find "$venv" -name 'libscipy_openblas64_*' \( -name '*.so' -o -name '*.dylib' -o -name '*.dll' \) | head -1)"
+          test -n "$lib"
+          echo "FIBRS_LAPACK=$lib" >> "$GITHUB_ENV"
+
+      # the unit tests, every reader fixture in tests/fixtures/readers, fibrs predict's plans, resume and argument
+      # checks against the Python reference's (tests/predict.rs), and tiled tracing end to end (tests/tile.rs)
       - name: Tests
         run: cargo test --release --locked
 
@@ -84,7 +107,7 @@ jobs:
           ! grep -q 'panicked' predict.log
           test ! -e ci-pred/semantic
           if [ "$RUNNER_OS" = macOS ]; then
-            grep -q 'needs an NVIDIA GPU on Linux x86_64' predict.log
+            grep -q 'needs an NVIDIA GPU on Linux or Windows x86_64' predict.log
           else
             grep -q 'no NVIDIA driver found' predict.log
           fi

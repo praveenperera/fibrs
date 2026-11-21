@@ -178,7 +178,7 @@ impl Gpu {
     pub fn open(device: Option<usize>, stages: Stages) -> Result<Self> {
         // SAFETY: probing for the driver library has no preconditions; cudarc panics on first use without it
         if !unsafe { sys::is_culib_present() } {
-            bail!("no NVIDIA driver found (libcuda.so)");
+            bail!("no NVIDIA driver found ({})", super::DRIVER);
         }
         // cudarc loads each driver function on first call and panics when the driver lacks it, so an older driver
         // is turned away before any of them runs

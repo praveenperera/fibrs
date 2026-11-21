@@ -39,7 +39,7 @@ pub(crate) struct SlabLayout {
     pub planes: usize,
 }
 
-#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+#[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
 impl SlabLayout {
     /// The chunk grid, z, y, x
     pub fn chunks(&self) -> Shape {
@@ -234,7 +234,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
     /// occupy; one of each is always kept. Freed buffers the pool keeps for reuse are outside the budget
     pub fn new(pred: &'a Predictions, budget_bytes: usize, pools: &'p CachePools) -> Self {
         // whole Zarr chunks are the unit of reading; NPY input uses the reference's 64³ blocks
-        let edge = pred.chunk_shape().unwrap_or([64, 64, 64]);
+        let edge = pred.read_unit();
         // a chunk of one slab is decoded whole either way, and needs no cache of compressed chunks
         let sliced = pred.slab_layout().is_some_and(|e| e[0] > SLAB_PLANES && e[0].is_multiple_of(SLAB_PLANES))
             && pred.blocks_fit_planes(SLAB_PLANES);
@@ -279,7 +279,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
     }
 
     /// Where the cache's slabs lie
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub(crate) fn layout(&self) -> SlabLayout {
         SlabLayout { shape: self.pred.shape, edge: self.edge, planes: self.planes }
     }
@@ -287,7 +287,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
     /// Write slab `key`, decoded through the cache, into `out` as [`SlabLayout`] lays a slab out: V then H, each
     /// `planes × ey × ex` at the chunk's full extent, voxel z, y, x at `(z - lo_z) · ey · ex + (y - lo_y) · ex +
     /// (x - lo_x)`; voxels past the array's edge, which no sample reads, are zero
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub(crate) fn copy_slab(&self, key: SlabKey, out: &mut [u8]) -> Result<()> {
         let slab = self.slab(key)?;
         let [_, ey, ex] = self.edge;
@@ -316,14 +316,14 @@ impl<'a, 'p> NativeCache<'a, 'p> {
     }
 
     /// The predictions the cache reads
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub(crate) fn predictions(&self) -> &'a Predictions {
         self.pred
     }
 
     /// Chunk `key`'s compressed bytes through the cache of compressed chunks, for a decoder outside the cache (the
     /// GPU's); `None` when the cache decodes whole chunks, and so keeps no compressed ones
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub(crate) fn packed_chunk(&self, key: Shape) -> Option<Result<Arc<PackedChunk<&'p BufferPool>>>> {
         (self.planes != self.edge[0]).then(|| self.packed(key))
     }
@@ -777,6 +777,31 @@ mod tests {
         }
         // two slab decodes of the first chunk, one whole decode of the second
         assert_eq!(cache.decoded(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The cache over a crop, keyed by the crop's own chunks, reads the whole array's values at the crop's offset,
+    /// by slabs and by whole decodes alike
+    #[test]
+    fn a_cropped_cache_reads_the_array_at_the_crop_offset() {
+        let edge = 2 * SLAB_PLANES;
+        let n = edge * edge * edge;
+        let (dir, pred) = store("crop-cache", edge, &[2 * n, SLAB_PLANES * edge * edge, 2 * n]);
+        let crop = pred.crop([0, 0, edge], [edge, edge, 3 * edge]).unwrap();
+        let pools = CachePools::new();
+        let cache = slab_cache(&crop, &pools, 64 << 20);
+        let mut sampler = NativeSampler::new(&cache);
+        let shape = [edge, edge, 2 * edge];
+        let window = pred.read_u8([0, 0, edge], [edge, edge, 3 * edge]).unwrap();
+        let plane = shape.iter().product::<usize>();
+        for z in 0..shape[0] {
+            for y in 0..shape[1] {
+                for x in 0..shape[2] {
+                    let at = (z * shape[1] + y) * shape[2] + x;
+                    assert_eq!(sampler.value(z, y, x).unwrap(), [window[at], window[plane + at]], "{z} {y} {x}");
+                }
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

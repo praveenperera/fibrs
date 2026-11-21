@@ -8,7 +8,8 @@ use crate::stage1::{Arith, stage1};
 use crate::vol::{Shape, Vol};
 
 /// Tile edge and halo of the reference's centrality pass (prepare.py:148-150); the kernel clamps samples
-/// to its tile, so these are part of the output, not a tuning choice
+/// to its tile, so these are part of the output, not a tuning choice. A traced crop keeps the window's centrality
+/// only where its offset is a whole number of these tiles
 pub(crate) const TILE: usize = 128;
 pub(crate) const TILE_HALO: usize = 8;
 
@@ -45,7 +46,7 @@ impl Seed {
     }
 
     /// A seed from its packed form, `index << 8 | priority`, as the GPU kernels write it
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub(crate) fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
@@ -223,6 +224,24 @@ fn centrality_tile<A: Arith, D: DirField>(pres: &Presence, dirs: &D, start: Shap
     Some((start, inner, c, s))
 }
 
+/// Where a traced volume lies in the window whose seed order it keeps: its first voxel in the window and the
+/// window's shape, in tracing voxels
+///
+/// The catalogue groups seeds by 1024³ regions of the window, so a tile traced from a crop of the window orders the
+/// seeds it shares with the window by the same regions. A whole window is its own frame at offset zero
+#[derive(Clone, Copy, Debug)]
+pub struct RegionFrame {
+    pub offset: Shape,
+    pub window: Shape,
+}
+
+impl RegionFrame {
+    /// The frame of a volume traced whole
+    pub fn whole(shape: Shape) -> Self {
+        Self { offset: [0; 3], window: shape }
+    }
+}
+
 /// The seed catalogue: coordinates in tracing order, grouped by 1024³ region
 pub struct Catalogue {
     pub coords: Vec<[i32; 3]>,
@@ -233,12 +252,13 @@ pub struct Catalogue {
 }
 
 /// `prepare_seeds` (prepare.py:162): priority 2 then 1, each in descending centrality (reversed
-/// unstable argsort), then a stable sort by region
+/// unstable argsort), then a stable sort by region of `frame`'s window
 ///
 /// Each step runs on the pool and gives exactly the serial result: the splits and gathers keep their order,
 /// the argsort sorts disjoint partitions in parallel, and the stable sort by region is a counting sort
-pub fn catalogue(seeds: &[Seed], cent: &Vol<u16>) -> Catalogue {
+pub fn catalogue(seeds: &[Seed], cent: &Vol<u16>, frame: RegionFrame) -> Catalogue {
     let shape = cent.shape();
+    debug_assert!((0..3).all(|a| frame.offset[a] + shape[a] <= frame.window[a]), "{frame:?} does not hold {shape:?}");
     let of_priority =
         |p: u8| -> Vec<[i32; 3]> { seeds.par_iter().filter(|s| s.priority() == p).map(|s| s.coords(shape)).collect() };
     let by_priority = [of_priority(2), of_priority(1)];
@@ -250,9 +270,9 @@ pub fn catalogue(seeds: &[Seed], cent: &Vol<u16>) -> Catalogue {
         ordered.par_extend(order.par_iter().rev().map(|&i| raw[i]));
     }
     const REGION: usize = 1024;
-    let grid = shape.map(|n| n.div_ceil(REGION));
+    let grid = frame.window.map(|n| n.div_ceil(REGION));
     let key = |c: &[i32; 3]| {
-        let r = c.map(|v| v as usize / REGION);
+        let r = [0, 1, 2].map(|a| (c[a] as usize + frame.offset[a]) / REGION);
         (r[0] * grid[1] + r[1]) * grid[2] + r[2]
     };
     let keys: Vec<usize> = ordered.par_iter().map(key).collect();
@@ -348,7 +368,7 @@ mod tests {
             })
             .collect();
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
-        let pooled = pool.install(|| catalogue(&seeds, &cent));
+        let pooled = pool.install(|| catalogue(&seeds, &cent, RegionFrame::whole(cent.shape())));
         let serial = serial_catalogue(&seeds, &cent);
         assert!(pooled.coords == serial.coords);
         assert_eq!(pooled.starts, serial.starts);

@@ -104,7 +104,7 @@ impl<T: Voxel> Vol<T> {
     }
 
     /// The value every voxel outside an allocated sub-brick reads as
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub fn default_value(&self) -> T {
         self.default
     }
@@ -282,14 +282,14 @@ impl<T: Voxel> Vol<T> {
 
     /// Whether brick `bi` (C order over the brick grid) holds an allocated sub-brick; where it does not, every voxel
     /// reads as the default
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub fn has_brick(&self, bi: usize) -> bool {
         self.bricks[bi] != 0
     }
 
     /// Copy brick `bi` (C order over the brick grid) into `out` in brick order, C order over its 16³ voxels, with
     /// voxels past the volume's edge at the default
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub fn read_brick(&self, bi: usize, out: &mut [T; BRICK]) {
         for (s, &id) in self.table(bi).iter().enumerate() {
             let sub = self.sub(id);
@@ -305,7 +305,7 @@ impl<T: Voxel> Vol<T> {
 
     /// Replace brick `bi` with `data`, one brick's voxels in brick order; voxels past the volume's edge are ignored,
     /// and sub-bricks that would hold only the default are not allocated
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub fn set_brick(&mut self, bi: usize, data: &[T; BRICK]) {
         let dims = self.brick_dims(bi).1;
         let (mut tables, mut store) = (self.tables.run(), self.store.run());
@@ -320,7 +320,7 @@ impl<T: Voxel> Vol<T> {
     /// Each slot may be filled once and must still read as the default, as in [`Vol::fill_brick_rows`]. A slot given
     /// twice is a caller error: debug builds panic when both bricks hold a non-default voxel, and an all-default
     /// brick is skipped before the slot is checked
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub fn set_bricks<'a, I>(&mut self, bricks: I)
     where
         I: IndexedParallelIterator<Item = (usize, &'a [T; BRICK])>,
@@ -351,7 +351,7 @@ impl<T: Voxel> Vol<T> {
 
     /// Whether any voxel of brick `bi` (C order over the brick grid) that lies in an allocated sub-brick satisfies
     /// `f`; the brick's other voxels read as the default and are not tested
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub fn any_allocated_in_brick(&self, bi: usize, f: impl Fn(T) -> bool) -> bool {
         self.table(bi).iter().filter(|&&id| id != 0).any(|&id| self.sub(id).iter().any(|&v| f(v)))
     }

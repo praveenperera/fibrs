@@ -74,7 +74,7 @@ impl Lapack {
         }
         // SAFETY: loading a shared library runs its initializers; numpy's OpenBLAS is built to be loaded
         // into arbitrary processes
-        let lib = unsafe { Library::new(path) }.map_err(|e| eyre!("{}: {e}", path.display()))?;
+        let lib = unsafe { crate::pyenv::open_library(path) }.map_err(|e| eyre!("{}: {e}", path.display()))?;
         // SAFETY: the symbol has the reference LAPACK signature with 64-bit integers
         let dsyevd: Dsyevd = unsafe { *lib.get::<Dsyevd>(b"scipy_dsyevd_64_\0")? };
         let mut lapack = Lapack { _lib: lib, dsyevd, lwork: -1, liwork: -1 };
@@ -153,11 +153,11 @@ impl Lapack {
 }
 
 /// Find numpy's OpenBLAS: `FIBRS_LAPACK`, else the venv this executable was started from
-/// (`VENV/bin/avf-spline-generator`), else `$VIRTUAL_ENV`
+/// (`VENV/bin/avf-spline-generator`, or `VENV\Scripts\avf-spline-generator.exe` on Windows), else `$VIRTUAL_ENV`
 ///
-/// In each venv, numpy's bundled copy (`numpy.libs`, Linux wheels) comes first, then the `scipy-openblas64`
-/// package's, which is the same OpenBLAS build as a standalone wheel. macOS numpy wheels link Accelerate instead
-/// and bundle no OpenBLAS, so there the wheel of this tool depends on `scipy-openblas64`
+/// In each venv, numpy's bundled copy (`numpy.libs`, Linux and Windows wheels) comes first, then the
+/// `scipy-openblas64` package's, which is the same OpenBLAS build as a standalone wheel. macOS numpy wheels link
+/// Accelerate instead and bundle no OpenBLAS, so there the wheel of this tool depends on `scipy-openblas64`
 pub fn find_lapack() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("FIBRS_LAPACK") {
         return Ok(PathBuf::from(p));
@@ -170,17 +170,28 @@ pub fn find_lapack() -> Result<PathBuf> {
         }
     }
     bail!(
-        "cannot find numpy's OpenBLAS (numpy.libs/libscipy_openblas64_*.so, or the scipy-openblas64 package); \
-         install this executable into the venv's bin directory or set FIBRS_LAPACK"
+        "cannot find numpy's OpenBLAS (numpy.libs/libscipy_openblas64_*.{SUFFIX}, or the scipy-openblas64 \
+         package); install this executable into the venv's {BIN} directory or set FIBRS_LAPACK"
     )
 }
+
+/// The extension of the OpenBLAS a numpy wheel bundles on this system, for messages
+const SUFFIX: &str = if cfg!(windows) { "dll" } else { "so" };
+
+/// The venv directory that holds its executables
+const BIN: &str = if cfg!(windows) { "Scripts" } else { "bin" };
 
 /// The `libscipy_openblas64_*` shared library in `dir`, if there is one
 fn openblas_in(dir: &Path) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     entries.flatten().map(|e| e.path()).find(|path| {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        name.starts_with("libscipy_openblas64_") && (name.ends_with(".so") || name.ends_with(".dylib"))
+        let shared = if cfg!(windows) {
+            name.to_ascii_lowercase().ends_with(".dll")
+        } else {
+            name.ends_with(".so") || name.ends_with(".dylib")
+        };
+        name.starts_with("libscipy_openblas64_") && shared
     })
 }
 

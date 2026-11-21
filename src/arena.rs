@@ -361,11 +361,12 @@ impl<T: Voxel, const N: usize> Drop for BrickRun<'_, T, N> {
 impl<T: Voxel, const N: usize> Drop for BrickStore<T, N> {
     fn drop(&mut self) {
         // SAFETY: the range was reserved by `reserve` with this length, and no brick outlives the store
-        unsafe { libc::munmap(self.base.as_ptr().cast(), self.capacity * N * size_of::<T>()) };
+        unsafe { release(self.base.cast(), self.capacity * N * size_of::<T>()) };
     }
 }
 
 /// An inaccessible private anonymous range of `bytes`, which costs address space only
+#[cfg(unix)]
 fn reserve(bytes: usize) -> NonNull<u8> {
     // SAFETY: a fresh private anonymous mapping aliases nothing
     let ptr = unsafe {
@@ -384,12 +385,59 @@ fn reserve(bytes: usize) -> NonNull<u8> {
     NonNull::new(ptr.cast()).expect("mmap never returns address zero on success")
 }
 
+/// A reserved region of `bytes`, which costs address space only until parts of it are committed
+#[cfg(windows)]
+fn reserve(bytes: usize) -> NonNull<u8> {
+    use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc};
+
+    // SAFETY: a fresh region at an address of the system's choosing aliases nothing
+    let ptr = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE, PAGE_NOACCESS) };
+    NonNull::new(ptr.cast())
+        .unwrap_or_else(|| handle_alloc_error(Layout::from_size_align(bytes, 4096).expect("a range is a valid layout")))
+}
+
 /// Open `bytes` of a reserved range for reading and writing; its pages stay zero until written
+#[cfg(unix)]
 fn open(at: NonNull<u8>, bytes: usize) {
     // SAFETY: the caller passes a part of a range `reserve` made, which nothing else maps
     if unsafe { libc::mprotect(at.as_ptr().cast(), bytes, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
         handle_alloc_error(Layout::from_size_align(bytes, 4096).expect("a segment is a valid layout"));
     }
+}
+
+/// Commit `bytes` of a reserved region for reading and writing; its pages stay zero until written. Windows backs a
+/// committed page with memory only once it is touched, as Linux does, but counts all of it against the commit limit
+/// (RAM plus the page file) at once
+#[cfg(windows)]
+fn open(at: NonNull<u8>, bytes: usize) {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+
+    // SAFETY: the caller passes a part of a region `reserve` made, which nothing else uses
+    if unsafe { VirtualAlloc(at.as_ptr().cast(), bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+        handle_alloc_error(Layout::from_size_align(bytes, 4096).expect("a segment is a valid layout"));
+    }
+}
+
+/// Unmaps a range [`reserve`] made
+///
+/// # Safety
+///
+/// `base` and `bytes` are one range's, and nothing reads or writes it afterwards
+#[cfg(unix)]
+unsafe fn release(base: NonNull<u8>, bytes: usize) {
+    unsafe { libc::munmap(base.as_ptr().cast(), bytes) };
+}
+
+/// Releases a region [`reserve`] made, committed parts and all; `VirtualFree` takes the whole region, so no length
+///
+/// # Safety
+///
+/// `base` is one region's, and nothing reads or writes it afterwards
+#[cfg(windows)]
+unsafe fn release(base: NonNull<u8>, _bytes: usize) {
+    use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+
+    unsafe { VirtualFree(base.as_ptr().cast(), 0, MEM_RELEASE) };
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
-# Builds and checks the fibrs wheels and CLI archives on every push and pull request, and publishes them from a
-# version tag
+# Builds and checks the fibrs wheels, CLI archives and crate on every push and pull request, and publishes them from
+# a version tag
 #
 # To release:
 #   1. set the version in Cargo.toml (pyproject.toml takes it from there)
@@ -9,11 +9,15 @@
 #        git tag vX.Y.Z
 #        git push origin vX.Y.Z
 #
-# The tag waits for a reviewer of the pypi environment, then publishes the wheels to PyPI and makes a GitHub release
-# with the tag's CHANGELOG.md entry as its notes and the wheels, CLI archives and SHA256SUMS-* files attached. PyPI
-# trusts this workflow and its environment through OIDC, so no token is stored. A tag whose version or changelog
-# entry is wrong fails before anything is published, and every publish skips what is already uploaded, so
-# "Re-run failed jobs" finishes a partial release. Third-party actions are pinned to commit SHAs, since these jobs
+# The tag waits for a reviewer of the pypi environment, then publishes the wheels to PyPI, makes a GitHub release
+# with the tag's CHANGELOG.md entry as its notes and the wheels, CLI archives and SHA256SUMS-* files attached, and
+# then, when the repository variable CRATES_IO_PUBLISH is "true", publishes the crate to crates.io, where
+# cargo-binstall finds the release's CLI archives through [package.metadata.binstall] in Cargo.toml. The variable is
+# unset by default: a crates.io publish can't be undone, and it needs crates.io's trusted publisher for this
+# workflow and its crates-io environment set up first. PyPI and crates.io trust this workflow and its environments
+# through OIDC, so no token is stored; crates.io's trusted publishing can't create a crate, so its first version
+# (0.4.0) was published by hand. The crate jobs gate only the crates.io publish, never PyPI or the GitHub release. A tag whose version or changelog entry is wrong fails before anything is published, and every
+# publish skips what is already uploaded, so "Re-run failed jobs" finishes a partial release. Third-party actions are pinned to commit SHAs, since these jobs
 # build and publish the release files; the trailing comment names the version
 
 name: Package
@@ -43,10 +47,11 @@ env:
 
 jobs:
   # one wheel per platform with the binary as its script, the CLI archive made from that wheel's binary, and both
-  # installed and run. The Linux wheel links glibc 2.28 through zig; the macOS wheel keeps the arm64 floor of 11.0
+  # installed and run. The Linux wheel links glibc 2.28 through zig; the macOS wheel keeps the arm64 floor of 11.0;
+  # the Windows wheel links the C runtime statically, so the binary runs without the Visual C++ redistributable
   wheels:
     name: Wheel and CLI (${{ matrix.name }})
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -61,9 +66,16 @@ jobs:
             target: aarch64-apple-darwin
             build: ""
             tag: macosx_11_0_arm64
+          # RUSTFLAGS replaces the target's own flags rather than adding to them, so this leg spells out its full set
+          - name: Windows x86_64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            build: ""
+            tag: win_amd64
+            rustflags: -D warnings -C target-feature=+crt-static
     runs-on: ${{ matrix.os }}
     env:
-      RUSTFLAGS: -D warnings
+      RUSTFLAGS: ${{ matrix.rustflags || '-D warnings' }}
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -90,8 +102,15 @@ jobs:
           # shellcheck disable=SC2086
           uvx --from "$from" maturin build --release --locked --target "$TARGET" $BUILD --out dist
           ls dist/*-${{ matrix.tag }}.whl
-          # no SBOM ([tool.maturin.sbom] in pyproject.toml), and the README, NOTICE and every licence text inside
-          unzip -Z1 dist/*.whl | tee members.txt
+          # no SBOM ([tool.maturin.sbom] in pyproject.toml), and the README, NOTICE and every licence text inside.
+          # Git Bash has no unzip, so Windows lists the members with Python, writing bytes to keep LF line ends
+          if [ "$RUNNER_OS" = Windows ]; then
+            python -I -c 'import sys, zipfile; sys.stdout.buffer.write("".join(n + "\n" for n in zipfile.ZipFile(sys.argv[1]).namelist()).encode())' \
+              dist/*.whl > members.txt
+          else
+            unzip -Z1 dist/*.whl > members.txt
+          fi
+          cat members.txt
           if grep -q '/sboms/' members.txt; then echo "the wheel carries an SBOM" >&2; exit 1; fi
           for f in LICENSE NOTICE licenses/apache-2.0.txt licenses/numpy.txt licenses/nvidia-gpu-kernels.txt; do
             grep -q "dist-info/licenses/$f\$" members.txt
@@ -101,12 +120,36 @@ jobs:
         shell: bash
         run: scripts/release-archive.sh dist "${{ matrix.target }}"
 
+      # with the C runtime linked in, the shipped binary imports only system DLLs that every Windows has; a
+      # vcruntime140.dll, ucrtbase.dll or api-ms-win-crt-* import would need the Visual C++ redistributable. The
+      # CUDA, cuDNN, cuBLAS, nvCOMP and OpenBLAS libraries load at run time, so none of them is an import either
+      - name: Check the Windows binary's imports
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup component add llvm-tools
+          readobj="$(find "$(rustc --print sysroot)" -name llvm-readobj.exe | head -1)"
+          test -n "$readobj"
+          archive="$(ls dist/fibrs-*-x86_64-pc-windows-msvc.zip)"
+          member="$(basename "$archive" .zip)/fibrs.exe"
+          python -I -c 'import sys, zipfile; sys.stdout.buffer.write(zipfile.ZipFile(sys.argv[1]).read(sys.argv[2]))' \
+            "$archive" "$member" > "$RUNNER_TEMP/fibrs.exe"
+          "$readobj" --coff-imports "$RUNNER_TEMP/fibrs.exe" | tr -d '\r' | sed -n 's/^ *Name: //p' | sort -u | tee imports.txt
+          test -s imports.txt
+          allowed='^(kernel32|ntdll|advapi32|bcrypt|bcryptprimitives|ws2_32|userenv|secur32|crypt32|ole32|oleaut32|shell32|user32|psapi|synchronization|api-ms-win-core-[a-z0-9-]+)\.dll$'
+          if grep -viE "$allowed" imports.txt; then
+            echo "fibrs.exe imports a DLL outside the system set above" >&2
+            exit 1
+          fi
+
       # the wheel on the oldest and a current CPython, then the drop-in into a venv with the original installed from
       # its tagged source, so VENV/bin/avf-spline-generator runs the binary. The synthetic fixture is traced through
       # the drop-in and through python -m fibrs, and both must write what the original wrote for it
       # (tests/fixtures/synthetic/reference.afv). So must the drop-in tracing no seed ahead of the commit point
       # (FIBRS_DEBUG_WINDOW=1), and tracing every seed traced ahead again (FIBRS_DEBUG_RETRACE=1); --restore must
-      # leave the wheel's fibrs in place
+      # leave the wheel's fibrs in place. A Windows venv keeps its executables, named with .exe, in Scripts, and
+      # the paths are written with / so that Git Bash and the binaries both read them
       - name: Install the wheel and the drop-in, and trace the fixture
         shell: bash
         working-directory: ${{ runner.temp }}
@@ -115,46 +158,60 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
+          dist="${DIST//\\//}" workspace="${GITHUB_WORKSPACE//\\//}"
+          bin=bin exe=''
+          if [ "$RUNNER_OS" = Windows ]; then bin=Scripts exe=.exe; fi
+          # run as fibrs, the binary prints the crate's version; run as the drop-in avf-spline-generator, 0.2.0
+          crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$workspace/Cargo.toml" | head -1)"
           for python in 3.9 3.13; do
+            venv="venv-$python/$bin"
             uv venv -q --python "$python" "venv-$python"
-            uv pip install -q --python "venv-$python/bin/python" "$DIST"/fibrs-*.whl
-            test "$("venv-$python/bin/fibrs" --version)" = 0.2.0
-            test "$("venv-$python/bin/python" -m fibrs --version)" = 0.2.0
-            "venv-$python/bin/python" -I -c 'import fibrs; print(fibrs.binary())'
+            uv pip install -q --python "$venv/python$exe" "$dist"/fibrs-*.whl
+            test "$("$venv/fibrs$exe" --version)" = "$crate_version"
+            test "$("$venv/python$exe" -m fibrs --version)" = "$crate_version"
+            "$venv/python$exe" -I -c 'import fibrs; print(fibrs.binary())'
           done
           # fibrs predict through the installed wheel: its command line, and a dry run of a fixture's plan (the
-          # runners have no GPU). On Linux the predict extra (cuDNN and cuBLAS from pip) must resolve; elsewhere a
-          # real run must refuse with the platform it needs
-          fixture="$GITHUB_WORKSPACE/tests/fixtures/predict"
-          venv-3.13/bin/fibrs predict --help > /dev/null
-          venv-3.13/bin/python -m fibrs predict --help > /dev/null
-          venv-3.13/bin/fibrs predict --dry-run --ct "$fixture/band.zarr" --z0 4 --z1 36 --column 192 --batch 3 \
+          # runners have no GPU). On Linux and Windows the predict extra (cuDNN and cuBLAS from pip) must resolve to
+          # NVIDIA's wheels; on macOS a real run must refuse with the platforms it needs
+          fixture="$workspace/tests/fixtures/predict"
+          venv="venv-3.13/$bin"
+          "$venv/fibrs$exe" predict --help > /dev/null
+          "$venv/python$exe" -m fibrs predict --help > /dev/null
+          "$venv/fibrs$exe" predict --dry-run --ct "$fixture/band.zarr" --z0 4 --z1 36 --column 192 --batch 3 \
             --model-dir "$fixture" --out predict-dry | tail -1
-          whl="$(ls "$DIST"/fibrs-*.whl)"
-          if [ "$RUNNER_OS" = Linux ]; then
-            uv pip install --dry-run --python venv-3.13/bin/python "fibrs[predict] @ file://$whl"
+          whl="$(ls "$dist"/fibrs-*.whl)"
+          if [ "$RUNNER_OS" != macOS ]; then
+            uv pip install --dry-run --python "$venv/python$exe" "fibrs[predict] @ file:///${whl#/}" 2>&1 | tee extra.txt
+            grep -q nvidia-cudnn-cu12 extra.txt
+            grep -q nvidia-cublas-cu12 extra.txt
           else
             mkdir -p model
             touch model/model.py model/plans.json model/dataset.json model/checkpoint_final.pth
-            if venv-3.13/bin/fibrs predict --ct "$fixture/band.zarr" --z0 4 --z1 36 --model-dir model \
+            if "$venv/fibrs" predict --ct "$fixture/band.zarr" --z0 4 --z1 36 --model-dir model \
               --out predict-out 2> refused.txt; then
               echo "fibrs predict ran without a GPU engine" >&2; exit 1
             fi
-            grep -q "needs an NVIDIA GPU on Linux x86_64" refused.txt
+            grep -q "needs an NVIDIA GPU on Linux or Windows x86_64" refused.txt
           fi
+          ref="venv-ref/$bin"
           uv venv -q --python 3.12 venv-ref
-          uv pip install -q --python venv-ref/bin/python numpy==2.4.6 scipy==1.18.1 numba==0.64.0 llvmlite==0.46.0 \
+          uv pip install -q --python "$ref/python$exe" numpy==2.4.6 scipy==1.18.1 numba==0.64.0 llvmlite==0.46.0 \
             zarr==2.18.7 numcodecs==0.15.2 \
             "avf-spline-generator @ git+https://github.com/Qualzz/AVF_SPLINE_GENERATOR@bee798f72751169065fe020d4ad02c52519c2d2b"
-          uv pip install -q --python venv-ref/bin/python "$DIST"/fibrs-*.whl
-          tar -xzf "$DIST"/fibrs-*-"$TARGET".tar.gz
-          bash fibrs-*-"$TARGET"/scripts/install-dropin.sh venv-ref fibrs-*-"$TARGET"/fibrs
-          test -e venv-ref/bin/avf-spline-generator.reference
-          test "$(venv-ref/bin/avf-spline-generator --version)" = 0.2.0
-          fixture="$GITHUB_WORKSPACE/tests/fixtures/synthetic"
-          for entry in "venv-ref/bin/avf-spline-generator" "venv-ref/bin/python -m fibrs" \
-            "env FIBRS_DEBUG_WINDOW=1 venv-ref/bin/avf-spline-generator" \
-            "env FIBRS_DEBUG_RETRACE=1 venv-ref/bin/avf-spline-generator"; do
+          uv pip install -q --python "$ref/python$exe" "$dist"/fibrs-*.whl
+          if [ -n "$exe" ]; then
+            python -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall()' "$dist"/fibrs-*-"$TARGET".zip
+          else
+            tar -xzf "$dist"/fibrs-*-"$TARGET".tar.gz
+          fi
+          bash fibrs-*-"$TARGET"/scripts/install-dropin.sh venv-ref fibrs-*-"$TARGET"/fibrs$exe
+          test -e "$ref/avf-spline-generator.reference$exe"
+          test "$("$ref/avf-spline-generator$exe" --version)" = 0.2.0
+          fixture="$workspace/tests/fixtures/synthetic"
+          for entry in "$ref/avf-spline-generator$exe" "$ref/python$exe -m fibrs" \
+            "env FIBRS_DEBUG_WINDOW=1 $ref/avf-spline-generator$exe" \
+            "env FIBRS_DEBUG_RETRACE=1 $ref/avf-spline-generator$exe"; do
             rm -rf trace
             # the macOS runners have 3 cores, and --threads can't exceed the core count; the output doesn't
             # depend on it
@@ -162,12 +219,12 @@ jobs:
             $entry --predictions "$fixture/predictions.zarr" --array semantic --channel-order VH \
               --tracing-predictions "$fixture/predictions.zarr" --tracing-array tracing --voxel-size-um 9.362 \
               --storage compressed --device cpu --threads 2 --output trace/fibers.afv --work-dir trace/work
-            venv-ref/bin/python -I "$GITHUB_WORKSPACE/scripts/compare_afv.py" trace/fibers.afv "$fixture/reference.afv"
+            "$ref/python$exe" -I "$workspace/scripts/compare_afv.py" trace/fibers.afv "$fixture/reference.afv"
           done
           bash fibrs-*-"$TARGET"/scripts/install-dropin.sh --restore venv-ref
-          venv-ref/bin/avf-spline-generator --version
-          test "$(venv-ref/bin/fibrs --version)" = 0.2.0
-          test "$(venv-ref/bin/python -m fibrs --version)" = 0.2.0
+          "$ref/avf-spline-generator$exe" --version
+          test "$("$ref/fibrs$exe" --version)" = "$crate_version"
+          test "$("$ref/python$exe" -m fibrs --version)" = "$crate_version"
 
       - name: Upload the wheel and CLI archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -176,7 +233,67 @@ jobs:
           path: |
             dist/*.whl
             dist/*.tar.gz
+            dist/*.zip
             dist/SHA256SUMS-*
+
+  # the crate as crates.io would receive it: packaged from the include list in Cargo.toml and built from the
+  # unpacked archive with its Cargo.lock, so a file the build needs but the list leaves out fails here
+  crate:
+    name: Crate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Package the crate
+        run: cargo package --locked
+
+      - name: Check the crate size
+        shell: bash
+        run: |
+          set -euo pipefail
+          # crates.io rejects uploads over 10 MiB unless it has raised the crate's limit
+          limit=$((10 * 1024 * 1024))
+          crate="$(find target/package -maxdepth 1 -name 'fibrs-*.crate' -print -quit)"
+          test -n "$crate"
+          size="$(stat -c %s "$crate")"
+          echo "$(basename "$crate"): $size bytes, $(tar -tzf "$crate" | grep -vc '/$') files"
+          test "$size" -le "$limit"
+
+      # the rest of what cargo publish checks before an upload; the package step already built it
+      - name: Check the upload
+        run: cargo publish --dry-run --no-verify --locked
+
+  # cargo-binstall downloads the archive [package.metadata.binstall] names, so the name and binary path the template
+  # renders to for each target must be what the wheels job built
+  binstall:
+    name: Binstall metadata
+    needs: wheels
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Download the CLI archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check the archives against the binstall metadata
+        run: scripts/check-binstall.sh dist
 
   # the tag must name the version Cargo.toml carries, and CHANGELOG.md needs a dated entry for it, which becomes
   # the GitHub release notes
@@ -241,8 +358,8 @@ jobs:
           mkdir dist
           mv all/*.whl dist/
           ls -la dist
-          # the Linux and macOS wheels; the source is this repository, so no sdist
-          test "$(find dist -type f | wc -l)" -eq 2
+          # the Linux, macOS and Windows wheels; the source is this repository, so no sdist
+          test "$(find dist -type f | wc -l)" -eq 3
           for file in dist/*; do
             case "$(basename "$file")" in
               "fibrs-${version}"-*.whl) ;;
@@ -328,3 +445,59 @@ jobs:
           fi
           echo "marking $GITHUB_REF_NAME latest: $latest"
           gh release edit "$GITHUB_REF_NAME" --draft=false --latest="$latest" --repo "$GITHUB_REPOSITORY"
+
+  # after the GitHub release, and only once the URLs the binstall metadata names serve its CLI archives, so a crate
+  # version cargo-binstall finds always has them to download; a release published by hand skips the upload above.
+  # It runs only when CRATES_IO_PUBLISH is "true"; otherwise the job is skipped and the tag's run still passes. A
+  # version already on crates.io is skipped, so a rerun passes without publishing again
+  crates-publish:
+    name: Publish to crates.io
+    if: vars.CRATES_IO_PUBLISH == 'true'
+    needs: [github-release, crate, binstall]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/fibrs
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Check the crate matches the tag and crates.io lacks it
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[0].version')"
+          test "v$version" = "$GITHUB_REF_NAME"
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -A 'fibrs-release (github.com/praveenperera/fibrs)' \
+            "https://crates.io/api/v1/crates/fibrs/$version")"
+          case "$status" in
+            200) echo "fibrs $version is already on crates.io"; echo "publish=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "crates.io answered HTTP $status" >&2; exit 1 ;;
+          esac
+
+      - name: Check the release serves the CLI archives
+        if: steps.version.outputs.publish == 'true'
+        run: scripts/check-binstall.sh --download
+
+      - name: Get a crates.io token
+        if: steps.version.outputs.publish == 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
+      - name: Publish
+        if: steps.version.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked
