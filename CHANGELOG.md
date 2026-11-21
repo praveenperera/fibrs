@@ -18,6 +18,14 @@
   space, source path and provenance. Fibres and joined chains of zero length are dropped and counted. On
   PHerc1545's 42 bands it writes the same `.afv` as `join.py` in half the time. See
   [Joining Z bands](README.md#joining-z-bands).
+- **The tracer runs without transparent huge pages.** On Linux with glibc the tracer's mimalloc no longer asks for
+  transparent huge pages, and asks Linux to disable them for its process and any child process it starts, unless
+  `MIMALLOC_ALLOW_THP=1` is set. On a host with THP set to `madvise`, most of those requests fell back to small
+  pages after the kernel had tried to compact memory. On a dense 1024-plane window of PHerc0358 with
+  `--device cuda --threads 8`, the tracer took about 103 s instead of 114–134 s, with the same `.afv` and less than
+  half the kernel time. A host with THP set to `never` for every page size (`enabled` and each
+  `hugepages-*kB/enabled` under `/sys/kernel/mm/transparent_hugepage`) gives mimalloc no huge pages either way; one
+  set to `always` has not been measured. `fibrs predict` is unchanged.
 
 ## [0.4.1] - 2026-11-20
 
