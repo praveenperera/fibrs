@@ -385,7 +385,7 @@ pub fn direction_field(tracing: &[Vol<u8>; 2], lapack: &Lapack, form: DirForm) -
     Ok(dirs)
 }
 
-/// Most freed tile buffers the direction field keeps for reuse, the bound the README states: one tile's buffers
+/// Most freed tile buffers the direction field keeps for reuse, one tile's buffers
 /// per thread up to 12 threads
 const TILE_POOL_RETAIN: usize = 128 << 20;
 

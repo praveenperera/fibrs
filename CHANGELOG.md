@@ -4,6 +4,19 @@
 
 ### What's new
 
+- The tracer stores its fields in 4³ sub-bricks within each 16³ brick, allocating only the sub-bricks that hold
+  data, so dense windows need less memory and write the same `.afv`. On PHerc0358's densest 1,024-plane window
+  with `--threads 8` and `--field-cache-mib 4096`, the peak fell from 20.6 GiB to 14.1 GiB with the same CPU time,
+  and on a 512-plane band of PHerc0826 with `--threads 4`, from 9.1 GiB to 7.1 GiB. No option or default changed.
+
+## [0.4.2] - 2026-11-21
+
+fibrs 0.4.2 builds, tests and ships on Windows x86-64, joins a scroll's Z-band traces into one `.afv` with
+`fibrs join`, and runs the tracer's mimalloc without transparent huge pages, which cut a dense PHerc0358 window
+from 114–134 s to about 103 s.
+
+### What's new
+
 - **Windows x86-64.** fibrs builds, tests and ships on Windows: a `win_amd64` wheel on PyPI, and a
   `fibrs-<version>-x86_64-pc-windows-msvc.zip` CLI archive holding `fibrs.exe`, which `cargo binstall fibrs`
   installs and which needs no Visual C++ redistributable. The tracer finds numpy's OpenBLAS in a Windows venv's
@@ -17,7 +30,7 @@
   `join.py` rule. A manifest lists each band's `.afv`, core planes and window planes, plus the output's coordinate
   space, source path and provenance. Fibres and joined chains of zero length are dropped and counted. On
   PHerc1545's 42 bands it writes the same `.afv` as `join.py` in half the time. See
-  [Joining Z bands](README.md#joining-z-bands).
+  [Joining Z bands](README.md#join-z-bands).
 - **The tracer runs without transparent huge pages.** On Linux with glibc the tracer's mimalloc no longer asks for
   transparent huge pages, and asks Linux to disable them for its process and any child process it starts, unless
   `MIMALLOC_ALLOW_THP=1` is set. On a host with THP set to `madvise`, most of those requests fell back to small
@@ -26,10 +39,13 @@
   half the kernel time. A host with THP set to `never` for every page size (`enabled` and each
   `hugepages-*kB/enabled` under `/sys/kernel/mm/transparent_hugepage`) gives mimalloc no huge pages either way; one
   set to `always` has not been measured. `fibrs predict` is unchanged.
-- The tracer stores its fields in 4³ sub-bricks within each 16³ brick, allocating only the sub-bricks that hold
-  data, so dense windows need less memory and write the same `.afv`. On PHerc0358's densest 1,024-plane window
-  with `--threads 8` and `--field-cache-mib 4096`, the peak fell from 20.6 GiB to 14.1 GiB with the same CPU time,
-  and on a 512-plane band of PHerc0826 with `--threads 4`, from 9.1 GiB to 7.1 GiB. No option or default changed.
+
+### Upgrading
+
+- 0.4.2 doesn't resume a tracer work directory that 0.4.1 started, finished or not, so a `--resume` that only
+  writes the `.afv` again needs 0.4.1 too. Finish a run with the binary that started it, or start a new work
+  directory. A `fibrs predict` output that 0.4.1 started, in band or villa mode, is refused on resume as well, as
+  it is by any other binary; finish it with 0.4.1 or write a new `--out`.
 
 ## [0.4.1] - 2026-11-20
 
@@ -49,7 +65,7 @@ fibrs' own version.
   their `run.json` are unchanged. See [Tiled tracing](README.md#tiled-tracing).
 - **Install with cargo.** fibrs is on crates.io from 0.4.0: `cargo binstall fibrs` installs the release's prebuilt
   CLI binary on Linux x86-64 and Apple silicon, and `cargo install fibrs --locked` builds it from source. See
-  [With cargo](README.md#with-cargo).
+  [With cargo](docs/install.md#cargo).
 - **`fibrs predict` reuses its buffers across a run.** Readers read each tile into a recycled buffer, the engine
   hands batches back already sized for the next one, and the writer keeps one chunk buffer and one compress buffer
   for the whole run, overwriting a chunk a column covers completely instead of zeroing it first. Once a column is
@@ -460,6 +476,7 @@ The first release.
   Python module, and a CLI archive for each with `scripts/install-dropin.sh`
 - `--version` prints `0.2.0`, the original's version, as a drop-in has to
 
+[0.4.2]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.2
 [0.4.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.1
 [0.4.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.0
 [0.3.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.3.1
