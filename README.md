@@ -512,7 +512,8 @@ cuDNN or cuBLAS is found in the executable's directory, System32, each absolute 
 `%CUDA_PATH%\bin\x64` and `%CUDA_PATH%\bin`, never in the current directory: the binary takes the current
 directory and `PATH` out of Windows' default DLL search when it starts, and loads each library by full path (see
 volkit's `dll` module). A newer cuBLAS is never picked up by mistake there, as each CUDA release installs its DLLs
-under names that carry the major version (`cublas64_13.dll`).
+under names that carry the major version (`cublas64_13.dll`). The driver is looked up by name before it is pinned to
+System32, so a stray `nvcuda.dll` or `cuda.dll` beside `fibrs.exe` is opened first: keep none there.
 
 cuDNN's convolution algorithms are timed on the first run and cached under `~/.cache` (`%LOCALAPPDATA%` on Windows;
 see volkit's documentation for the cache variables). They set the rounding, so the provenance
