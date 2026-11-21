@@ -305,8 +305,9 @@ fn an_output_in_use_by_another_run_is_refused() {
     let run = predict(&[&args[..], &["--out", out.to_str().unwrap()]].concat());
     assert_eq!(run.status.code(), Some(1));
     assert!(text(&run).contains("is in use by another fibrs predict run"), "{}", text(&run));
-    assert_eq!(fs::read_to_string(out.join("attempts.jsonl")).unwrap(), "");
+    // Windows locks are mandatory, so the file is read once the lock is released
     drop(held);
+    assert_eq!(fs::read_to_string(out.join("attempts.jsonl")).unwrap(), "");
 }
 
 #[test]
@@ -325,8 +326,11 @@ fn an_output_that_overlaps_the_ct_is_refused() {
     }
     let before: Vec<_> = fs::read_dir(&ct).unwrap().map(|e| e.unwrap().file_name()).collect();
     let dir = ct.parent().unwrap();
-    std::os::unix::fs::symlink(&ct, dir.join("link.zarr")).unwrap();
-    std::os::unix::fs::symlink(dir.join("gone"), dir.join("broken")).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&ct, dir.join("link.zarr")).unwrap();
+        std::os::unix::fs::symlink(dir.join("gone"), dir.join("broken")).unwrap();
+    }
     fs::write(dir.join("done.txt"), "").unwrap();
     let args = ["--ct", ct.to_str().unwrap(), "--z0", "0", "--z1", "8", "--model-dir", model.to_str().unwrap()];
     let refused = |out: PathBuf, why: &str| {
@@ -339,14 +343,18 @@ fn an_output_that_overlaps_the_ct_is_refused() {
     for out in [ct.clone(), ct.join("pred.zarr"), dir.to_path_buf(), ct.join("../band.zarr")] {
         refused(out, "overlaps --ct");
     }
-    for out in [dir.join("link.zarr"), dir.join("link.zarr/pred.zarr")] {
-        refused(out, "overlaps --ct");
+    // a path the system would not open is refused, whatever it would name lexically. Windows resolves `..`
+    // lexically before it opens a path, so there these name what they read as
+    #[cfg(unix)]
+    {
+        for out in [dir.join("link.zarr"), dir.join("link.zarr/pred.zarr")] {
+            refused(out, "overlaps --ct");
+        }
+        refused(dir.join("broken/../pred.zarr"), "which does not resolve");
+        refused(dir.join("done.txt/../pred.zarr"), "steps through");
+        refused(dir.join("missing/../pred.zarr"), "uses .. after");
+        refused(ct.join("0.0.0/../../pred.zarr"), "uses .. after");
     }
-    // a path the system would not open is refused, whatever it would name lexically
-    refused(dir.join("broken/../pred.zarr"), "which does not resolve");
-    refused(dir.join("done.txt/../pred.zarr"), "steps through");
-    refused(dir.join("missing/../pred.zarr"), "uses .. after");
-    refused(ct.join("0.0.0/../../pred.zarr"), "uses .. after");
 
     let after: Vec<_> = fs::read_dir(&ct).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(before, after);

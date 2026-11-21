@@ -39,7 +39,7 @@ pub(crate) struct SlabLayout {
     pub planes: usize,
 }
 
-#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+#[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
 impl SlabLayout {
     /// The chunk grid, z, y, x
     pub fn chunks(&self) -> Shape {
@@ -279,7 +279,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
     }
 
     /// Where the cache's slabs lie
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub(crate) fn layout(&self) -> SlabLayout {
         SlabLayout { shape: self.pred.shape, edge: self.edge, planes: self.planes }
     }
@@ -287,7 +287,7 @@ impl<'a, 'p> NativeCache<'a, 'p> {
     /// Write slab `key`, decoded through the cache, into `out` as [`SlabLayout`] lays a slab out: V then H, each
     /// `planes × ey × ex` at the chunk's full extent, voxel z, y, x at `(z - lo_z) · ey · ex + (y - lo_y) · ex +
     /// (x - lo_x)`; voxels past the array's edge, which no sample reads, are zero
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub(crate) fn copy_slab(&self, key: SlabKey, out: &mut [u8]) -> Result<()> {
         let slab = self.slab(key)?;
         let [_, ey, ex] = self.edge;
@@ -316,14 +316,14 @@ impl<'a, 'p> NativeCache<'a, 'p> {
     }
 
     /// The predictions the cache reads
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub(crate) fn predictions(&self) -> &'a Predictions {
         self.pred
     }
 
     /// Chunk `key`'s compressed bytes through the cache of compressed chunks, for a decoder outside the cache (the
     /// GPU's); `None` when the cache decodes whole chunks, and so keeps no compressed ones
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub(crate) fn packed_chunk(&self, key: Shape) -> Option<Result<Arc<PackedChunk<&'p BufferPool>>>> {
         (self.planes != self.edge[0]).then(|| self.packed(key))
     }

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### What's new
+
+- **Windows x86-64.** fibrs builds, tests and ships on Windows: a `win_amd64` wheel on PyPI, and a
+  `fibrs-<version>-x86_64-pc-windows-msvc.zip` CLI archive holding `fibrs.exe`, which `cargo binstall fibrs`
+  installs and which needs no Visual C++ redistributable. The tracer finds numpy's OpenBLAS in a Windows venv's
+  `Lib\site-packages`, `scripts/install-dropin.sh` installs the drop-in into one from Git Bash, and CI checks that
+  the tracer writes the original's `.afv` for the synthetic fixture there. `fibrs predict` and `--device cuda` are
+  built on Windows too and load the driver, cuDNN and cuBLAS from their Windows DLLs, including the
+  `fibrs[predict]` pip copies; they have not yet run on a Windows machine with an NVIDIA GPU. See
+  [Install](README.md#install).
+
 ## [0.4.1] - 2026-11-20
 
 fibrs 0.4.1 can trace a wide window as Y-X tiles, so a run's peak memory follows its densest tile instead of the

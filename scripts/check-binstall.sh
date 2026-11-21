@@ -9,11 +9,11 @@
 #
 #   scripts/check-binstall.sh [ARCHIVE_DIR | --download]
 #
-# Needs cargo, jq and tar, and curl for --download
+# Needs cargo, jq, tar and unzip, and curl for --download
 set -euo pipefail
 
 # the targets package.yml builds; cargo-binstall falls back to a source build anywhere else
-targets=(x86_64-unknown-linux-gnu aarch64-apple-darwin)
+targets=(x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc)
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dir="${1:-}"
@@ -46,7 +46,7 @@ render() {
     -e "s|\{ *version *\}|$version|g" \
     -e "s|\{ *target *\}|$target|g" \
     -e "s|\{ *archive-suffix *\}|$suffix|g" \
-    -e "s|\{ *binary-ext *\}||g" \
+    -e "s|\{ *binary-ext *\}|$binary_ext|g" \
     -e "s|\{ *bin *\}|$bin|g" \
     -e "s|\{ *repo *\}|$repo|g" <<< "$1")"
   if [[ "$out" == *"{"* ]]; then
@@ -58,12 +58,15 @@ render() {
 
 expected=()
 for target in "${targets[@]}"; do
+  # release-archive.sh builds a zip for Windows and a tgz for the rest, and cargo-binstall gives a Windows
+  # binary its .exe
   fmt="$(field "$target" pkg-fmt)"
-  if [ "$fmt" != tgz ]; then
-    echo "$target: release-archive.sh builds only tgz archives, not $fmt" >&2
-    exit 1
-  fi
-  suffix=.tar.gz
+  case "$target:$fmt" in
+    *-windows-*:zip) suffix=.zip binary_ext=.exe ;;
+    *-windows-*:*) echo "$target: release-archive.sh builds a zip for Windows, not $fmt" >&2; exit 1 ;;
+    *:tgz) suffix=.tar.gz binary_ext='' ;;
+    *) echo "$target: release-archive.sh builds only tgz archives here, not $fmt" >&2; exit 1 ;;
+  esac
 
   url="$(render "$(field "$target" pkg-url)")"
   path="$(render "$(field "$target" bin-dir)")"
@@ -86,7 +89,11 @@ for target in "${targets[@]}"; do
     exit 1
   fi
 
-  entries="$(tar -tzf "$dir/$archive")"
+  if [ "$suffix" = .zip ]; then
+    entries="$(unzip -Z1 "$dir/$archive")"
+  else
+    entries="$(tar -tzf "$dir/$archive")"
+  fi
   if ! grep -Fxq "$path" <<< "$entries"; then
     echo "$archive has no $path; it holds:" >&2
     echo "$entries" >&2
@@ -97,7 +104,7 @@ done
 if $download; then
   echo "every released CLI archive matches the binstall metadata"
 elif [ -n "$dir" ]; then
-  found="$(find "$dir" -type f -name '*.tar.gz' -exec basename {} \; | sort)"
+  found="$(find "$dir" -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec basename {} \; | sort)"
   want="$(printf '%s\n' "${expected[@]}" | sort)"
   if [ "$found" != "$want" ]; then
     echo "$dir holds"$'\n'"$found"$'\n'"but the binstall metadata names"$'\n'"$want" >&2
