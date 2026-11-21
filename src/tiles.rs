@@ -6,9 +6,7 @@
 //! crop lies on whole chunks of both prediction arrays and on the window's 2× pooling and centrality grids. The
 //! tiles' fibres are then cut to their cores and joined across the seams ([`crate::seams`]) as they are exported
 
-use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
-use std::vec::IntoIter;
+use std::path::Path;
 
 use color_eyre::eyre::{Result, bail};
 use serde_json::{Value, json};
@@ -16,9 +14,8 @@ use serde_json::{Value, json};
 use crate::afv::{Curve, tracing_to_native};
 use crate::fields;
 use crate::input::Predictions;
-use crate::log;
 use crate::run::{CurveReader, gcd};
-use crate::seams::{CoreBox, Cut, Face, Point, RADIUS, Run, cut, join};
+use crate::seams::{CoreBox, Face, FamilySeams, Point, RADIUS, Reports};
 
 /// Native voxels of the Y and X extent: `lo..hi`
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,12 +173,20 @@ impl Tiling {
     }
 }
 
-/// A tile's curves as the export reads them
-struct TileCurves {
-    dir: PathBuf,
-    core: CoreBox,
+/// A tile's fibres of one family in native coordinates, read back from its work directory
+struct TileFibres {
+    reader: CurveReader,
     /// The native coordinate of the tile's first voxel, x, y, z, for [`tracing_to_native`]
     origin: [f64; 3],
+}
+
+impl Iterator for TileFibres {
+    type Item = Result<Vec<Point>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.reader.next()?;
+        Some(item.map(|(_, points)| tracing_to_native(&points, self.origin)))
+    }
 }
 
 /// The export's curves for a tiled trace, in the order an untiled trace writes them: family by family, every tile's
@@ -196,119 +201,21 @@ pub fn seam_curves<'a>(
     origin_xyz: [i64; 3],
 ) -> impl Iterator<Item = Result<Curve>> + 'a {
     let interior = tiling.interior(origin_xyz);
+    // the tiled trace logs each family's counts; nothing else reads them
+    let reports = Reports::default();
     families.iter().flat_map(move |&family| {
-        let tiles: VecDeque<TileCurves> = tiling
-            .tiles()
-            .iter()
-            .map(|t| TileCurves {
-                dir: work.join(t.name()),
-                core: tiling.core_box(t, origin_xyz),
-                origin: [
-                    (origin_xyz[0] + t.traced[1].lo as i64) as f64,
-                    (origin_xyz[1] + t.traced[0].lo as i64) as f64,
-                    origin_xyz[2] as f64,
-                ],
-            })
-            .collect();
-        FamilySeams {
-            family,
-            tiles,
-            reading: None,
-            interior: interior.clone(),
-            ready: VecDeque::new(),
-            uncut: 0,
-            cut: Vec::new(),
-            chains: None,
-        }
+        let pieces = tiling.tiles().into_iter().map(move |t| {
+            let core = tiling.core_box(&t, origin_xyz);
+            let origin = [
+                (origin_xyz[0] + t.traced[1].lo as i64) as f64,
+                (origin_xyz[1] + t.traced[0].lo as i64) as f64,
+                origin_xyz[2] as f64,
+            ];
+            let reader = CurveReader::open(&work.join(t.name()), family)?;
+            Ok((core, TileFibres { reader, origin }))
+        });
+        FamilySeams::new(family, pieces, interior.clone(), RADIUS, reports.clone())
     })
-}
-
-/// One family's part of [`seam_curves`]
-struct FamilySeams {
-    family: usize,
-    /// Tiles not yet read
-    tiles: VecDeque<TileCurves>,
-    /// The tile being read
-    reading: Option<(CurveReader, TileCurves)>,
-    interior: Vec<Face>,
-    /// Uncut fibres and runs of the curve read last, in fibre order
-    ready: VecDeque<Vec<Point>>,
-    uncut: usize,
-    /// Runs cut onto an interior face, held for the join
-    cut: Vec<Run>,
-    /// The joined chains, once every tile is read
-    chains: Option<IntoIter<Curve>>,
-}
-
-impl FamilySeams {
-    /// Read and cut the next curve, open the next tile, or join once every tile is read
-    fn advance(&mut self) -> Result<()> {
-        if self.reading.is_none() {
-            let Some(tile) = self.tiles.pop_front() else {
-                self.join();
-                return Ok(());
-            };
-            self.reading = Some((CurveReader::open(&tile.dir, self.family)?, tile));
-        }
-
-        let (reader, tile) = self.reading.as_mut().expect("a tile is open");
-        let Some(item) = reader.next() else {
-            self.reading = None;
-            return Ok(());
-        };
-        let (_, points) = item?;
-        let points = tracing_to_native(&points, tile.origin);
-        let runs = match cut(points, self.family, &tile.core, &self.interior) {
-            Cut::Whole(points) => {
-                self.ready.push_back(points);
-                return Ok(());
-            }
-            Cut::Runs(runs) => runs,
-        };
-        for run in runs {
-            if run.is_cut() {
-                self.cut.push(run);
-            } else {
-                self.ready.push_back(run.points);
-            }
-        }
-        Ok(())
-    }
-
-    fn join(&mut self) {
-        let (chains, s) = join(std::mem::take(&mut self.cut), RADIUS);
-        let label = if self.family == 1 { "V" } else { "H" };
-        log!(
-            "{label} seams: {} uncut fibres, {} cut runs with {} cut ends, {} joins, {} joined fibres",
-            self.uncut,
-            s.cut_runs,
-            s.cut_ends,
-            s.joins,
-            s.chains
-        );
-        self.chains = Some(chains.into_iter());
-    }
-}
-
-impl Iterator for FamilySeams {
-    type Item = Result<Curve>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(points) = self.ready.pop_front() {
-                self.uncut += 1;
-                return Some(Ok((self.family, points)));
-            }
-            if let Some(chains) = self.chains.as_mut() {
-                return chains.next().map(Ok);
-            }
-            if let Err(e) = self.advance() {
-                // nothing follows an error
-                self.chains = Some(Vec::new().into_iter());
-                return Some(Err(e));
-            }
-        }
-    }
 }
 
 #[cfg(test)]
