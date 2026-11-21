@@ -81,7 +81,7 @@ unsafe impl GlobalAlloc for Dispatch {
 /// a dense PHerc0358 window cost the tracer about a sixth of its wall time and more than doubled its kernel time.
 /// Off, mimalloc also asks Linux to disable THP for the whole process with `PR_SET_THP_DISABLE`, unless the process
 /// already has a THP-disable mode, exactly as `MIMALLOC_ALLOW_THP=0` does. `fibrs predict` runs on the system
-/// allocator and keeps the host's setting
+/// allocator and keeps mimalloc's own default, which `MIMALLOC_ALLOW_THP` can still change for its process
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod thp {
     use libmimalloc_sys::{_mi_option_last, mi_option_set_default, mi_option_t};
