@@ -375,6 +375,12 @@ fn write_replacing(path: &Path, text: &str) -> Result<()> {
     // ever removes a file this call made; written through the handle that created it, never reopened by name
     let (temporary, mut file) = mkstemp(dir, Access::Umask)?;
     let _guard = TempGuard(temporary.clone());
+    // stats that replace a file keep its access, as a write in place would
+    if let Ok(existing) = fs::symlink_metadata(path)
+        && existing.is_file()
+    {
+        file.set_permissions(existing.permissions()).map_err(fail)?;
+    }
     file.write_all(text.as_bytes()).map_err(fail)?;
     // closed first, since Windows renames no file that is open
     drop(file);
