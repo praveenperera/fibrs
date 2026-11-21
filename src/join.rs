@@ -31,7 +31,7 @@ use color_eyre::eyre::{Result, bail, eyre};
 use serde_json::{Map, Value, json};
 
 use crate::afv::read::{AfvReader, Frame};
-use crate::afv::{Collection, ExportOptions, MinLength, export_afv};
+use crate::afv::{ClosingChecks, Collection, ExportOptions, MinLength, export_afv};
 use crate::log;
 use crate::pyfmt::py_json_indent;
 use crate::seams::{CoreBox, Face, FamilyReport, FamilySeams, Point, RADIUS, Reports};
@@ -62,6 +62,10 @@ pub struct Args {
     /// Threads preparing the output's rows; 0 = one per core
     #[arg(long, default_value_t = 0)]
     threads: usize,
+    /// Skip the output's closing SQLite checks (integrity_check, foreign_key_check, rtreecheck); the caller must
+    /// then run them on the output itself
+    #[arg(long)]
+    skip_closing_checks: bool,
 }
 
 /// Whether `argv` asks for `fibrs join`; the drop-in `avf-spline-generator` has no subcommands
@@ -303,6 +307,7 @@ fn run(args: &Args) -> Result<()> {
             source_path: manifest.source_path.as_deref(),
             provenance: manifest.provenance.as_ref(),
         }),
+        closing_checks: if args.skip_closing_checks { ClosingChecks::Skip } else { ClosingChecks::Run },
     };
     let pool = rayon::ThreadPoolBuilder::new().num_threads(args.threads).build()?;
     let summary = pool.install(|| export_afv(curves, &args.output, &opt))?;

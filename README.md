@@ -217,6 +217,8 @@ from, `[z0, z1)`:
   space and the file's totals. The output and the stats must be two files, neither of them an input.
 - **Memory.** The join holds one family's pieces that end on a plane, plus up to three bands' fibres of that family:
   the band being cut, the next one, read ahead on its own thread, and the one after it being read.
+- **Closing checks.** `--skip-closing-checks` skips the SQLite checks the output gets before it is closed
+  (`integrity_check`, `foreign_key_check` and `rtreecheck` on `block_bounds`); the caller must then run them itself.
 - **Speed.** On PHerc1545's 42 bands (34.6 GiB), `fibrs join` writes the same fibres, blocks and metadata as
   `join.py` in 13 minutes at 5.6 GiB of memory, against 26 minutes for `join.py` on the same machine. About six of
   its minutes are SQLite's closing `integrity_check`, which `join.py` also runs.
