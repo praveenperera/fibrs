@@ -3,7 +3,9 @@
 //! Every stored value matches the reference: the schema text (SQLite keeps it verbatim in
 //! `sqlite_master`), the metadata JSON with Python's float repr and key order, the fibre rows, the
 //! little-endian float64 blocks and the R*Tree rows. Only the per-run uuid and SQLite's page layout
-//! differ, so outputs are compared table by table rather than by file hash
+//! differ, so outputs are compared table by table rather than by file hash. [`read`] reads a complete file back
+
+pub mod read;
 
 use std::fs;
 #[cfg(unix)]
@@ -38,6 +40,18 @@ pub struct ExportOptions<'a> {
     /// `--min-length-mm`; the reference stores the untouched default as the integer 0
     pub minimum_mm: MinLength,
     pub coordinate_space: Option<&'a str>,
+    /// For a collection joined from several traces, the public sets' layout and keys; `None` for one trace
+    pub collection: Option<Collection<'a>>,
+}
+
+/// The metadata of a collection joined from several traces, laid out as the public sets (PHerc1447_1mm_v2) and the
+/// v2-run join lay it out: the coordinate space first in the frame and the root, the volume's source path after the
+/// frame's keys in the root, and how the fibres were made under its own `provenance` key, left out when empty
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Collection<'a> {
+    /// The volume's zarr URL (`vc_open_data_source_path`)
+    pub source_path: Option<&'a str>,
+    pub provenance: Option<&'a Map<String, Value>>,
 }
 
 /// `--min-length-mm` as argparse leaves it: the integer default or a parsed float
@@ -86,8 +100,18 @@ fn uuid4() -> Result<String> {
     Ok(format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..]))
 }
 
-/// `tempfile.mkstemp(prefix=".afv-", suffix=".partial", dir=parent)`: an exclusively created, empty file
-fn mkstemp(parent: &Path) -> Result<PathBuf> {
+/// Who may read a file published from a temporary one
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Access {
+    /// The owner only, as `tempfile.mkstemp` creates it, which the reference's .afv keeps
+    Owner,
+    /// Whoever the process's umask allows, as a plain write gives the v2 run's JSON sidecar
+    Umask,
+}
+
+/// `tempfile.mkstemp(prefix=".afv-", suffix=".partial", dir=parent)`: an exclusively created, empty file and its
+/// handle
+pub(crate) fn mkstemp(parent: &Path, access: Access) -> Result<(PathBuf, fs::File)> {
     for _ in 0..100 {
         let mut b = [0u8; 6];
         fill_random(&mut b)?;
@@ -96,11 +120,15 @@ fn mkstemp(parent: &Path) -> Result<PathBuf> {
         let path = parent.join(format!(".afv-{name}.partial"));
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
-        // owner-only, as mkstemp creates it; Windows files take their directory's access list instead
         #[cfg(unix)]
-        options.mode(0o600);
+        if access == Access::Owner {
+            options.mode(0o600);
+        }
+        // Windows files take their directory's access list instead
+        #[cfg(not(unix))]
+        let _ = access;
         match options.open(&path) {
-            Ok(_) => return Ok(path),
+            Ok(file) => return Ok((path, file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.into()),
         }
@@ -122,7 +150,7 @@ fn bounds(q: &[[f64; 3]]) -> [f64; 6] {
 }
 
 /// Removes the temporary file however the export ends, as the reference's `finally` does
-struct TempGuard(PathBuf);
+pub(crate) struct TempGuard(pub(crate) PathBuf);
 
 impl Drop for TempGuard {
     fn drop(&mut self) {
@@ -157,7 +185,7 @@ where
     let parent = destination.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let parent = if parent.as_os_str().is_empty() { PathBuf::from(".") } else { parent };
     fs::create_dir_all(&parent)?;
-    let temporary = mkstemp(&parent)?;
+    let (temporary, _) = mkstemp(&parent, Access::Owner)?;
     let _guard = TempGuard(temporary.clone());
     let summary = write_db(curves, &temporary, opt)?;
     // opened for writing, since Windows flushes a file only through a handle that may write it
@@ -169,19 +197,28 @@ where
 }
 
 fn metadata(opt: &ExportOptions) -> Result<Vec<(&'static str, Value)>> {
+    let space = opt.coordinate_space.filter(|s| !s.is_empty());
     let mut frame = Map::new();
+    // afv.py puts the coordinate space last in the frame; the public sets put it first
+    if let Some(space) = space.filter(|_| opt.collection.is_some()) {
+        frame.insert("vc_open_data_coordinate_space".into(), json!(space));
+    }
     frame.insert("coordinate_base_shape_zyx".into(), json!(opt.volume_shape));
     frame.insert("vc_open_data_source_coordinate_level".into(), json!(0));
     frame.insert("vc_open_data_source_coordinate_scale_factor".into(), json!(1));
     frame.insert("vc_open_data_source_original_resolution".into(), json!(opt.voxel_um));
-    if let Some(space) = opt.coordinate_space.filter(|s| !s.is_empty()) {
+    if let Some(space) = space.filter(|_| opt.collection.is_none()) {
         frame.insert("vc_open_data_coordinate_space".into(), json!(space));
     }
+    let collection = opt.collection.unwrap_or_default();
     let mut root = Map::new();
     root.insert("type".into(), json!("vc3d_fiber_collection"));
     root.insert("version".into(), json!(1));
     root.insert("scale".into(), json!(1));
     root.extend(frame.clone());
+    if let Some(source) = collection.source_path {
+        root.insert("vc_open_data_source_path".into(), json!(source));
+    }
     root.insert("coordinate_order".into(), json!("XYZ"));
     root.insert("coordinate_units".into(), json!("voxel"));
     root.insert("voxel_size_mm".into(), json!(opt.voxel_um / 1000.0));
@@ -192,7 +229,7 @@ fn metadata(opt: &ExportOptions) -> Result<Vec<(&'static str, Value)>> {
     tracing.insert("minimum_length_mm".into(), opt.minimum_mm.json());
     tracing.insert("family_locked".into(), json!(true));
     tracing.insert("ct_exterior_filter".into(), json!(false));
-    Ok(vec![
+    let mut rows = vec![
         ("complete", json!(false)),
         ("uuid", json!(uuid4()?)),
         ("root", Value::Object(root)),
@@ -201,7 +238,11 @@ fn metadata(opt: &ExportOptions) -> Result<Vec<(&'static str, Value)>> {
         ("block_segments", json!(256)),
         ("source", json!("AVF_SPLINE_GENERATOR")),
         ("tracing", Value::Object(tracing)),
-    ])
+    ];
+    if let Some(provenance) = collection.provenance.filter(|p| !p.is_empty()) {
+        rows.push(("provenance", Value::Object(provenance.clone())));
+    }
+    Ok(rows)
 }
 
 /// Curves prepared at a time: the pool makes one batch's rows while the calling thread inserts the batch before
@@ -479,6 +520,7 @@ mod tests {
             volume_shape: [64, 1 << 16, 1 << 16],
             minimum_mm: MinLength::Given(0.01),
             coordinate_space: None,
+            collection: None,
         }
     }
 

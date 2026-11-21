@@ -12,6 +12,12 @@
   built on Windows too and load the driver, cuDNN and cuBLAS from their Windows DLLs, including the
   `fibrs[predict]` pip copies; they have not yet run on a Windows machine with an NVIDIA GPU. See
   [Install](README.md#install).
+- **`fibrs join`.** Joins a scroll's Z-band traces into one `.afv`: each band's fibres are cut to its core planes
+  and the cut ends joined across the planes between adjoining cores, by the tiled-tracing seam rule, the v2-run
+  `join.py` rule. A manifest lists each band's `.afv`, core planes and window planes, plus the output's coordinate
+  space, source path and provenance. Fibres and joined chains of zero length are dropped and counted. On
+  PHerc1545's 42 bands it writes the same `.afv` as `join.py` in half the time. See
+  [Joining Z bands](README.md#joining-z-bands).
 
 ## [0.4.1] - 2026-11-20
 
