@@ -42,16 +42,6 @@ pub struct ExportOptions<'a> {
     pub coordinate_space: Option<&'a str>,
     /// For a collection joined from several traces, the public sets' layout and keys; `None` for one trace
     pub collection: Option<Collection<'a>>,
-    /// Whether to check the finished file with SQLite's integrity, foreign key and R*Tree checks before closing it
-    pub closing_checks: ClosingChecks,
-}
-
-/// The finished file's SQLite checks: on for every run, and left to the caller only when it says it runs them
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClosingChecks {
-    Run,
-    /// The caller checks the file itself; on a whole scroll the checks take about half the join's time
-    Skip,
 }
 
 /// The metadata of a collection joined from several traces, laid out as the public sets (PHerc1447_1mm_v2) and the
@@ -484,9 +474,7 @@ where
         }
     }
     tx.commit()?;
-    if opt.closing_checks == ClosingChecks::Run {
-        check(&db)?;
-    }
+    check(&db)?;
     db.close().map_err(|(_, e)| e)?;
     Ok(s)
 }
@@ -519,7 +507,6 @@ mod tests {
             minimum_mm: MinLength::Given(0.01),
             coordinate_space: None,
             collection: None,
-            closing_checks: ClosingChecks::Run,
         }
     }
 

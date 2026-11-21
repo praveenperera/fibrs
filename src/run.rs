@@ -21,7 +21,7 @@ use rayon::prelude::*;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::afv::{ClosingChecks, Curve, ExportOptions, MinLength, Summary, export_afv, tracing_to_native};
+use crate::afv::{Curve, ExportOptions, MinLength, Summary, export_afv, tracing_to_native};
 use crate::axes::{Lapack, direction_field, find_lapack};
 use crate::fields::{FamilyFields, Presence, RegionFrame, Seed, catalogue, centrality};
 use crate::finish::{CachePools, FinishCtx, NativeCache, NativeSampler};
@@ -683,7 +683,6 @@ pub fn run(args: Args) -> Result<Summary> {
         minimum_mm: min_mm,
         coordinate_space: args.coordinate_space.as_deref(),
         collection: None,
-        closing_checks: ClosingChecks::Run,
     };
     let summary = pool.install(|| export_afv(curves, &args.output, &opt))?;
     log!("Export: {:.1} s", started.elapsed().as_secs_f64());
