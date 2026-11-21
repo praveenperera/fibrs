@@ -21,6 +21,7 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread;
@@ -31,7 +32,7 @@ use color_eyre::eyre::{Result, bail, eyre};
 use serde_json::{Map, Value, json};
 
 use crate::afv::read::{AfvReader, Frame};
-use crate::afv::{Collection, ExportOptions, MinLength, TempGuard, export_afv, mkstemp};
+use crate::afv::{Access, Collection, ExportOptions, MinLength, TempGuard, export_afv, mkstemp};
 use crate::log;
 use crate::pyfmt::py_json_indent;
 use crate::seams::{CoreBox, Face, FamilyReport, FamilySeams, Point, RADIUS, Reports};
@@ -371,10 +372,12 @@ fn write_replacing(path: &Path, text: &str) -> Result<()> {
     let fail = |e: std::io::Error| eyre!("{}: {e}", path.display());
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     // a short name of the writer's own, created exclusively, so a long stats name still fits and the cleanup only
-    // ever removes a file this call made
-    let temporary = mkstemp(dir)?;
+    // ever removes a file this call made; written through the handle that created it, never reopened by name
+    let (temporary, mut file) = mkstemp(dir, Access::Umask)?;
     let _guard = TempGuard(temporary.clone());
-    fs::write(&temporary, text).map_err(fail)?;
+    file.write_all(text.as_bytes()).map_err(fail)?;
+    // closed first, since Windows renames no file that is open
+    drop(file);
     fs::rename(&temporary, path).map_err(fail)
 }
 

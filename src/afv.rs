@@ -100,8 +100,18 @@ fn uuid4() -> Result<String> {
     Ok(format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..]))
 }
 
-/// `tempfile.mkstemp(prefix=".afv-", suffix=".partial", dir=parent)`: an exclusively created, empty file
-pub(crate) fn mkstemp(parent: &Path) -> Result<PathBuf> {
+/// Who may read a file published from a temporary one
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Access {
+    /// The owner only, as `tempfile.mkstemp` creates it, which the reference's .afv keeps
+    Owner,
+    /// Whoever the process's umask allows, as a plain write gives the v2 run's JSON sidecar
+    Umask,
+}
+
+/// `tempfile.mkstemp(prefix=".afv-", suffix=".partial", dir=parent)`: an exclusively created, empty file and its
+/// handle
+pub(crate) fn mkstemp(parent: &Path, access: Access) -> Result<(PathBuf, fs::File)> {
     for _ in 0..100 {
         let mut b = [0u8; 6];
         fill_random(&mut b)?;
@@ -110,11 +120,15 @@ pub(crate) fn mkstemp(parent: &Path) -> Result<PathBuf> {
         let path = parent.join(format!(".afv-{name}.partial"));
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
-        // owner-only, as mkstemp creates it; Windows files take their directory's access list instead
         #[cfg(unix)]
-        options.mode(0o600);
+        if access == Access::Owner {
+            options.mode(0o600);
+        }
+        // Windows files take their directory's access list instead
+        #[cfg(not(unix))]
+        let _ = access;
         match options.open(&path) {
-            Ok(_) => return Ok(path),
+            Ok(file) => return Ok((path, file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.into()),
         }
@@ -171,7 +185,7 @@ where
     let parent = destination.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let parent = if parent.as_os_str().is_empty() { PathBuf::from(".") } else { parent };
     fs::create_dir_all(&parent)?;
-    let temporary = mkstemp(&parent)?;
+    let (temporary, _) = mkstemp(&parent, Access::Owner)?;
     let _guard = TempGuard(temporary.clone());
     let summary = write_db(curves, &temporary, opt)?;
     // opened for writing, since Windows flushes a file only through a handle that may write it
