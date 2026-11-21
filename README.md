@@ -17,7 +17,7 @@ write.
 
 Whole-scroll fibre sets traced with fibrs are published at
 [praveenperera/afv-v2-fibers](https://huggingface.co/datasets/praveenperera/afv-v2-fibers), one `.afv` per
-scroll (CC BY-NC 4.0). They are unreviewed model output.
+scroll (CC BY-NC 4.0).
 
 ## Speed
 
