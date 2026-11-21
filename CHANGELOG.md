@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## [0.4.2] - 2026-11-20
+
+fibrs 0.4.2 builds, tests and ships on Windows x86-64, joins a scroll's Z-band traces into one `.afv` with
+`fibrs join`, and runs the tracer's mimalloc without transparent huge pages, which cut a dense PHerc0358 window
+from 114–134 s to about 103 s.
 
 ### What's new
 
@@ -26,6 +30,13 @@
   half the kernel time. A host with THP set to `never` for every page size (`enabled` and each
   `hugepages-*kB/enabled` under `/sys/kernel/mm/transparent_hugepage`) gives mimalloc no huge pages either way; one
   set to `always` has not been measured. `fibrs predict` is unchanged.
+
+### Upgrading
+
+- 0.4.2 doesn't resume a tracer work directory that 0.4.1 started, finished or not, so a `--resume` that only
+  writes the `.afv` again needs 0.4.1 too. Finish a run with the binary that started it, or start a new work
+  directory. A `fibrs predict` output that 0.4.1 started, in band or villa mode, is refused on resume as well, as
+  it is by any other binary; finish it with 0.4.1 or write a new `--out`.
 
 ## [0.4.1] - 2026-11-20
 
@@ -456,6 +467,7 @@ The first release.
   Python module, and a CLI archive for each with `scripts/install-dropin.sh`
 - `--version` prints `0.2.0`, the original's version, as a drop-in has to
 
+[0.4.2]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.2
 [0.4.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.1
 [0.4.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.0
 [0.3.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.3.1
