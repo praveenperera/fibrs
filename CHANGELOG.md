@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.4.2] - 2026-11-20
+## [0.4.2] - 2026-11-21
 
 fibrs 0.4.2 builds, tests and ships on Windows x86-64, joins a scroll's Z-band traces into one `.afv` with
 `fibrs join`, and runs the tracer's mimalloc without transparent huge pages, which cut a dense PHerc0358 window
