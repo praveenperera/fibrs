@@ -9,11 +9,23 @@
 //! the corner; halojoin cuts across one axis only and never meets it. At each interior face, a cut end from a core
 //! below the face and one from a core above it that shares the face with it (not one meeting it only at a corner),
 //! of the same family and at most [`RADIUS`] voxels apart, are joined: shortest first (ties by run and end), each end
-//! once, and a join that would close a loop is skipped. Runs of fewer than two points are dropped. Nothing depends on
-//! hash order, so the same runs always give the same chains
+//! once, and a join that would close a loop is skipped. Runs of fewer than two points are dropped, and so is a fibre
+//! or joined chain of zero length (every point one point), as when a fibre's only point in a core lies on an interior
+//! face and both its crossings land on that point. Nothing depends on hash order, so the same runs always give the
+//! same chains
+//!
+//! [`FamilySeams`] streams one family's fibres through the cut and the join for the export, from the pieces a trace
+//! was made in: a window's Y-X tiles ([`crate::tiles`]) or a scroll's Z bands ([`crate::join`])
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::vec::IntoIter;
+
+use color_eyre::eyre::Result;
+
+use crate::afv::Curve;
+use crate::log;
 
 /// Native voxels within which two cut ends are joined: halojoin's radius for the HF PHerc sets and v2-run
 pub const RADIUS: f64 = 1.5;
@@ -321,6 +333,155 @@ pub fn join(runs: Vec<Run>, radius: f64) -> (Vec<(usize, Vec<Point>)>, JoinStats
     let cut_ends = runs.iter().map(|r| r.head.is_some() as usize + r.tail.is_some() as usize).sum();
     let stats = JoinStats { cut_runs: n, cut_ends, joins, chains: chains.len() };
     (chains, stats)
+}
+
+/// Whether every point of `points` is the same point, so the curve has zero length (join.py's `is_point`)
+fn is_point(points: &[Point]) -> bool {
+    points.iter().all(|p| *p == points[0])
+}
+
+/// What one family's cut and join gave, with join.py's counts
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FamilyReport {
+    /// 1 = V, 2 = H
+    pub family: usize,
+    /// Fibres and runs written as they were, with no cut end
+    pub uncut: usize,
+    pub join: JoinStats,
+    /// Uncut fibres or runs of zero length, dropped
+    pub zero_length_uncut: usize,
+    /// Joined chains of zero length, dropped
+    pub zero_length_chains: usize,
+}
+
+impl FamilyReport {
+    /// The fibres written: the uncut ones and the chains of nonzero length
+    pub fn fibres(&self) -> usize {
+        self.uncut + self.join.chains - self.zero_length_chains
+    }
+}
+
+/// Where each family's [`FamilyReport`] goes once its cut runs are joined
+pub type Reports = Arc<Mutex<Vec<FamilyReport>>>;
+
+/// One family's curves for the export, from the pieces a trace was made in, each a core and the family's fibres
+/// in native coordinates: every piece's uncut fibres in piece order, then the chains its cut runs join into
+///
+/// Fibres are read and cut one at a time, and only the family's cut runs are held, so the export holds no more
+/// than the runs that end on an interior face. A piece is opened only once the one before it is read
+pub struct FamilySeams<I, F> {
+    family: usize,
+    /// Pieces not yet opened
+    pieces: I,
+    /// The piece being read
+    reading: Option<(CoreBox, F)>,
+    interior: Vec<Face>,
+    radius: f64,
+    /// Uncut fibres and runs of the fibre read last, in fibre order
+    ready: VecDeque<Vec<Point>>,
+    /// Runs cut onto an interior face, held for the join
+    cut: Vec<Run>,
+    report: FamilyReport,
+    reports: Reports,
+    /// The joined chains, once every piece is read
+    chains: Option<IntoIter<(usize, Vec<Point>)>>,
+}
+
+impl<I, F> FamilySeams<I, F>
+where
+    I: Iterator<Item = Result<(CoreBox, F)>>,
+    F: Iterator<Item = Result<Vec<Point>>>,
+{
+    /// `family`'s curves from `pieces`, cut ends joined across the `interior` faces within `radius`; the family's
+    /// counts go to `reports` once it is joined
+    pub fn new(family: usize, pieces: I, interior: Vec<Face>, radius: f64, reports: Reports) -> Self {
+        let report = FamilyReport { family, ..FamilyReport::default() };
+        let (ready, cut) = (VecDeque::new(), Vec::new());
+        Self { family, pieces, reading: None, interior, radius, ready, cut, report, reports, chains: None }
+    }
+
+    /// Read and cut the next fibre, open the next piece, or join once every piece is read
+    fn advance(&mut self) -> Result<()> {
+        if self.reading.is_none() {
+            let Some(piece) = self.pieces.next() else {
+                self.join();
+                return Ok(());
+            };
+            self.reading = Some(piece?);
+        }
+
+        let (core, fibres) = self.reading.as_mut().expect("a piece is open");
+        let Some(points) = fibres.next() else {
+            self.reading = None;
+            return Ok(());
+        };
+        let runs = match cut(points?, self.family, core, &self.interior) {
+            Cut::Whole(points) => {
+                self.ready.push_back(points);
+                return Ok(());
+            }
+            Cut::Runs(runs) => runs,
+        };
+        for run in runs {
+            if run.is_cut() {
+                self.cut.push(run);
+            } else {
+                self.ready.push_back(run.points);
+            }
+        }
+        Ok(())
+    }
+
+    fn join(&mut self) {
+        let (mut chains, s) = join(std::mem::take(&mut self.cut), self.radius);
+        chains.retain(|(_, points)| !is_point(points));
+        self.report.join = s;
+        self.report.zero_length_chains = s.chains - chains.len();
+        let r = self.report;
+        let label = if self.family == 1 { "V" } else { "H" };
+        log!(
+            "{label} seams: {} uncut fibres, {} cut runs with {} cut ends, {} joins, {} joined fibres; zero-length \
+             fibres dropped: {} uncut, {} joined",
+            r.uncut,
+            s.cut_runs,
+            s.cut_ends,
+            s.joins,
+            s.chains,
+            r.zero_length_uncut,
+            r.zero_length_chains
+        );
+        self.reports.lock().expect("no thread panicked holding the reports").push(r);
+        self.chains = Some(chains.into_iter());
+    }
+}
+
+impl<I, F> Iterator for FamilySeams<I, F>
+where
+    I: Iterator<Item = Result<(CoreBox, F)>>,
+    F: Iterator<Item = Result<Vec<Point>>>,
+{
+    type Item = Result<Curve>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(points) = self.ready.pop_front() {
+                if is_point(&points) {
+                    self.report.zero_length_uncut += 1;
+                    continue;
+                }
+                self.report.uncut += 1;
+                return Some(Ok((self.family, points)));
+            }
+            if let Some(chains) = self.chains.as_mut() {
+                return chains.next().map(Ok);
+            }
+            if let Err(e) = self.advance() {
+                // nothing follows an error
+                self.chains = Some(Vec::new().into_iter());
+                return Some(Err(e));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
