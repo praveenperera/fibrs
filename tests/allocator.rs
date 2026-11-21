@@ -12,17 +12,21 @@ use std::process::{Command, Output};
 /// A run of `exe` with `args` and `MIMALLOC_SHOW_STATS` set, so mimalloc, if it started, prints its statistics, the
 /// memory it reserved among them, to stderr at exit
 fn run(exe: &Path, args: &[&str]) -> Output {
-    let mut command = Command::new(exe);
+    mimalloc_command(exe, args).env("MIMALLOC_SHOW_STATS", "1").output().unwrap()
+}
 
-    // other mimalloc settings from the caller's environment, such as one that skips the exit report, would change
-    // what the run prints; mimalloc reads their names in any case
+/// A command for `exe` with `args` and none of the caller's mimalloc settings: one that skips the exit report or
+/// sets an option would change what the run prints, and mimalloc reads their names in any case
+fn mimalloc_command(exe: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(exe);
     for (name, _) in std::env::vars_os() {
         if name.to_string_lossy().to_ascii_uppercase().starts_with("MIMALLOC_") {
             command.env_remove(name);
         }
     }
 
-    command.args(args).env("MIMALLOC_SHOW_STATS", "1").output().unwrap()
+    command.args(args);
+    command
 }
 
 fn mimalloc_started(out: &Output) -> bool {
@@ -46,6 +50,35 @@ fn predict_runs_on_the_system_allocator_and_the_rest_on_mimalloc() {
     fs::create_dir_all(&dir).unwrap();
     let dropin = dropin(fibrs, &dir);
     assert!(mimalloc_started(&run(&dropin, &["predict"])), "avf-spline-generator predict did not start mimalloc");
+}
+
+/// The value of mimalloc's `allow_thp` option in a run of `exe` with `args`, and `MIMALLOC_ALLOW_THP` set to
+/// `allow` if given, as mimalloc prints its options at start with `MIMALLOC_VERBOSE` set
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn allow_thp(exe: &Path, args: &[&str], allow: Option<&str>) -> String {
+    let mut command = mimalloc_command(exe, args);
+    command.env("MIMALLOC_VERBOSE", "1");
+    if let Some(allow) = allow {
+        command.env("MIMALLOC_ALLOW_THP", allow);
+    }
+
+    let out = command.output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr.lines().find(|l| l.contains("option 'allow_thp':"));
+    let line = line.unwrap_or_else(|| panic!("mimalloc printed no allow_thp option: {stderr}"));
+    line.rsplit(':').next().unwrap().trim().to_owned()
+}
+
+/// The tracer runs mimalloc without transparent huge pages unless `MIMALLOC_ALLOW_THP` turns them on, and
+/// `fibrs predict` leaves mimalloc's default alone
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn tracer_runs_without_thp_unless_asked() {
+    let fibrs = Path::new(env!("CARGO_BIN_EXE_fibrs"));
+
+    assert_eq!(allow_thp(fibrs, &["--version"], None), "0");
+    assert_eq!(allow_thp(fibrs, &["--version"], Some("1")), "1");
+    assert_eq!(allow_thp(fibrs, &["predict", "--help"], None), "1");
 }
 
 /// `fibrs` under the drop-in's name in `dir`: a symlink, or on Windows, where a link needs a privilege and the
