@@ -77,7 +77,11 @@ impl Args {
             let name = p.file_name().ok_or_else(|| eyre!("{flag} {} is not a file path", p.display()))?;
             let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
             // the directory by its real path, so two names for one file are caught
-            Ok(fs::canonicalize(dir).map_err(|e| eyre!("{flag} {}: {e}", dir.display()))?.join(name))
+            let real = fs::canonicalize(dir).map_err(|e| eyre!("{flag} {}: {e}", dir.display()))?;
+            if !real.is_dir() {
+                bail!("{flag} {}: {} is not a directory", p.display(), dir.display());
+            }
+            Ok(real.join(name))
         };
         let output = new("--output", &self.output)?;
         if let Some(stats) = &self.stats
@@ -236,8 +240,11 @@ impl Band {
         let fibres = AfvReader::open(&self.afv)?.fibres(label)?;
         // checked here on points already read rather than by scanning each band's fibre bounds up front, which
         // cost about two seconds a band on 1545
-        let (lo, hi) = (self.window[0] as f64, self.window[1] as f64);
-        if let Some(p) = fibres.iter().flatten().find(|p| p[2] < lo || p[2] >= hi) {
+        let window = self.window[0] as f64..self.window[1] as f64;
+        if let Some(p) = fibres.iter().flatten().find(|p| !p.iter().all(|v| v.is_finite())) {
+            bail!("{} has a point that is not finite: {p:?}", self.afv.display());
+        }
+        if let Some(p) = fibres.iter().flatten().find(|p| !window.contains(&p[2])) {
             bail!("{} has a point at z {}, outside its window {:?}", self.afv.display(), p[2], self.window);
         }
 

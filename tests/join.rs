@@ -186,6 +186,15 @@ fn a_band_with_points_outside_its_window_is_refused() {
     let run = fibrs(&["join", "--manifest", manifest.to_str().unwrap(), "--output", out.to_str().unwrap()]);
     assert!(!run.status.success());
     assert!(text(&run).contains("has a point at z 14, outside its window [0, 14]"), "{}", text(&run));
+
+    // a coordinate that is not a number lies in no window, nor is it dropped by the cut
+    band(&dir.join("nan.afv"), 0, &[("V", vec![[5.0, 5.0, f64::NAN], [5.0, 5.0, 2.0]])]);
+    let manifest = json!({"bands": [{"afv": "nan.afv", "core_z": [0, 10], "window_z": [0, 14]}]});
+    fs::write(dir.join("nan.json"), manifest.to_string()).unwrap();
+    let manifest = dir.join("nan.json");
+    let run = fibrs(&["join", "--manifest", manifest.to_str().unwrap(), "--output", out.to_str().unwrap()]);
+    assert!(!run.status.success());
+    assert!(text(&run).contains("has a point that is not finite"), "{}", text(&run));
 }
 
 #[test]
@@ -209,6 +218,7 @@ fn outputs_that_would_replace_a_file_are_refused() {
     fs::create_dir(dir.join("reports")).unwrap();
     assert!(join(&out, &dir.join("reports")).contains("already exists"));
     assert!(join(&out, &dir.join("missing").join("scroll.json")).contains("missing"));
+    assert!(join(&out, &dir.join("bands.json").join("scroll.json")).contains("is not a directory"));
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(&dir, dir.join("alias")).unwrap();
