@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### What's new
+
+- **`fibrs join`.** Joins a scroll's Z-band traces into one `.afv`: each band's fibres are cut to its core planes
+  and the cut ends joined across the planes between adjoining cores, by the tiled-tracing seam rule, the v2-run
+  `join.py` rule. A manifest lists each band's `.afv`, core planes and window planes, plus the output's coordinate
+  space, source path and provenance. Fibres and joined chains of zero length are dropped and counted. On
+  PHerc1545's 42 bands it writes the same `.afv` as `join.py` in half the time. See
+  [Joining Z bands](README.md#joining-z-bands).
+
 ## [0.4.1] - 2026-11-20
 
 fibrs 0.4.1 can trace a wide window as Y-X tiles, so a run's peak memory follows its densest tile instead of the

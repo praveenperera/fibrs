@@ -10,6 +10,7 @@ mod fields;
 mod finish;
 mod gpu;
 mod input;
+mod join;
 mod kernels;
 mod predict;
 mod produce;
@@ -61,6 +62,9 @@ fn main() {
     // the predictor has its own command line and none of the tracer's process setup
     if predict::requested(&argv) {
         std::process::exit(predict::main(&argv[2..]));
+    }
+    if join::requested(&argv) {
+        std::process::exit(join::main(&argv[2..]));
     }
 
     // numpy's OpenBLAS is loaded only for 3x3 eigenproblems; its own thread pool would only add threads

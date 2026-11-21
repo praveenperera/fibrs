@@ -156,7 +156,10 @@ fibrs --predictions P --array semantic --tracing-predictions P --tracing-array t
 - **Seams.** Each tile's fibres are cut to its core. Where a fibre leaves the core through a face shared with another
   tile, the point where it crosses the face is added. The cut ends on the two sides of each face, from tiles that
   share that face (not tiles meeting only at a corner), are joined when they are of the same family and at most 1.5
-  native voxels apart: shortest first, each end once, and never into a loop. Pieces under two points are dropped. This is the rule the v2-run pipeline uses to join its Z bands. Near a
+  native voxels apart: shortest first, each end once, and never into a loop. Pieces under two points are dropped,
+  and so are fibres of zero length, as when a fibre's only point in a core lies on a seam and both its crossings land
+  on that point; the log counts them. This is the rule the v2-run pipeline uses to join its Z bands, and the one
+  [`fibrs join`](#joining-z-bands) applies to them. Near a
   seam the output can differ from an untiled run: a fibre traced from each side whose cut ends land more than 1.5
   voxels apart stays split, and a tile sees its neighbours' data only as far as the halo reaches. A step of a fibre
   that cuts across a tile corner, with no point in the tile it passes through, gives that tile the piece between
@@ -170,6 +173,56 @@ fibrs --predictions P --array semantic --tracing-predictions P --tracing-array t
 - **Work directory.** Each tile has its own directory, `work/tile-YY-XX/family-N/`. `--resume` skips tiles whose
   families are complete. `run.json` records the grid, the halo, the alignment and each tile's boxes; an untiled
   run's `run.json` has no tiling key, as before.
+
+## Joining Z bands
+
+A whole scroll is usually traced as Z bands, each from a window of its core planes plus a halo of the bands beside
+it. `fibrs join` cuts each band's `.afv` to its core and joins the cut ends across the planes between adjoining
+cores into one `.afv`, by the seam rule of [tiled tracing](#tiled-tracing) on Z. This command is fibrs's own; the
+original has none.
+
+```sh
+fibrs join --manifest bands.json --output fibers-scroll.afv --stats fibers-scroll.json
+```
+
+The manifest lists the bands, each with its trace, the core planes it keeps and the window planes it was traced
+from, `[z0, z1)`:
+
+```json
+{
+  "bands": [
+    {"afv": "trace/z08448-08960/fibers.afv", "core_z": [8448, 8960], "window_z": [8192, 9216]},
+    {"afv": "trace/z08960-09472/fibers.afv", "core_z": [8960, 9472], "window_z": [8704, 9728]}
+  ],
+  "coordinate_space": "PHerc1545/20250821151648",
+  "source_path": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1545/volumes/....zarr",
+  "provenance": {"operation": "halo_band_trace_join", "haloPlanes": 256}
+}
+```
+
+- **Bands.** A relative `afv` path is taken from the manifest's directory. Bands may be listed in any order; their
+  cores must not overlap. Each trace must be complete, traced from its window's first plane (`tracing.origin_xyz`),
+  with no point outside its window, and every band must be traced in the same volume (voxel size and shape), which
+  the output takes. Cut ends are joined across a plane only where one core ends and the next begins.
+- **Cut and join.** A fibre is cut to its band's core `z0 <= z < z1`; where it leaves through a plane shared with the
+  next core, the point where it crosses the plane is added. Cut ends on the two sides of a plane are joined when they
+  are of the same family and at most `--radius` native voxels apart (default 1.5): shortest first, each end once,
+  never into a loop. Pieces under two points are dropped. A fibre or joined chain of zero length (every point one
+  point, as when a fibre's only point in a core lies on the plane and both crossings land on it) is dropped and
+  counted.
+- **Output.** Every V fibre, then every H fibre; each family's uncut fibres in band order, then its joined fibres.
+  The metadata is the public sets' for a whole volume (origin 0): the coordinate space first in the frame, the
+  source path in the root and the manifest's `provenance` under its own key. `--stats` writes the counts per family
+  (`uncut`, `cut_runs`, `cut_ends`, `joins`, `chains`, `zero_length_dropped`, `fibres`) and the file's totals.
+- **Memory.** The join holds one family's pieces that end on a plane, plus up to three bands' fibres of that family:
+  the band being cut, the next one, read ahead on its own thread, and the one after it being read.
+- **Speed.** On PHerc1545's 42 bands (34.6 GiB), `fibrs join` writes the same fibres, blocks and metadata as
+  `join.py` in 13 minutes at 5.6 GiB of memory, against 26 minutes for `join.py` on the same machine. About six of
+  its minutes are SQLite's closing `integrity_check`, which `join.py` also runs.
+- **The v2-run pipeline.** This is `join.py`'s join (with `halojoin.py`), in the same order and with the same
+  metadata. `join.py` can write the manifest from its plan (each band's `core_z` from the plan, `window_z` from
+  its `trace.json`, and the coordinate space, source path and provenance it already builds), run `fibrs join`, and
+  add its own keys (`plan_sha256`, `halo`, `afv_sha256`) to the `--stats` counts for its sidecar.
 
 ## Build
 

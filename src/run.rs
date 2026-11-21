@@ -665,6 +665,7 @@ pub fn run(args: Args) -> Result<Summary> {
         volume_shape: [domain[0], domain[1], domain[2]],
         minimum_mm: min_mm,
         coordinate_space: args.coordinate_space.as_deref(),
+        collection: None,
     };
     let summary = pool.install(|| export_afv(curves, &args.output, &opt))?;
     log!("Export: {:.1} s", started.elapsed().as_secs_f64());
