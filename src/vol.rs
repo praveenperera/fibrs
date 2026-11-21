@@ -168,7 +168,8 @@ impl<T: Voxel> Vol<T> {
             let sub_row = |z: usize, y: usize| &row(slo[0] + z, slo[1] + y)[slo[2]..][..n[2]];
             let have = table.as_ref().map_or(0, |t| t[s]);
             let ptr = if have != 0 {
-                store.get(have)
+                // SAFETY: a table holds only ids its sub-brick store handed out
+                unsafe { store.get(have) }
             } else {
                 if !(0..n[0]).any(|z| (0..n[1]).any(|y| sub_row(z, y).iter().any(|&v| v != default))) {
                     continue;
@@ -263,7 +264,8 @@ impl<T: Voxel> Vol<T> {
                 self.bricks[bi] = id;
                 t
             }
-            id => self.tables.get(id),
+            // SAFETY: a brick slot holds only ids the table store handed out
+            id => unsafe { self.tables.get(id) },
         };
         // SAFETY: the table is SUBS ids in `tables`, and `&mut self` makes this the only access to it
         let slot = unsafe { &mut *table.as_ptr().add(Self::sub_index(z, y, x)) };
@@ -274,7 +276,8 @@ impl<T: Voxel> Vol<T> {
                 *slot = id;
                 ptr
             }
-            id => self.store.get(id),
+            // SAFETY: a table holds only ids its sub-brick store handed out
+            id => unsafe { self.store.get(id) },
         };
         // SAFETY: an allocated sub-brick is SUB voxels of `store`, and `&mut self` makes this the only access to it
         unsafe { *ptr.as_ptr().add(Self::offset(z, y, x)) = value };

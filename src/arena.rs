@@ -257,11 +257,15 @@ impl<T: Voxel, const N: usize> BrickStore<T, N> {
         Self { default, base, capacity, segment, cursor: Mutex::new(cursor) }
     }
 
-    /// The first voxel of brick `id`, which the store has handed out
+    /// The first voxel of brick `id`
+    ///
+    /// # Safety
+    ///
+    /// The store has handed out `id`; any other id would point outside its range
     #[inline(always)]
-    pub fn get(&self, id: u32) -> NonNull<T> {
+    pub unsafe fn get(&self, id: u32) -> NonNull<T> {
         debug_assert!((id as usize) < self.cursor.lock().map_or(usize::MAX, |c| c.opened), "brick {id} is not open");
-        // SAFETY: a handed-out id lies in the opened part of the range
+        // SAFETY: the caller passes a handed-out id, which lies in the opened part of the range
         unsafe { self.base.add(id as usize * N) }
     }
 
@@ -285,7 +289,8 @@ impl<T: Voxel, const N: usize> BrickStore<T, N> {
     }
 
     fn fill(&self, id: usize) -> NonNull<T> {
-        let ptr = self.get(id as u32);
+        // SAFETY: the store has just handed out `id`
+        let ptr = unsafe { self.get(id as u32) };
         if self.default != T::ZERO {
             // SAFETY: the brick is `N` voxels in the opened range, handed to this caller only
             unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), N) }.fill(self.default);
@@ -343,10 +348,15 @@ impl<T: Voxel, const N: usize> BrickRun<'_, T, N> {
         (id as u32, self.store.fill(id))
     }
 
-    /// The address of a brick its store handed out, as [`BrickStore::get`]
+    /// The address of brick `id`, as [`BrickStore::get`]
+    ///
+    /// # Safety
+    ///
+    /// The run's store has handed out `id`
     #[inline(always)]
-    pub fn get(&self, id: u32) -> NonNull<T> {
-        self.store.get(id)
+    pub unsafe fn get(&self, id: u32) -> NonNull<T> {
+        // SAFETY: the caller passes an id the store handed out
+        unsafe { self.store.get(id) }
     }
 }
 
@@ -365,19 +375,14 @@ impl<T: Voxel, const N: usize> Drop for BrickStore<T, N> {
     }
 }
 
-/// An inaccessible private anonymous range of `bytes`, which costs address space only
+/// An inaccessible private anonymous range of `bytes`, which costs address space only. Linux charges a private
+/// mapping against the commit limit only while it is writable, so the range is not `MAP_NORESERVE`: that would leave
+/// the segments [`open`] makes writable uncharged too
 #[cfg(unix)]
 fn reserve(bytes: usize) -> NonNull<u8> {
     // SAFETY: a fresh private anonymous mapping aliases nothing
     let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            bytes,
-            libc::PROT_NONE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-            -1,
-            0,
-        )
+        libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
     };
     if ptr == libc::MAP_FAILED {
         handle_alloc_error(Layout::from_size_align(bytes, 4096).expect("a range is a valid layout"));
@@ -504,12 +509,12 @@ mod tests {
         let (ib, b) = store.alloc();
         assert_eq!((ia, ib), (0, 1));
         assert_eq!(unsafe { b.as_ptr().offset_from(a.as_ptr()) }, 4096);
-        assert_eq!(store.get(ib), b);
+        assert_eq!(unsafe { store.get(ib) }, b);
         let ((ic, c), (_, d)) = {
             let mut run = store.run();
             (run.alloc(), run.alloc())
         };
-        assert_eq!(store.get(ic), c);
+        assert_eq!(unsafe { store.get(ic) }, c);
         let brick = unsafe { std::slice::from_raw_parts(c.as_ptr(), 4096) };
         assert!(brick.iter().all(|&v| v == 128));
         // a dropped run's unused bricks go to the next run instead of being skipped
@@ -522,7 +527,7 @@ mod tests {
         let mut small = BrickStore::<u16, 2048>::new(0, 5);
         let bricks: Vec<_> = (0..5).map(|_| small.alloc()).collect();
         assert!(bricks.windows(2).all(|w| w[0].1 != w[1].1));
-        assert!(bricks.iter().all(|&(id, ptr)| small.get(id) == ptr));
+        assert!(bricks.iter().all(|&(id, ptr)| unsafe { small.get(id) } == ptr));
         // the range opens a segment at a time; bricks past the first segment are writable and keep their ids
         let mut tiny = BrickStore::<u8, 64>::new(0, 5_000_000);
         let ids: Vec<_> = (0..(1 << 20) + 3).map(|_| tiny.alloc()).collect();
@@ -530,6 +535,6 @@ mod tests {
         let (id, last) = ids[ids.len() - 1];
         unsafe { last.as_ptr().write(5) };
         assert_eq!(unsafe { tiny.get(id).as_ptr().read() }, 5);
-        assert!(ids.iter().step_by(4099).all(|&(id, ptr)| tiny.get(id) == ptr));
+        assert!(ids.iter().step_by(4099).all(|&(id, ptr)| unsafe { tiny.get(id) } == ptr));
     }
 }
