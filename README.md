@@ -13,6 +13,12 @@ It also includes:
 The tracing algorithm, the AFV format and the model are Qual's. fibrs makes them faster without changing what they
 write.
 
+## Fibre sets
+
+Whole-scroll fibre sets traced with fibrs are published at
+[praveenperera/afv-v2-fibers](https://huggingface.co/datasets/praveenperera/afv-v2-fibers), one `.afv` per
+scroll (CC BY-NC 4.0). They are unreviewed model output.
+
 ## Speed
 
 From CT to `.afv` on three 512-plane bands (PHerc1545, PHerc0826 and PHerc0358), on one RTX 5090 at fp32:
