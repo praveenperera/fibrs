@@ -664,3 +664,34 @@ fn columns(
     }
     Ok(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, TryLockError};
+    use std::io::{Read, Write};
+
+    use super::try_lock;
+
+    /// The output lock turns away a second run, and on Windows, where locks are mandatory, still lets another
+    /// handle read the attempt log while it is held
+    #[test]
+    fn the_output_lock_refuses_a_second_run_and_leaves_the_log_readable() {
+        let dir = std::env::temp_dir().join(format!("fibrs-output-lock-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("attempts.jsonl");
+        let open = || fs::OpenOptions::new().create(true).read(true).append(true).open(&log).unwrap();
+
+        let mut held = open();
+        try_lock(&held).unwrap();
+        held.write_all(b"{\"attempt\": 1}\n").unwrap();
+
+        assert!(matches!(try_lock(&open()), Err(TryLockError::WouldBlock)));
+        let mut read = String::new();
+        fs::File::open(&log).unwrap().read_to_string(&mut read).unwrap();
+        assert_eq!(read, "{\"attempt\": 1}\n");
+
+        drop(held);
+        try_lock(&open()).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}
