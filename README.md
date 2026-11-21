@@ -251,10 +251,11 @@ took 52.6 s and 65.9 s with `--device cuda`, against 35.3 s and 59.3 s with `--d
   only once it holds a value other than the field's default: centrality and coverage are thin shells around the
   fibres, and on PHerc0358's densest windows their values fill a tenth to a sixth of the 16³ bricks they touch. On
   the 1,024-plane window z 1536–2560 of PHerc0358 (the 512-plane band z 1792–2304 with 256 planes on each side),
-  with `--threads 8` and `--field-cache-mib 4096`, the peak is 15.4 GiB, against 21.6 GiB for 0.2.0, which stored
-  whole 16³ bricks; both wrote the same `.afv`. 4.1 GiB of that peak is the chunk cache. A smaller cache lowers the
-  peak by the difference but decodes again more often: at `--field-cache-mib 1024` the same window peaked at 11.1
-  GiB and used 8% more CPU time. Memory each stage frees goes back to the system before the next stage allocates.
+  with `--threads 8` and `--field-cache-mib 4096`, the peak is 14.1 GiB, against 20.6 GiB when whole 16³ bricks
+  were stored; both wrote the same `.afv`, with the same CPU time. 4.1 GiB of that peak is the chunk cache. A
+  smaller cache lowers the peak by about the difference but decodes again more often. On a 512 × 8169 × 8169 band
+  of PHerc0826 with `--threads 4`, the peak fell from 9.1 GiB to 7.1 GiB, against the original's 4.6 GiB. Memory
+  each stage frees goes back to the system before the next stage allocates.
 - A point's value needs 8 voxels of the native predictions, so they are decoded 8 planes at a time (one 128 KiB
   Blosc block of each channel in a prediction zarr) instead of a whole chunk at a time. The cache holds these
   slabs, with the chunks' compressed bytes in a quarter of its budget, and a chunk whose Blosc blocks are larger

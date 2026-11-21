@@ -6,8 +6,8 @@
 
 - The tracer stores its fields in 4³ sub-bricks within each 16³ brick, allocating only the sub-bricks that hold
   data, so dense windows need less memory and write the same `.afv`. On PHerc0358's densest 1,024-plane window
-  with `--threads 8`, the peak fell from 21.6 GiB to 15.4 GiB with `--field-cache-mib 4096`, and from 17.7 GiB to
-  11.1 GiB with the default of 1024. No option or default changed.
+  with `--threads 8` and `--field-cache-mib 4096`, the peak fell from 20.6 GiB to 14.1 GiB with the same CPU time,
+  and on a 512-plane band of PHerc0826 with `--threads 4`, from 9.1 GiB to 7.1 GiB. No option or default changed.
 
 ## [0.4.0] - 2026-11-20
 
