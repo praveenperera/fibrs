@@ -54,7 +54,7 @@ pub struct Args {
     /// The joined .afv; must not exist
     #[arg(long)]
     output: PathBuf,
-    /// Write the join's counts here as JSON (join.py's per-family counts)
+    /// Write the join's counts here as JSON (join.py's per-family counts); must not exist
     #[arg(long)]
     stats: Option<PathBuf>,
     /// Native voxels within which two cut ends are joined
@@ -63,6 +63,31 @@ pub struct Args {
     /// Threads preparing the output's rows; 0 = one per core
     #[arg(long, default_value_t = 0)]
     threads: usize,
+}
+
+impl Args {
+    /// That the output and the stats are two new files in directories that exist, so the join replaces nothing and
+    /// a bad path fails before the join rather than after it
+    fn check_outputs(&self) -> Result<()> {
+        let new = |flag: &str, p: &Path| -> Result<PathBuf> {
+            // a link counts as a file, even one that names nothing
+            if fs::symlink_metadata(p).is_ok() {
+                bail!("{flag} {} already exists", p.display());
+            }
+            let name = p.file_name().ok_or_else(|| eyre!("{flag} {} is not a file path", p.display()))?;
+            let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            // the directory by its real path, so two names for one file are caught
+            Ok(fs::canonicalize(dir).map_err(|e| eyre!("{flag} {}: {e}", dir.display()))?.join(name))
+        };
+        let output = new("--output", &self.output)?;
+        if let Some(stats) = &self.stats
+            && new("--stats", stats)? == output
+        {
+            bail!("--stats and --output are the same file, {}", output.display());
+        }
+
+        Ok(())
+    }
 }
 
 /// Whether `argv` asks for `fibrs join`; the drop-in `avf-spline-generator` has no subcommands
@@ -150,45 +175,6 @@ impl Manifest {
 
         let (coordinate_space, source_path) = (text_key("coordinate_space")?, text_key("source_path")?);
         Ok(Self { bands, coordinate_space, source_path, provenance })
-    }
-
-    /// That the output and the stats are two files, and neither is the manifest or a band's trace, which writing
-    /// them would replace; a link at the stats path is safe, since the stats replace the path rather than write
-    /// through it
-    fn check_outputs(&self, args: &Args) -> Result<()> {
-        if let Some(stats) = &args.stats
-            && stats.is_dir()
-        {
-            bail!("--stats {} is a directory", stats.display());
-        }
-
-        // an existing file by its real path, so a link to an input is caught too; a file still to be written by its
-        // directory's real path, which must exist, so a missing directory fails before the join rather than after
-        let key = |p: &Path| -> Result<PathBuf> {
-            if let Ok(real) = fs::canonicalize(p) {
-                return Ok(real);
-            }
-            let name = p.file_name().ok_or_else(|| eyre!("{} is not a file path", p.display()))?;
-            let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-            Ok(fs::canonicalize(dir).map_err(|e| eyre!("{}: {e}", dir.display()))?.join(name))
-        };
-        let inputs = std::iter::once(&args.manifest).chain(self.bands.iter().map(|b| &b.afv));
-        let inputs = inputs.map(|p| key(p)).collect::<Result<Vec<_>>>()?;
-
-        let output = key(&args.output)?;
-        let stats = args.stats.as_deref().map(key).transpose()?;
-        for (flag, path) in [("--output", Some(&output)), ("--stats", stats.as_ref())] {
-            if let Some(path) = path
-                && inputs.contains(path)
-            {
-                bail!("{flag} {} is one of the join's inputs", path.display());
-            }
-        }
-        if stats.as_ref() == Some(&output) {
-            bail!("--stats and --output are the same file, {}", output.display());
-        }
-
-        Ok(())
     }
 
     /// That every band was traced in one volume: the same voxel size and shape, and the same scan wherever a band or
@@ -313,7 +299,7 @@ fn run(args: &Args) -> Result<()> {
         bail!("--radius must be a nonnegative number of voxels");
     }
     let manifest = Manifest::read(&args.manifest)?;
-    manifest.check_outputs(args)?;
+    args.check_outputs()?;
     let frames = manifest.bands.iter().map(Band::check).collect::<Result<Vec<_>>>()?;
     let scan = manifest.check_volume(&frames)?;
     let frame = &frames[0];
@@ -363,28 +349,19 @@ fn run(args: &Args) -> Result<()> {
     if let Some(space) = &scan {
         doc.as_object_mut().expect("an object").shift_insert(1, "coordinate_space".into(), json!(space));
     }
-    write_replacing(stats, &(py_json_indent(&doc) + "\n"))
+    write_new(stats, &(py_json_indent(&doc) + "\n"))
 }
 
-/// Write `text` to a new file beside `path` and rename it over `path`, so a link at `path` is replaced rather than
-/// written through to the file it names
-fn write_replacing(path: &Path, text: &str) -> Result<()> {
+/// Write `text` to `path`, which must not exist, all at once: through a temporary file beside it, linked to
+/// `path` once complete, as the .afv is
+fn write_new(path: &Path, text: &str) -> Result<()> {
     let fail = |e: std::io::Error| eyre!("{}: {e}", path.display());
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    // a short name of the writer's own, created exclusively, so a long stats name still fits and the cleanup only
-    // ever removes a file this call made; written through the handle that created it, never reopened by name
     let (temporary, mut file) = mkstemp(dir, Access::Umask)?;
     let _guard = TempGuard(temporary.clone());
-    // stats that replace a file keep its access, as a write in place would
-    if let Ok(existing) = fs::symlink_metadata(path)
-        && existing.is_file()
-    {
-        file.set_permissions(existing.permissions()).map_err(fail)?;
-    }
     file.write_all(text.as_bytes()).map_err(fail)?;
-    // closed first, since Windows renames no file that is open
-    drop(file);
-    fs::rename(&temporary, path).map_err(fail)
+    // a hard link fails on any existing path, so nothing that appeared there during the join is replaced
+    fs::hard_link(&temporary, path).map_err(fail)
 }
 
 fn label(r: &FamilyReport) -> &'static str {

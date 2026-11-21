@@ -189,8 +189,8 @@ fn a_band_with_points_outside_its_window_is_refused() {
 }
 
 #[test]
-fn stats_that_would_replace_the_output_or_an_input_are_refused() {
-    let dir = scratch("stats-path");
+fn outputs_that_would_replace_a_file_are_refused() {
+    let dir = scratch("output-paths");
     band(&dir.join("low.afv"), 0, &[("V", line(5.0, &[6.0, 8.0]))]);
     let manifest = json!({"bands": [{"afv": "low.afv", "core_z": [0, 10], "window_z": [0, 20]}]});
     fs::write(dir.join("bands.json"), manifest.to_string()).unwrap();
@@ -202,32 +202,28 @@ fn stats_that_would_replace_the_output_or_an_input_are_refused() {
 
     let out = dir.join("scroll.afv");
     assert!(join(&out, &out).contains("--stats and --output are the same file"));
-    assert!(join(&out, &dir.join("low.afv")).contains("is one of the join's inputs"));
-    assert!(join(&manifest, &dir.join("scroll.json")).contains("is one of the join's inputs"));
-    assert!(fs::read_to_string(&manifest).unwrap().contains("low.afv"));
-    // a missing directory fails before the join, not after the output is written
+    assert!(join(&out, &dir.join("low.afv")).contains("--stats"));
+    assert!(join(&manifest, &dir.join("scroll.json")).contains("--output"));
+    fs::hard_link(dir.join("low.afv"), dir.join("linked.json")).unwrap();
+    assert!(join(&out, &dir.join("linked.json")).contains("already exists"));
+    fs::create_dir(dir.join("reports")).unwrap();
+    assert!(join(&out, &dir.join("reports")).contains("already exists"));
     assert!(join(&out, &dir.join("missing").join("scroll.json")).contains("missing"));
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(&dir, dir.join("alias")).unwrap();
         assert!(join(&out, &dir.join("alias").join("scroll.afv")).contains("--stats and --output are the same file"));
+        std::os::unix::fs::symlink(&out, dir.join("dangling.json")).unwrap();
+        assert!(join(&out, &dir.join("dangling.json")).contains("already exists"));
     }
-    fs::create_dir(dir.join("reports")).unwrap();
-    assert!(join(&out, &dir.join("reports")).contains("is a directory"));
     assert!(!out.exists());
-
-    // stats at a link replace the link, not the file it names
-    let band_bytes = fs::read(dir.join("low.afv")).unwrap();
-    fs::hard_link(dir.join("low.afv"), dir.join("linked.json")).unwrap();
-    join(&out, &dir.join("linked.json"));
-    assert!(out.exists());
-    assert_eq!(fs::read(dir.join("low.afv")).unwrap(), band_bytes);
-    assert!(fs::read_to_string(dir.join("linked.json")).unwrap().contains("\"fiber_count\": 1"));
+    assert!(fs::read_to_string(&manifest).unwrap().contains("low.afv"));
 
     // a 255-byte name, the longest most Linux file systems take, which a temporary name built from it would overflow
     let long = dir.join(format!("{}.json", "s".repeat(250)));
     if fs::write(&long, "").is_ok() {
-        join(&dir.join("long.afv"), &long);
+        fs::remove_file(&long).unwrap();
+        join(&out, &long);
         assert!(fs::read_to_string(&long).unwrap().contains("\"fiber_count\": 1"));
     }
 }

@@ -226,7 +226,7 @@ from, `[z0, z1)`:
   the bands name) first in the frame, the source path in the root and the manifest's `provenance` under its own
   key. `--stats` writes the counts per family (`uncut`, `cut_runs`, `cut_ends`, `joins`, `chains`,
   `zero_length_dropped`, `fibres`), the coordinate space and the file's totals. The output and the stats must be two
-  files in existing directories, neither of them an input; the stats replace whatever is at their path.
+  new files in directories that exist.
 - **Memory.** The join holds one family's pieces that end on a plane, plus up to three bands' fibres of that family:
   the band being cut, the next one, read ahead on its own thread, and the one after it being read.
 - **Speed.** On PHerc1545's 42 bands (34.6 GiB), `fibrs join` writes the same fibres, blocks and metadata as
