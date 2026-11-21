@@ -5,9 +5,10 @@
 
 Takes the reference CLI's arguments unchanged (``avf_spline_generator.cli.parser``) and writes the same ``.afv``.
 The native binary is found through ``FIBRS_BIN``, then ``bin/fibrs`` next to this package,
-then the environment's scripts directory (where the wheel installs it), then ``PATH``. When ``FIBRS_LAPACK`` is
-unset, the OpenBLAS that supplies the binary's ``dsyevd`` is numpy's bundled copy (Linux), else the
-``scipy-openblas64`` package's (macOS, whose numpy wheels link Accelerate). GPU slab decoding with nvCOMP is
+then the environment's scripts directory (where the wheel installs it) and the per-user one
+(``pip install --user``), then ``PATH``; on Windows each name ends in
+``.exe``. When ``FIBRS_LAPACK`` is unset, the OpenBLAS that supplies the binary's ``dsyevd`` is numpy's bundled
+copy (Linux and Windows), else the ``scipy-openblas64`` package's (macOS, whose numpy wheels link Accelerate). GPU slab decoding with nvCOMP is
 opt-in: with ``FIBRS_NVCOMP=on``, the binary is pointed at the ``nvidia-libnvcomp-cu12`` wheel the
 ``fibrs[gpu-zstd]`` extra put in this Python's environment, when there is one; unset, slabs decode on the CPU
 """
@@ -17,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+import site
 import subprocess
 import sys
 import sysconfig
@@ -24,23 +26,46 @@ from pathlib import Path
 
 __all__ = ["binary", "main", "run"]
 
+_WINDOWS = sys.platform == "win32"
+_EXE = "fibrs.exe" if _WINDOWS else "fibrs"
+
 
 def binary() -> str:
     """Path of the native executable"""
     explicit = os.environ.get("FIBRS_BIN")
     if explicit:
         return explicit
-    bundled = Path(__file__).resolve().parent / "bin" / "fibrs"
+    bundled = Path(__file__).resolve().parent / "bin" / _EXE
     if bundled.is_file():
         return str(bundled)
-    # the wheel installs the binary as a script; a venv's python run without activating the venv has no PATH to it
-    scripts = Path(sysconfig.get_path("scripts")) / "fibrs"
-    if scripts.is_file():
-        return str(scripts)
+    # the wheel installs the binary as a script; a venv's python run without activating the venv has no PATH to it,
+    # and neither has one whose per-user scripts directory (pip install --user) is off PATH, as it is by default
+    # on Windows
+    for scripts in (d / _EXE for d in _script_dirs()):
+        if scripts.is_file():
+            return str(scripts)
     found = shutil.which("fibrs")
     if found:
         return found
     raise FileNotFoundError("fibrs not found; set FIBRS_BIN or put it on PATH")
+
+
+def _script_dirs() -> list[Path]:
+    """The scripts directories that may hold the wheel's binary: this interpreter's default one and, when user
+    site-packages are enabled (never in a venv), its per-user one. The one this package was installed beside comes
+    first, so a ``pip install --user`` over a system-wide install runs its own binary"""
+    default = Path(sysconfig.get_path("scripts"))
+    if not site.ENABLE_USER_SITE:
+        return [default]
+    # get_preferred_scheme came in 3.10; before it, the user scheme is named after os.name
+    preferred = getattr(sysconfig, "get_preferred_scheme", None)
+    scheme = preferred("user") if preferred else f"{os.name}_user"
+    if scheme not in sysconfig.get_scheme_names():
+        return [default]
+    user = Path(sysconfig.get_path("scripts", scheme))
+    package = Path(__file__).resolve()
+    from_user_site = package.is_relative_to(Path(sysconfig.get_path("purelib", scheme)).resolve())
+    return [user, default] if from_user_site else [default, user]
 
 
 def _environment() -> dict[str, str]:
@@ -61,28 +86,28 @@ def _environment() -> dict[str, str]:
 
 
 def _nvcomp() -> str | None:
-    """The nvidia-libnvcomp-cu12 wheel's libnvcomp.so.6, found through the import system without loading it, so
-    nothing CUDA starts in this process"""
+    """The nvidia-libnvcomp-cu12 wheel's libnvcomp.so.6 (bin/nvcomp64_6.dll on Windows), found through the import
+    system without loading it, so nothing CUDA starts in this process"""
     try:
         spec = importlib.util.find_spec("nvidia.libnvcomp")
     except (ImportError, ValueError):
         return None
     for root in (spec and spec.submodule_search_locations) or []:
-        lib = Path(root) / "lib64" / "libnvcomp.so.6"
+        lib = Path(root) / "bin" / "nvcomp64_6.dll" if _WINDOWS else Path(root) / "lib64" / "libnvcomp.so.6"
         if lib.is_file():
             return str(lib)
     return None
 
 
 def _openblas() -> str | None:
-    """numpy's bundled OpenBLAS (Linux wheels), else the scipy-openblas64 package's (macOS, where numpy links
-    Accelerate)"""
+    """numpy's bundled OpenBLAS (Linux and Windows wheels), else the scipy-openblas64 package's (macOS, where numpy
+    links Accelerate)"""
     try:
         import numpy
     except ImportError:
         return None
     libs = Path(numpy.__file__).resolve().parent.parent / "numpy.libs"
-    candidates = sorted(libs.glob("libscipy_openblas64_*.so"))
+    candidates = sorted(libs.glob("libscipy_openblas64_*.dll" if _WINDOWS else "libscipy_openblas64_*.so"))
     if candidates:
         return str(candidates[0])
     try:
@@ -90,7 +115,8 @@ def _openblas() -> str | None:
     except ImportError:
         return None
     lib_dir = Path(scipy_openblas64.get_lib_dir())
-    candidates = sorted([*lib_dir.glob("libscipy_openblas64_*.so"), *lib_dir.glob("libscipy_openblas64_*.dylib")])
+    patterns = ("libscipy_openblas64_*.so", "libscipy_openblas64_*.dylib", "libscipy_openblas64_*.dll")
+    candidates = sorted(lib for pattern in patterns for lib in lib_dir.glob(pattern))
     return str(candidates[0]) if candidates else None
 
 

@@ -44,20 +44,35 @@ macro_rules! log {
 pub fn clock() -> String {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let now = unsafe { libc::time(std::ptr::null_mut()) };
-    unsafe { libc::localtime_r(&now, &mut tm) };
+    // the C runtime's reentrant local time: POSIX's localtime_r, or the MSVC runtime's localtime_s, which takes
+    // its arguments the other way round
+    #[cfg(unix)]
+    let _ = unsafe { libc::localtime_r(&now, &mut tm) };
+    #[cfg(windows)]
+    let _ = unsafe { libc::localtime_s(&mut tm, &now) };
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
 extern "C" fn on_interrupt(_: libc::c_int) {
-    // only async-signal-safe calls here: write(2) and _exit(2)
+    // only async-signal-safe calls here: write(2) and _exit(2). On Windows the C runtime runs the handler on a
+    // thread of its own when Ctrl+C arrives, and both calls are as safe there
     const MSG: &[u8] = b"Interrupted. Run the same command with --resume to continue.\n";
     unsafe {
-        libc::write(2, MSG.as_ptr().cast(), MSG.len());
+        libc::write(2, MSG.as_ptr().cast(), MSG.len() as _);
         libc::_exit(130);
     }
 }
 
 fn main() {
+    // Windows' default DLL search includes the current directory and PATH; volkit takes both out before any CUDA
+    // library loads by bare name, so a DLL planted in the folder a run starts from is never opened. It must come
+    // before anything else in the process loads a library
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if let Err(e) = volkit::dll::restrict_search() {
+        eprintln!("fibrs: {e}");
+        std::process::exit(1);
+    }
+
     let argv: Vec<OsString> = std::env::args_os().collect();
     // the predictor has its own command line and none of the tracer's process setup
     if predict::requested(&argv) {

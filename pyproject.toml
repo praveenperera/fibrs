@@ -18,28 +18,31 @@ classifiers = [
   "Intended Audience :: Science/Research",
   "Environment :: GPU :: NVIDIA CUDA :: 12",
   "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Rust",
   "Topic :: Scientific/Engineering :: Image Processing",
 ]
-# the direction field calls dsyevd from numpy's bundled OpenBLAS, so the tracer runs in an environment with numpy, as
-# the reference does. macOS numpy wheels link Accelerate and bundle no OpenBLAS, so there the same OpenBLAS build as
-# numpy 2.4.6's Linux wheel comes from scipy-openblas64
+# the direction field calls dsyevd from numpy's bundled OpenBLAS (Linux and Windows wheels), so the tracer runs in an
+# environment with numpy, as the reference does. macOS numpy wheels link Accelerate and bundle no OpenBLAS, so there
+# the same OpenBLAS build as numpy 2.4.6's Linux wheel comes from scipy-openblas64
 dependencies = ["numpy>=2", "scipy-openblas64==0.3.31.188.0; sys_platform == 'darwin'"]
 
 [project.optional-dependencies]
 # cuDNN 9 and cuBLAS 12 for `fibrs predict`, for a machine without them installed; the binary loads them from this
-# environment's site-packages before the system's. NVIDIA ships both for Linux x86-64 only, where the binary has
-# its GPU engine, so elsewhere the extra installs nothing
+# environment's site-packages before the system's. NVIDIA ships both for Linux and Windows x86-64, where the binary
+# has its GPU engine, so elsewhere the extra installs nothing
 predict = [
-  "nvidia-cudnn-cu12>=9.1,<10; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "nvidia-cublas-cu12>=12.1,<13; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "nvidia-cudnn-cu12>=9.1,<10; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+  "nvidia-cublas-cu12>=12.1,<13; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
 ]
 # nvCOMP 6 for decoding prediction slabs on the GPU in trace finishing, which a run opts in to with FIBRS_NVCOMP=on;
 # otherwise they decode on the CPU with c-blosc's checks. nvCOMP's behaviour on a corrupt chunk is undefined.
-# Linux x86-64 only, like the GPU engine
-gpu-zstd = ["nvidia-libnvcomp-cu12>=6,<7; sys_platform == 'linux' and platform_machine == 'x86_64'"]
+# Linux and Windows x86-64 only, like the GPU engine
+gpu-zstd = [
+  "nvidia-libnvcomp-cu12>=6,<7; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
+]
 
 [project.urls]
 Repository = "https://github.com/praveenperera/fibrs"

@@ -311,12 +311,49 @@ impl<T: Voxel> Drop for BrickStore<T> {
         let cursor = self.cursor.get_mut().expect("brick store lock");
         for &(ptr, bytes) in &cursor.segments {
             // SAFETY: each segment was mapped by `map_segment` with this length, and no brick outlives the store
-            unsafe { libc::munmap(ptr.as_ptr().cast(), bytes) };
+            unsafe { unmap_segment(ptr, bytes) };
         }
     }
 }
 
+/// Unmaps a segment [`map_segment`] mapped
+///
+/// # Safety
+///
+/// `ptr` and `bytes` are one segment's, and nothing reads or writes it afterwards
+#[cfg(unix)]
+unsafe fn unmap_segment(ptr: NonNull<u8>, bytes: usize) {
+    unsafe { libc::munmap(ptr.as_ptr().cast(), bytes) };
+}
+
+/// Releases a segment [`map_segment`] reserved and committed; `VirtualFree` takes the whole region, so no length
+///
+/// # Safety
+///
+/// `ptr` is one segment's, and nothing reads or writes it afterwards
+#[cfg(windows)]
+unsafe fn unmap_segment(ptr: NonNull<u8>, _bytes: usize) {
+    use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+
+    unsafe { VirtualFree(ptr.as_ptr().cast(), 0, MEM_RELEASE) };
+}
+
+/// Pages of `bytes` reserved and committed in one region, zero until written. Windows backs a committed page
+/// with memory only once it is touched, as an anonymous mapping is on Linux, but counts all of it against the
+/// commit limit (RAM plus the page file) at once
+#[cfg(windows)]
+fn map_segment(bytes: usize) -> NonNull<u8> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+
+    // SAFETY: a fresh region at an address of the system's choosing aliases nothing
+    let ptr = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+    NonNull::new(ptr.cast()).unwrap_or_else(|| {
+        handle_alloc_error(Layout::from_size_align(bytes, 4096).expect("a segment is a valid layout"))
+    })
+}
+
 /// A private anonymous mapping of `bytes`, zero until written
+#[cfg(unix)]
 fn map_segment(bytes: usize) -> NonNull<u8> {
     // SAFETY: a fresh private anonymous mapping aliases nothing
     let ptr = unsafe {

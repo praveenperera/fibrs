@@ -9,7 +9,6 @@ use std::alloc::{Allocator, Global};
 use std::fs;
 use std::io::{self, Read};
 use std::mem::MaybeUninit;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -484,7 +483,7 @@ impl Predictions {
     /// Each channel's planes must be exactly one Blosc block: a single zstd frame or a block stored as is, with no
     /// shuffle to undo (byte shuffle at one-byte items moves nothing) and no split into streams per item byte
     // only GPU finishing reads slabs this way
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub fn plane_blocks<A: Allocator>(
         &self,
         packed: &PackedChunk<A>,
@@ -875,21 +874,36 @@ pub fn zstd_frame_fits(frame: &[u8], size: usize) -> bool {
 fn read_exact_uninit(file: &fs::File, buf: &mut [MaybeUninit<u8>]) -> io::Result<()> {
     let mut done = 0;
     while done < buf.len() {
-        let rest = &mut buf[done..];
-        // SAFETY: `rest` is valid for writes of `rest.len()` bytes, and pread writes at most that many
-        let n = unsafe { libc::pread(file.as_raw_fd(), rest.as_mut_ptr().cast(), rest.len(), done as libc::off_t) };
-        match n {
-            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
-            n if n > 0 => done += n as usize,
-            _ => {
-                let e = io::Error::last_os_error();
-                if e.kind() != io::ErrorKind::Interrupted {
-                    return Err(e);
-                }
-            }
+        match read_at_uninit(file, &mut buf[done..], done as u64) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(())
+}
+
+/// One `pread` of `file` at `offset` into `buf`: the bytes read, all of them written to the front of `buf`
+#[cfg(unix)]
+fn read_at_uninit(file: &fs::File, buf: &mut [MaybeUninit<u8>], offset: u64) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `buf` is valid for writes of `buf.len()` bytes, and pread writes at most that many
+    let n = unsafe { libc::pread(file.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), offset as libc::off_t) };
+    if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
+}
+
+/// One positional read of `file` at `offset` into `buf`. std's `seek_read` takes initialised bytes, so `buf` is
+/// zeroed first: one more pass over memory the read then writes anyway
+#[cfg(windows)]
+fn read_at_uninit(file: &fs::File, buf: &mut [MaybeUninit<u8>], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+
+    buf.fill(MaybeUninit::new(0));
+    // SAFETY: every byte of `buf` was just initialised, and `MaybeUninit<u8>` has `u8`'s layout
+    let buf = unsafe { &mut *(buf as *mut [MaybeUninit<u8>] as *mut [u8]) };
+    file.seek_read(buf, offset)
 }
 
 fn open_npy(path: &Path) -> Result<(Store, Vec<usize>, Dtype)> {

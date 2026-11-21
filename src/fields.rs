@@ -46,7 +46,7 @@ impl Seed {
     }
 
     /// A seed from its packed form, `index << 8 | priority`, as the GPU kernels write it
-    #[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+    #[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
     pub(crate) fn from_raw(raw: u64) -> Self {
         Self(raw)
     }

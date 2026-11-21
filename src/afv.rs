@@ -7,7 +7,8 @@
 
 pub mod read;
 
-use std::fs::{self, File};
+use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -94,18 +95,12 @@ pub struct Summary {
     pub block_count: i64,
 }
 
-/// Fill `buf` (at most 256 bytes) from the kernel's random source
-///
-/// `getentropy` rather than `getrandom`, since macOS has only the former; glibc has had both since 2.25
+/// Fill `buf` from the operating system's random source, as Python's `os.urandom` does
 fn fill_random(buf: &mut [u8]) -> Result<()> {
-    // SAFETY: the pointer and length describe `buf`, which getentropy fills in full or not at all
-    if unsafe { libc::getentropy(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
-        bail!("getentropy failed: {}", std::io::Error::last_os_error());
-    }
-    Ok(())
+    getrandom::fill(buf).map_err(|e| eyre!("could not read the system's random source: {e}"))
 }
 
-/// A random version 4 UUID in canonical form, from the kernel's random source
+/// A random version 4 UUID in canonical form, from the system's random source
 fn uuid4() -> Result<String> {
     let mut b = [0u8; 16];
     fill_random(&mut b)?;
@@ -123,7 +118,12 @@ fn mkstemp(parent: &Path) -> Result<PathBuf> {
         const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789_";
         let name: String = b.iter().map(|v| ALPHABET[*v as usize % ALPHABET.len()] as char).collect();
         let path = parent.join(format!(".afv-{name}.partial"));
-        match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // owner-only, as mkstemp creates it; Windows files take their directory's access list instead
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&path) {
             Ok(_) => return Ok(path),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.into()),
@@ -184,7 +184,8 @@ where
     let temporary = mkstemp(&parent)?;
     let _guard = TempGuard(temporary.clone());
     let summary = write_db(curves, &temporary, opt)?;
-    File::open(&temporary)?.sync_all()?;
+    // opened for writing, since Windows flushes a file only through a handle that may write it
+    fs::OpenOptions::new().write(true).open(&temporary)?.sync_all()?;
     // a hard link publishes the complete file without overwriting a path that another process may
     // have created while tracing was running
     fs::hard_link(&temporary, destination).map_err(|e| eyre!("{}: {e}", destination.display()))?;

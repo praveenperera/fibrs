@@ -373,6 +373,7 @@ dependencies = [
  "color-eyre",
  "cudarc",
  "flate2",
+ "getrandom",
  "half",
  "libc",
  "libloading",
@@ -385,6 +386,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "volkit",
+ "windows-sys",
  "zstd",
 ]
 
