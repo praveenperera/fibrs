@@ -481,9 +481,10 @@ took 52.6 s and 65.9 s with `--device cuda`, against 35.3 s and 59.3 s with `--d
   fewer, or other layouts and compressors) give the whole budget to decoded chunks. Decoded slabs, compressed chunks and the
   direction field's tile buffers come from pools that each keep at most 128 MiB of freed buffers for reuse,
   beside the cache, and each field reserves one range of addresses for its sub-bricks and commits it 64 MiB at a
-  time. Sub-bricks are named by 32-bit ids, so one run's window, with each axis rounded up to a multiple of 32
-  native voxels, must hold a little fewer than 2⁴¹ of them (2⁴¹ is 32,768 × 8,192 × 8,192); PHerc1545's whole
-  20,961 × 7,506 × 7,506 volume is about half of that. Dense bands evict and decode
+  time. Sub-bricks are named by 32-bit ids, so the volume traced at once (the window, or with `--tiles-yx` each tile
+  with its halo), with each axis rounded up to a multiple of 32 native voxels, must hold a little fewer than 2⁴¹ of
+  them (2⁴¹ is 32,768 × 8,192 × 8,192); PHerc1545's whole 20,961 × 7,506 × 7,506 volume is about half of that.
+  Dense bands evict and decode
   hundreds of times a second, and on Linux mapping and unmapping memory takes a lock that every page fault in
   the process waits for, so a mapping per decode and per brick stalled the tracing threads. Other allocations
   of 1 MiB or more have their own mapping on Linux, so freed memory does not stay resident. `FIBRS_DEBUG_MEM=1`
