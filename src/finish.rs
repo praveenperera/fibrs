@@ -494,13 +494,19 @@ fn sample_tracing(tracing: &[Vol<u8>; 2], p: [f32; 3]) -> [f32; 2] {
         let len = shape[a] as i64;
         idx[a] = [s, s + 1].map(|i| i.clamp(0, len - 1) as usize);
     }
+    // a cell clamped at the volume's edge reads one voxel twice; any other is one `Vol::cell`
+    let inside = (0..3).all(|a| idx[a][1] == idx[a][0] + 1);
     let mut out = [0.0f32; 2];
     for (ch, field) in tracing.iter().enumerate() {
+        let corners = match inside {
+            true => field.corners(idx[0][0], idx[1][0], idx[2][0]),
+            false => std::array::from_fn(|c| field.get(idx[0][c >> 2], idx[1][c >> 1 & 1], idx[2][c & 1])),
+        };
         let mut acc = 0.0f64;
         for kz in 0..2 {
             for ky in 0..2 {
                 for kx in 0..2 {
-                    let mut coeff = field.get(idx[0][kz], idx[1][ky], idx[2][kx]) as f64;
+                    let mut coeff = corners[kz * 4 + ky * 2 + kx] as f64;
                     coeff *= wts[0][kz];
                     coeff *= wts[1][ky];
                     coeff *= wts[2][kx];

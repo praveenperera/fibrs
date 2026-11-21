@@ -9,7 +9,7 @@
 //!
 //! - [`BufferPool`], an [`Allocator`] that keeps freed large buffers by size and hands them out again, for the
 //!   native predictions (decoded slabs and compressed chunks) and the direction field's tile buffers
-//! - [`BrickStore`], the bump storage behind a [`Vol`](crate::vol::Vol)'s bricks: whole segments mapped at once and
+//! - [`BrickStore`], the bump storage behind a [`Vol`](crate::vol::Vol)'s bricks: one reserved range, opened a segment at a time and
 //!   carved into bricks in allocation order, freed together with the volume
 
 use std::alloc::{AllocError, Allocator, Global, Layout, handle_alloc_error};
@@ -178,36 +178,54 @@ unsafe impl Voxel for u16 {
     const ZERO: Self = 0;
 }
 
-/// Bytes mapped per segment: large enough that the mappings of a dense window number in the hundreds, small
-/// enough that the unused tail of the last segment, which is never touched and so never resident, stays virtual
+// SAFETY: every bit pattern is a valid `u32`, and all zero bits are 0; a volume's tables of sub-brick ids are stored
+// as bricks of `u32`
+unsafe impl Voxel for u32 {
+    const ZERO: Self = 0;
+}
+
+/// Bytes opened for writing at a time: large enough that a dense window opens its stores' range in a few hundred
+/// steps, small enough that the unused tail of the last step, which is never touched and so never resident, stays
+/// virtual
 const SEGMENT_BYTES: usize = 64 << 20;
 /// Bricks a parallel writer takes from the shared cursor at a time
 const RUN_BRICKS: usize = 64;
+/// Runs a store makes room for at once beyond its bricks: far more than the writers of one parallel fill
+const RUN_SLACK: usize = 4096;
 
-/// Bump storage for the bricks of one volume
+/// Bump storage for the bricks of one volume, each named by a 32-bit id
 ///
-/// Segments are anonymous mappings made directly, not through the global allocator, so their pages are zero and
-/// untouched until a brick is written, whatever allocator the process runs on. A brick of a zero default is
-/// handed out as it is; any other default is written into the brick when it is handed out, so only bricks in use
-/// are ever resident. Bricks are never freed one by one: the segments are unmapped when the store is dropped
-pub struct BrickStore<T: Voxel> {
-    brick: usize,
+/// The store reserves the address range of every brick it can hold up front, inaccessible, and opens it for
+/// writing a segment at a time as bricks are handed out. The range is an anonymous mapping made directly, not
+/// through the global allocator, so its pages are zero and untouched until a brick is written, whatever allocator
+/// the process runs on, and only the opened segments count against the system's commit limit, as separate mappings
+/// would. A brick of a zero default is handed out as it is; any other default is written into the brick when it is
+/// handed out, so only bricks in use are ever resident. Bricks are never freed one by one: the range is unmapped
+/// when the store is dropped.
+///
+/// A brick's address is the range's start plus its id times the brick size, so ids, which take half the room of
+/// pointers in the tables that hold them, cost no lookup to follow. Id 0 is the first brick handed out
+pub struct BrickStore<T: Voxel, const N: usize> {
     default: T,
-    segment_bricks: usize,
-    cursor: Mutex<Cursor<T>>,
+    /// The reserved range: room for `capacity` bricks
+    base: NonNull<T>,
+    capacity: usize,
+    /// Bricks opened for writing at a time
+    segment: usize,
+    cursor: Mutex<Cursor>,
 }
 
-/// The unused part of the newest segment, the unused tails of finished runs, and every segment mapped so far
-struct Cursor<T> {
-    next: *mut T,
+// SAFETY: the store owns its range; bricks are handed to one writer each, and the cursor is behind its lock
+unsafe impl<T: Voxel, const N: usize> Send for BrickStore<T, N> {}
+unsafe impl<T: Voxel, const N: usize> Sync for BrickStore<T, N> {}
+
+/// The unused ids of the newest segment, the unused tails of finished runs, and the bricks opened so far
+struct Cursor {
+    next: usize,
     left: usize,
-    spare: Vec<(*mut T, usize)>,
-    segments: Vec<(NonNull<u8>, usize)>,
+    spare: Vec<(usize, usize)>,
+    opened: usize,
 }
-
-// SAFETY: the cursor's pointers address the store's own mappings, which live as long as the store; the cursor is
-// only reached through the store's lock or `&mut self`
-unsafe impl<T: Send> Send for Cursor<T> {}
 
 /// Bricks taken from a store for one writer, so parallel writers touch the shared cursor once per
 /// `RUN_BRICKS` bricks
@@ -215,61 +233,137 @@ unsafe impl<T: Send> Send for Cursor<T> {}
 /// A run borrows its store, so its bricks cannot outlive their mapping, and gives the bricks it did not hand out
 /// back to the store when it is dropped: a parallel fill starts a run for every job it splits into, and most jobs
 /// over sparse rows use one brick or none
-pub struct BrickRun<'s, T: Voxel> {
-    store: &'s BrickStore<T>,
-    next: *mut T,
+pub struct BrickRun<'s, T: Voxel, const N: usize> {
+    store: &'s BrickStore<T, N>,
+    next: usize,
     left: usize,
 }
 
-impl<T: Voxel> BrickStore<T> {
-    /// Storage for bricks of `brick` voxels of `T` reading `default` until written; `max_bricks` bounds how many the
-    /// volume can hold, so a small volume maps no more than it could use
-    pub fn new(brick: usize, default: T, max_bricks: usize) -> Self {
-        let per_segment = (SEGMENT_BYTES / (brick * size_of::<T>())).max(1);
-        let cursor = Cursor { next: std::ptr::null_mut(), left: 0, spare: Vec::new(), segments: Vec::new() };
-        Self { brick, default, segment_bricks: per_segment.min(max_bricks.max(1)), cursor: Mutex::new(cursor) }
+impl<T: Voxel, const N: usize> BrickStore<T, N> {
+    /// Storage for up to `max_bricks` bricks of `N` voxels of `T` reading `default` until written
+    ///
+    /// # Panics
+    ///
+    /// When `max_bricks` ids do not fit in 32 bits. Taking more bricks than the store was sized for panics too
+    pub fn new(default: T, max_bricks: usize) -> Self {
+        // a brick of a power-of-two size divides the page and the segment, so every segment the store opens starts on
+        // a page, as `open` needs
+        const { assert!((N * size_of::<T>()).is_power_of_two(), "a brick's size must be a power of two") };
+        let bytes = N * size_of::<T>();
+        // runs in flight hold up to RUN_BRICKS ids each that they may not use, so the range has room for that many
+        // more bricks than the volume can hold, for up to RUN_SLACK runs at once
+        let capacity = max_bricks.max(1) + RUN_SLACK * RUN_BRICKS;
+        assert!(capacity <= 1 << 32, "{max_bricks} bricks do not fit 32-bit ids");
+        let segment = (SEGMENT_BYTES / bytes).clamp(1, capacity);
+        let base = reserve(capacity * bytes).cast();
+        let cursor = Cursor { next: 0, left: 0, spare: Vec::new(), opened: 0 };
+        Self { default, base, capacity, segment, cursor: Mutex::new(cursor) }
+    }
+
+    /// The first voxel of brick `id`
+    ///
+    /// # Safety
+    ///
+    /// The store has handed out `id`; any other id would point outside its range
+    #[inline(always)]
+    pub unsafe fn get(&self, id: u32) -> NonNull<T> {
+        debug_assert!((id as usize) < self.cursor.lock().map_or(usize::MAX, |c| c.opened), "brick {id} is not open");
+        // SAFETY: the caller passes a handed-out id, which lies in the opened part of the range
+        unsafe { self.base.add(id as usize * N) }
     }
 
     /// One brick filled with the default, from a store this thread owns
-    pub fn alloc(&mut self) -> NonNull<T> {
-        let (brick, segment_bricks) = (self.brick, self.segment_bricks);
+    pub fn alloc(&mut self) -> (u32, NonNull<T>) {
+        let (base, segment, capacity) = (self.base, self.segment, self.capacity);
         let cursor = self.cursor.get_mut().expect("brick store lock");
-        let (ptr, _) = cursor.take(1, brick, segment_bricks);
-        self.fill(ptr)
+        let (id, _) = cursor.take(1, base.cast(), N * size_of::<T>(), segment, capacity);
+        (id as u32, self.fill(id))
     }
 
     /// An empty run for a parallel writer; [`BrickRun::alloc`] fills it on first use
-    pub fn run(&self) -> BrickRun<'_, T> {
-        BrickRun { store: self, next: std::ptr::null_mut(), left: 0 }
+    pub fn run(&self) -> BrickRun<'_, T, N> {
+        BrickRun { store: self, next: 0, left: 0 }
     }
 
-    fn fill(&self, ptr: *mut T) -> NonNull<T> {
+    /// Up to `want` bricks from the shared cursor
+    fn take(&self, want: usize) -> (usize, usize) {
+        let mut cursor = self.cursor.lock().expect("brick store lock");
+        cursor.take(want, self.base.cast(), N * size_of::<T>(), self.segment, self.capacity)
+    }
+
+    fn fill(&self, id: usize) -> NonNull<T> {
+        // SAFETY: the store has just handed out `id`
+        let ptr = unsafe { self.get(id as u32) };
         if self.default != T::ZERO {
-            // SAFETY: the brick is `brick` voxels inside a live segment, handed to this caller only
-            unsafe { std::slice::from_raw_parts_mut(ptr, self.brick) }.fill(self.default);
+            // SAFETY: the brick is `N` voxels in the opened range, handed to this caller only
+            unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), N) }.fill(self.default);
         }
-        NonNull::new(ptr).expect("segments are never at address zero")
+        ptr
     }
 }
 
-impl<T: Voxel> BrickRun<'_, T> {
-    /// One brick filled with the default, refilling the run from its store when it runs out
-    pub fn alloc(&mut self) -> NonNull<T> {
-        let store = self.store;
+impl Cursor {
+    /// The first id and the length of up to `want` bricks, from a finished run's tail or the newest segment,
+    /// opening the next segment of the range when both are used up
+    fn take(
+        &mut self,
+        want: usize,
+        base: NonNull<u8>,
+        bytes: usize,
+        segment: usize,
+        capacity: usize,
+    ) -> (usize, usize) {
+        if let Some((next, left)) = self.spare.pop() {
+            let n = want.min(left);
+            if n < left {
+                self.spare.push((next + n, left - n));
+            }
+            return (next, n);
+        }
+
         if self.left == 0 {
-            let mut cursor = store.cursor.lock().expect("brick store lock");
-            (self.next, self.left) = cursor.take(RUN_BRICKS, store.brick, store.segment_bricks);
+            assert!(self.opened < capacity, "brick store is full");
+            let n = segment.min(capacity - self.opened);
+            // SAFETY: the bricks from `opened` on lie in the reserved range
+            open(unsafe { base.add(self.opened * bytes) }, n * bytes);
+            self.next = self.opened;
+            self.left = n;
+            self.opened += n;
         }
-
-        let ptr = self.next;
-        // SAFETY: the run holds `left` more bricks of `brick` voxels from `next` on, inside one segment
-        self.next = unsafe { ptr.add(store.brick) };
-        self.left -= 1;
-        store.fill(ptr)
+        let n = want.min(self.left);
+        let next = self.next;
+        self.next += n;
+        self.left -= n;
+        (next, n)
     }
 }
 
-impl<T: Voxel> Drop for BrickRun<'_, T> {
+impl<T: Voxel, const N: usize> BrickRun<'_, T, N> {
+    /// One brick filled with the default and its id, refilling the run from its store when it runs out
+    pub fn alloc(&mut self) -> (u32, NonNull<T>) {
+        if self.left == 0 {
+            (self.next, self.left) = self.store.take(RUN_BRICKS);
+        }
+
+        let id = self.next;
+        self.next += 1;
+        self.left -= 1;
+        (id as u32, self.store.fill(id))
+    }
+
+    /// The address of brick `id`, as [`BrickStore::get`]
+    ///
+    /// # Safety
+    ///
+    /// The run's store has handed out `id`
+    #[inline(always)]
+    pub unsafe fn get(&self, id: u32) -> NonNull<T> {
+        // SAFETY: the caller passes an id the store handed out
+        unsafe { self.store.get(id) }
+    }
+}
+
+impl<T: Voxel, const N: usize> Drop for BrickRun<'_, T, N> {
     fn drop(&mut self) {
         if self.left > 0 {
             self.store.cursor.lock().expect("brick store lock").spare.push((self.next, self.left));
@@ -277,99 +371,81 @@ impl<T: Voxel> Drop for BrickRun<'_, T> {
     }
 }
 
-impl<T> Cursor<T> {
-    /// The start and length of up to `want` bricks, from a finished run's tail or the newest segment, mapping a new
-    /// segment when both are used up
-    fn take(&mut self, want: usize, brick: usize, segment_bricks: usize) -> (*mut T, usize) {
-        if let Some((next, left)) = self.spare.pop() {
-            let n = want.min(left);
-            if n < left {
-                // SAFETY: the tail holds `left` bricks from `next` on, inside one segment
-                self.spare.push((unsafe { next.add(n * brick) }, left - n));
-            }
-            return (next, n);
-        }
-
-        if self.left == 0 {
-            let bytes = segment_bricks * brick * size_of::<T>();
-            let ptr = map_segment(bytes);
-            self.segments.push((ptr, bytes));
-            self.next = ptr.as_ptr().cast();
-            self.left = segment_bricks;
-        }
-        let n = want.min(self.left);
-        let next = self.next;
-        // SAFETY: `n` bricks remain in the newest segment from `next` on
-        self.next = unsafe { self.next.add(n * brick) };
-        self.left -= n;
-        (next, n)
-    }
-}
-
-impl<T: Voxel> Drop for BrickStore<T> {
+impl<T: Voxel, const N: usize> Drop for BrickStore<T, N> {
     fn drop(&mut self) {
-        let cursor = self.cursor.get_mut().expect("brick store lock");
-        for &(ptr, bytes) in &cursor.segments {
-            // SAFETY: each segment was mapped by `map_segment` with this length, and no brick outlives the store
-            unsafe { unmap_segment(ptr, bytes) };
-        }
+        // SAFETY: the range was reserved by `reserve` with this length, and no brick outlives the store
+        unsafe { release(self.base.cast(), self.capacity * N * size_of::<T>()) };
     }
 }
 
-/// Unmaps a segment [`map_segment`] mapped
-///
-/// # Safety
-///
-/// `ptr` and `bytes` are one segment's, and nothing reads or writes it afterwards
+/// An inaccessible private anonymous range of `bytes`, which costs address space only. Linux charges a private
+/// mapping against the commit limit only while it is writable, so the range is not `MAP_NORESERVE`: that would leave
+/// the segments [`open`] makes writable uncharged too
 #[cfg(unix)]
-unsafe fn unmap_segment(ptr: NonNull<u8>, bytes: usize) {
-    unsafe { libc::munmap(ptr.as_ptr().cast(), bytes) };
-}
-
-/// Releases a segment [`map_segment`] reserved and committed; `VirtualFree` takes the whole region, so no length
-///
-/// # Safety
-///
-/// `ptr` is one segment's, and nothing reads or writes it afterwards
-#[cfg(windows)]
-unsafe fn unmap_segment(ptr: NonNull<u8>, _bytes: usize) {
-    use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
-
-    unsafe { VirtualFree(ptr.as_ptr().cast(), 0, MEM_RELEASE) };
-}
-
-/// Pages of `bytes` reserved and committed in one region, zero until written. Windows backs a committed page
-/// with memory only once it is touched, as an anonymous mapping is on Linux, but counts all of it against the
-/// commit limit (RAM plus the page file) at once
-#[cfg(windows)]
-fn map_segment(bytes: usize) -> NonNull<u8> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-
-    // SAFETY: a fresh region at an address of the system's choosing aliases nothing
-    let ptr = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
-    NonNull::new(ptr.cast()).unwrap_or_else(|| {
-        handle_alloc_error(Layout::from_size_align(bytes, 4096).expect("a segment is a valid layout"))
-    })
-}
-
-/// A private anonymous mapping of `bytes`, zero until written
-#[cfg(unix)]
-fn map_segment(bytes: usize) -> NonNull<u8> {
+fn reserve(bytes: usize) -> NonNull<u8> {
     // SAFETY: a fresh private anonymous mapping aliases nothing
     let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            bytes,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
+        libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
     };
     if ptr == libc::MAP_FAILED {
-        handle_alloc_error(Layout::from_size_align(bytes, 4096).expect("a segment is a valid layout"));
+        handle_alloc_error(Layout::from_size_align(bytes, 4096).expect("a range is a valid layout"));
     }
     NonNull::new(ptr.cast()).expect("mmap never returns address zero on success")
+}
+
+/// A reserved region of `bytes`, which costs address space only until parts of it are committed
+#[cfg(windows)]
+fn reserve(bytes: usize) -> NonNull<u8> {
+    use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc};
+
+    // SAFETY: a fresh region at an address of the system's choosing aliases nothing
+    let ptr = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE, PAGE_NOACCESS) };
+    NonNull::new(ptr.cast())
+        .unwrap_or_else(|| handle_alloc_error(Layout::from_size_align(bytes, 4096).expect("a range is a valid layout")))
+}
+
+/// Open `bytes` of a reserved range for reading and writing; its pages stay zero until written
+#[cfg(unix)]
+fn open(at: NonNull<u8>, bytes: usize) {
+    // SAFETY: the caller passes a part of a range `reserve` made, which nothing else maps
+    if unsafe { libc::mprotect(at.as_ptr().cast(), bytes, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
+        handle_alloc_error(Layout::from_size_align(bytes, 4096).expect("a segment is a valid layout"));
+    }
+}
+
+/// Commit `bytes` of a reserved region for reading and writing; its pages stay zero until written. Windows backs a
+/// committed page with memory only once it is touched, as Linux does, but counts all of it against the commit limit
+/// (RAM plus the page file) at once
+#[cfg(windows)]
+fn open(at: NonNull<u8>, bytes: usize) {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+
+    // SAFETY: the caller passes a part of a region `reserve` made, which nothing else uses
+    if unsafe { VirtualAlloc(at.as_ptr().cast(), bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+        handle_alloc_error(Layout::from_size_align(bytes, 4096).expect("a segment is a valid layout"));
+    }
+}
+
+/// Unmaps a range [`reserve`] made
+///
+/// # Safety
+///
+/// `base` and `bytes` are one range's, and nothing reads or writes it afterwards
+#[cfg(unix)]
+unsafe fn release(base: NonNull<u8>, bytes: usize) {
+    unsafe { libc::munmap(base.as_ptr().cast(), bytes) };
+}
+
+/// Releases a region [`reserve`] made, committed parts and all; `VirtualFree` takes the whole region, so no length
+///
+/// # Safety
+///
+/// `base` is one region's, and nothing reads or writes it afterwards
+#[cfg(windows)]
+unsafe fn release(base: NonNull<u8>, _bytes: usize) {
+    use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+
+    unsafe { VirtualFree(base.as_ptr().cast(), 0, MEM_RELEASE) };
 }
 
 #[cfg(test)]
@@ -431,25 +507,37 @@ mod tests {
 
     #[test]
     fn bricks_are_distinct_and_hold_the_default() {
-        let mut store = BrickStore::new(4096, 128u8, 10_000);
-        let a = store.alloc();
-        let b = store.alloc();
+        let mut store = BrickStore::<u8, 4096>::new(128, 10_000);
+        let (ia, a) = store.alloc();
+        let (ib, b) = store.alloc();
+        assert_eq!((ia, ib), (0, 1));
         assert_eq!(unsafe { b.as_ptr().offset_from(a.as_ptr()) }, 4096);
-        let (c, d) = {
+        assert_eq!(unsafe { store.get(ib) }, b);
+        let ((ic, c), (_, d)) = {
             let mut run = store.run();
             (run.alloc(), run.alloc())
         };
+        assert_eq!(unsafe { store.get(ic) }, c);
         let brick = unsafe { std::slice::from_raw_parts(c.as_ptr(), 4096) };
         assert!(brick.iter().all(|&v| v == 128));
         // a dropped run's unused bricks go to the next run instead of being skipped
-        let e = store.run().alloc();
+        let (_, e) = store.run().alloc();
         assert_eq!(unsafe { e.as_ptr().offset_from(d.as_ptr()) }, 4096);
-        let fresh = store.run().alloc();
+        let (_, fresh) = store.run().alloc();
         assert_eq!(unsafe { fresh.as_ptr().offset_from(e.as_ptr()) }, 4096);
-        // a store sized for few bricks maps no more than it can hold, and maps again when that is used up
-        let mut small = BrickStore::new(4096, 0u16, 2);
+        // a store sized for few bricks maps no more than it can hold, and maps again when that is used up; ids
+        // keep naming their own bricks across segments
+        let mut small = BrickStore::<u16, 2048>::new(0, 5);
         let bricks: Vec<_> = (0..5).map(|_| small.alloc()).collect();
-        assert_eq!(small.cursor.lock().unwrap().segments.len(), 3);
-        assert!(bricks.windows(2).all(|w| w[0] != w[1]));
+        assert!(bricks.windows(2).all(|w| w[0].1 != w[1].1));
+        assert!(bricks.iter().all(|&(id, ptr)| unsafe { small.get(id) } == ptr));
+        // the range opens a segment at a time; bricks past the first segment are writable and keep their ids
+        let mut tiny = BrickStore::<u8, 64>::new(0, 5_000_000);
+        let ids: Vec<_> = (0..(1 << 20) + 3).map(|_| tiny.alloc()).collect();
+        assert_eq!(tiny.cursor.lock().unwrap().opened, 2 << 20);
+        let (id, last) = ids[ids.len() - 1];
+        unsafe { last.as_ptr().write(5) };
+        assert_eq!(unsafe { tiny.get(id).as_ptr().read() }, 5);
+        assert!(ids.iter().step_by(4099).all(|&(id, ptr)| unsafe { tiny.get(id) } == ptr));
     }
 }

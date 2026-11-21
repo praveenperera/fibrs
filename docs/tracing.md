@@ -127,10 +127,16 @@ took tracing from 114–134 s to about 103 s, with the same `.afv` and less than
 
 ## Differences from the original
 
-- **Memory.** Fields are kept in memory as sparse 16³ bricks instead of a Zarr work store. Peak memory is higher
-  and grows with how much of the band holds fibres: 9.0 GiB against the original's 4.6 GiB on a
-  512 × 8169 × 8169 band of PHerc0826. The chunk cache is bounded by `--native-cache-mib` plus
-  `--field-cache-mib`. A smaller cache lowers the peak but decodes more often.
+- **Memory.** Fields are kept in memory instead of a Zarr work store. Peak memory is higher and grows with how
+  much of the band holds fibres. Each field is cut into 16³ bricks of 4³ sub-bricks, and a sub-brick is stored
+  only once it holds a value other than the field's default. On a 512 × 8169 × 8169 band of PHerc0826 with
+  `--threads 4` the peak is 7.1 GiB, against the original's 4.6 GiB. On PHerc0358's densest 1,024-plane window
+  (z 1536–2560) with `--threads 8` and `--field-cache-mib 4096` it is 14.1 GiB, of which 4.1 GiB is the chunk
+  cache, against 20.6 GiB when whole 16³ bricks were stored. The chunk cache is bounded by `--native-cache-mib`
+  plus `--field-cache-mib`. A smaller cache lowers the peak but decodes more often. Sub-bricks are named by
+  32-bit ids, so the volume traced at once (the window, or with `--tiles-yx` each tile with its halo), with each
+  axis rounded up to a multiple of 32 native voxels, must hold a little fewer than 2⁴¹ of them (2⁴¹ is
+  32,768 × 8,192 × 8,192). PHerc1545's whole 20,961 × 7,506 × 7,506 volume is about half of that.
 - **Decoding.** Predictions are decoded 8 planes at a time instead of a whole chunk at a time. Arrays whose layout
   or compressor doesn't allow that are still decoded whole.
 - **Work directory.** `run.json` has a `native` key, so neither tool resumes the other's work directory, and only
