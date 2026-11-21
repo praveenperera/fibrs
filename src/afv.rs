@@ -101,7 +101,7 @@ fn uuid4() -> Result<String> {
 }
 
 /// `tempfile.mkstemp(prefix=".afv-", suffix=".partial", dir=parent)`: an exclusively created, empty file
-fn mkstemp(parent: &Path) -> Result<PathBuf> {
+pub(crate) fn mkstemp(parent: &Path) -> Result<PathBuf> {
     for _ in 0..100 {
         let mut b = [0u8; 6];
         fill_random(&mut b)?;
@@ -136,7 +136,7 @@ fn bounds(q: &[[f64; 3]]) -> [f64; 6] {
 }
 
 /// Removes the temporary file however the export ends, as the reference's `finally` does
-struct TempGuard(PathBuf);
+pub(crate) struct TempGuard(pub(crate) PathBuf);
 
 impl Drop for TempGuard {
     fn drop(&mut self) {

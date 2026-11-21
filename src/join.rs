@@ -21,7 +21,6 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread;
@@ -32,7 +31,7 @@ use color_eyre::eyre::{Result, bail, eyre};
 use serde_json::{Map, Value, json};
 
 use crate::afv::read::{AfvReader, Frame};
-use crate::afv::{Collection, ExportOptions, MinLength, export_afv};
+use crate::afv::{Collection, ExportOptions, MinLength, TempGuard, export_afv, mkstemp};
 use crate::log;
 use crate::pyfmt::py_json_indent;
 use crate::seams::{CoreBox, Face, FamilyReport, FamilySeams, Point, RADIUS, Reports};
@@ -369,19 +368,14 @@ fn run(args: &Args) -> Result<()> {
 /// Write `text` to a new file beside `path` and rename it over `path`, so a link at `path` is replaced rather than
 /// written through to the file it names
 fn write_replacing(path: &Path, text: &str) -> Result<()> {
-    let name = path.file_name().ok_or_else(|| eyre!("{} is not a file path", path.display()))?;
-    let temporary = path.with_file_name(format!(".{}.{}.partial", name.to_string_lossy(), std::process::id()));
-    let written = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .and_then(|mut file| file.write_all(text.as_bytes()))
-        .and_then(|()| fs::rename(&temporary, path));
-    if written.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-
-    written.map_err(|e| eyre!("{}: {e}", path.display()))
+    let fail = |e: std::io::Error| eyre!("{}: {e}", path.display());
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    // a short name of the writer's own, created exclusively, so a long stats name still fits and the cleanup only
+    // ever removes a file this call made
+    let temporary = mkstemp(dir)?;
+    let _guard = TempGuard(temporary.clone());
+    fs::write(&temporary, text).map_err(fail)?;
+    fs::rename(&temporary, path).map_err(fail)
 }
 
 fn label(r: &FamilyReport) -> &'static str {

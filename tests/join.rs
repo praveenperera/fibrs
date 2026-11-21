@@ -223,6 +223,14 @@ fn stats_that_would_replace_the_output_or_an_input_are_refused() {
     assert!(out.exists());
     assert_eq!(fs::read(dir.join("low.afv")).unwrap(), band_bytes);
     assert!(fs::read_to_string(dir.join("linked.json")).unwrap().contains("\"fiber_count\": 1"));
+
+    // the longest name the file system takes, which a temporary name built from it would overflow
+    #[cfg(target_os = "linux")]
+    {
+        let long = dir.join(format!("{}.json", "s".repeat(250)));
+        join(&dir.join("long.afv"), &long);
+        assert!(fs::read_to_string(&long).unwrap().contains("\"fiber_count\": 1"));
+    }
 }
 
 #[test]
