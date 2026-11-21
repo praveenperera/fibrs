@@ -26,21 +26,41 @@ pip install fibrs
 
 Install it into the environment that has numpy (normally the one that runs `avf-spline-generator`). It
 adds a `fibrs` command and a Python module, `fibrs`. `fibrs predict` is built into the same binary on Linux
-x86-64; `pip install "fibrs[predict]"` adds the cuDNN and cuBLAS it needs when the system has none (see
+and Windows x86-64; `pip install "fibrs[predict]"` adds the cuDNN and cuBLAS it needs when the system has none (see
 [Predictions](#predictions)). Prebuilt CLI archives for Linux
-x86-64 (glibc 2.28+) and Apple silicon (macOS 11+) are named `fibrs-<version>-<target>.tar.gz`.
+x86-64 (glibc 2.28+) and Apple silicon (macOS 11+) are named `fibrs-<version>-<target>.tar.gz`. The Windows x86-64
+archive is `fibrs-<version>-x86_64-pc-windows-msvc.zip`, holding `fibrs.exe`, which needs no Visual C++
+redistributable.
 
 The archive's binary bundles no OpenBLAS: it loads numpy's at run time, from the environment it is installed
 into (`scripts/install-dropin.sh` puts it there) or else from the active one (`$VIRTUAL_ENV`). On macOS that
 environment also needs `scipy-openblas64==0.3.31.188.0` (see [Numerics](#numerics)). Run from anywhere else, it
 stops with "cannot find numpy's OpenBLAS" once the tracing predictions are loaded, after it has written the work
 directory's `run.json`. Activate the numpy environment, or set `FIBRS_LAPACK` to the library's full path (on
-Linux, the `libscipy_openblas64_*.so` file in its `site-packages/numpy.libs`; fibrs does not expand a `*`), and run
+Linux, the `libscipy_openblas64_*.so` file in its `site-packages/numpy.libs`, and on Windows the
+`libscipy_openblas64_*.dll` in `Lib\site-packages\numpy.libs`; fibrs does not expand a `*`), and run
 the same command again with `--resume`, through the same binary: an activated environment's `fibrs` can come first
 on `PATH`, and a run resumes only with the version that started it. `pip install fibrs` into an environment
 that holds its own numpy wheel needs none of this. fibrs looks only inside that environment, so one that inherits
 numpy (`--system-site-packages`) or has a distribution's numpy, such as Debian's `python3-numpy`, needs
 `scipy-openblas64==0.3.31.188.0` installed into it, as on macOS.
+
+### With cargo
+
+```sh
+cargo binstall fibrs        # the release's prebuilt CLI binary
+cargo install fibrs --locked  # a build from source
+```
+
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall) downloads the prebuilt binary from the GitHub release
+on Linux x86-64, Apple silicon and Windows x86-64. Elsewhere it tries
+[cargo-quickinstall](https://github.com/cargo-bins/cargo-quickinstall)'s third-party builds and then builds from
+source. `cargo install` builds the crate from crates.io, with `--locked` at the dependency versions the release was
+tested with; it needs Rust 1.100 or later, and on Windows the MSVC toolchain (see [Build](#build)). Either way only
+the binary is installed, into `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Windows). Like the CLI archive's, it
+loads numpy's OpenBLAS at run time, so activate the numpy environment or set `FIBRS_LAPACK`, as above.
+`scripts/install-dropin.sh`, which makes it the drop-in `avf-spline-generator`, is in the CLI archive and the
+repository.
 
 ## Use
 
@@ -51,7 +71,7 @@ fibrs --predictions P --array semantic --channel-order VH --tracing-predictions 
 python -m fibrs ARGS      # the same, from Python
 ```
 
-The direction field and centrality run on the GPU when a usable one is found: Linux x86-64, an NVIDIA GPU of compute
+The direction field and centrality run on the GPU when a usable one is found: Linux or Windows x86-64, an NVIDIA GPU of compute
 capability 8.0 or later, and a driver for CUDA 12.0 or newer (no CUDA toolkit). Otherwise they run on the CPU, and
 the log says why. `--device cpu` keeps them on the CPU, `--device cuda` fails instead of falling back, and
 `--cuda-device N` picks the GPU (by default the first usable one). The GPU direction field is the CPU's bit for bit:
@@ -73,13 +93,17 @@ cached, by where they were decoded, and the batches the CPU finished. If the GPU
 
 By default the slabs are decoded on the CPU, with c-blosc's checks. Decoding them on the GPU with NVIDIA's nvCOMP is
 opt-in, with the same output on sound files: run `pip install "fibrs[gpu-zstd]"` and set `FIBRS_NVCOMP=on`, or
-set `FIBRS_NVCOMP` to the path of a `libnvcomp.so.6`. GPU slab decoding trusts the prediction files: on a corrupt
-chunk nvCOMP's behaviour is undefined, so it may give wrong output or a CUDA fault where the CPU decoder would
+set `FIBRS_NVCOMP` to the path of a `libnvcomp.so.6` (`nvcomp64_6.dll` on Windows, where a relative path or bare
+file name is taken from the current directory). GPU slab decoding trusts the prediction files: on a corrupt chunk nvCOMP's behaviour is undefined, so it may give wrong output or a CUDA fault where the CPU decoder would
 report the corruption.
 
 nvCOMP is not part of fibrs: it is NVIDIA's own PyPI package, `nvidia-libnvcomp-cu12` (version 6, under NVIDIA's
 licence), which the `gpu-zstd` extra installs. With `FIBRS_NVCOMP=on` (in any case), fibrs loads that wheel from
 the environment fibrs is installed into or the active one (`$VIRTUAL_ENV`), then tries the system's library path.
+On Windows that last search covers only the executable's directory and System32, since fibrs takes the current
+directory and `PATH` out of the DLL search, so point `FIBRS_NVCOMP` at a standalone nvCOMP's DLL. NVIDIA's Windows
+nvCOMP needs the Visual C++ runtime (`vcruntime140.dll`, `msvcp140.dll`), which `fibrs.exe` itself does not; without
+it, slabs stay on the CPU and the log says nvCOMP did not load.
 Run from Python (`python -m fibrs` or `fibrs.run`), it loads only the wheel in that Python's environment, venv or
 not, when there is one, so a wheel whose library fails to load leaves slabs on the CPU. Unset or `off`,
 nvCOMP is never loaded, whether or not the wheel is installed. The log says once whether slabs decode on the GPU, or
@@ -105,10 +129,13 @@ scripts/install-dropin.sh VENV [BINARY]   # VENV/bin/avf-spline-generator -> fib
 scripts/install-dropin.sh --restore VENV  # put the original back
 ```
 
-BINARY defaults to the `fibrs` in the archive the script came from, then to the one on `PATH`.
-The original entry is kept as `avf-spline-generator.reference`, and `NOTICE` and `licenses/` are copied to
-`VENV/share/fibrs`. Callers that run `Path(sys.executable).parent / "avf-spline-generator"`
-need no other change. Run as `avf-spline-generator`, `--version` prints `0.2.0`, the release it stands in for; run
+BINARY defaults to the `fibrs` in the archive the script came from, then to the one on `PATH`. On Linux and macOS
+the original entry is kept as `VENV/bin/avf-spline-generator.reference`, and callers that run
+`Path(sys.executable).parent / "avf-spline-generator"` need no other change. On Windows, run it from Git Bash:
+`VENV\Scripts\avf-spline-generator.exe` becomes a copy of `fibrs.exe`, the original is kept as
+`VENV\Scripts\avf-spline-generator.reference.exe`, and a caller that builds the path itself names it with `.exe`
+(`Path(sys.executable).parent / "avf-spline-generator.exe"`). Either way `NOTICE` and `licenses/` are copied to
+`VENV/share/fibrs`. Run as `avf-spline-generator`, `--version` prints `0.2.0`, the release it stands in for; run
 as `fibrs` or `python -m fibrs`, it prints fibrs' own version.
 
 ## Tiled tracing
@@ -164,9 +191,9 @@ FIBRS_LAPACK=/path/to/libscipy_openblas64_.so cargo test --release
 The tests that trace (`tests/tile.rs`) need numpy's OpenBLAS, named by `FIBRS_LAPACK`; without it they are
 skipped, except on CI, where they fail.
 
-It builds on Linux and macOS with Rust 1.100 or later, the first stable release with the allocator API it uses.
-The tracer allocates through mimalloc. On Linux with glibc and on macOS, `fibrs predict` allocates through the
-system allocator; elsewhere it keeps mimalloc. `cargo build --release --no-default-features` builds a binary that
+It builds on Linux, macOS and Windows (the MSVC toolchain) with Rust 1.100 or later, the first stable release with
+the allocator API it uses. The tracer allocates through mimalloc. On Linux with glibc, on macOS and on Windows,
+`fibrs predict` allocates through the system allocator; elsewhere it keeps mimalloc. `cargo build --release --no-default-features` builds a binary that
 uses the system allocator throughout.
 On Linux with glibc the tracer runs mimalloc with its `allow_thp` option off, as `MIMALLOC_ALLOW_THP=0` would.
 mimalloc then stops asking for transparent huge pages (THP) and, unless the process already has a THP-disable mode
@@ -181,14 +208,16 @@ pages either way, though the tracer's process can still lose file-backed huge pa
 mounted with them. A host set to `always` has not been measured.
 The wheel is built with maturin from
 `pyproject.toml` (`maturin build --release`; the published Linux wheel uses `--zig --compatibility
-manylinux_2_28`, and the macOS wheel `MACOSX_DEPLOYMENT_TARGET=11.0`).
+manylinux_2_28`, the macOS wheel `MACOSX_DEPLOYMENT_TARGET=11.0`, and the Windows wheel
+`RUSTFLAGS="-C target-feature=+crt-static"`, which links the C runtime into the binary).
 
 ## Numerics
 
 On the CPU, the direction field's eigenvectors come from `dsyevd` in numpy's own OpenBLAS, on float64 copies as
 `numpy.linalg.eigh` computes them, so they match `eigh` bit for bit. On the GPU, each voxel's eigenvector is
 certified against an error bound to equal that result, and voxels that can't be certified go to the same `dsyevd`. The binary finds that library from its
-own path (`bin/../lib/python*/site-packages/numpy.libs/libscipy_openblas64_*.so`), then from
+own path (`bin/../lib/python*/site-packages/numpy.libs/libscipy_openblas64_*.so`, or on Windows
+`Scripts\..\Lib\site-packages\numpy.libs\libscipy_openblas64_*.dll`), then from
 `$VIRTUAL_ENV`, looking in each environment in numpy's copy first and then in the `scipy-openblas64`
 package (`site-packages/scipy_openblas64/lib`). `FIBRS_LAPACK` overrides both.
 
@@ -227,7 +256,7 @@ Centrality on the GPU gives the same `.afv`. On the PHerc0826 band and on a 512-
 kernels round some multiply-adds as one operation where its CPU code rounds twice; the port reproduces each, and on
 these bands both roundings give the same `.afv`.
 
-CI traces a small synthetic input (`tests/fixtures/synthetic`) with every build's wheel on Linux and macOS,
+CI traces a small synthetic input (`tests/fixtures/synthetic`) with every build's wheel on Linux, macOS and Windows,
 through the drop-in and through `python -m fibrs`. Both must write what the original wrote for it, compared by
 `scripts/compare_afv.py`: every metadata value except the per-run uuid, the schema and every table row. The drop-in
 must also write it with no seed traced ahead of the one being committed (`FIBRS_DEBUG_WINDOW=1`) and with every seed
@@ -396,7 +425,8 @@ took 52.6 s and 65.9 s with `--device cuda`, against 35.3 s and 59.3 s with `--d
   hundreds of times a second, and on Linux mapping and unmapping memory takes a lock that every page fault in
   the process waits for, so a mapping per decode and per brick stalled the tracing threads. Other allocations
   of 1 MiB or more have their own mapping on Linux, so freed memory does not stay resident. `FIBRS_DEBUG_MEM=1`
-  logs each stage's field sizes and resident memory.
+  logs each stage's field sizes and resident memory (the working set on Windows; zero on macOS, which the log
+  cannot read it from).
 - The work directory holds `run.json` (with a `native` key, so neither tool resumes the other's
   directory, and only the fibrs version that started it resumes it) and one finished curve file per
   family. An interrupted family is traced again from its first
@@ -434,11 +464,14 @@ float32 order. Tiles are read on several threads ahead of the GPU, and one threa
 
 ### Requirements
 
-- Linux x86-64 and an NVIDIA GPU of compute capability 8.0 or later (RTX 30 series, A100 and newer; not the
-  T4 or the RTX 20 series), with a driver for CUDA 12 or later. The binary needs only the driver
-  (`libcuda.so.1`), not a CUDA toolkit.
-- cuDNN 9 (`libcudnn.so.9`) and cuBLAS 12 (`libcublas.so.12`). `pip install "fibrs[predict]"` installs them
-  from NVIDIA's pip packages (`nvidia-cudnn-cu12`, `nvidia-cublas-cu12`); a system install works too.
+- Linux or Windows x86-64 and an NVIDIA GPU of compute capability 8.0 or later (RTX 30 series, A100 and newer;
+  not the T4 or the RTX 20 series), with a driver for CUDA 12 or later. The binary needs only the driver
+  (`libcuda.so.1`, or `nvcuda.dll` in System32 on Windows), not a CUDA toolkit.
+- cuDNN 9 (`libcudnn.so.9`, `cudnn64_9.dll`) and cuBLAS 12 (`libcublas.so.12`, `cublas64_12.dll`).
+  `pip install "fibrs[predict]"` installs them from NVIDIA's pip packages (`nvidia-cudnn-cu12`,
+  `nvidia-cublas-cu12`); a system install works too.
+- On Windows, the GPU paths (`fibrs predict` and `--device cuda`) build and pass CI, which has no GPU, but have not
+  yet run on a Windows machine with an NVIDIA GPU.
 - No PyTorch, and no Python at run time beyond what installs the wheel.
 
 On macOS and other platforms the binary has no GPU engine: `fibrs predict --dry-run` plans a run there, and a real
@@ -483,8 +516,18 @@ name; `FIBRS_CUDA_LIBS=system` skips the pip copies. The engine asks for the unv
 not 12.x, and its provenance records the cuBLAS and cuDNN versions. To use cuBLAS 12 on such a machine, put a
 directory holding `libcublas.so -> libcublas.so.12` and `libcudnn.so -> libcudnn.so.9` symlinks first on
 `LD_LIBRARY_PATH`, or keep the CUDA 13 library directories off the loader's path. Each run's `summary-*.json`
-lists the cuDNN and cuBLAS files it loaded. cuDNN's convolution algorithms are timed on the first run and cached
-under `~/.cache` (see volkit's documentation for the cache variables). They set the rounding, so the provenance
+lists the cuDNN and cuBLAS files it loaded.
+
+On Windows the pip copies are the DLLs in `Lib\site-packages\nvidia\*\bin` beside `Scripts\fibrs.exe`. A system
+cuDNN or cuBLAS is found in the executable's directory, System32, each absolute `PATH` entry, then
+`%CUDA_PATH%\bin\x64` and `%CUDA_PATH%\bin`, never in the current directory: the binary takes the current
+directory and `PATH` out of Windows' default DLL search when it starts, and loads each library by full path (see
+volkit's `dll` module). A newer cuBLAS is never picked up by mistake there, as each CUDA release installs its DLLs
+under names that carry the major version (`cublas64_13.dll`). The driver is looked up by name before it is pinned to
+System32, so a stray `nvcuda.dll` or `cuda.dll` beside `fibrs.exe` is opened first: keep none there.
+
+cuDNN's convolution algorithms are timed on the first run and cached under `~/.cache` (`%LOCALAPPDATA%` on Windows;
+see volkit's documentation for the cache variables). They set the rounding, so the provenance
 lists them and a resume that picks others is refused: keep the cache between a run and its resume.
 
 ### Modes

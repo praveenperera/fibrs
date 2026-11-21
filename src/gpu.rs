@@ -5,17 +5,21 @@
 //! round some multiply-adds as one `fma` where its CPU kernel rounds the product and the sum apart (see
 //! `stage1.rs`), so this path gives the reference's CUDA output, not its CPU output. The
 //! kernels (`fibrs-kernels/`) are built to PTX ahead of time and embedded; at run time the NVIDIA driver loads
-//! them, so neither building nor running fibrs needs a CUDA toolkit. Linux x86_64 only, like `fibrs predict`;
+//! them, so neither building nor running fibrs needs a CUDA toolkit. Linux and Windows x86_64 only, like `fibrs predict`;
 //! `--device auto`, the default, uses the GPU when [`Gpu::open`] succeeds and the CPU otherwise
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64"))]
 mod cuda;
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64"))]
 pub use cuda::{Gpu, GpuFinisher};
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")))]
 pub use unsupported::{Gpu, GpuFinisher};
+
+/// The NVIDIA driver's CUDA library, which errors name when it is missing
+#[cfg(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64"))]
+pub const DRIVER: &str = if cfg!(windows) { "nvcuda.dll" } else { "libcuda.so" };
 
 /// The stages a run gives the GPU, which set how much free memory [`Gpu::open`] looks for when it picks a device
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,7 +57,7 @@ impl SlabLoads {
 }
 
 /// What [`GpuFinisher::finish`] made of a batch of raw curves
-#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+#[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
 pub enum Finished {
     /// Every curve's pieces, in batch order, equal to `FinishCtx::finish`'s
     Pieces(Vec<Pieces>),
@@ -63,7 +67,7 @@ pub enum Finished {
 
 /// Why the GPU handed a batch of raw curves back for the CPU to finish
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
+#[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
 pub enum CpuReason {
     /// The batch can read more native slabs than the GPU's slab cache holds
     Slabs,
@@ -76,7 +80,7 @@ pub enum CpuReason {
     Decode,
 }
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")))]
 mod unsupported {
     use color_eyre::eyre::{Result, bail};
 
@@ -114,7 +118,7 @@ mod unsupported {
 
     impl Gpu {
         pub fn open(_device: Option<usize>, _stages: Stages) -> Result<Self> {
-            bail!("fibrs runs on the GPU on Linux x86_64 only")
+            bail!("fibrs runs on the GPU on Linux and Windows x86_64 only")
         }
 
         pub fn name(&self) -> &str {

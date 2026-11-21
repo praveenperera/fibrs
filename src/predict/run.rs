@@ -368,7 +368,8 @@ fn check_column_memory(c: &Checked, p: &Plan, e: &Opened) -> Result<()> {
 
 /// `path` made absolute and resolved as the system would open it: the part that exists is canonicalized, links
 /// and `..` included, and the rest, which a run creates, may hold only plain names, so the path given and the path
-/// resolved always name the same place
+/// resolved always name the same place. On Windows, `std::path::absolute` already resolves `..` lexically, as the
+/// system does before it opens a path
 fn resolved(path: &Path) -> Result<PathBuf> {
     let path = std::path::absolute(path)?;
     let parts: Vec<Component> = path.components().filter(|c| *c != Component::CurDir).collect();
@@ -402,7 +403,7 @@ fn resolved(path: &Path) -> Result<PathBuf> {
 
 /// Locks the output for this process; the lock goes with the process, so a killed run leaves none behind
 fn lock_output(attempts: &fs::File, out: &Path) -> Result<()> {
-    match attempts.try_lock() {
+    match try_lock(attempts) {
         Ok(()) => Ok(()),
         Err(TryLockError::WouldBlock) => {
             bail!("{} is in use by another fibrs predict run; wait for it to end or use another --out", out.display())
@@ -411,6 +412,40 @@ fn lock_output(attempts: &fs::File, out: &Path) -> Result<()> {
         Err(TryLockError::Error(e)) => {
             bail!("cannot lock {} ({e}); fibrs predict needs an output on a filesystem with file locks", out.display())
         }
+    }
+}
+
+/// An exclusive lock on the whole file: flock(LOCK_EX | LOCK_NB), advisory, so the attempt log stays readable
+#[cfg(not(windows))]
+fn try_lock(file: &fs::File) -> Result<(), TryLockError> {
+    file.try_lock()
+}
+
+/// An exclusive lock on one byte far past any attempt log's end. Windows' locks are mandatory, so the whole-file lock
+/// std takes would keep anyone from reading the log while the run goes on; this byte excludes a second run just as
+/// well, and a whole-file lock overlaps it
+#[cfg(windows)]
+fn try_lock(file: &fs::File) -> Result<(), TryLockError> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx};
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    // the byte at offset 2^62
+    let mut at = OVERLAPPED::default();
+    at.Anonymous.Anonymous.OffsetHigh = 1 << 30;
+    let flags = LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY;
+    // SAFETY: the handle is open for the call, and on a synchronous handle LockFileEx is done with `at` on return
+    if unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut at) } != 0 {
+        return Ok(());
+    }
+
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Err(TryLockError::WouldBlock)
+    } else {
+        Err(TryLockError::Error(e))
     }
 }
 
@@ -461,7 +496,9 @@ fn run(c: Checked) -> Result<()> {
     // every run that passes the checks above is recorded before the model loads, so one capped or killed after
     // that still shows it
     fs::create_dir_all(out)?;
-    let mut attempts = fs::OpenOptions::new().create(true).append(true).open(out.join("attempts.jsonl"))?;
+    // read as well as append: Windows locks a file only through a handle with read or write access, and append
+    // alone is neither
+    let mut attempts = fs::OpenOptions::new().create(true).read(true).append(true).open(out.join("attempts.jsonl"))?;
     // held until the run ends: two runs on one output, on different --only-columns say, would each rewrite the
     // chunks their columns share from what they read, losing the other's columns while both record progress
     lock_output(&attempts, out)?;
@@ -626,4 +663,35 @@ fn columns(
         writer.submit(Finished { col: *col, nz: p.nz, sem: out.semantic, tra: out.tracing, record, started: t0 })?;
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, TryLockError};
+    use std::io::{Read, Write};
+
+    use super::try_lock;
+
+    /// The output lock turns away a second run, and on Windows, where locks are mandatory, still lets another
+    /// handle read the attempt log while it is held
+    #[test]
+    fn the_output_lock_refuses_a_second_run_and_leaves_the_log_readable() {
+        let dir = std::env::temp_dir().join(format!("fibrs-output-lock-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("attempts.jsonl");
+        let open = || fs::OpenOptions::new().create(true).read(true).append(true).open(&log).unwrap();
+
+        let mut held = open();
+        try_lock(&held).unwrap();
+        held.write_all(b"{\"attempt\": 1}\n").unwrap();
+
+        assert!(matches!(try_lock(&open()), Err(TryLockError::WouldBlock)));
+        let mut read = String::new();
+        fs::File::open(&log).unwrap().read_to_string(&mut read).unwrap();
+        assert_eq!(read, "{\"attempt\": 1}\n");
+
+        drop(held);
+        try_lock(&open()).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

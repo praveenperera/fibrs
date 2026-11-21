@@ -1,8 +1,7 @@
 //! What `--version` prints, by the name the binary runs as
 
 use std::fs;
-use std::os::unix::fs::symlink;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// What `exe --version` prints, without its trailing newline, after checking that it exited cleanly
@@ -22,7 +21,24 @@ fn version_follows_the_name_the_binary_runs_as() {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("version");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
-    let dropin = dir.join("avf-spline-generator");
-    symlink(fibrs, &dropin).unwrap();
+    let dropin = dropin(fibrs, &dir);
     assert_eq!(version(&dropin), "0.2.0");
+}
+
+/// `fibrs` under the drop-in's name in `dir`: a symlink, or on Windows, where a link needs a privilege and the
+/// system runs only a name ending in `.exe`, a copy
+fn dropin(fibrs: &Path, dir: &Path) -> PathBuf {
+    #[cfg(unix)]
+    let dropin = {
+        let dropin = dir.join("avf-spline-generator");
+        std::os::unix::fs::symlink(fibrs, &dropin).unwrap();
+        dropin
+    };
+    #[cfg(windows)]
+    let dropin = {
+        let dropin = dir.join("avf-spline-generator.exe");
+        fs::copy(fibrs, &dropin).unwrap();
+        dropin
+    };
+    dropin
 }

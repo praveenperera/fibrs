@@ -6,8 +6,8 @@
 //! band it doubled the predictor's kernel time and took 12% longer end to end, with the forward pass unchanged
 //!
 //! The choice is made at the first allocation, from the command line, and never changes, so every block is freed
-//! by the allocator that made it. Where the command line cannot be read without allocating, the binary keeps
-//! mimalloc
+//! by the allocator that made it. Where the command line cannot be read without allocating (any system but glibc
+//! Linux, macOS and MSVC Windows), the binary keeps mimalloc
 //!
 //! On Linux with glibc the tracer's mimalloc runs without transparent huge pages unless `MIMALLOC_ALLOW_THP` asks
 //! for them (`thp`)
@@ -177,7 +177,26 @@ mod args {
         unsafe { Some((*_NSGetArgc() as isize, (*_NSGetArgv()).cast_const().cast())) }
     }
 
-    #[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_vendor = "apple")))]
+    // the MSVC C runtime fills `__argc` and `__argv`, the command line in the ANSI code page, before it calls
+    // `main`, and Rust's std starts from that `main`; the first allocation comes after, from Rust code. The two
+    // arguments the choice reads are ASCII when they ask for `fibrs predict`, so the code page never matters
+    #[cfg(all(windows, target_env = "msvc"))]
+    fn argc_argv() -> Option<(isize, *const *const c_char)> {
+        unsafe extern "C" {
+            fn __p___argc() -> *mut std::ffi::c_int;
+            fn __p___argv() -> *mut *mut *mut c_char;
+        }
+
+        // SAFETY: the runtime's accessors return pointers to its own globals, valid for the whole process
+        let (argc, argv) = unsafe { (*__p___argc(), *__p___argv()) };
+        Some((argc as isize, argv.cast_const().cast()))
+    }
+
+    #[cfg(not(any(
+        all(target_os = "linux", target_env = "gnu"),
+        target_vendor = "apple",
+        all(windows, target_env = "msvc")
+    )))]
     fn argc_argv() -> Option<(isize, *const *const c_char)> {
         None
     }

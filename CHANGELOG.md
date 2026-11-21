@@ -1,6 +1,32 @@
 # Changelog
 
-## [Unreleased]
+## Unreleased
+
+### What's new
+
+- **Windows x86-64.** fibrs builds, tests and ships on Windows: a `win_amd64` wheel on PyPI, and a
+  `fibrs-<version>-x86_64-pc-windows-msvc.zip` CLI archive holding `fibrs.exe`, which `cargo binstall fibrs`
+  installs and which needs no Visual C++ redistributable. The tracer finds numpy's OpenBLAS in a Windows venv's
+  `Lib\site-packages`, `scripts/install-dropin.sh` installs the drop-in into one from Git Bash, and CI checks that
+  the tracer writes the original's `.afv` for the synthetic fixture there. `fibrs predict` and `--device cuda` are
+  built on Windows too and load the driver, cuDNN and cuBLAS from their Windows DLLs, including the
+  `fibrs[predict]` pip copies; they have not yet run on a Windows machine with an NVIDIA GPU. See
+  [Install](README.md#install).
+- **The tracer runs without transparent huge pages.** On Linux with glibc the tracer's mimalloc no longer asks for
+  transparent huge pages, and asks Linux to disable them for its process and any child process it starts, unless
+  `MIMALLOC_ALLOW_THP=1` is set. On a host with THP set to `madvise`, most of those requests fell back to small
+  pages after the kernel had tried to compact memory. On a dense 1024-plane window of PHerc0358 with
+  `--device cuda --threads 8`, the tracer took about 103 s instead of 114–134 s, with the same `.afv` and less than
+  half the kernel time. A host with THP set to `never` for every page size (`enabled` and each
+  `hugepages-*kB/enabled` under `/sys/kernel/mm/transparent_hugepage`) gives mimalloc no huge pages either way; one
+  set to `always` has not been measured. `fibrs predict` is unchanged.
+
+## [0.4.1] - 2026-11-20
+
+fibrs 0.4.1 can trace a wide window as Y-X tiles, so a run's peak memory follows its densest tile instead of the
+whole window, and a run without `--tiles-yx` writes the same `.afv` as before. fibrs installs with cargo from
+crates.io, `fibrs predict` reuses its buffers across a run with unchanged predictions, and `fibrs --version` prints
+fibrs' own version.
 
 ### What's new
 
@@ -11,21 +37,28 @@
   v2-run pipeline uses for its Z bands: cut ends of the same family at most 1.5 voxels apart, shortest first, never
   into a loop. A `--tiles-yx 1 1` run writes the untiled run's `.afv`. Without `--tiles-yx`, runs, their output and
   their `run.json` are unchanged. See [Tiled tracing](README.md#tiled-tracing).
-
-- **The tracer runs without transparent huge pages.** On Linux with glibc the tracer's mimalloc no longer asks for
-  transparent huge pages, and asks Linux to disable them for its process and any child process it starts, unless
-  `MIMALLOC_ALLOW_THP=1` is set. On a host with THP set to `madvise`, most of those requests fell back to small
-  pages after the kernel had tried to compact memory. On a dense 1024-plane window of PHerc0358 with
-  `--device cuda --threads 8`, the tracer took about 103 s instead of 114–134 s, with the same `.afv` and less than
-  half the kernel time. A host with THP set to `never` for every page size (`enabled` and each
-  `hugepages-*kB/enabled` under `/sys/kernel/mm/transparent_hugepage`) gives mimalloc no huge pages either way; one
-  set to `always` has not been measured. `fibrs predict` is unchanged.
+- **Install with cargo.** fibrs is on crates.io from 0.4.0: `cargo binstall fibrs` installs the release's prebuilt
+  CLI binary on Linux x86-64 and Apple silicon, and `cargo install fibrs --locked` builds it from source. See
+  [With cargo](README.md#with-cargo).
+- **`fibrs predict` reuses its buffers across a run.** Readers read each tile into a recycled buffer, the engine
+  hands batches back already sized for the next one, and the writer keeps one chunk buffer and one compress buffer
+  for the whole run, overwriting a chunk a column covers completely instead of zeroing it first. Once a column is
+  on disk its semantic and tracing vectors go back to the engine, which downloads the next column into them with
+  volkit's `finish_into`, so this needs volkit 0.1.2. The predictions are unchanged, and each chunk is still
+  compressed with numcodecs' destination size, so the chunk files stay byte for byte as numcodecs writes them.
 
 ### Fixes
 
 - **`fibrs --version` prints fibrs' version.** Run as `fibrs` or `python -m fibrs`, `--version` now prints fibrs'
   own version; it printed `0.2.0`, the version of `avf-spline-generator` it reproduces, on every release. Run as the
   drop-in `avf-spline-generator`, it still prints `0.2.0`. `fibrs predict --version` is unchanged.
+
+### Upgrading
+
+- 0.4.1 doesn't resume a tracer work directory that 0.4.0 started, finished or not, so a `--resume` that only
+  writes the `.afv` again needs 0.4.0 too. Finish a run with the binary that started it, or start a new work
+  directory. A `fibrs predict` output that 0.4.0 started, in band or villa mode, is refused on resume as well, as
+  it is by any other binary; finish it with 0.4.0 or write a new `--out`.
 
 ## [0.4.0] - 2026-11-20
 
@@ -417,6 +450,7 @@ The first release.
   Python module, and a CLI archive for each with `scripts/install-dropin.sh`
 - `--version` prints `0.2.0`, the original's version, as a drop-in has to
 
+[0.4.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.1
 [0.4.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.0
 [0.3.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.3.1
 [0.3.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.3.0

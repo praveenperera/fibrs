@@ -548,6 +548,8 @@ mod tests {
         fs::remove_dir_all(out).unwrap();
     }
 
+    // a dangling symlink; Windows needs a privilege to make one
+    #[cfg(unix)]
     #[test]
     fn progress_that_cannot_be_checked_is_not_taken_as_empty() {
         let out = fresh("dangling");
