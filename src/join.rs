@@ -151,6 +151,32 @@ impl Manifest {
         Ok(Self { bands, coordinate_space, source_path, provenance })
     }
 
+    /// That the output and the stats are two files, and neither is the manifest or a band's trace, which writing
+    /// them would replace
+    fn check_outputs(&self, args: &Args) -> Result<()> {
+        // an existing file by its real path, so a link to an input is caught too; a new one by its absolute path
+        let key = |p: &Path| {
+            fs::canonicalize(p).or_else(|_| std::path::absolute(p)).map_err(|e| eyre!("{}: {e}", p.display()))
+        };
+        let inputs = std::iter::once(&args.manifest).chain(self.bands.iter().map(|b| &b.afv));
+        let inputs = inputs.map(|p| key(p)).collect::<Result<Vec<_>>>()?;
+
+        let output = key(&args.output)?;
+        let stats = args.stats.as_deref().map(key).transpose()?;
+        for (flag, path) in [("--output", Some(&output)), ("--stats", stats.as_ref())] {
+            if let Some(path) = path
+                && inputs.contains(path)
+            {
+                bail!("{flag} {} is one of the join's inputs", path.display());
+            }
+        }
+        if stats.as_ref() == Some(&output) {
+            bail!("--stats and --output are the same file, {}", output.display());
+        }
+
+        Ok(())
+    }
+
     /// The planes between adjoining cores, where cut ends are joined
     fn interior(&self) -> Vec<Face> {
         let shared = self.bands.windows(2).filter(|p| p[0].core[1] == p[1].core[0]);
@@ -186,7 +212,7 @@ impl Band {
         // checked here on points already read rather than by scanning each band's fibre bounds up front, which
         // cost about two seconds a band on 1545
         let (lo, hi) = (self.window[0] as f64, self.window[1] as f64);
-        if let Some(p) = fibres.iter().flatten().find(|p| p[2] < lo || p[2] > hi) {
+        if let Some(p) = fibres.iter().flatten().find(|p| p[2] < lo || p[2] >= hi) {
             bail!("{} has a point at z {}, outside its window {:?}", self.afv.display(), p[2], self.window);
         }
 
@@ -248,6 +274,7 @@ fn run(args: &Args) -> Result<()> {
         bail!("--radius must be a nonnegative number of voxels");
     }
     let manifest = Manifest::read(&args.manifest)?;
+    manifest.check_outputs(args)?;
     let frames = manifest.bands.iter().map(Band::check).collect::<Result<Vec<_>>>()?;
     let frame = frames[0];
     if let Some((b, f)) = manifest
@@ -290,7 +317,7 @@ fn run(args: &Args) -> Result<()> {
     let Some(stats) = &args.stats else { return Ok(()) };
     let reports = reports.lock().expect("the export has finished").clone();
     let families: Map<String, Value> = reports.iter().map(|r| (label(r).to_string(), family_json(r))).collect();
-    let doc = json!({
+    let mut doc = json!({
         "radius": args.radius,
         "interior_planes": interior.len(),
         "families": families,
@@ -300,6 +327,10 @@ fn run(args: &Args) -> Result<()> {
         "block_count": summary.block_count,
         "wall_s": (wall * 10.0).round() / 10.0,
     });
+    // join.py's sidecar gives the coordinate space after the radius, and the v2 run's finish.sh reads it
+    if let Some(space) = &manifest.coordinate_space {
+        doc.as_object_mut().expect("an object").shift_insert(1, "coordinate_space".into(), json!(space));
+    }
     fs::write(stats, py_json_indent(&doc) + "\n").map_err(|e| eyre!("{}: {e}", stats.display()))?;
     Ok(())
 }

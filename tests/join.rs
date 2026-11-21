@@ -154,6 +154,7 @@ fn bands_are_cut_to_their_cores_and_joined_across_the_plane() {
     assert_eq!(v["fibres"], 2);
     assert_eq!(stats["families"]["H"]["fibres"], 1);
     assert_eq!((stats["interior_planes"].clone(), stats["fiber_count"].clone()), (json!(1), json!(3)));
+    assert_eq!(stats["coordinate_space"], "PHerc0000/20250101000000");
 
     // the public sets' layout: the coordinate space first in the frame, provenance under its own key
     assert!(metadata(&out, "frame").starts_with(r#"{"vc_open_data_coordinate_space":"PHerc0000/20250101000000","#));
@@ -178,10 +179,31 @@ fn a_band_traced_from_another_window_is_refused() {
 fn a_band_with_points_outside_its_window_is_refused() {
     let dir = scratch("outside-window");
     band(&dir.join("low.afv"), 0, &[("V", line(5.0, &[6.0, 14.0]))]);
-    let manifest = json!({"bands": [{"afv": "low.afv", "core_z": [0, 10], "window_z": [0, 12]}]});
+    // a window's last plane is excluded, as in the manifest's [z0, z1)
+    let manifest = json!({"bands": [{"afv": "low.afv", "core_z": [0, 10], "window_z": [0, 14]}]});
     fs::write(dir.join("bands.json"), manifest.to_string()).unwrap();
     let (manifest, out) = (dir.join("bands.json"), dir.join("scroll.afv"));
     let run = fibrs(&["join", "--manifest", manifest.to_str().unwrap(), "--output", out.to_str().unwrap()]);
     assert!(!run.status.success());
-    assert!(text(&run).contains("has a point at z 14, outside its window [0, 12]"), "{}", text(&run));
+    assert!(text(&run).contains("has a point at z 14, outside its window [0, 14]"), "{}", text(&run));
+}
+
+#[test]
+fn stats_that_would_replace_the_output_or_an_input_are_refused() {
+    let dir = scratch("stats-path");
+    band(&dir.join("low.afv"), 0, &[("V", line(5.0, &[6.0, 8.0]))]);
+    let manifest = json!({"bands": [{"afv": "low.afv", "core_z": [0, 10], "window_z": [0, 20]}]});
+    fs::write(dir.join("bands.json"), manifest.to_string()).unwrap();
+    let manifest = dir.join("bands.json");
+    let join = |out: &Path, stats: &Path| {
+        let (m, o, s) = (manifest.to_str().unwrap(), out.to_str().unwrap(), stats.to_str().unwrap());
+        text(&fibrs(&["join", "--manifest", m, "--output", o, "--stats", s]))
+    };
+
+    let out = dir.join("scroll.afv");
+    assert!(join(&out, &out).contains("--stats and --output are the same file"));
+    assert!(join(&out, &dir.join("low.afv")).contains("is one of the join's inputs"));
+    assert!(join(&manifest, &dir.join("scroll.json")).contains("is one of the join's inputs"));
+    assert!(fs::read_to_string(&manifest).unwrap().contains("low.afv"));
+    assert!(!out.exists());
 }
