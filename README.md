@@ -222,10 +222,11 @@ from, `[z0, z1)`:
   point, as when a fibre's only point in a core lies on the plane and both crossings land on it) is dropped and
   counted.
 - **Output.** Every V fibre, then every H fibre; each family's uncut fibres in band order, then its joined fibres.
-  The metadata is the public sets' for a whole volume (origin 0): the coordinate space first in the frame, the
-  source path in the root and the manifest's `provenance` under its own key. `--stats` writes the counts per family
-  (`uncut`, `cut_runs`, `cut_ends`, `joins`, `chains`, `zero_length_dropped`, `fibres`), the manifest's coordinate
-  space and the file's totals. The output and the stats must be two files in existing directories, neither of them an input.
+  The metadata is the public sets' for a whole volume (origin 0): the coordinate space (the manifest's, or the one
+  the bands name) first in the frame, the source path in the root and the manifest's `provenance` under its own
+  key. `--stats` writes the counts per family (`uncut`, `cut_runs`, `cut_ends`, `joins`, `chains`,
+  `zero_length_dropped`, `fibres`), the coordinate space and the file's totals. The output and the stats must be two
+  files in existing directories, neither of them an input; the stats replace whatever is at their path.
 - **Memory.** The join holds one family's pieces that end on a plane, plus up to three bands' fibres of that family:
   the band being cut, the next one, read ahead on its own thread, and the one after it being read.
 - **Speed.** On PHerc1545's 42 bands (34.6 GiB), `fibrs join` writes the same fibres, blocks and metadata as

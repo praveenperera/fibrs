@@ -212,7 +212,39 @@ fn stats_that_would_replace_the_output_or_an_input_are_refused() {
         std::os::unix::fs::symlink(&dir, dir.join("alias")).unwrap();
         assert!(join(&out, &dir.join("alias").join("scroll.afv")).contains("--stats and --output are the same file"));
     }
+    fs::create_dir(dir.join("reports")).unwrap();
+    assert!(join(&out, &dir.join("reports")).contains("is a directory"));
     assert!(!out.exists());
+
+    // stats at a link replace the link, not the file it names
+    let band_bytes = fs::read(dir.join("low.afv")).unwrap();
+    fs::hard_link(dir.join("low.afv"), dir.join("linked.json")).unwrap();
+    join(&out, &dir.join("linked.json"));
+    assert!(out.exists());
+    assert_eq!(fs::read(dir.join("low.afv")).unwrap(), band_bytes);
+    assert!(fs::read_to_string(dir.join("linked.json")).unwrap().contains("\"fiber_count\": 1"));
+}
+
+#[test]
+fn a_block_that_does_not_start_where_the_last_ended_is_refused() {
+    let dir = scratch("broken-block");
+    band(&dir.join("low.afv"), 0, &[]);
+    let db = Connection::open(dir.join("low.afv")).unwrap();
+    db.execute("INSERT INTO fibers VALUES(1,'fiber_1.json','V',3,0,0,64,0,64,4,6,'{}')", []).unwrap();
+    let blob = |points: &[Point]| -> Vec<u8> { points.iter().flatten().flat_map(|v| v.to_le_bytes()).collect() };
+    let blocks =
+        [(1, 0, blob(&[[5.0, 5.0, 4.0], [5.0, 5.0, 5.0]])), (2, 1, blob(&[[50.0, 5.0, 5.0], [5.0, 5.0, 6.0]]))];
+    for (id, first, points) in blocks {
+        db.execute("INSERT INTO blocks VALUES(?,1,?,?)", params![id, first, points]).unwrap();
+    }
+    drop(db);
+
+    let manifest = json!({"bands": [{"afv": "low.afv", "core_z": [0, 10], "window_z": [0, 20]}]});
+    fs::write(dir.join("bands.json"), manifest.to_string()).unwrap();
+    let (manifest, out) = (dir.join("bands.json"), dir.join("scroll.afv"));
+    let run = fibrs(&["join", "--manifest", manifest.to_str().unwrap(), "--output", out.to_str().unwrap()]);
+    assert!(!run.status.success());
+    assert!(text(&run).contains("does not start where the block before it ends"), "{}", text(&run));
 }
 
 #[test]
@@ -220,12 +252,14 @@ fn bands_traced_in_different_scans_are_refused() {
     let dir = scratch("two-scans");
     band(&dir.join("low.afv"), 0, &[("V", line(5.0, &[6.0, 8.0]))]);
     band(&dir.join("high.afv"), 4, &[("V", line(5.0, &[12.0, 14.0]))]);
-    for (name, scan) in [("low.afv", "PHerc0000/20250101000000"), ("high.afv", "PHerc0001/20250101000000")] {
+    let name_scan = |name: &str, scan: &str| {
         let db = Connection::open(dir.join(name)).unwrap();
         let named =
             "UPDATE metadata SET value = json_set(value, '$.vc_open_data_coordinate_space', ?) WHERE key = 'frame'";
         db.execute(named, [scan]).unwrap();
-    }
+    };
+    name_scan("low.afv", "PHerc0000/20250101000000");
+    name_scan("high.afv", "PHerc0001/20250101000000");
     let manifest = json!({"bands": [
         {"afv": "low.afv", "core_z": [0, 10], "window_z": [0, 16]},
         {"afv": "high.afv", "core_z": [10, 20], "window_z": [4, 20]},
@@ -240,4 +274,10 @@ fn bands_traced_in_different_scans_are_refused() {
         text(&run)
     );
     assert!(!out.exists());
+
+    // the scan the bands agree on is the output's when the manifest names none
+    name_scan("high.afv", "PHerc0000/20250101000000");
+    let run = fibrs(&["join", "--manifest", manifest.to_str().unwrap(), "--output", out.to_str().unwrap()]);
+    assert!(run.status.success(), "{}", text(&run));
+    assert!(metadata(&out, "frame").starts_with(r#"{"vc_open_data_coordinate_space":"PHerc0000/20250101000000","#));
 }

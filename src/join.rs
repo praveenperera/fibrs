@@ -21,6 +21,7 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread;
@@ -152,8 +153,15 @@ impl Manifest {
     }
 
     /// That the output and the stats are two files, and neither is the manifest or a band's trace, which writing
-    /// them would replace
+    /// them would replace; a link at the stats path is safe, since the stats replace the path rather than write
+    /// through it
     fn check_outputs(&self, args: &Args) -> Result<()> {
+        if let Some(stats) = &args.stats
+            && stats.is_dir()
+        {
+            bail!("--stats {} is a directory", stats.display());
+        }
+
         // an existing file by its real path, so a link to an input is caught too; a file still to be written by its
         // directory's real path, which must exist, so a missing directory fails before the join rather than after
         let key = |p: &Path| -> Result<PathBuf> {
@@ -184,8 +192,8 @@ impl Manifest {
     }
 
     /// That every band was traced in one volume: the same voxel size and shape, and the same scan wherever a band or
-    /// the manifest names it
-    fn check_volume(&self, frames: &[Frame]) -> Result<()> {
+    /// the manifest names it; that scan, if any names it
+    fn check_volume(&self, frames: &[Frame]) -> Result<Option<String>> {
         let frame = &frames[0];
         let bands = self.bands.iter().zip(frames);
         if let Some((b, f)) =
@@ -205,7 +213,7 @@ impl Manifest {
             }
         }
 
-        Ok(())
+        Ok(scan.map(str::to_owned))
     }
 
     /// The planes between adjoining cores, where cut ends are joined
@@ -307,7 +315,7 @@ fn run(args: &Args) -> Result<()> {
     let manifest = Manifest::read(&args.manifest)?;
     manifest.check_outputs(args)?;
     let frames = manifest.bands.iter().map(Band::check).collect::<Result<Vec<_>>>()?;
-    manifest.check_volume(&frames)?;
+    let scan = manifest.check_volume(&frames)?;
     let frame = &frames[0];
     let interior = manifest.interior();
     log!("Joining {} bands across {} planes into {}", manifest.bands.len(), interior.len(), args.output.display());
@@ -322,7 +330,7 @@ fn run(args: &Args) -> Result<()> {
         origin_xyz: [0, 0, 0],
         volume_shape: frame.volume_shape,
         minimum_mm: MinLength::Default,
-        coordinate_space: manifest.coordinate_space.as_deref(),
+        coordinate_space: scan.as_deref(),
         collection: Some(Collection {
             source_path: manifest.source_path.as_deref(),
             provenance: manifest.provenance.as_ref(),
@@ -352,11 +360,28 @@ fn run(args: &Args) -> Result<()> {
         "wall_s": (wall * 10.0).round() / 10.0,
     });
     // join.py's sidecar gives the coordinate space after the radius, and the v2 run's finish.sh reads it
-    if let Some(space) = &manifest.coordinate_space {
+    if let Some(space) = &scan {
         doc.as_object_mut().expect("an object").shift_insert(1, "coordinate_space".into(), json!(space));
     }
-    fs::write(stats, py_json_indent(&doc) + "\n").map_err(|e| eyre!("{}: {e}", stats.display()))?;
-    Ok(())
+    write_replacing(stats, &(py_json_indent(&doc) + "\n"))
+}
+
+/// Write `text` to a new file beside `path` and rename it over `path`, so a link at `path` is replaced rather than
+/// written through to the file it names
+fn write_replacing(path: &Path, text: &str) -> Result<()> {
+    let name = path.file_name().ok_or_else(|| eyre!("{} is not a file path", path.display()))?;
+    let temporary = path.with_file_name(format!(".{}.{}.partial", name.to_string_lossy(), std::process::id()));
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .and_then(|()| fs::rename(&temporary, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+
+    written.map_err(|e| eyre!("{}: {e}", path.display()))
 }
 
 fn label(r: &FamilyReport) -> &'static str {

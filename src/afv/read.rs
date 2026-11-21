@@ -110,9 +110,18 @@ impl AfvReader {
             if blob.is_empty() || !blob.len().is_multiple_of(POINT_BYTES) {
                 bail!("{}: fibre {id} has a block of {} bytes", self.path.display(), blob.len());
             }
+            let stored: Vec<Point> =
+                blob.as_chunks::<8>().0.as_chunks::<3>().0.iter().map(|p| p.map(f64::from_le_bytes)).collect();
+            // a later block starts on the point the block before it ends on, which is dropped as a repeat only
+            // when it is one, so a damaged boundary is refused rather than read as a different segment
             let skip = usize::from(first > 0);
-            let stored = blob.as_chunks::<8>().0.as_chunks::<3>().0;
-            points.extend(stored[skip..].iter().map(|p| p.map(f64::from_le_bytes)));
+            if skip == 1 && points.last() != stored.first() {
+                bail!(
+                    "{}: fibre {id}'s block at segment {first} does not start where the block before it ends",
+                    self.path.display()
+                );
+            }
+            points.extend_from_slice(&stored[skip..]);
         }
         self.check_last(current, &out)?;
         Ok(out)
