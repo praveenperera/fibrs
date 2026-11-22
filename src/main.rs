@@ -19,6 +19,7 @@ mod pyfmt;
 mod run;
 mod seams;
 mod stage1;
+mod subset;
 mod tiles;
 mod vol;
 
@@ -80,6 +81,9 @@ fn main() {
     }
     if join::requested(&argv) {
         std::process::exit(join::main(&argv[2..]));
+    }
+    if subset::requested(&argv) {
+        std::process::exit(subset::main(&argv[2..]));
     }
 
     // numpy's OpenBLAS is loaded only for 3x3 eigenproblems; its own thread pool would only add threads

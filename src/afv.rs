@@ -19,7 +19,7 @@ use serde_json::{Map, Value, json};
 
 use crate::pyfmt::{np_sum_f64, py_json};
 
-const SCHEMA: &str = "
+pub(crate) const SCHEMA: &str = "
 PRAGMA application_id=0x56434643;
 PRAGMA user_version=1;
 CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -188,12 +188,18 @@ where
     let (temporary, _) = mkstemp(&parent, Access::Owner)?;
     let _guard = TempGuard(temporary.clone());
     let summary = write_db(curves, &temporary, opt)?;
+    publish(&temporary, destination)?;
+    Ok(summary)
+}
+
+/// Flush a complete temporary file and link it at `destination`, which must not exist
+pub(crate) fn publish(temporary: &Path, destination: &Path) -> Result<()> {
     // opened for writing, since Windows flushes a file only through a handle that may write it
-    fs::OpenOptions::new().write(true).open(&temporary)?.sync_all()?;
+    fs::OpenOptions::new().write(true).open(temporary)?.sync_all()?;
     // a hard link publishes the complete file without overwriting a path that another process may
     // have created while tracing was running
-    fs::hard_link(&temporary, destination).map_err(|e| eyre!("{}: {e}", destination.display()))?;
-    Ok(summary)
+    fs::hard_link(temporary, destination).map_err(|e| eyre!("{}: {e}", destination.display()))?;
+    Ok(())
 }
 
 fn metadata(opt: &ExportOptions) -> Result<Vec<(&'static str, Value)>> {
@@ -493,7 +499,8 @@ where
     Ok(s)
 }
 
-fn check(db: &Connection) -> Result<()> {
+/// SQLite's integrity, foreign-key and R*Tree checks on a written AFV
+pub(crate) fn check(db: &Connection) -> Result<()> {
     let integrity: Vec<String> =
         db.prepare("PRAGMA integrity_check")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
     if integrity != ["ok"] {

@@ -85,6 +85,21 @@ fibrs join --manifest bands.json --output fibers-scroll.afv --stats fibers-scrol
 
 `core_z` is the planes a band keeps, `window_z` the planes it was traced from.
 
+## Subset
+
+```sh
+# the fibres with a point in a box of native level-0 voxels: X0 X1 Y0 Y1 Z0 Z1
+fibrs subset --input fibers-scroll.afv --output region.afv --box 2500 3524 3600 4624 8000 9024
+
+# every fibre of 2.5 mm or more, the sheet-strip runner's default minimum
+fibrs subset --input fibers-scroll.afv --output long.afv --min-length-mm 2.5
+```
+
+Writes a smaller `.afv` that villa's AFV importers read like the whole set. Fibres are kept whole and keep their
+ids, and the file keeps the set's uuid, so an imported fibre has the same UUID as in a whole-scroll import.
+`--box`, `--min-length-mm` and `--family V|H` combine. A box of a 27.6 GB scroll set takes about 20 s and under
+1 GB of memory.
+
 ## Predict
 
 ```sh
