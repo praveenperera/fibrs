@@ -1,6 +1,9 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.0] - 2026-11-22
+
+fibrs 0.5.0 adds `fibrs subset`, which cuts a whole-scroll fibre set down to a box, a minimum length or a family
+as a smaller `.afv` that villa's importers read like the whole set, with the same fibre UUIDs.
 
 ### What's new
 
@@ -9,6 +12,13 @@
   are copied as stored and the file keeps the set's uuid, so villa's importers give each fibre the UUID a
   whole-scroll import gives it. A whole-scroll set took about 1.5× its size in memory to import into villa's fibre
   store in one pass on PHerc1545; a region does not. See [Subset](README.md#subset).
+
+### Upgrading
+
+- 0.5.0 doesn't resume a tracer work directory that 0.4.2 started, finished or not, so a `--resume` that only
+  writes the `.afv` again needs 0.4.2 too. Finish a run with the binary that started it, or start a new work
+  directory. A `fibrs predict` output that 0.4.2 started is refused on resume as well; finish it with 0.4.2 or
+  write a new `--out`.
 
 ## [0.4.2] - 2026-11-21
 
@@ -477,6 +487,7 @@ The first release.
   Python module, and a CLI archive for each with `scripts/install-dropin.sh`
 - `--version` prints `0.2.0`, the original's version, as a drop-in has to
 
+[0.5.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.5.0
 [0.4.2]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.2
 [0.4.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.1
 [0.4.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.0
