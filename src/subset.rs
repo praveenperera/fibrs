@@ -1,5 +1,5 @@
-//! `fibrs subset`: the fibres of a complete `.afv` that touch a box, or pass a length or family filter, written as a
-//! smaller complete `.afv`
+//! `fibrs subset`: the fibres of a complete `.afv` that pass every filter given (a box they touch, a minimum length,
+//! a family), written as a smaller complete `.afv`
 //!
 //! A whole-scroll fibre set is too large for most machines to import whole into villa's fibre store (villa's
 //! importer holds about its whole output in memory, 27 GiB for an 18.6 GB set), and the tools that read the store
@@ -36,10 +36,11 @@ const RECOMPUTED: [&str; 5] = ["complete", "fiber_count", "point_count", "block_
 /// SQLite's page cache for each connection, in KiB: enough for the R*Tree and the fibre table's upper pages
 const CACHE_KIB: i64 = 256 << 10;
 
-/// Write the fibres of a complete .afv that touch a box or pass a length or family filter as a new, smaller .afv
+/// Write the fibres of a complete .afv that pass every filter given as a new, smaller .afv
 ///
-/// Fibres are kept whole and keep their ids, and the output keeps the input's uuid, so villa's importers give each
-/// fibre the same UUID as a whole-scroll import does
+/// A fibre is kept when it has a point in --box, is at least --min-length-mm long, and is of --family, for each of
+/// those given. Fibres are kept whole and keep their ids, and the output keeps the input's uuid, so villa's
+/// importers give each fibre the same UUID as a whole-scroll import does
 #[derive(Parser, Debug)]
 #[command(name = "fibrs subset", version = env!("CARGO_PKG_VERSION"))]
 pub struct Args {
@@ -297,8 +298,9 @@ fn write(source: &Source, filter: &Filter, candidates: &[i64], path: &Path) -> R
     {
         let mut fibre = source.db.prepare("SELECT * FROM fibers WHERE id = ?")?;
         let mut blocks = source.db.prepare(
+            // a left join, so a block the input's R*Tree lacks stops the copy instead of leaving its fibre short
             "SELECT b.id, b.fiber_id, b.first_segment, b.points, r.min_x, r.max_x, r.min_y, r.max_y, r.min_z, r.max_z \
-             FROM blocks b JOIN block_bounds r ON r.id = b.id WHERE b.fiber_id = ? ORDER BY b.first_segment",
+             FROM blocks b LEFT JOIN block_bounds r ON r.id = b.id WHERE b.fiber_id = ? ORDER BY b.first_segment",
         )?;
         let mut put_fibre = tx.prepare("INSERT INTO fibers VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")?;
         let mut put_block = tx.prepare("INSERT INTO blocks VALUES(?,?,?,?)")?;
@@ -321,6 +323,11 @@ fn write(source: &Source, filter: &Filter, candidates: &[i64], path: &Path) -> R
             while let Some(r) = rows.next()? {
                 let block: Vec<Sql> = (0..4).map(|i| r.get::<_, Sql>(i)).collect::<Result<_, _>>()?;
                 let bound: Vec<Sql> = (4..10).map(|i| r.get::<_, Sql>(i)).collect::<Result<_, _>>()?;
+                if bound[0] == Sql::Null {
+                    let block_id: i64 = r.get(0)?;
+                    bail!("block {block_id} of fibre {id} has no row in the spatial index");
+                }
+
                 put_block.execute(rusqlite::params_from_iter(&block))?;
                 put_bound.execute(rusqlite::params_from_iter(std::iter::once(&block[0]).chain(&bound)))?;
                 kept.blocks += 1;

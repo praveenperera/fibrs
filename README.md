@@ -97,8 +97,8 @@ fibrs subset --input fibers-scroll.afv --output long.afv --min-length-mm 2.5
 
 Writes a smaller `.afv` that villa's AFV importers read like the whole set. Fibres are kept whole and keep their
 ids, and the file keeps the set's uuid, so an imported fibre has the same UUID as in a whole-scroll import.
-`--box`, `--min-length-mm` and `--family V|H` combine. A box of a 27.6 GB scroll set takes about 20 s and under
-1 GB of memory.
+`--box`, `--min-length-mm` and `--family V|H` combine: a fibre is kept only when it passes each one given. A box
+of a 27.6 GB scroll set takes about 20 s and under 1 GB of memory.
 
 ## Predict
 

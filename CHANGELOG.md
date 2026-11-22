@@ -5,10 +5,10 @@
 ### What's new
 
 - **`fibrs subset`.** Writes the fibres of a complete `.afv` that have a point in a box (`--box`), are at least
-  `--min-length-mm` long, or are of one `--family`, as a smaller complete `.afv`. Rows are copied as stored and
-  the file keeps the set's uuid, so villa's importers give each fibre the UUID a whole-scroll import gives it. A
-  whole-scroll set needs about 1.5× its size in memory to import into villa's fibre store in one pass; a region
-  does not. See [Subset](README.md#subset).
+  `--min-length-mm` long, and are of one `--family`, for each of those given, as a smaller complete `.afv`. Rows
+  are copied as stored and the file keeps the set's uuid, so villa's importers give each fibre the UUID a
+  whole-scroll import gives it. A whole-scroll set took about 1.5× its size in memory to import into villa's fibre
+  store in one pass on PHerc1545; a region does not. See [Subset](README.md#subset).
 
 ## [0.4.2] - 2026-11-21
 
