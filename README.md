@@ -4,7 +4,7 @@ A fast drop-in for `avf-spline-generator` 0.2.0, Qual's AFV fibre tracer
 ([Qualzz/AVF_SPLINE_GENERATOR](https://github.com/Qualzz/AVF_SPLINE_GENERATOR) @ `bee798f`). Same flags, same
 `.afv` output.
 
-- **`fibrs predict`** runs Qual's AFV fibre model V2 on an NVIDIA GPU, without PyTorch.
+- **`fibrs predict`** runs Qual's AFV fibre model V2 on an NVIDIA GPU or an Apple silicon Mac, without PyTorch.
 - **`fibrs join`** joins a scroll's Z bands into one `.afv`.
 
 Fibre sets for whole scrolls, traced with fibrs:
@@ -110,8 +110,9 @@ fibrs predict --mode villa --ct scroll.zarr/0 --model-dir afv_fiber_9um_v2 --out
 fibrs predict --ct scroll.zarr/0 --z0 12032 --z1 12544 --model-dir afv_fiber_9um_v2 --out band.zarr
 ```
 
-Needs Linux or Windows x86-64, an RTX 30-series or newer GPU, cuDNN 9, cuBLAS 12, and the model from
-[Qualzz20/afv_fiber_9um_v2](https://huggingface.co/Qualzz20/afv_fiber_9um_v2).
+Needs the model from [Qualzz20/afv_fiber_9um_v2](https://huggingface.co/Qualzz20/afv_fiber_9um_v2) and either
+Linux or Windows x86-64 with an RTX 30-series or newer GPU, cuDNN 9 and cuBLAS 12, or an Apple silicon Mac on
+macOS 26 or newer.
 [Predict details](https://github.com/praveenperera/fibrs/blob/master/docs/predict.md).
 
 ## Build

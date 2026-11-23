@@ -12,14 +12,24 @@ All-zero chunks aren't written. They read as zero.
 
 ## Requirements
 
-- Linux or Windows x86-64
+On Linux or Windows x86-64:
+
 - NVIDIA GPU, compute capability 8.0+ (RTX 30 series, A100 or newer)
 - CUDA 12+ driver
 - cuDNN 9 and cuBLAS 12: `pip install "fibrs[predict]"`, or a system install
-- the model from [Qualzz20/afv_fiber_9um_v2](https://huggingface.co/Qualzz20/afv_fiber_9um_v2), passed as
-  `--model-dir`
 
-Windows hasn't been tested on a real GPU yet. On macOS, only `--dry-run` works.
+Windows hasn't been tested on a real GPU yet.
+
+On macOS:
+
+- Apple silicon (M1 or newer)
+- macOS 26 or newer
+- nothing else to install: the GPU kernels compile when fibrs starts
+
+On an Intel Mac, only `--dry-run` works.
+
+Both need the model from [Qualzz20/afv_fiber_9um_v2](https://huggingface.co/Qualzz20/afv_fiber_9um_v2), passed as
+`--model-dir`.
 
 ## Options
 
@@ -28,8 +38,8 @@ Windows hasn't been tested on a real GPU yet. On macOS, only `--dry-run` works.
 | `--ct` | level-0 uint8 zarr v2 array (the `/0` of an OME-Zarr) |
 | `--mode villa` | whole array, matching villa |
 | `--z0`, `--z1` | band to run, in band mode (the default) |
-| `--precision` | `fp32` (default) or `bf16` |
-| `--device` | `cuda` or `cuda:N` |
+| `--precision` | `fp32` (default) or `bf16` (NVIDIA only) |
+| `--device` | `cuda` or `cuda:N`; `metal` on macOS |
 | `--voxel-size-um` | voxel size written to the output (default 9.362) |
 | `--max-minutes` | stop after this long |
 | `--dry-run` | show what would run, without a GPU |
@@ -51,6 +61,9 @@ from villa near band edges.
 **bf16** is about twice as fast. Traced fibre length agrees with fp32 to about 99%. It's never used for published
 fibre sets.
 
+On a Mac, fp32 runs in full float32 where NVIDIA GPUs use TF32, so its output is within TF32's rounding of the
+NVIDIA output rather than byte-identical to it. bf16 isn't available on a Mac.
+
 ## Resuming
 
 Run the same command again on the same `--out`. It must use the same settings, binary and GPU model.
@@ -67,6 +80,8 @@ run's `summary-*.json` lists the libraries it loaded.
 ## Limits
 
 - Very tall bands may not fit in GPU memory. fibrs checks before starting and suggests a smaller `--column`.
-- Output can differ slightly between GPU models and cuDNN versions.
+- Output can differ slightly between GPU models and cuDNN versions, and between a Mac and an NVIDIA GPU.
+- On a Mac, the GPU shares the system's memory: a column has to fit in the share macOS gives the GPU, which fibrs
+  checks before starting.
 
 Speed and accuracy against villa: [benchmarks](benchmarks.md#prediction).

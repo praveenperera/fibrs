@@ -69,8 +69,8 @@ pub struct Args {
     /// Stop between columns after this long; 0 = no cap
     #[arg(long, default_value_t = 0.0)]
     max_minutes: f64,
-    /// CUDA device: cuda or cuda:N
-    #[arg(long, default_value = "cuda")]
+    /// GPU device: cuda or cuda:N, or metal on macOS
+    #[arg(long, default_value = engine::DEVICE_KIND)]
     device: String,
     /// Checkpoint sha256 the run must load
     #[arg(long)]
@@ -545,7 +545,7 @@ fn run(c: Checked) -> Result<()> {
         prov.insert("drop_in_for".into(), json!(DROP_IN_FOR));
     }
     // GPUs round differently, so a resume must run where the output started
-    prov.insert("device".into(), json!("cuda"));
+    prov.insert("device".into(), json!(engine::DEVICE_KIND));
     prov.insert("gpu".into(), json!(e.gpu));
     if villa {
         prov.insert("mode".into(), json!("villa"));
