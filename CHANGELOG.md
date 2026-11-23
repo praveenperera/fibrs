@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.0] - Unreleased
+
+fibrs 0.6.0 runs `fibrs predict` on Apple silicon Macs, on the GPU through volkit 0.2.0's Metal backend, with no
+PyTorch and nothing else to install.
+
+### What's new
+
+- **`fibrs predict` on a Mac.** On an M1 or newer with macOS 26 or newer, `fibrs predict` runs AFV fibre model V2
+  on the GPU with `--device metal`, the default there. It runs fp32 in full float32, where NVIDIA GPUs use TF32,
+  so its output is within TF32's rounding of the NVIDIA output rather than byte-identical to it; bf16 is
+  NVIDIA-only. On an M4 Pro the network runs 1.77× faster than PyTorch on MPS on the same tiles (226.6 against
+  402.1 ms a 128³ tile). A Mac prediction's provenance records `device: metal` and the Winograd levels it ran,
+  so a resume under another `VOLKIT_METAL_WINOGRAD` setting is refused rather than mixing outputs. See
+  [Predict](docs/predict.md).
+
 ## [0.5.0] - 2026-11-22
 
 fibrs 0.5.0 adds `fibrs subset`, which cuts a whole-scroll fibre set down to a box, a minimum length or a family
