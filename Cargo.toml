@@ -98,6 +98,7 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 debug = 1
 codegen-units = 4
 
-# the unreleased volkit 0.2.0 (Metal backend) from its branch checkout beside this one; drop once 0.2.0 is on crates.io
+# the Metal backend needs volkit 0.2.0 (praveenperera/volkit, branch metal), which is not released yet; replace with
+# the release before publishing
 [patch.crates-io]
-volkit = { path = "../volkit/volkit" }
+volkit = { git = "https://github.com/praveenperera/volkit", rev = "99c746e1935f21c1657942f292f640616153d57d" }
