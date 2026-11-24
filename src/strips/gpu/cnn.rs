@@ -1120,6 +1120,18 @@ mod tests {
         Ok(json!({"name": name, "vs_bf16": vs_bf16, "vs_f32": vs_f32, "band": band}))
     }
 
+    /// Under `STRIPS_CNN_DUMP`, block `name`'s output (bf16 bits, NDHWC) as `<STRIPS_CNN_OUT>/<mode>_<name>.bf16`, for
+    /// offline signed-bias analysis (`ops/vesuvius/strips-native/cells_bias.py`; the parity rows hold only magnitudes)
+    fn dump(mode: &str, name: &str, got: &[u16]) -> Result<()> {
+        let (Some(_), Some(dir)) = (std::env::var_os("STRIPS_CNN_DUMP"), std::env::var_os("STRIPS_CNN_OUT")) else {
+            return Ok(());
+        };
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir)?;
+        let bytes: Vec<u8> = got.iter().flat_map(|v| v.to_le_bytes()).collect();
+        Ok(std::fs::write(dir.join(format!("{mode}_{name}.bf16")), bytes)?)
+    }
+
     fn modes() -> Vec<(&'static str, Stages01)> {
         let names = std::env::var("STRIPS_CNN_MODES").unwrap_or_else(|_| "native,cudnn".into());
         let modes = names.split(',').map(|m| match m.trim() {
@@ -1157,6 +1169,7 @@ mod tests {
         // the tapped forward runs stage 2 on the whole batch, so every block is checked ungrouped
         let mut tap = |name: &str, buf: &volkit::gpu::Buf, shape: [usize; 5]| -> Result<()> {
             let got: Vec<u16> = s.dev.gpu.download_range(buf, 0, shape.iter().product())?;
+            dump(mode_name, name, &got)?;
             rows.push(check(s, &blocks, name, name, &got, shape)?);
             seen.push(name.to_string());
             Ok(())

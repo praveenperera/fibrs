@@ -312,11 +312,14 @@ fn source(dst: u32, size: u32) -> (u32, u32, f32) {
 }
 
 /// The CNN output from the last stage's output `x` and the context fuse's 1x1 conv `y` of the context block's
-/// output, at the context's size: `cells = rbf(x + rbf(up(y) + bias))`, `up` the 2x trilinear upsample
+/// output, at the context's size: `cells = rbf(x + rbf(rbf(up(y)) + bias))`, `up` the 2x trilinear upsample
 /// (align_corners False) in float32, `bias` the fuse's bias as bf16 holds it
 ///
 /// PyTorch upsamples first and convolves the upsampled tensor; both are linear and the upsample's weights sum to 1,
-/// so the order only moves bf16 rounding, and the conv runs on an eighth of the voxels
+/// so the order only moves bf16 rounding, and the conv runs on an eighth of the voxels. The bias goes on as PyTorch's
+/// cuDNN conv adds it: to the conv output already rounded to bf16, then rounded again. That second rounding snaps the
+/// small bias onto the coarser bf16 grid of the conv's values, a per-channel offset of up to a few 1e-3 the trained
+/// head expects; adding the bias in float32 before one rounding drops it and tilts the strip heights
 ///
 /// `x` and `cells` are `[B, 2D, 2H, 2W, C]` and `y` `[B, D, H, W, C]`, bf16 pairs as `U32x2`, `C % 4 == 0`. One
 /// thread per output `U32x2`: `quads` = C/4, `d`, `h`, `w` the context's size
@@ -360,7 +363,7 @@ pub fn sn_upfuse(
         let k = j as usize;
         let near = my * (mx * a000[k] + lx * a001[k]) + ly * (mx * a010[k] + lx * a011[k]);
         let far = my * (mx * a100[k] + lx * a101[k]) + ly * (mx * a110[k] + lx * a111[k]);
-        r[k] = rbf(skip[k] + rbf(mz * near + lz * far + bias[(4 * q) as usize + k]));
+        r[k] = rbf(skip[k] + rbf(rbf(mz * near + lz * far) + bias[(4 * q) as usize + k]));
         j += 1;
     }
     o.write(U32x2([pack(r[0], r[1]), pack(r[2], r[3])]));
