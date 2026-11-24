@@ -70,9 +70,13 @@ zstd = "0.13"
 # elsewhere `fibrs predict` plans a run (--dry-run) but refuses to start one. Cargo.lock pins the release; build.rs
 # records it in the provenance from there
 [target.'cfg(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64"))'.dependencies]
-volkit = "0.1.2"
+volkit = "0.1.3"
 # the free device memory for the column check, from the cudarc volkit already brings into the tree
 cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12040"] }
+# `fibrs strips`: the PTX tier type volkit's module loader takes, and the checkpoint's exported weights; the
+# versions volkit already brings into the tree
+cudakit = { version = "0.1", features = ["libraries"] }
+safetensors = "0.6"
 
 # Windows' memory, module-list and loader calls: the brick store's pages, the predictor's record of the cuDNN and
 # cuBLAS DLLs it loaded; the version volkit already brings into the tree

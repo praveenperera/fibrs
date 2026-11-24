@@ -7,3 +7,5 @@ ptx/*.txt binary
 ptx/sources.sha256 binary
 # zarr chunks (extensionless), .npy arrays and the reference .afv files the tests compare byte for byte
 tests/fixtures/** -text
+# the strips kernels' PTX and build records, embedded or hashed byte for byte
+ptx/strips*.ptx binary

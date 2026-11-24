@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### What's new
+
+- **`fibrs strips run`.** Runs villa's sheet-strip inference (`scrollprize/fiber_strip_small_v1`) over an AFV's
+  fibres natively, with Rust and cuda-oxide kernels and cuDNN for the convolutions. It writes the Python runner's
+  strip layout and index. On one RTX 5090 it ran the whole PHerc0211 scroll at 2,095 decisions/s, about 8× villa's
+  PyTorch runner, with the strips' error measures matching PyTorch's. A run's output doesn't depend on its batch size
+  or worker count. Fibres whose CT chunks aren't in the disk cache are deferred and listed, and the run exits with
+  code 75. See [Strips](docs/strips.md).
+
+### Upgrading
+
+- fibrs now needs volkit 0.1.3, whose device layer is public so `fibrs strips` can run its own kernels on
+  volkit's GPU.
+
 ## [0.5.0] - 2026-11-22
 
 fibrs 0.5.0 adds `fibrs subset`, which cuts a whole-scroll fibre set down to a box, a minimum length or a family
