@@ -458,3 +458,57 @@ fn head_matches_strip_reference() -> Result<()> {
     ensure!(e.max <= 0.25 && e.p99 <= 0.0625, "heights: {e} against stock PyTorch, past fast1's distance to stock");
     Ok(())
 }
+
+/// One gpu-ab arm (`ops/vesuvius/strips-native/gpu-ab-head.toml`): the head at batch `FIBRS_HEAD_BATCH` (default
+/// 64) on the dump's decisions, `FIBRS_HEAD_REPS` (default 50) untraced forwards after 5 warmups; writes the median
+/// ms/decision and the host load to `FIBRS_HEAD_OUT/metrics.json`, and the sha256 of the last forward's heights and
+/// log scales to `fp.txt`, so arms that should match bit for bit are checked
+#[test]
+#[ignore = "needs an NVIDIA GPU and the head dump (FIBRS_HEAD_REF); run through the GPU queue"]
+fn head_bench() -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let out = PathBuf::from(std::env::var_os("FIBRS_HEAD_OUT").ok_or_else(|| eyre!("FIBRS_HEAD_OUT is not set"))?);
+    let b: usize = std::env::var("FIBRS_HEAD_BATCH").map_or(Ok(64), |s| s.parse())?;
+    let reps: usize = std::env::var("FIBRS_HEAD_REPS").map_or(Ok(50), |s| s.parse())?;
+    let w = weights()?;
+    let dev = Device::open(0)?;
+    let inputs = Dump::open("inputs")?;
+    let inputs = inputs.tensors()?;
+    let head = Head::new(&dev, &w, b)?;
+    let requests = requests(&inputs, b)?;
+    let (cells, crop) = upload_inputs(&dev, &inputs, b)?;
+    let load = || std::fs::read_to_string("/proc/loadavg").unwrap_or_default().trim().to_string();
+    let load_start = load();
+    for _ in 0..5 {
+        head.forward(&dev, &cells, &crop, &requests)?;
+    }
+
+    let mut times = Vec::with_capacity(reps);
+    let mut results = Vec::new();
+    for _ in 0..reps {
+        let start = Instant::now();
+        results = head.forward(&dev, &cells, &crop, &requests)?;
+        times.push(start.elapsed().as_secs_f64() * 1e3);
+    }
+    let ms = median(times) / b as f64;
+    let mut hash = Sha256::new();
+    for r in &results {
+        for v in r.heights.iter().flatten().chain(r.log_scale.iter().flatten()) {
+            hash.update(v.to_le_bytes());
+        }
+    }
+    let fp = format!("{:x}", hash.finalize());
+    std::fs::create_dir_all(&out)?;
+    std::fs::write(out.join("fp.txt"), format!("{fp}\n"))?;
+    let metrics = serde_json::json!({
+        "batch": b,
+        "reps": reps,
+        "ms_per_decision": ms,
+        "loadavg_start": load_start,
+        "loadavg_end": load(),
+    });
+    std::fs::write(out.join("metrics.json"), serde_json::to_string_pretty(&metrics)?)?;
+    println!("b{b}: {ms:.5} ms/decision, fingerprint {fp}");
+    Ok(())
+}
