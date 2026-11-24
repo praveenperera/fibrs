@@ -7,7 +7,7 @@
 //! the CPU stitches the decisions into a strip and writes it (`out`). Decisions batch across fibres on the GPU;
 //! the CPU work runs on a thread pool. [`types`] holds the records that pass between the two sides
 
-mod bench;
+mod bench_model;
 pub mod ct;
 pub mod gpu;
 pub mod refset;
@@ -28,14 +28,14 @@ pub fn requested(argv: &[OsString]) -> bool {
 #[command(name = "fibrs strips", version = env!("CARGO_PKG_VERSION"))]
 enum Command {
     /// Time the native strip model and check it against PyTorch's reference
-    BenchModel(bench::Args),
+    BenchModel(bench_model::Args),
 }
 
 /// Runs `fibrs strips` on the arguments after the subcommand; the process exit code
 pub fn main(args: &[OsString]) -> i32 {
     let command = Command::parse_from(std::iter::once(OsString::from("fibrs strips")).chain(args.iter().cloned()));
     let result = match &command {
-        Command::BenchModel(args) => bench::run(args),
+        Command::BenchModel(args) => bench_model::run(args),
     };
     match result {
         Ok(()) => 0,
