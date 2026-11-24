@@ -13,8 +13,10 @@ use super::crops::Pinned;
 use super::{Device, Weights};
 use crate::strips::types::{FrameRequest, FrameResult};
 
-/// Output channels per conv thread and conv block threads (strips-kernels `CONV_CO_TILE`, `CONV_THREADS`)
+/// Output channels and positions per conv block, and its threads (strips-kernels `CONV_CO_TILE`,
+/// `CONV_POSITIONS`, `CONV_THREADS`)
 const CO_TILE: u32 = 16;
+const CONV_POSITIONS: u32 = 32;
 const CONV_THREADS: u32 = 128;
 
 /// One of layers 2-4: weights `[(tap · ci + c) · co + o]`, bias, and the layer's shape
@@ -54,6 +56,8 @@ impl FrameModel {
             gpu.upload(&weights.get(&format!("frame.{name}"), shape)?.values)
         };
         let conv = |idx: usize, ci: usize, co: usize, s_shift: u32| -> Result<Conv> {
+            // sf_conv's input copies split k into taps and channels with a shift and a mask
+            ensure!(ci.is_power_of_two() && ci >= 16, "frame conv {idx}: {ci} input channels");
             let t = weights.get(&format!("frame.features.{idx}.weight"), &[co, ci, 4, 4, 4])?;
             let mut w = vec![0f32; 64 * ci * co];
             for o in 0..co {
@@ -148,7 +152,7 @@ impl FrameModel {
             k.launch(
                 gpu,
                 "sf_conv",
-                (n.div_ceil(CONV_THREADS), c.co as u32 / CO_TILE, 1),
+                (n.div_ceil(CONV_POSITIONS), c.co as u32 / CO_TILE, 1),
                 (CONV_THREADS, 1, 1),
                 0,
                 &[

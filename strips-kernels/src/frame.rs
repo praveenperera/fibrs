@@ -15,8 +15,9 @@
 
 use core::ptr::addr_of_mut;
 
+use cuda_device::async_copy::{cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_group};
 use cuda_device::float::{add_rn_f32, div_rn_f32, fma_rn_f32, mul_rn_f32, sqrt_rn_f32};
-use cuda_device::thread::{blockDim_x, blockIdx_x, blockIdx_y, sync_threads, threadIdx_x};
+use cuda_device::thread::{__unroll_config, blockDim_x, blockIdx_x, blockIdx_y, sync_threads, threadIdx_x};
 use cuda_device::vector::F32x4;
 use cuda_device::{SharedArray, kernel};
 
@@ -24,12 +25,22 @@ unsafe extern "C" {
     fn __nv_expf(x: f32) -> f32;
 }
 
-/// Output channels each [`sf_conv`] thread computes
+/// Output channels each [`sf_conv`] block computes
 pub const CONV_CO_TILE: u32 = 16;
-/// Threads (output positions) per [`sf_conv`] block
-pub const CONV_THREADS: u32 = 128;
+/// Output positions each [`sf_conv`] block computes
+pub const CONV_POSITIONS: u32 = 32;
+/// Threads per [`sf_conv`] block: one warp per group of 4 of the block's channels, one lane per position
+pub const CONV_THREADS: u32 = CONV_POSITIONS * CONV_CO_TILE / 4;
 /// Rows of the weight matrix a [`sf_conv`] block stages at a time
 const CONV_K_TILE: u32 = 64;
+/// One staged weight tile in 4-channel vectors
+const CONV_W_TILE: u32 = CONV_K_TILE * CONV_CO_TILE / 4;
+/// k tiles in flight in [`sf_conv`]: one computing, the rest loading
+const CONV_STAGES: u32 = 3;
+/// One position's staged k tile in 4-value vectors, padded by one vector
+const CONV_X_ROW: u32 = CONV_K_TILE / 4 + 1;
+/// One staged input tile in 4-value vectors
+const CONV_X_STAGE: u32 = CONV_POSITIONS * CONV_X_ROW;
 
 #[inline(always)]
 fn silu(x: f32) -> f32 {
@@ -89,17 +100,22 @@ pub unsafe fn sf_conv1(crop: *const f32, w: *const f32, bias: *const f32, n: u32
     #[unroll]
     for q in 0..4 {
         unsafe {
-            *dst.add(q) = F32x4::new([silu(acc[4 * q]), silu(acc[4 * q + 1]), silu(acc[4 * q + 2]), silu(acc[4 * q + 3])]);
+            *dst.add(q) =
+                F32x4::new([silu(acc[4 * q]), silu(acc[4 * q + 1]), silu(acc[4 * q + 2]), silu(acc[4 * q + 3])]);
         }
     }
 }
 
 /// Layers 2-4: `y[b, o, co] = silu(bias[co] + Σ_{tap, ci} w[(tap · ci_n + ci) · co_n + co] · x[b, 2o + k - 1, ci])`
 /// from the channels-last `(B, s_in, s_in, s_in, ci_n)` input to `(B, s_in/2, s_in/2, s_in/2, co_n)`, zero padding.
-/// `s_in` is `1 << s_shift`, `ci_n` a multiple of 4 and `co_n` of [`CONV_CO_TILE`]; `n` is `B · (s_in/2)^3`
+/// `s_in` is `1 << s_shift`, `ci_n` a power of two of at least 16 and `co_n` a multiple of [`CONV_CO_TILE`]; `n`
+/// is `B · (s_in/2)^3`
 ///
-/// Grid: x over `n / CONV_THREADS` rounded up, y over `co_n / CONV_CO_TILE`; [`CONV_THREADS`] threads, one output
-/// position each, computing the block's [`CONV_CO_TILE`] channels
+/// Grid: x over `n / CONV_POSITIONS` rounded up, y over `co_n / CONV_CO_TILE`; [`CONV_THREADS`] threads. Warp `g`
+/// computes channels `4g..4g + 4` of the block's tile, lane `l` position `l`; each channel sums its taps in `k`
+/// order whatever the tiling. The k tiles of input and weights stream through [`CONV_STAGES`] shared buffers
+/// with async copies: the last layer has only `8 B` positions and the longest sums, so its time is one thread's
+/// chain of tiles, and loads two tiles ahead hide the L2 latency
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn sf_conv(
@@ -112,78 +128,128 @@ pub unsafe fn sf_conv(
     n: u32,
     y: *mut f32,
 ) {
-    static mut W: SharedArray<f32, { (CONV_K_TILE * CONV_CO_TILE) as usize }, 16> = SharedArray::UNINIT;
-    let ws = unsafe { &mut *addr_of_mut!(W) };
+    // stage `s` holds one k tile: position `l`'s 64 inputs at `XS[s · CONV_X_STAGE + l · CONV_X_ROW ..]` (a padded
+    // row, so a warp reading one vector per lane hits every bank once per quarter-warp) and weight row `r`'s
+    // channels `4q..4q + 4` at `WS[s · CONV_W_TILE + 4r + q]`
+    static mut XS: SharedArray<F32x4, { (CONV_STAGES * CONV_X_STAGE) as usize }, 16> = SharedArray::UNINIT;
+    static mut WS: SharedArray<F32x4, { (CONV_STAGES * CONV_W_TILE) as usize }, 16> = SharedArray::UNINIT;
+    let xs = unsafe { &mut *addr_of_mut!(XS) };
+    let ws = unsafe { &mut *addr_of_mut!(WS) };
     let t = threadIdx_x();
+    let (g, lane) = (t >> 5, t & 31);
     let co0 = blockIdx_y() * CONV_CO_TILE;
-    let p = blockIdx_x() * blockDim_x() + t;
-    let live = p < n;
+    let p0 = blockIdx_x() * CONV_POSITIONS;
     let o_shift = s_shift - 1;
     let o_mask = (1u32 << o_shift) - 1;
-    let b = p >> (3 * o_shift);
-    let (oz, oy, ox) = ((p >> (2 * o_shift)) & o_mask, (p >> o_shift) & o_mask, p & o_mask);
-    let s_in = 1i32 << s_shift;
-    let src = unsafe { x.add(((b as usize) << (3 * s_shift)) * ci_n as usize) };
-    let mut acc = [0f32; 16];
+    let s_in = 1u32 << s_shift;
+    let ci_shift = ci_n.trailing_zeros();
+
+    // this thread copies input vector `q` (k values `k0 + 4q..`) of positions `t / 16 + 8m`, m < 4, and weight
+    // vectors `t` and `t + CONV_THREADS` of each tile
+    let q = t & 15;
+    let mut src = [x; 4];
+    let mut at = [(0u32, 0u32, 0u32); 4];
+    let mut live = [false; 4];
     #[unroll]
-    for c in 0..16 {
-        // SAFETY: `co_n` biases
-        acc[c] = unsafe { *bias.add((co0 + c as u32) as usize) };
+    for m in 0..4 {
+        let p = p0 + (t >> 4) + 8 * m as u32;
+        let b = p >> (3 * o_shift);
+        live[m] = p < n;
+        at[m] = ((p >> (2 * o_shift)) & o_mask, (p >> o_shift) & o_mask, p & o_mask);
+        src[m] = unsafe { x.add(((b as usize) << (3 * s_shift)) * ci_n as usize) };
     }
-    let k_total = 64 * ci_n;
-    let mut k0 = 0u32;
-    while k0 < k_total {
-        sync_threads();
-        let mut i = t;
-        while i < CONV_K_TILE * CONV_CO_TILE {
-            let (r, c) = (i >> 4, i & 15);
-            // SAFETY: `k0 + r < k_total` since `k_total` is a multiple of the tile
-            ws[i as usize] = unsafe { *w.add(((k0 + r) * co_n + co0 + c) as usize) };
-            i += blockDim_x();
-        }
-        sync_threads();
-        if live {
-            let mut kk = 0u32;
-            while kk < CONV_K_TILE {
-                let k = k0 + kk;
-                let tap = k / ci_n;
-                let ci = k - tap * ci_n;
-                let (kz, ky, kx) = ((tap >> 4) as i32, ((tap >> 2) & 3) as i32, (tap & 3) as i32);
-                let iz = 2 * oz as i32 + kz - 1;
-                let iy = 2 * oy as i32 + ky - 1;
-                let ix = 2 * ox as i32 + kx - 1;
-                let inside = ((iz as u32) < s_in as u32) & ((iy as u32) < s_in as u32) & ((ix as u32) < s_in as u32);
-                let v = if inside {
-                    let at = ((((iz << s_shift) | iy) << s_shift) | ix) as usize * ci_n as usize + ci as usize;
-                    // SAFETY: inside the input, and `ci` is a multiple of 4 with `ci + 4 <= ci_n`
-                    unsafe { *(src.add(at) as *const F32x4) }
-                } else {
-                    F32x4::new([0.0; 4])
+    let tiles = 64 * ci_n / CONV_K_TILE;
+    // starts the async copies of k tile `$tile` into its stage
+    macro_rules! issue {
+        ($tile:expr) => {{
+            let tile: u32 = $tile;
+            let stage = tile % CONV_STAGES;
+            let k = tile * CONV_K_TILE + 4 * q;
+            let (tap, ci) = (k >> ci_shift, k & (ci_n - 1));
+            let (kz, ky, kx) = (tap >> 4, (tap >> 2) & 3, tap & 3);
+            let mut m = 0;
+            while m < 4 {
+                __unroll_config::<0>();
+                let (oz, oy, ox) = at[m];
+                // unsigned, so the padding row -1 wraps above `s_in`
+                let iz = (2 * oz + kz).wrapping_sub(1);
+                let iy = (2 * oy + ky).wrapping_sub(1);
+                let ix = (2 * ox + kx).wrapping_sub(1);
+                let inside = live[m] & (iz < s_in) & (iy < s_in) & (ix < s_in);
+                let off = ((((iz << s_shift) | iy) << s_shift) | ix) as usize * ci_n as usize + ci as usize;
+                let row = (t >> 4) + 8 * m as u32;
+                let dst = &mut xs[(stage * CONV_X_STAGE + row * CONV_X_ROW + q) as usize] as *mut F32x4 as *mut u32;
+                // SAFETY: a 16-byte aligned shared slot; the source is inside the input when `inside`; otherwise
+                // (padding or past `n`) the size is zero, so nothing is read and the slot is zero filled
+                let from = if inside { unsafe { src[m].add(off) } } else { x };
+                unsafe { cp_async_cg_zfill_16(dst, from as *const u8, if inside { 16 } else { 0 }) };
+                m += 1;
+            }
+            let mut j = 0;
+            while j < 2 {
+                __unroll_config::<0>();
+                let slot = t + j * CONV_THREADS;
+                let (r, v) = (slot >> 2, slot & 3);
+                let dst = &mut ws[(stage * CONV_W_TILE + slot) as usize] as *mut F32x4 as *mut u32;
+                // SAFETY: weight row `tile · CONV_K_TILE + r < 64 · ci_n` of `co_n` channels, 16-byte aligned since
+                // `co_n` and `co0` are multiples of 4
+                unsafe {
+                    cp_async_cg_16(dst, w.add(((tile * CONV_K_TILE + r) * co_n + co0 + 4 * v) as usize) as *const u32)
                 };
-                let v = v.to_array();
+                j += 1;
+            }
+        }};
+    }
+
+    let mut acc = [0f32; 4];
+    #[unroll]
+    for c in 0..4 {
+        // SAFETY: `co_n` biases
+        acc[c] = unsafe { *bias.add((co0 + 4 * g + c as u32) as usize) };
+    }
+    #[unroll]
+    for s in 0..(CONV_STAGES - 1) {
+        if (s as u32) < tiles {
+            issue!(s as u32);
+        }
+        unsafe { cp_async_commit_group() };
+    }
+    let mut i = 0u32;
+    while i < tiles {
+        // tile `i`'s copies from this thread have landed; the barrier makes every thread's visible and frees the
+        // stage tile `i - 1` used, which the next issue refills
+        unsafe { cp_async_wait_group(CONV_STAGES - 2) };
+        sync_threads();
+        if i + CONV_STAGES - 1 < tiles {
+            issue!(i + CONV_STAGES - 1);
+        }
+        // an empty group keeps the count of pending groups at CONV_STAGES - 1 through the last tiles
+        unsafe { cp_async_commit_group() };
+        let stage = i % CONV_STAGES;
+        let xrow = stage * CONV_X_STAGE + lane * CONV_X_ROW;
+        let wrow = stage * CONV_W_TILE + g;
+        #[unroll]
+        for q in 0..16 {
+            let v = xs[(xrow + q as u32) as usize].to_array();
+            #[unroll]
+            for j in 0..4 {
+                let wr = ws[(wrow + (4 * q as u32 + j as u32) * 4) as usize].to_array();
                 #[unroll]
-                for j in 0..4 {
-                    let row = ((kk + j as u32) * CONV_CO_TILE) as usize;
-                    #[unroll]
-                    for c in 0..16 {
-                        acc[c] = fma_rn_f32(ws[row + c], v[j], acc[c]);
-                    }
+                for c in 0..4 {
+                    acc[c] = fma_rn_f32(wr[c], v[j], acc[c]);
                 }
-                kk += 4;
             }
         }
-        k0 += CONV_K_TILE;
+        i += 1;
     }
-    if !live {
+    let p = p0 + lane;
+    if p >= n {
         return;
     }
     // SAFETY: `co_n` channels per position
-    let dst = unsafe { y.add(p as usize * co_n as usize + co0 as usize) as *mut F32x4 };
-    #[unroll]
-    for q in 0..4 {
-        unsafe {
-            *dst.add(q) = F32x4::new([silu(acc[4 * q]), silu(acc[4 * q + 1]), silu(acc[4 * q + 2]), silu(acc[4 * q + 3])]);
-        }
+    unsafe {
+        *(y.add(p as usize * co_n as usize + (co0 + 4 * g) as usize) as *mut F32x4) =
+            F32x4::new([silu(acc[0]), silu(acc[1]), silu(acc[2]), silu(acc[3])]);
     }
 }
 

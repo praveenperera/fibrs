@@ -134,7 +134,7 @@ ptxas info    : Used 90 registers, used 1 barriers, 4096 bytes smem, 392 bytes c
 ptxas info    : Compiling entry function 'sf_conv' for 'sm_80'
 ptxas info    : Function properties for sf_conv
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 52 registers, used 1 barriers, 4096 bytes smem, 400 bytes cmem[0]
+ptxas info    : Used 56 registers, used 1 barriers, 38400 bytes smem, 400 bytes cmem[0]
 ptxas info    : Compiling entry function 'sc_write' for 'sm_80'
 ptxas info    : Function properties for sc_write
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
