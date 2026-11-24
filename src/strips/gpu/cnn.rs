@@ -18,6 +18,11 @@
 //!
 //! One departure from PyTorch's order, exact in real arithmetic: the context fuse convolves the context output before
 //! the upsample rather than after (both are linear and the upsample's weights sum to 1), on an eighth of the voxels
+//!
+//! Batch invariance: a crop's cells are the same bits whatever launch it runs in. cuDNN picks its kernels by the
+//! batch size it is planned for, so every cuDNN conv runs on sample groups of one fixed size (16): a launch is
+//! padded to a multiple of it, and the pad samples compute on zeros and are never read back. Every other kernel
+//! works per sample, and the InstanceNorm statistics sum each sample in the same chunks at any batch size
 
 use std::collections::HashMap;
 
@@ -38,14 +43,37 @@ pub const CELL_CHANNELS: usize = 64;
 
 /// The first block of stage 2, where sample groups start (see [`CropCnn::set_group`])
 const STAGE2: usize = 3;
-/// Stage 2's default sample group
+/// The sample group every cuDNN conv runs on by default (see the module doc's batch invariance)
 const DEFAULT_GROUP: usize = 16;
 /// InstanceNorm3d's epsilon
 const EPS: f32 = 1e-5;
 /// The most workspace a cuDNN algorithm may take
 const MAX_WORKSPACE: usize = 1 << 30;
-/// Blocks the statistics kernel aims for per launch (a few waves of the GPU's SMs)
-const STATS_BLOCKS: usize = 2048;
+/// Chunks the statistics kernel splits each sample into, whatever the batch: a group of 16 samples is a few waves of
+/// the GPU's SMs, and a fixed split keeps each sample's sums in the same order at any batch size
+const STATS_CHUNKS: usize = 128;
+
+/// Zeroes samples `range` of `buf` (`per` bytes each), queued on the stream
+fn zero_samples(dev: &Device, buf: &Buf, per: usize, range: std::ops::Range<usize>) -> Result<()> {
+    if range.is_empty() {
+        return Ok(());
+    }
+    ensure!(
+        range.end * per <= buf.bytes(),
+        "zeroing samples {range:?} of {per} bytes past a {}-byte buffer",
+        buf.bytes()
+    );
+    // SAFETY: the range lies inside the live allocation, checked above
+    unsafe {
+        cudarc::driver::result::memset_d8_async(
+            buf.ptr() + (range.start * per) as u64,
+            0,
+            range.len() * per,
+            dev.gpu.cu_stream(),
+        )
+    }
+    .wrap_err("zero the pad samples")
+}
 
 fn voxels(s: [usize; 3]) -> usize {
     s[0] * s[1] * s[2]
@@ -443,10 +471,12 @@ pub struct CropCnn {
     fuse: Conv,
     native: Native,
     stages01: Stages01,
-    /// The sample group stage 2 onward runs in, `None` for the whole batch
+    /// The sample group every cuDNN conv runs on, `None` for the whole batch (not batch-invariant)
     group: Option<usize>,
     plans: HashMap<usize, Plans>,
     max_batch: usize,
+    /// Samples the buffers hold: `max_batch` padded to a multiple of the default group
+    capacity: usize,
     /// The input crop in bf16 `[B, 144, 128, 128, 2]` (cuDNN stage 0 only)
     xb: Buf,
     /// The input's 2x2x2 average in bf16 `[B, 72, 64, 64, 2]`
@@ -465,17 +495,18 @@ impl CropCnn {
     pub fn new(dev: &Device, weights: &Weights, max_batch: usize) -> Result<Self> {
         ensure!(max_batch > 0, "max_batch 0");
         let gpu = &dev.gpu;
+        let capacity = max_batch.next_multiple_of(DEFAULT_GROUP);
         let s0 = CROP;
         let s1 = s0.map(|d| d / 2);
         let s2 = s1.map(|d| d / 2);
         let p = "strip.cnn";
         let blocks = vec![
-            Block::load(gpu, weights, "stage0.block0", &format!("{p}.stages.0.blocks.0"), 2, 12, 2, s0, max_batch)?,
-            Block::load(gpu, weights, "stage1.block0", &format!("{p}.stages.1.blocks.0"), 12, 24, 2, s1, max_batch)?,
-            Block::load(gpu, weights, "stage1.block1", &format!("{p}.stages.1.blocks.1"), 24, 24, 1, s2, max_batch)?,
-            Block::load(gpu, weights, "stage2.block0", &format!("{p}.stages.2.blocks.0"), 24, 64, 1, s2, max_batch)?,
-            Block::load(gpu, weights, "stage2.block1", &format!("{p}.stages.2.blocks.1"), 64, 64, 1, s2, max_batch)?,
-            Block::load(gpu, weights, "context", &format!("{p}.context_stage.blocks.0"), 64, 64, 2, s2, max_batch)?,
+            Block::load(gpu, weights, "stage0.block0", &format!("{p}.stages.0.blocks.0"), 2, 12, 2, s0, capacity)?,
+            Block::load(gpu, weights, "stage1.block0", &format!("{p}.stages.1.blocks.0"), 12, 24, 2, s1, capacity)?,
+            Block::load(gpu, weights, "stage1.block1", &format!("{p}.stages.1.blocks.1"), 24, 24, 1, s2, capacity)?,
+            Block::load(gpu, weights, "stage2.block0", &format!("{p}.stages.2.blocks.0"), 24, 64, 1, s2, capacity)?,
+            Block::load(gpu, weights, "stage2.block1", &format!("{p}.stages.2.blocks.1"), 64, 64, 1, s2, capacity)?,
+            Block::load(gpu, weights, "context", &format!("{p}.context_stage.blocks.0"), 64, 64, 2, s2, capacity)?,
         ];
         // the fuse runs on the context block's output, before the upsample (see `sn_upfuse`)
         let fuse = Conv::load(gpu, weights, &format!("{p}.context_fuse"), 64, 64, 1, 1, s2.map(|d| d / 2))?;
@@ -483,11 +514,11 @@ impl CropCnn {
         ensure!(blocks[0].conv1.bias.is_some() && blocks[0].conv2.bias.is_some(), "stage 0's convs have no bias");
         let native = Native::load(dev, weights)?;
 
-        let n = max_batch;
+        let n = capacity;
         let largest = voxels(s1) * 12;
-        // the larger of sn_conv0's tile partials and the statistics kernel's (`n * chunks` stays under
-        // STATS_BLOCKS + n, see `stats`)
-        let partial = (n * CONV0_TILES * 24).max((STATS_BLOCKS + n) * 64) * 8;
+        // the larger of sn_conv0's tile partials and the statistics kernel's (at most STATS_CHUNKS per sample and
+        // channel, see `stats`)
+        let partial = (n * CONV0_TILES * 24).max(n * STATS_CHUNKS * 64) * 8;
         Ok(Self {
             blocks,
             fuse,
@@ -496,6 +527,7 @@ impl CropCnn {
             group: Some(DEFAULT_GROUP),
             plans: HashMap::new(),
             max_batch,
+            capacity,
             xb: gpu.alloc(n * voxels(s0) * IN_CHANNELS * 2)?,
             pooled: gpu.alloc(n * voxels(s1) * IN_CHANNELS * 2)?,
             t: [
@@ -520,20 +552,22 @@ impl CropCnn {
         self.stages01 = mode;
     }
 
-    /// Runs stage 2, the context block and the cells `group` samples at a time from the next forward on (`None`:
-    /// the whole batch at once). A group's 64-channel activations (4.7 MB per sample) then stay in L2 between the
-    /// cuDNN convs and the norm passes that read them back, at the cost of smaller conv launches
+    /// Runs every cuDNN conv `group` samples at a time from the next forward on, padding the batch to a multiple of
+    /// it (`None`: the whole batch at once, whose cuDNN kernels then depend on the batch size). A group's 64-channel
+    /// activations (4.7 MB per sample) stay in L2 between the cuDNN convs and the norm passes that read them back
     pub fn set_group(&mut self, group: Option<usize>) {
         self.group = group;
     }
 
-    /// Plans every conv for batch `n` and for the sample groups it splits into (cuDNN's timed pick, replayed from
-    /// volkit's algorithm cache when it has one), and grows the shared workspace to fit
+    /// Plans every conv for the sample group batch `n` runs in, and for `n` itself when cuDNN runs stages 0 and 1
+    /// (cuDNN's timed pick, replayed from volkit's algorithm cache when it has one), and grows the shared workspace
+    /// to fit
     pub fn prepare(&mut self, dev: &Device, n: usize) -> Result<()> {
         ensure!(n > 0 && n <= self.max_batch, "batch {n} outside 1..={}", self.max_batch);
-        let group = self.group(n);
-        for k in [n, group, n % group] {
-            self.plan(dev, k)?;
+        self.plan(dev, self.group(n))?;
+        // cuDNN's own stages 0 and 1 run on the whole batch
+        if self.stages01 == Stages01::Cudnn {
+            self.plan(dev, n)?;
         }
         Ok(())
     }
@@ -581,16 +615,26 @@ impl CropCnn {
     }
 
     fn run(&mut self, dev: &Device, input: &Buf, n: usize, mut tap: Option<Tap>) -> Result<()> {
+        // a tapped forward runs every block on the whole batch, so each block's whole output exists when tapped
+        let group = if tap.is_some() { n } else { self.group(n) };
+        let padded = n.next_multiple_of(group);
+        ensure!(
+            padded <= self.capacity,
+            "batch {n} in groups of {group} needs {padded} samples, past {}",
+            self.capacity
+        );
         self.prepare(dev, n)?;
+        self.plan(dev, group)?;
         let need = n * voxels(CROP) * IN_CHANNELS * 4;
         ensure!(input.bytes() >= need, "CNN input: {} bytes, {n} crops need {need}", input.bytes());
-        let plans = &self.plans[&n];
+        let plans = self.plans.get(&n);
+        let gplans = &self.plans[&group];
         let gpu = &dev.gpu;
 
         // stages 0 and 1 leave their output in activation buffer `x`; then each block reads `x` and writes its
         // output into one of the other activation buffers
         let (first, mut x) = match self.stages01 {
-            Stages01::Native => (STAGE2, self.native01(dev, input, n, plans, &mut tap)?),
+            Stages01::Native => (STAGE2, self.native01(dev, input, n, (gplans, group, padded), &mut tap)?),
             Stages01::Cudnn => {
                 self.cast_input(dev, input, n)?;
                 (0, None)
@@ -598,19 +642,23 @@ impl CropCnn {
         };
         for i in first..STAGE2 {
             let blk = &self.blocks[i];
+            let plans = plans.expect("cuDNN's stages 0 and 1 planned for the batch");
             x = Some(self.block(dev, blk, &plans.blocks[i], x, None, Samples::all(n))?);
             self.tap_block(dev, blk, x, n, &mut tap)?;
         }
+        // the pad samples run stage 2 onward on zeros
+        let stage1 = &self.t[x.expect("stage 1's output")];
+        let c = &self.blocks[STAGE2].conv1;
+        zero_samples(dev, stage1, voxels(c.input) * c.cin * 2, n..padded)?;
 
         // stage 2, the context block and the cells, a sample group at a time (see `CropCnn::set_group`); a tapped
         // forward runs them on the whole batch, so each block's whole output exists when it is tapped. Stage 1's
         // output, in `x`, is packed at its own per-sample size, so no group writes its buffer: a group's 64-channel
         // tensors there would cover samples of later groups
         let keep = x;
-        let group = if tap.is_some() { n } else { self.group(n) };
-        for g in (0..n).step_by(group) {
-            let s = Samples { first: g, n: group.min(n - g) };
-            let plans = &self.plans[&s.n];
+        for g in (0..padded).step_by(group) {
+            let s = Samples { first: g, n: group };
+            let plans = gplans;
             let mut xg = x;
             let mut outputs = Vec::with_capacity(self.blocks.len() - STAGE2);
             for i in STAGE2..self.blocks.len() {
@@ -629,9 +677,9 @@ impl CropCnn {
         Ok(())
     }
 
-    /// The sample group stage 2 onward runs in, for batch `n`
+    /// The sample group every cuDNN conv runs on, for batch `n`
     fn group(&self, n: usize) -> usize {
-        self.group.map_or(n, |g| g.clamp(1, n))
+        self.group.unwrap_or(n).max(1)
     }
 
     /// Hands block `blk`'s output, in activation buffer `out`, to `tap` after a stream sync
@@ -746,12 +794,15 @@ impl CropCnn {
 
     /// Stages 0 and 1 on the strips kernels' convs (see [`Stages01::Native`]); returns the activation buffer
     /// holding stage 1's output
+    ///
+    /// `group` holds the group's conv plans, its size and the batch padded to a multiple of it: the stage 1 skip's
+    /// cuDNN projection runs a group at a time, the pad samples on zeros
     fn native01(
         &self,
         dev: &Device,
         input: &Buf,
         n: usize,
-        plans: &Plans,
+        (plans, group, padded): (&Plans, usize, usize),
         tap: &mut Option<Tap>,
     ) -> Result<Option<usize>> {
         let nat = &self.native;
@@ -796,7 +847,10 @@ impl CropCnn {
         }
         let (proj, proj_norm) = sk1;
         let pp = plans.blocks[1].proj.as_ref().expect("stage 1 block 0 projects");
-        proj.run(dev, pp, t2, t3, self.workspace.as_ref(), all)?;
+        zero_samples(dev, t2, voxels(proj.input) * proj.cin * 2, n..padded)?;
+        for g in (0..padded).step_by(group) {
+            proj.run(dev, pp, t2, t3, self.workspace.as_ref(), Samples { first: g, n: group })?;
+        }
         self.stats(dev, t3, proj_norm, all, v2)?;
         self.mma(dev, &nat.s1[0], t0, Prologue::Norm(&b1.norm1), t2, &b1.norm2, n)?;
         self.apply(dev, t2, &b1.norm2, Residual::Norm(t3, proj_norm), all, v2, true)?;
@@ -890,8 +944,7 @@ impl CropCnn {
         let (n, c) = (s.n, norm.c);
         let pairs = c / 2;
         let lanes = 256 / pairs;
-        let want = STATS_BLOCKS.div_ceil(n).max(1);
-        let chunk_rows = rows.div_ceil(want).max(lanes * 8);
+        let chunk_rows = rows.div_ceil(STATS_CHUNKS).max(lanes * 8);
         let chunks = rows.div_ceil(chunk_rows);
         ensure!(n * chunks * c * 8 <= self.partial.bytes(), "statistics partials overflow");
         let args = [

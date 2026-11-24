@@ -357,10 +357,16 @@ impl Probe<'_> {
             println!("{}", json!({"invariance": name, "vs": format!("b={b} in order"), "result": row.clone()}));
             out.insert(format!("{name} (b={b})"), row);
         }
-        let mut sizes: Vec<usize> = [b, 17, n % b, n % 17].into_iter().filter(|&k| k > 0).collect();
+        let mut sizes: Vec<usize> = [16, b, 17, n % b, n % 17].into_iter().filter(|&k| k > 0).collect();
+        sizes.sort_unstable();
         sizes.dedup();
-        let algos: serde_json::Map<String, Value> =
-            sizes.iter().map(|&k| (k.to_string(), Value::from(cnn.algorithms(k)))).collect();
+        // only the sizes the CNN planned: with fixed sample groups that is the group alone
+        let algos: serde_json::Map<String, Value> = sizes
+            .iter()
+            .map(|&k| (k, cnn.algorithms(k)))
+            .filter(|(_, a)| !a.is_empty())
+            .map(|(k, a)| (k.to_string(), Value::from(a)))
+            .collect();
         println!("{}", json!({"cnn_algorithms": algos.clone()}));
         out.insert("cnn_algorithms".into(), Value::from(algos));
         // the first batching's bits, to compare runs in separate processes (each plans its own algorithms)
