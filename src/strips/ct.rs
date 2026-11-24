@@ -95,6 +95,35 @@ impl Volume {
         Ok(chunk)
     }
 
+    /// Reads chunk `c` (chunk-grid zyx) into `out`, which holds one chunk; false when the source holds none (the
+    /// cache has its missing marker), an error when the cache holds neither
+    ///
+    /// Unlike [`Volume::chunk`] this keeps no mapping open, so a run's device cache can stream every chunk of a
+    /// scroll through it without growing the process's map count
+    pub fn read_chunk(&self, c: [usize; 3], out: &mut [u8]) -> Result<bool> {
+        use std::io::Read;
+
+        let want = self.chunks.iter().product::<usize>();
+        ensure!(out.len() == want, "read_chunk: output of {} bytes for a {want}-byte chunk", out.len());
+        let path = self.dir.join(c[0].to_string()).join(c[1].to_string()).join(c[2].to_string());
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut marker = path.clone().into_os_string();
+                marker.push(".missing");
+                if !Path::new(&marker).exists() {
+                    bail!("CT chunk {c:?} is not in the disk cache {} (prefetch the scroll first)", self.dir.display());
+                }
+                return Ok(false);
+            }
+            Err(e) => return Err(e).wrap_err_with(|| format!("open {}", path.display())),
+        };
+        let len = file.metadata().wrap_err_with(|| format!("stat {}", path.display()))?.len();
+        ensure!(len == want as u64, "{}: {len} bytes, expected {want}", path.display());
+        file.read_exact(out).wrap_err_with(|| format!("read {}", path.display()))?;
+        Ok(true)
+    }
+
     /// Copies the box `start .. start + size` (zyx, inside the level) into `out`, zyx C order
     pub fn read_region(&self, start: [usize; 3], size: [usize; 3], out: &mut [u8]) -> Result<()> {
         ensure!(out.len() == size.iter().product::<usize>(), "read_region: output of {} for {size:?}", out.len());

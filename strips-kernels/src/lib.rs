@@ -9,4 +9,5 @@
 #![allow(clippy::missing_safety_doc)]
 
 pub mod cnn;
-pub mod probe;
+pub mod crops;
+pub mod frame;
