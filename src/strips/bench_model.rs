@@ -84,6 +84,14 @@ pub struct Args {
     /// CUDA device ordinal
     #[arg(long, default_value_t = 0)]
     device: usize,
+    /// Also writes the native cells of every reference decision here (bf16 bits, the layout of the reference's
+    /// `cells.bf16`)
+    #[arg(long)]
+    cells_out: Option<PathBuf>,
+    /// Cells files (the layout of `cells.bf16`) to run the head alone on; each one's heights go to
+    /// `<file>.h1.f32`, and its column tilt against stock to the report
+    #[arg(long)]
+    head_cells: Vec<PathBuf>,
 }
 
 /// Runs the bench; the report also goes to stdout, a line per result
@@ -153,35 +161,51 @@ pub fn run(args: &Args) -> Result<()> {
     // parity: every decision through the whole model, against each PyTorch variant
     let mut h1 = Vec::with_capacity(refs.n * GRID_LEN);
     let mut logs = Vec::with_capacity(refs.n * GRID_LEN);
+    let mut native_cells: Vec<u16> = Vec::new();
     for a in (0..refs.n).step_by(b) {
         let e = (a + b).min(refs.n);
         dev.gpu.upload_into(&input, 0, refs.crop(a..e))?;
         let cells = cnn.forward(&dev, &input, e - a)?;
+        if args.cells_out.is_some() {
+            native_cells.extend(dev.gpu.download_range::<u16>(cells, 0, (e - a) * CELLS_LEN)?);
+        }
         for r in head.forward(&dev, cells, &input, &requests[a..e])? {
             h1.extend(r.heights.iter().flatten());
             logs.extend(r.log_scale.iter().flatten());
         }
     }
+    if let Some(path) = &args.cells_out {
+        std::fs::write(path, native_cells.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())
+            .wrap_err_with(|| format!("write {}", path.display()))?;
+    }
     ensure!(h1.len() == refs.n * GRID_LEN && logs.len() == h1.len(), "the model returned {} grid values", h1.len());
     // the raw heights beside the report, for signed (bias) comparisons the spreads cannot show
-    let raw = args.out.with_extension("h1.f32");
-    std::fs::write(&raw, h1.iter().flat_map(|v: &f32| v.to_le_bytes()).collect::<Vec<u8>>())
-        .wrap_err_with(|| format!("write {}", raw.display()))?;
+    write_f32(&args.out.with_extension("h1.f32"), &h1)?;
 
-    // the head alone: the same decisions on the stock CNN's own cells, to split a bias between the CNN and the head
-    let stock_cells = dev.gpu.alloc(b * CELLS_LEN * 2)?;
-    let mut h1_head = Vec::with_capacity(refs.n * GRID_LEN);
-    for a in (0..refs.n).step_by(b) {
-        let e = (a + b).min(refs.n);
-        dev.gpu.upload_into(&input, 0, refs.crop(a..e))?;
-        dev.gpu.upload_into(&stock_cells, 0, refs.cells(a..e))?;
-        for r in head.forward(&dev, &stock_cells, &input, &requests[a..e])? {
-            h1_head.extend(r.heights.iter().flatten());
-        }
+    // the head alone on the stock CNN's own cells, and on any cells files given, to split a bias between the CNN and
+    // the head (and, with hybrid cells files, within the cells)
+    let h1_head = head_on_cells(&dev, &head, &input, &refs, &requests, b, |r| Ok(refs.cells(r).to_vec()))?;
+    write_f32(&args.out.with_extension("h1_stockcells.f32"), &h1_head)?;
+    let mut head_tilts = serde_json::Map::new();
+    head_tilts.insert("stock cells".into(), Value::from(column_tilt(&h1_head, refs.output("stock.h1")?)));
+    for path in &args.head_cells {
+        let bytes = std::fs::read(path).wrap_err_with(|| format!("read {}", path.display()))?;
+        ensure!(
+            bytes.len() == refs.n * CELLS_LEN * 2,
+            "{}: {} bytes for {} decisions",
+            path.display(),
+            bytes.len(),
+            refs.n
+        );
+        let values: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        let h = head_on_cells(&dev, &head, &input, &refs, &requests, b, |r| {
+            Ok(values[r.start * CELLS_LEN..r.end * CELLS_LEN].to_vec())
+        })?;
+        write_f32(&path.with_extension("h1.f32"), &h)?;
+        head_tilts.insert(path.display().to_string(), Value::from(column_tilt(&h, refs.output("stock.h1")?)));
     }
-    let raw = args.out.with_extension("h1_stockcells.f32");
-    std::fs::write(&raw, h1_head.iter().flat_map(|v: &f32| v.to_le_bytes()).collect::<Vec<u8>>())
-        .wrap_err_with(|| format!("write {}", raw.display()))?;
+    println!("{}", json!({"head_column_tilt_vs_stock": head_tilts}));
+    report["head_column_tilt_vs_stock"] = Value::from(head_tilts);
 
     let mut parity = serde_json::Map::new();
     let mut failed = Vec::new();
@@ -211,6 +235,36 @@ pub fn run(args: &Args) -> Result<()> {
         bail!("parity outside PyTorch's bf16 spread: {}", failed.join("; "));
     }
     Ok(())
+}
+
+/// The head on every reference decision, batches of `b`, with each batch's cells from `cells` (bf16 bits); the
+/// heights in decision order
+fn head_on_cells(
+    dev: &Device,
+    head: &Head,
+    input: &volkit::gpu::Buf,
+    refs: &RefSet,
+    requests: &[StripRequest],
+    b: usize,
+    cells: impl Fn(std::ops::Range<usize>) -> Result<Vec<u16>>,
+) -> Result<Vec<f32>> {
+    let buf = dev.gpu.alloc(b * CELLS_LEN * 2)?;
+    let mut h1 = Vec::with_capacity(refs.n * GRID_LEN);
+    for a in (0..refs.n).step_by(b) {
+        let e = (a + b).min(refs.n);
+        dev.gpu.upload_into(input, 0, refs.crop(a..e))?;
+        dev.gpu.upload_into(&buf, 0, &cells(a..e)?)?;
+        for r in head.forward(dev, &buf, input, &requests[a..e])? {
+            h1.extend(r.heights.iter().flatten());
+        }
+    }
+    Ok(h1)
+}
+
+/// `values` as raw little-endian float32
+fn write_f32(path: &std::path::Path, values: &[f32]) -> Result<()> {
+    std::fs::write(path, values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())
+        .wrap_err_with(|| format!("write {}", path.display()))
 }
 
 fn bf16(bits: u16) -> f32 {
