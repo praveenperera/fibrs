@@ -14,7 +14,7 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use color_eyre::eyre::{Result, WrapErr, bail, ensure};
+use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
 use cudarc::driver::result as cur;
 use cudarc::driver::{CudaContext, CudaEvent, CudaStream};
 use volkit::gpu::{Arg, Buf, Gpu};
@@ -30,6 +30,9 @@ const ABSENT: u32 = 0xFFFF_FFFF;
 /// The chunk edge the kernels address by shifts
 const CHUNK: usize = 128;
 const CHUNK_BYTES: usize = CHUNK * CHUNK * CHUNK;
+/// Threads reading a launch's missing chunks from the disk cache: the reads, one at a time on the engine thread, took
+/// as long as every kernel of the run together (13.3 of 26.3 s on Check A's 200 fibres, nsys)
+const READERS: usize = 16;
 /// Words per crop grid record (strips-kernels `GRID_WORDS`)
 const GRID_WORDS: usize = 16;
 /// Threads per sampler block (strips-kernels `SAMPLE_THREADS`): a 2·[`STEPS`] x 8 x 16 tile
@@ -292,7 +295,6 @@ pub struct ChunkCache {
     epoch: u64,
     copy: Arc<CudaStream>,
     staging: Vec<Pinned<u8>>,
-    next: usize,
     entries: Pinned<u32>,
     uploaded: CudaEvent,
     sampled: CudaEvent,
@@ -331,7 +333,6 @@ impl ChunkCache {
             epoch: 0,
             copy: ctx.new_stream()?,
             staging,
-            next: 0,
             entries: Pinned::new(ctx, 1 << 16)?,
             uploaded: ctx.new_event(None)?,
             sampled: ctx.new_event(None)?,
@@ -376,38 +377,69 @@ impl ChunkCache {
             }
         }
 
+        let missing: Vec<u32> = needed.iter().copied().filter(|&idx| self.host_table[idx as usize] == ABSENT).collect();
         let mut updates: Vec<(u32, u32)> = Vec::new();
-        for &idx in needed {
-            if self.host_table[idx as usize] != ABSENT {
-                continue;
+        for group in missing.chunks(self.staging.len()) {
+            let present = self.read_group(group)?;
+            for (k, (&idx, present)) in group.iter().zip(present).enumerate() {
+                if !present {
+                    self.host_table[idx as usize] = FILL;
+                    updates.push((idx, FILL));
+                    self.counts.fills += 1;
+                    continue;
+                }
+                let slot = self.take_slot(&mut updates)?;
+                upload(
+                    &self.copy,
+                    self.pool.ptr() + (slot as u64) * CHUNK_BYTES as u64,
+                    &mut self.staging[k],
+                    CHUNK_BYTES,
+                )?;
+                self.host_table[idx as usize] = slot;
+                self.owner[slot as usize] = idx;
+                self.last_use[slot as usize] = self.epoch;
+                updates.push((idx, slot));
+                self.counts.uploads += 1;
             }
-            let c = self.coords(idx);
-            let k = self.next;
-            self.next = (self.next + 1) % self.staging.len();
-            let present = self.vol.read_chunk(c, self.staging[k].slice_mut()?)?;
-            if !present {
-                self.host_table[idx as usize] = FILL;
-                updates.push((idx, FILL));
-                self.counts.fills += 1;
-                continue;
-            }
-            let slot = self.take_slot(&mut updates)?;
-            upload(
-                &self.copy,
-                self.pool.ptr() + (slot as u64) * CHUNK_BYTES as u64,
-                &mut self.staging[k],
-                CHUNK_BYTES,
-            )?;
-            self.host_table[idx as usize] = slot;
-            self.owner[slot as usize] = idx;
-            self.last_use[slot as usize] = self.epoch;
-            updates.push((idx, slot));
-            self.counts.uploads += 1;
         }
         self.write_entries(&mut updates)?;
         self.uploaded.record(&self.copy)?;
         gpu.inner.stream().wait(&self.uploaded)?;
         Ok(())
+    }
+
+    /// Reads the chunks `group` (table indices, at most one per staging buffer) into staging buffers `0..`, in
+    /// parallel; per chunk, false where the source holds none
+    fn read_group(&mut self, group: &[u32]) -> Result<Vec<bool>> {
+        let coords: Vec<[usize; 3]> = group.iter().map(|&idx| self.coords(idx)).collect();
+        let mut bufs = Vec::with_capacity(group.len());
+        for staging in &mut self.staging[..group.len()] {
+            bufs.push(staging.slice_mut()?);
+        }
+
+        let vol = &*self.vol;
+        let mut present = vec![false; group.len()];
+        let per = group.len().div_ceil(READERS);
+        std::thread::scope(|scope| -> Result<()> {
+            let readers: Vec<_> = bufs
+                .chunks_mut(per)
+                .zip(coords.chunks(per))
+                .zip(present.chunks_mut(per))
+                .map(|((bufs, coords), present)| {
+                    scope.spawn(move || -> Result<()> {
+                        for ((buf, &c), present) in bufs.iter_mut().zip(coords).zip(present) {
+                            *present = vol.read_chunk(c, buf)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for reader in readers {
+                reader.join().map_err(|_| eyre!("a chunk reader panicked"))??;
+            }
+            Ok(())
+        })?;
+        Ok(present)
     }
 
     /// Marks the end of the crops that read the cache, queued on the compute stream after their kernels
