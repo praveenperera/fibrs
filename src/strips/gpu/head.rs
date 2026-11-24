@@ -44,8 +44,10 @@ const R_SEED_TANGENT: usize = 517;
 const R_GEOM: usize = 520;
 const R_GEOM_VALID: usize = 752;
 const R_ORIENT: usize = 781;
-/// Padded input widths of the projections (`strips-kernels` `head::tokens::K_*`)
-const K_SECTOR: usize = 576;
+/// The sector projection's re-laid-out depth (`strips-kernels` `head::sector::K_SECTOR`): 8 points of 64 channels,
+/// then their 8 supports and a zero pad of 8
+const K_SECTOR: usize = 528;
+/// Padded input widths of the other projections (`strips-kernels` `head::tokens::K_*`)
 const K_TUBE: usize = 960;
 const K_REF: usize = 128;
 const K_GEOM: usize = 128;
@@ -53,7 +55,7 @@ const K_QUERY: usize = 128;
 const K_ORIENT: usize = 64;
 const K_REFINE: usize = 192;
 const K_PROFILE: usize = 128;
-/// Decisions per warp of `sm_cell_tokens` (`strips-kernels` `head::tokens::CELL_DECISIONS`)
+/// Decisions per warp of `sm_tube_tokens` (`strips-kernels` `head::tokens::CELL_DECISIONS`)
 const CELL_DECISIONS: u32 = 4;
 /// Epilogue activations and token modes of `sm_linear` and `sm_linear_tok`
 const ACT_NONE: u32 = 0;
@@ -135,10 +137,11 @@ struct Params {
 
 /// The fixed sampling tables
 struct Tables {
-    /// The cell tokens' sampling operator (`gather.rs`): per point its entries, output slot and support
-    points: Buf,
-    npoints: usize,
-    /// Per operator entry: lattice cell, weight (f32 bits)
+    /// The cell tokens' sampling operator (`gather.rs`): the sector points by slot, the tube points with their
+    /// output slots, and per entry a lattice cell and weight (f32 bits)
+    sector: Buf,
+    tube: Buf,
+    ntube: usize,
     entries: Buf,
     /// Strip anchors `[450, 3]`
     anchors: Buf,
@@ -159,7 +162,6 @@ pub(crate) struct Buffers {
     /// One byte per key and decision `[B, 2048]`: the cells and strip tokens valid and the padding invalid from
     /// allocation on, the reference and geometry keys rewritten by their token kernels every batch
     pub(crate) keymask: Buf,
-    pub(crate) xs: Buf,
     pub(crate) xt: Buf,
     pub(crate) xr: Buf,
     pub(crate) xg: Buf,
@@ -211,15 +213,41 @@ fn round_bf16(values: &[f32]) -> Vec<f32> {
 impl Linear {
     /// Linear `name` (`[n, k]` weight), its input padded to `kp` columns
     fn load(dev: &Device, w: &Weights, name: &str, n: usize, k: usize, kp: usize) -> Result<Self> {
+        Self::load_cols(dev, w, name, n, k, kp, |c| (c < k).then_some(c))
+    }
+
+    /// The sector projection (`[128, 520]`: 8 points of 64 channels and a support each) re-laid-out for
+    /// `sm_sector_tokens`: the points' channels first, then their supports, then zeros to `K_SECTOR`
+    fn load_sector(dev: &Device, w: &Weights, name: &str) -> Result<Self> {
+        let cols = |c: usize| match c {
+            0..512 => Some(c / 64 * 65 + c % 64),
+            512..520 => Some((c - 512) * 65 + 64),
+            _ => None,
+        };
+        Self::load_cols(dev, w, name, WIDTH, 520, K_SECTOR, cols)
+    }
+
+    /// Linear `name` (`[n, k]` weight) with `kp` input columns, column `c` the weight's column `src(c)` or zero
+    fn load_cols(
+        dev: &Device,
+        w: &Weights,
+        name: &str,
+        n: usize,
+        k: usize,
+        kp: usize,
+        src: impl Fn(usize) -> Option<usize>,
+    ) -> Result<Self> {
         let weight = w.get(&format!("{name}.weight"), &[n, k])?;
         let bias = w.get(&format!("{name}.bias"), &[n])?;
-        let mut padded = vec![0u16; n * kp];
-        for (row, src) in padded.chunks_exact_mut(kp).zip(weight.values.chunks_exact(k)) {
-            for (d, &s) in row.iter_mut().zip(src) {
-                *d = bf16(s);
+        let mut out = vec![0u16; n * kp];
+        for (row, from) in out.chunks_exact_mut(kp).zip(weight.values.chunks_exact(k)) {
+            for (c, d) in row.iter_mut().enumerate() {
+                if let Some(s) = src(c) {
+                    *d = bf16(from[s]);
+                }
             }
         }
-        Ok(Self { w: dev.gpu.upload(&padded)?, b: dev.gpu.upload(&round_bf16(&bias.values))?, n, kp })
+        Ok(Self { w: dev.gpu.upload(&out)?, b: dev.gpu.upload(&round_bf16(&bias.values))?, n, kp })
     }
 }
 
@@ -265,7 +293,7 @@ impl Head {
             })
             .collect::<Result<Vec<_>>>()?;
         let params = Params {
-            sector: Linear::load(dev, w, &p("cell_token.sector_projection"), WIDTH, 520, K_SECTOR)?,
+            sector: Linear::load_sector(dev, w, &p("cell_token.sector_projection"))?,
             tube: Linear::load(dev, w, &p("cell_token.tube_projection"), WIDTH, 910, K_TUBE)?,
             reference: Mlp::load(dev, w, &p("reference_token"), (72, K_REF), WIDTH, WIDTH)?,
             geometry: Mlp::load(dev, w, &p("path_geometry.embed"), (68, K_GEOM), WIDTH, WIDTH)?,
@@ -293,9 +321,11 @@ impl Head {
         let mut keymask = vec![0u8; LDK];
         keymask[..CELLS].fill(1);
         keymask[CONTEXT..CONTEXT + STRIPS].fill(1);
+        let tube = op.tube_points();
         let tables = Tables {
-            points: dev.gpu.upload(op.points.as_flattened())?,
-            npoints: op.points.len(),
+            sector: dev.gpu.upload(op.sector_table()?.as_flattened())?,
+            tube: dev.gpu.upload(tube.as_flattened())?,
+            ntube: tube.len(),
             entries: dev.gpu.upload(op.entries.as_flattened())?,
             anchors: dev.gpu.upload(&strip.anchors.concat())?,
             grid: dev.gpu.upload(&grid)?,
@@ -307,7 +337,6 @@ impl Head {
         let bufs = Buffers {
             req: zeros(b * REQ * 4)?,
             keymask: dev.gpu.upload(&keymask.repeat(b))?,
-            xs: zeros(b * layout::SECTOR_TOKENS * K_SECTOR * 2)?,
             xt: zeros(b * layout::TUBE_TOKENS * K_TUBE * 2)?,
             xr: zeros(b * REFS * K_REF * 2)?,
             xg: zeros(b * GEOMS * K_GEOM * 2)?,
@@ -398,17 +427,16 @@ impl Head {
         let k = &dev.kernels;
         k.launch(
             &dev.gpu,
-            "sm_cell_tokens",
-            (t.npoints.div_ceil(4) as u32, bu.div_ceil(CELL_DECISIONS), 1),
+            "sm_tube_tokens",
+            (t.ntube.div_ceil(4) as u32, bu.div_ceil(CELL_DECISIONS), 1),
             (128, 1, 1),
             0,
             &[
-                x.xs.arg::<u16>(),
                 x.xt.arg::<u16>(),
                 cells.arg::<u32>(),
-                t.points.arg::<u32>(),
+                t.tube.arg::<u32>(),
                 t.entries.arg::<u32>(),
-                Arg::U32(t.npoints as u32),
+                Arg::U32(t.ntube as u32),
                 Arg::U32(bu),
             ],
         )?;
@@ -440,12 +468,29 @@ impl Head {
         )?;
         trace("token_inputs", self)?;
 
-        let sectors = b * layout::SECTOR_TOKENS;
+        k.launch(
+            &dev.gpu,
+            "sm_sector_tokens",
+            (layout::SECTOR_TOKENS.div_ceil(64) as u32, bu, 1),
+            (256, 1, 1),
+            0,
+            &[
+                x.seq.arg::<u32>(),
+                cells.arg::<u32>(),
+                t.sector.arg::<u32>(),
+                t.entries.arg::<u32>(),
+                p.sector.w.arg::<u16>(),
+                p.sector.b.arg::<f32>(),
+                p.position.arg::<u32>(),
+                p.kind_cell.arg::<f32>(),
+                Arg::U32(bu),
+                Arg::U32(CONTEXT as u32),
+            ],
+        )?;
         let tok = |a: (&Buf, usize), m: usize, lin: &Linear, tab: Arg, vec: &Buf, (rpd, off): (usize, usize), mode| {
             self.tokens(dev, a, m, lin, tab, vec, None, (rpd, off), mode)
         };
         let position = p.position.arg::<u32>();
-        tok((&x.xs, K_SECTOR), sectors, &p.sector, position, &p.kind_cell, (layout::SECTOR_TOKENS, 0), TOK_PER_TOKEN)?;
         let tubes = b * layout::TUBE_TOKENS;
         let tube_rows = (layout::TUBE_TOKENS, layout::SECTOR_TOKENS);
         tok((&x.xt, K_TUBE), tubes, &p.tube, position, &p.kind_cell, tube_rows, TOK_PER_TOKEN)?;
