@@ -8,7 +8,6 @@
 //! decisions are done
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
@@ -29,8 +28,6 @@ use super::types::{FrameRequest, FrameResult, StripRequest, StripResult};
 pub struct EngineConfig {
     /// CUDA device ordinal
     pub device: usize,
-    /// The weights export
-    pub weights: PathBuf,
     /// Decisions per GPU launch
     pub batch: usize,
     /// CT chunk slots on the device (2 MiB each)
@@ -72,17 +69,16 @@ struct Engine {
 }
 
 impl Engine {
-    fn new(config: &EngineConfig, vol: Arc<Volume>) -> Result<Self> {
+    fn new(config: &EngineConfig, weights: &Weights, vol: Arc<Volume>) -> Result<Self> {
         ensure!(config.batch > 0, "engine batch 0");
-        let weights = Weights::open(&config.weights)?;
         let dev = Device::open(config.device)?;
         let b = config.batch;
         let cache = ChunkCache::new(&dev, vol, config.chunk_slots, config.staging).wrap_err("the CT cache")?;
         let crops = Crops::new(&dev, b, config.input_scale)?;
-        let frame = FrameModel::new(&dev, &weights, b).wrap_err("the frame model")?;
-        let mut cnn = CropCnn::new(&dev, &weights, b).wrap_err("the CNN")?;
+        let frame = FrameModel::new(&dev, weights, b).wrap_err("the frame model")?;
+        let mut cnn = CropCnn::new(&dev, weights, b).wrap_err("the CNN")?;
         cnn.prepare(&dev, b)?;
-        let head = Head::new(&dev, &weights, b).wrap_err("the head")?;
+        let head = Head::new(&dev, weights, b).wrap_err("the head")?;
         let frame_crops = dev.gpu.alloc(b * FRAME_CROP.samples() * 4)?;
         let strip_input = dev.gpu.alloc(b * CROP_LEN * 4)?;
         Ok(Self { dev, cache, crops, frame, cnn, head, frame_crops, strip_input, batch: b })
@@ -180,11 +176,12 @@ impl<Q: Clone, R> Queue<Q, R> {
 /// building it (the device, the models, the cache) before any work runs
 pub fn serve(
     config: &EngineConfig,
+    weights: &Weights,
     vol: Arc<Volume>,
     work: Receiver<Work>,
     ready: Sender<Result<(), String>>,
 ) -> Result<EngineCounts> {
-    let mut engine = match Engine::new(config, vol) {
+    let mut engine = match Engine::new(config, weights, vol) {
         Ok(engine) => {
             let _ = ready.send(Ok(()));
             engine

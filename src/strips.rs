@@ -17,6 +17,7 @@ pub mod gpu;
 pub mod np;
 pub mod out;
 pub mod refset;
+mod runner;
 pub mod seed;
 pub mod stitch;
 pub mod types;
@@ -38,6 +39,8 @@ pub fn requested(argv: &[OsString]) -> bool {
 #[derive(Parser, Debug)]
 #[command(name = "fibrs strips", version = env!("CARGO_PKG_VERSION"))]
 enum Command {
+    /// Run the native strip runner over an AFV's fibres (`strips_fast.py`'s command line and outputs)
+    Run(Box<runner::Args>),
     /// Time the native strip model and check it against PyTorch's reference
     BenchModel(bench_model::Args),
 }
@@ -50,6 +53,7 @@ pub fn main(args: &[OsString]) -> i32 {
     } else {
         let command = Command::parse_from(std::iter::once(OsString::from("fibrs strips")).chain(args.iter().cloned()));
         match &command {
+            Command::Run(args) => runner::run(args),
             Command::BenchModel(args) => bench_model::run(args),
         }
     };
