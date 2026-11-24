@@ -172,7 +172,7 @@ mod tests {
                 }
             }
         }
-        fs::remove_dir_all(&level.join("0/0/0")).ok();
+        fs::remove_dir_all(level.join("0/0/0")).ok();
         fs::remove_file(level.join("0/0/0")).ok();
         assert!(Volume::open(&root, "s3://bucket/v.zarr", 0).unwrap().chunk([0, 0, 0]).is_err());
         fs::remove_dir_all(&root).unwrap();

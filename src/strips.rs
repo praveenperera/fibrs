@@ -9,6 +9,7 @@
 
 pub mod ct;
 pub mod gpu;
+pub mod refset;
 pub mod types;
 
 use std::ffi::OsString;
