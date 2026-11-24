@@ -461,8 +461,10 @@ fn head_matches_strip_reference() -> Result<()> {
 
 /// One gpu-ab arm (`ops/vesuvius/strips-native/gpu-ab-head.toml`): the head at batch `FIBRS_HEAD_BATCH` (default
 /// 64) on the dump's decisions, `FIBRS_HEAD_REPS` (default 50) untraced forwards after 5 warmups; writes the median
-/// ms/decision and the host load to `FIBRS_HEAD_OUT/metrics.json`, and the sha256 of the last forward's heights and
-/// log scales to `fp.txt`, so arms that should match bit for bit are checked
+/// ms/decision and the host load to `FIBRS_HEAD_OUT/metrics.json`, the sha256 of the last forward's heights and
+/// log scales to `fp.txt`, so arms that should match bit for bit are checked, and the values themselves (every
+/// decision's heights, then every decision's log scales, little-endian f32) to `outputs.f32` for arms whose
+/// arithmetic changed (`head_gate.py`)
 #[test]
 #[ignore = "needs an NVIDIA GPU and the head dump (FIBRS_HEAD_REF); run through the GPU queue"]
 fn head_bench() -> Result<()> {
@@ -499,8 +501,15 @@ fn head_bench() -> Result<()> {
         }
     }
     let fp = format!("{:x}", hash.finalize());
+    let values: Vec<u8> = results
+        .iter()
+        .flat_map(|r| r.heights.iter().flatten())
+        .chain(results.iter().flat_map(|r| r.log_scale.iter().flatten()))
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
     std::fs::create_dir_all(&out)?;
     std::fs::write(out.join("fp.txt"), format!("{fp}\n"))?;
+    std::fs::write(out.join("outputs.f32"), values)?;
     let metrics = serde_json::json!({
         "batch": b,
         "reps": reps,
