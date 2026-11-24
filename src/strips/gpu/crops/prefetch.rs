@@ -120,12 +120,17 @@ impl Prefetcher {
         })
     }
 
-    /// Starts reading the chunks `missing` (table index, chunk-grid zyx) not already read or being read, while
-    /// buffers last: free ones first, then those holding chunks of earlier read-aheads
+    /// Starts reading the chunks `missing` (table index, chunk-grid zyx) not already read or being read, in order
+    /// while buffers last: free ones first, then those holding chunks of earlier read-aheads that this one does not
+    /// ask for
     pub(super) fn start(&mut self, missing: &[(u32, [usize; 3])]) -> Result<()> {
         self.generation += 1;
-        while let Ok(done) = self.results.try_recv() {
-            self.finish(done);
+        self.collect();
+        // chunks asked for again join this read-ahead first, so no claim below reclaims a buffer it still wants
+        for &(idx, _) in missing {
+            if let Some(&buf) = self.held.get(&idx) {
+                self.renew(buf);
+            }
         }
         for &(idx, c) in missing {
             if self.held.contains_key(&idx) {
@@ -164,6 +169,18 @@ impl Prefetcher {
         Some((buf, present))
     }
 
+    /// Records every read finished so far, without waiting
+    pub(super) fn collect(&mut self) {
+        while let Ok(done) = self.results.try_recv() {
+            self.finish(done);
+        }
+    }
+
+    /// Whether chunk `idx` was read ahead and its read has finished, as of the last [`Prefetcher::collect`]
+    pub(super) fn ready(&self, idx: u32) -> bool {
+        self.held.get(&idx).is_some_and(|&buf| matches!(self.state[buf], State::Ready { .. }))
+    }
+
     /// Buffer `buf`, for the upload of a chunk [`Prefetcher::take`] returned
     pub(super) fn buf_mut(&mut self, buf: usize) -> &mut Pinned<u8> {
         &mut self.bufs[buf]
@@ -180,6 +197,15 @@ impl Prefetcher {
                 self.state[done.buf] = State::Free;
                 self.held.remove(&idx);
             }
+        }
+    }
+
+    /// Moves buffer `buf`'s read or chunk into the current read-ahead
+    fn renew(&mut self, buf: usize) {
+        let generation = self.generation;
+        match &mut self.state[buf] {
+            State::Reading { generation: g, .. } | State::Ready { generation: g, .. } => *g = generation,
+            State::Free => {}
         }
     }
 

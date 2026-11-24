@@ -431,7 +431,7 @@ fn prefetch_pass(slots: usize, ahead: bool) -> Result<PrefetchPass> {
         };
         if let Some((next_frame, next)) = launches.get(i + 1).filter(|_| ahead) {
             let (spec, at) = if *next_frame { (&FRAME_CROP, &s.dec.req_at) } else { (&STRIP_CROP, &s.dec.strip_at) };
-            s.crops.prefetch(&mut s.cache, spec, &at[next.clone()])?;
+            s.crops.prefetch(&mut s.cache, &[(spec, &at[next.clone()])])?;
         }
 
         let got: Vec<f32> = gpu.download_range(buf, 0, r.len() * n)?;

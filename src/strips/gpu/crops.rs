@@ -375,6 +375,15 @@ impl ChunkCache {
         self.prefetch.start(&missing)
     }
 
+    /// Starts reading the chunks of `needed` that are not resident, as [`ChunkCache::prefetch`] does, and counts
+    /// those still unread: a launch on them now would wait for the disk that long
+    pub fn unread(&mut self, needed: &[u32]) -> Result<usize> {
+        self.prefetch(needed)?;
+        self.prefetch.collect();
+        let absent = |idx: u32| self.host_table[idx as usize] == ABSENT;
+        Ok(needed.iter().filter(|&&idx| absent(idx) && !self.prefetch.ready(idx)).count())
+    }
+
     /// Makes the chunks `needed` (table indices) resident and the compute stream wait for their uploads
     pub fn prepare(&mut self, gpu: &Gpu, needed: &[u32]) -> Result<()> {
         self.epoch += 1;
@@ -688,15 +697,28 @@ impl Crops {
         self.sample(dev, cache, &FRAME_CROP, at, None, out, Pass::ZScored)
     }
 
-    /// Starts reading ahead the CT chunks that crops of `spec` at `at` need and the cache lacks, for a later launch
-    /// on them; see [`ChunkCache::prefetch`]
-    pub fn prefetch(&self, cache: &mut ChunkCache, spec: &CropSpec, at: &[CropAt]) -> Result<()> {
-        if at.is_empty() {
+    /// How many CT chunks crops of `spec` at `at` need that are neither resident nor read ahead yet, after starting
+    /// their reads; see [`ChunkCache::unread`]
+    pub fn unread(&self, cache: &mut ChunkCache, spec: &CropSpec, at: &[CropAt]) -> Result<usize> {
+        let needed = self.needed(cache, spec, at);
+        cache.unread(&needed)
+    }
+
+    /// Starts reading ahead the CT chunks that the crops of `reads` (each a spec and its crops) need and the cache
+    /// lacks, for later launches on them, as one read-ahead: when buffers run short, the earlier reads keep theirs;
+    /// see [`ChunkCache::prefetch`]
+    pub fn prefetch(&self, cache: &mut ChunkCache, reads: &[(&CropSpec, &[CropAt])]) -> Result<()> {
+        let needed: Vec<u32> = reads.iter().flat_map(|&(spec, at)| self.needed(cache, spec, at)).collect();
+        if needed.is_empty() {
             return Ok(());
         }
-        let grids: Vec<CropGrid> = at.iter().map(|c| CropGrid::new(spec, c.pos, &c.frame, self.scale)).collect();
-        let needed = cache.needed(spec, &grids);
         cache.prefetch(&needed)
+    }
+
+    /// The table indices of the CT chunks crops of `spec` at `at` need
+    fn needed(&self, cache: &ChunkCache, spec: &CropSpec, at: &[CropAt]) -> Vec<u32> {
+        let grids: Vec<CropGrid> = at.iter().map(|c| CropGrid::new(spec, c.pos, &c.frame, self.scale)).collect();
+        cache.needed(spec, &grids)
     }
 
     /// Stages the grids (and tube points), makes their chunks resident and launches the sampler for `pass`, writing
