@@ -403,7 +403,8 @@ fn map(path: &std::path::Path) -> Result<Mmap> {
 
 /// The head on the shared strip-model reference's decisions (`ops/vesuvius/strips-native/ref_strip.py`;
 /// `FIBRS_STRIP_REF`, default its 340-decision run) in batches of 64 on PyTorch's stock cells, against the stock
-/// (bf16, batch 4) and batch-64 PyTorch heights and log scales, with the reference's own variant distances beside
+/// (bf16, batch 4) and batch-64 PyTorch heights and log scales, with the reference's own variant distances beside;
+/// with `FIBRS_HEAD_DUMP` set, also writes the native grids there
 #[test]
 #[ignore = "needs an NVIDIA GPU and the strip-model reference (FIBRS_STRIP_REF); run through the GPU queue"]
 fn head_matches_strip_reference() -> Result<()> {
@@ -435,17 +436,20 @@ fn head_matches_strip_reference() -> Result<()> {
         }
     }
 
+    // the raw grids for signed-bias and worst-item checks (tilt.py): `h1.f32`, `logs.f32`, `[n, 36, 25]` f32
+    if let Some(dump) = std::env::var_os("FIBRS_HEAD_DUMP").map(PathBuf::from) {
+        std::fs::create_dir_all(&dump)?;
+        let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        std::fs::write(dump.join("h1.f32"), bytes(&heights))?;
+        std::fs::write(dump.join("logs.f32"), bytes(&logs))?;
+    }
+
     println!("{n} decisions, batches of {batch}: |native - torch| and torch's own variant distances");
     println!("{:<22} {:>10} {:>10} {:>10}", "", "mean", "p99", "max");
-    let mut worst = None;
     for (field, ours) in [("h1", &heights), ("logs", &logs)] {
         for variant in ["stock", "b64", "fp32"] {
             let (_, want) = get(&outputs, &format!("{variant}.{field}"))?;
-            let e = Err3::of(ours, &want);
-            println!("{:<22} {e}", format!("{field} native vs {variant}"));
-            if field == "h1" && variant == "stock" {
-                worst = Some(e);
-            }
+            println!("{:<22} {}", format!("{field} native vs {variant}"), Err3::of(ours, &want));
         }
         let (_, stock) = get(&outputs, &format!("stock.{field}"))?;
         for variant in ["b64", "fp32"] {
@@ -453,10 +457,42 @@ fn head_matches_strip_reference() -> Result<()> {
             println!("{:<22} {}", format!("{field} {variant} vs stock"), Err3::of(&other, &stock));
         }
     }
-    let e = worst.ok_or_else(|| eyre!("no stock heights"))?;
-    // fast1's distance to stock: mean 0.0106, p99 0.0625, max 0.25
-    ensure!(e.max <= 0.25 && e.p99 <= 0.0625, "heights: {e} against stock PyTorch, past fast1's distance to stock");
+
+    // bench-model's bars against the fp32 forward (PyTorch's own bf16 spread with ~15% headroom), and the worst
+    // single height no further from fp32 than stock's own worst. Against stock the worst item compounds two bf16
+    // errors: at |h| >= 16 a height step is 0.125, so native and stock rounding opposite ways reach 0.375
+    let (_, fp32) = get(&outputs, "fp32.h1")?;
+    let (_, stock) = get(&outputs, "stock.h1")?;
+    let (h, own) = (Err3::of(&heights, &fp32), Err3::of(&stock, &fp32));
+    let (_, fp32_logs) = get(&outputs, "fp32.logs")?;
+    let l = Err3::of(&logs, &fp32_logs);
+    ensure!(h.mean <= 0.012 && h.p99 <= 0.065, "heights: {h} against fp32, past bench-model's bar");
+    ensure!(h.max <= own.max, "heights: worst {} against fp32, past stock's own {}", h.max, own.max);
+    ensure!(l.mean <= 0.004 && l.p99 <= 0.015, "log scales: {l} against fp32, past bench-model's bar");
+
+    // bench-model's column-tilt bar against stock: a lateral convention bug tilted 5e-3 with every spread in bar
+    let tilt = column_tilt(&heights, &stock);
+    println!("h1 column tilt vs stock {tilt:+.3e} (bar 1.5e-3)");
+    ensure!(tilt.abs() <= 1.5e-3, "heights tilt {tilt:+.3e} across the columns against stock");
     Ok(())
+}
+
+/// The tilt of `ours - theirs` (row-major `[n, 36, 25]` grids) across the strip's columns: the least-squares slope
+/// of the per-column mean signed difference times 24, as bench-model computes it
+fn column_tilt(ours: &[f32], theirs: &[f32]) -> f64 {
+    let mut sums = [0f64; 25];
+    for (k, (a, b)) in ours.iter().zip(theirs).enumerate() {
+        sums[k % 25] += f64::from(a - b);
+    }
+
+    let n = (ours.len() / 25) as f64;
+    let (mut num, mut den) = (0.0, 0.0);
+    for (c, sum) in sums.iter().enumerate() {
+        let x = c as f64 - 12.0;
+        num += x * sum / n;
+        den += x * x;
+    }
+    num / den * 24.0
 }
 
 /// One gpu-ab arm (`ops/vesuvius/strips-native/gpu-ab-head.toml`): the head at batch `FIBRS_HEAD_BATCH` (default
