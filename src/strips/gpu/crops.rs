@@ -38,7 +38,7 @@ const ABSENT: u32 = 0xFFFF_FFFF;
 const CHUNK: usize = 128;
 const CHUNK_BYTES: usize = CHUNK * CHUNK * CHUNK;
 /// Threads reading a launch's missing chunks from the disk cache: the reads, one at a time on the engine thread, took
-/// as long as every kernel of the run together (13.3 of 26.3 s on Check A's 200 fibres, nsys)
+/// as long as every kernel of the run together (13.3 of 26.3 s on a 200-fibre PHerc0211 set, nsys)
 const READERS: usize = 16;
 /// Words per crop grid record (strips-kernels `GRID_WORDS`)
 const GRID_WORDS: usize = 16;
@@ -351,16 +351,6 @@ impl ChunkCache {
             prefetch,
             counts: CacheCounts::default(),
         })
-    }
-
-    /// Slots in the pool
-    pub fn slots(&self) -> usize {
-        self.slots
-    }
-
-    /// Device bytes the pool and the table hold
-    pub fn device_bytes(&self) -> usize {
-        self.pool.bytes() + self.table.bytes()
     }
 
     /// The table indices of every chunk the crops `grids` of `spec` read, sorted and unique
@@ -845,6 +835,13 @@ impl Crops {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl ChunkCache {
+        /// Device bytes the pool and the table hold
+        pub fn device_bytes(&self) -> usize {
+            self.pool.bytes() + self.table.bytes()
+        }
+    }
 
     /// villa's `crop_grids` + vc_reader's `localOrigin` on a rotated frame: the record and the base split
     #[test]

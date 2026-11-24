@@ -383,11 +383,6 @@ impl Head {
         Ok(head)
     }
 
-    /// The largest batch the buffers hold
-    pub fn max_batch(&self) -> usize {
-        self.max_batch
-    }
-
     /// Heights and log error scales of the last strip pass for each request: `cells` bf16 NDHWC `(B, 36, 32, 32,
     /// 64)`, `crop` f32 NDHWC `(B, 144, 128, 128, 2)` (CT, tube; the CT z-scored or raw with its statistics), B =
     /// `requests.len()`

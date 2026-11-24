@@ -556,23 +556,6 @@ impl CropCnn {
         })
     }
 
-    /// The most crops one forward takes
-    pub fn max_batch(&self) -> usize {
-        self.max_batch
-    }
-
-    /// Chooses how stages 0 and 1 run from the next forward on
-    pub fn set_convs(&mut self, mode: Convs) {
-        self.convs = mode;
-    }
-
-    /// Runs every cuDNN conv `group` samples at a time from the next forward on, padding the batch to a multiple of
-    /// it (`None`: the whole batch at once, whose cuDNN kernels then depend on the batch size). A group's 64-channel
-    /// activations (4.7 MB per sample) stay in L2 between the cuDNN convs and the norm passes that read them back
-    pub fn set_group(&mut self, group: Option<usize>) {
-        self.group = group;
-    }
-
     /// Plans every conv for the sample group batch `n` runs in, and for `n` itself when cuDNN runs stages 0 and 1
     /// (cuDNN's timed pick, replayed from volkit's algorithm cache when it has one), and grows the shared workspace
     /// to fit
@@ -620,18 +603,6 @@ impl CropCnn {
     /// forward
     pub fn forward<'a>(&mut self, dev: &Device, input: impl Into<StripInput<'a>>, n: usize) -> Result<&Buf> {
         self.run(dev, input.into(), n, None)?;
-        Ok(&self.cells)
-    }
-
-    /// [`CropCnn::forward`], also handing each block's output to `tap` (after a stream sync) as it is written
-    pub fn forward_tapped<'a>(
-        &mut self,
-        dev: &Device,
-        input: impl Into<StripInput<'a>>,
-        n: usize,
-        tap: Tap,
-    ) -> Result<&Buf> {
-        self.run(dev, input.into(), n, Some(tap))?;
         Ok(&self.cells)
     }
 
@@ -1099,7 +1070,7 @@ impl Samples {
 mod tests {
     //! GPU checks, run through the GPU queue from a prebuilt test binary:
     //! - `parity`: every block's output and the cells against PyTorch's bf16-autocast and float32 forwards on
-    //!   recorded inputs (`ops/vesuvius/strips-native/cnn_ref.py`), gated on PyTorch's own noise band
+    //!   recorded inputs (a PyTorch dump script outside this repository), gated on PyTorch's own noise band
     //! - `bench`: ms per decision at batch 32, 64 and 128 (`STRIPS_CNN_BATCHES`), untraced
     //!
     //! Both read `STRIPS_CNN_REF` (the reference directory) and `STRIPS_WEIGHTS` (the weights export), run each
@@ -1109,11 +1080,42 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
-    use color_eyre::eyre::{Result, WrapErr, bail, ensure};
+    use color_eyre::eyre::{Result, WrapErr, ensure};
     use serde_json::{Value, json};
 
-    use super::{CELL_CHANNELS, CELLS, CROP, Convs, CropCnn, IN_CHANNELS, voxels};
+    use volkit::gpu::Buf;
+
+    use super::{CELL_CHANNELS, CELLS, CROP, Convs, CropCnn, IN_CHANNELS, Tap, voxels};
+    use crate::strips::gpu::crops::StripInput;
     use crate::strips::gpu::{Device, Weights};
+
+    // the test-only controls: production runs the native stages 0-1 and its fixed sample group
+    impl CropCnn {
+        /// Chooses how stages 0 and 1 run from the next forward on
+        pub fn set_convs(&mut self, mode: Convs) {
+            self.convs = mode;
+        }
+
+        /// Runs every cuDNN conv `group` samples at a time from the next forward on, padding the batch to a multiple
+        /// of it (`None`: the whole batch at once, whose cuDNN kernels then depend on the batch size). A group's
+        /// 64-channel activations (4.7 MB per sample) stay in L2 between the cuDNN convs and the norm passes that
+        /// read them back
+        pub fn set_group(&mut self, group: Option<usize>) {
+            self.group = group;
+        }
+
+        /// [`CropCnn::forward`], also handing each block's output to `tap` (after a stream sync) as it is written
+        pub fn forward_tapped<'a>(
+            &mut self,
+            dev: &Device,
+            input: impl Into<StripInput<'a>>,
+            n: usize,
+            tap: Tap,
+        ) -> Result<&Buf> {
+            self.run(dev, input.into(), n, Some(tap))?;
+            Ok(&self.cells)
+        }
+    }
 
     const WEIGHTS: &str = "/build/vesuvius/strips-scale/speed/native/weights/fiber_strip_small_v1.safetensors";
     /// The p99 sample: every k-th element, at most this many, as the reference script takes it
@@ -1235,7 +1237,7 @@ mod tests {
     }
 
     /// Under `STRIPS_CNN_DUMP`, block `name`'s output (bf16 bits, NDHWC) as `<STRIPS_CNN_OUT>/<mode>_<name>.bf16`, for
-    /// offline signed-bias analysis (`ops/vesuvius/strips-native/cells_bias.py`; the parity rows hold only magnitudes)
+    /// offline signed-bias analysis (outside this repository; the parity rows hold only magnitudes)
     fn dump(mode: &str, name: &str, got: &[u16]) -> Result<()> {
         let (Some(_), Some(dir)) = (std::env::var_os("STRIPS_CNN_DUMP"), std::env::var_os("STRIPS_CNN_OUT")) else {
             return Ok(());

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# scripts/check-ptx.sh for the strips kernels (ptx/strips.*). Fails when the committed PTX is stale: ptx/sources.sha256 records the hashes of the kernel crate's sources,
-# manifest, lockfile and toolchain pin, the build script, the tool versions it built with (ptx/tools.txt), the
-# PTX it produced and ptxas's report on it. A source is hashed without its comments and blank lines, so editing
-# a comment leaves the PTX current. Needs no CUDA toolkit or cuda-oxide
+# Fails when the committed strips PTX is stale: ptx/strips-sources.sha256 records the hashes of the strips kernel
+# crate's sources, manifest, lockfile and toolchain pin, the build script, the tool versions it built with
+# (ptx/strips-tools.txt), the PTX it produced and ptxas's report on it. A source is hashed without its comments and
+# blank lines, so editing a comment leaves the PTX current. Needs no CUDA toolkit or cuda-oxide
 #
-#   scripts/check-ptx.sh            # check
-#   scripts/check-ptx.sh --write    # record the current files (build-ptx.sh does this)
+#   scripts/check-strips-ptx.sh            # check
+#   scripts/check-strips-ptx.sh --write    # record the current files (build-strips-ptx.sh does this)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

@@ -1,4 +1,4 @@
-//! The GPU side of `fibrs strips`: the device (volkit's GPU with cuDNN and cuBLAS, and the strips PTX module) and
+//! The GPU side of `fibrs strips`: the device (volkit's GPU with cuDNN, and the strips PTX module) and
 //! the checkpoint's weights
 //!
 //! Stages live in submodules: `crops` (the CT device cache, the strip and frame crops, the tube), `frame` (the
@@ -16,18 +16,16 @@ use std::path::Path;
 
 use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
 use cudakit::PtxTier;
-use volkit::dnn::{Blas, Dnn};
+use volkit::dnn::Dnn;
 use volkit::gpu::{Gpu, Module};
 
 /// The strips kernels, built from `strips-kernels` by `scripts/build-strips-ptx.sh`
 pub const PTX: &[(PtxTier, &str)] = &[(PtxTier::Sm80, include_str!("../../ptx/strips.sm80.ptx"))];
 
-/// The GPU, its stream, the strips kernels and the cuDNN and cuBLAS handles on that stream
+/// The GPU, its stream, the strips kernels and the cuDNN handle on that stream
 pub struct Device {
     /// cuDNN, bound to the GPU's stream
     pub dnn: Dnn,
-    /// cuBLAS, bound to the GPU's stream
-    pub blas: Blas,
     /// The strips kernels
     pub kernels: Module,
     /// volkit's GPU: context, stream, buffers and volkit's own kernels
@@ -40,8 +38,7 @@ impl Device {
         let gpu = Gpu::open_device(ordinal).wrap_err("open the GPU")?;
         let kernels = gpu.load_module(PTX).wrap_err("load the strips kernels")?;
         let dnn = Dnn::new(&gpu).wrap_err("create the cuDNN handle")?;
-        let blas = Blas::new(&gpu).wrap_err("create the cuBLAS handle")?;
-        Ok(Self { dnn, blas, kernels, gpu })
+        Ok(Self { dnn, kernels, gpu })
     }
 }
 
@@ -53,7 +50,7 @@ pub struct Tensor {
     pub values: Vec<f32>,
 }
 
-/// The exported checkpoint (`ops/vesuvius/strips-native/export_weights.py`): the strip model's EMA state under
+/// The exported checkpoint (the PyTorch checkpoint's tensors as float32 safetensors): the strip model's EMA state under
 /// `strip.`, the frame model's under `frame.`, and the sources' hashes and configs as metadata
 pub struct Weights {
     tensors: HashMap<String, Tensor>,
@@ -100,12 +97,5 @@ impl Weights {
     /// Whether the export holds tensor `name`
     pub fn has(&self, name: &str) -> bool {
         self.tensors.contains_key(name)
-    }
-
-    /// The names of every tensor, sorted
-    pub fn names(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = self.tensors.keys().map(String::as_str).collect();
-        names.sort_unstable();
-        names
     }
 }
