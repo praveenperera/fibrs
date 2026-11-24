@@ -133,10 +133,14 @@ struct Pool {
     wall: f64,
     loadavg: String,
     fibres: Vec<Fibre>,
+    /// Fibres that stopped on another error (a CT chunk the cache lacks): how many, and the first
+    errors: (usize, Option<String>),
 }
 
+/// The 1, 5 and 15 minute load averages
 fn loadavg() -> String {
-    fs::read_to_string("/proc/loadavg").map(|s| s.trim().to_string()).unwrap_or_default()
+    let text = fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    text.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
 }
 
 /// Runs every CPU stage of one fibre
@@ -311,18 +315,28 @@ pub fn main(argv: &[std::ffi::OsString]) -> Result<()> {
         });
         let wall = t.elapsed().as_secs_f64();
         let mut fibres = Vec::with_capacity(results.len());
+        let mut errors = (0, None);
         for r in results {
-            if let Some(f) = r? {
-                fibres.push(f);
+            match r {
+                Ok(Some(f)) => fibres.push(f),
+                Ok(None) => {}
+                Err(e) => {
+                    errors.0 += 1;
+                    errors.1.get_or_insert_with(|| format!("{e:#}"));
+                }
             }
         }
         if fibres.is_empty() {
             bail!("no fibre ran");
         }
         let loadavg = format!("{load_before} -> {}", loadavg());
-        eprintln!("{} pool {threads}: {wall:.2} s, load {loadavg}", if warm { "warm-up" } else { "timed" });
+        eprintln!(
+            "{} pool {threads}: {wall:.2} s, load {loadavg}, {} errors",
+            if warm { "warm-up" } else { "timed" },
+            errors.0
+        );
         if !warm {
-            pools.push(Pool { threads, wall, loadavg, fibres });
+            pools.push(Pool { threads, wall, loadavg, fibres, errors });
         }
     }
 
@@ -342,10 +356,12 @@ fn report(pools: &[Pool], tensors: &Value, selected: usize) -> (Value, String) {
     let failed = first.fibres.iter().filter(|f| f.failed).count();
     let decisions: usize = first.fibres.iter().map(|f| f.decisions).sum();
     let repairs: usize = first.fibres.iter().map(|f| f.kink_repairs).sum();
+    let (errors, first_error) = &first.errors;
     md.push_str(&format!(
-        "{selected} selected, {fibres} ran ({failed} SeedHeadingError, {} too short), {decisions} decisions, {:.1} \
-         decisions/fibre, {repairs} kinks repaired\n\n",
-        selected - fibres,
+        "{selected} selected, {fibres} ran ({failed} SeedHeadingError), {} too short, {errors} stopped on an error \
+         (first: {}), {decisions} decisions, {:.1} decisions/fibre, {repairs} kinks repaired\n\n",
+        selected - fibres - errors,
+        first_error.as_deref().unwrap_or("none"),
         decisions as f64 / (fibres - failed).max(1) as f64
     ));
     md.push_str("| threads | load avg (before -> after) | wall s | dec/s | stage | ms/fibre | ms/decision | fit ms/fibre at 40 dec | 40-dec ceiling dec/s |\n");
@@ -385,7 +401,8 @@ fn report(pools: &[Pool], tensors: &Value, selected: usize) -> (Value, String) {
         let total = fit(&pool.fibres, STAGES[5].1);
         out.push(json!({
             "threads": pool.threads, "loadavg": pool.loadavg, "wall_s": pool.wall, "decisions": decisions,
-            "fibres": pool.fibres.len(), "dec_per_s": dps, "speedup": speedup,
+            "fibres": pool.fibres.len(), "errors": pool.errors.0, "first_error": pool.errors.1,
+            "dec_per_s": dps, "speedup": speedup,
             "ceiling_dec_per_s_at_40": 40.0 / (total.0 + 40.0 * total.1) * speedup, "stages": stages,
         }));
     }
