@@ -173,7 +173,10 @@ fn validate(args: &Args) -> Result<()> {
     ensure!(args.blend.is_finite() && args.blend >= 0.0, "--blend: zero or more patch voxels");
     ensure!(args.trim.is_finite() && args.trim >= 0.0, "--trim: zero or more patch voxels");
     ensure!(
-        args.ct_grid_scale > 0.0 && args.grid_scale == 2.0 * args.ct_grid_scale,
+        args.ct_grid_scale.is_finite()
+            && args.grid_scale.is_finite()
+            && args.ct_grid_scale > 0.0
+            && args.grid_scale == 2.0 * args.ct_grid_scale,
         "--grid-scale {} with --ct-grid-scale {}: the runner supports two CT voxels per trace voxel only",
         args.grid_scale,
         args.ct_grid_scale
@@ -203,16 +206,22 @@ pub fn run(args: &Args) -> Result<()> {
     let carried: f64 = weights.metadata.get("perturb").map_or(Ok(0.0), |p| p.parse()).wrap_err("weights perturb")?;
     ensure!(carried == args.perturb, "--perturb {} but the weights carry perturb {carried}", args.perturb);
 
-    // every shard claims or checks run.json before it reads or repairs the index
-    fs::create_dir_all(args.out.join("index")).wrap_err_with(|| format!("create {}", args.out.display()))?;
-    let inputs = Inputs::read(args, &weights)?;
-    let fields = run_fields(args, n, &tag, &inputs);
-    claim_run_json(&args.out, &fields, &provenance, &tag)?;
-    let todo = select(args, k, n)?;
-
+    let inputs = Inputs::read(args, &weights.sha256)?;
     let vol = Arc::new(Volume::open(&args.cache_dir, &args.ct, args.ct_level)?);
-    let umbilicus = Umbilicus::read(&args.umbilicus)?;
-    let geometry = Geometry { ct: &vol, input_scale, trace_per_patch: TRACE_PER_PATCH, umbilicus: &umbilicus };
+    let chosen = choose(args, k, n)?;
+    let fields = run_fields(args, n, &tag, &inputs);
+    // an OUT begun with other settings refuses here, before the GPU cache's allocation can fail on a busy GPU and
+    // hide why; this only reads, and the claim after startup checks again
+    if args
+        .out
+        .join("run.json")
+        .try_exists()
+        .wrap_err_with(|| format!("look for run.json in {}", args.out.display()))?
+    {
+        check_resume(&args.out, &tag, &fields)?;
+    }
+
+    let geometry = Geometry { ct: &vol, input_scale, trace_per_patch: TRACE_PER_PATCH, umbilicus: &inputs.umbilicus };
     let settings = Settings {
         out: (!args.no_write).then(|| args.out.clone()),
         npz: args.npz.clone(),
@@ -240,6 +249,19 @@ pub fn run(args: &Args) -> Result<()> {
         Ok(Err(e)) => bail!("the GPU engine: {e}"),
         Err(_) => bail!("the GPU engine stopped before it was ready"),
     }
+
+    // run.json marks a run that got going: only now, with every input read and the GPU cache and models built,
+    // does the shard claim or check it, so a startup failure leaves OUT without one and the corrected rerun starts
+    // it. Every shard claims or checks run.json before it reads or repairs the index
+    let todo = match begin_shard(args, k, &fields, &provenance, &tag, chosen) {
+        Ok(todo) => todo,
+        Err(e) => {
+            // the engine stops once its work channel closes
+            drop(work_tx);
+            let _ = engine.join();
+            return Err(e);
+        }
+    };
     println!(
         "{}",
         json!({"load_s": round2(t0.elapsed().as_secs_f64()), "shard": [k, n], "fibres": todo.total,
@@ -286,13 +308,29 @@ pub fn run(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Claims or checks run.json, then takes the shard's fibres not yet indexed
+fn begin_shard(
+    args: &Args,
+    k: usize,
+    fields: &Map<String, Value>,
+    provenance: &Map<String, Value>,
+    tag: &str,
+    chosen: Vec<FibreRow>,
+) -> Result<Todo> {
+    fs::create_dir_all(args.out.join("index")).wrap_err_with(|| format!("create {}", args.out.display()))?;
+    claim_run_json(&args.out, fields, provenance, tag)?;
+    remaining(args, k, chosen)
+}
+
 /// The shard's fibres not yet in any shard's index, and the shard's size before that
 struct Todo {
     rows: Vec<FibreRow>,
     total: usize,
 }
 
-fn select(args: &Args, k: usize, n: usize) -> Result<Todo> {
+/// The shard's fibres: the ids asked for (or every fibre long enough), less the excluded ones, split into N shards
+/// and limited; refuses an empty ids file and repeated ids
+fn choose(args: &Args, k: usize, n: usize) -> Result<Vec<FibreRow>> {
     let mut ids = args.ids.clone();
     if let Some(path) = &args.ids_file {
         ids = read_ids(path)?;
@@ -312,6 +350,11 @@ fn select(args: &Args, k: usize, n: usize) -> Result<Todo> {
     if let Some(limit) = args.limit {
         chosen.truncate(limit);
     }
+    Ok(chosen)
+}
+
+/// The shard's chosen fibres without those its index already holds
+fn remaining(args: &Args, k: usize, chosen: Vec<FibreRow>) -> Result<Todo> {
     let done = indexed(&args.out.join("index"), k)?;
     let total = chosen.len();
     Ok(Todo { rows: chosen.into_iter().filter(|r| !done.contains(&r.id)).collect(), total })
@@ -393,7 +436,8 @@ fn whole_lines(mut text: String) -> String {
 /// Refuses an OUT begun under another runner tag (one scroll, one runner) or with other output-affecting settings
 fn check_resume(out: &Path, tag: &str, fields: &Map<String, Value>) -> Result<()> {
     let path = out.join("run.json");
-    let Ok(text) = fs::read_to_string(&path) else { return Ok(()) };
+    // called once run.json is known to be present, so a file that can't be read is an error, never a pass
+    let text = fs::read_to_string(&path).wrap_err_with(|| format!("read {}", path.display()))?;
     let previous: Value = serde_json::from_str(&text).wrap_err_with(|| format!("parse {}", path.display()))?;
     if let Some(p) = previous.get("runner").and_then(Value::as_str)
         && p != tag
@@ -412,17 +456,26 @@ fn check_resume(out: &Path, tag: &str, fields: &Map<String, Value>) -> Result<()
 struct Inputs {
     afv_uuid: String,
     afv_bytes: u64,
+    /// The umbilicus, parsed and checked from the same bytes its hash is taken of
+    umbilicus: Umbilicus,
     umbilicus_sha256: String,
     weights_sha256: String,
 }
 
 impl Inputs {
-    fn read(args: &Args, weights: &Weights) -> Result<Self> {
+    fn read(args: &Args, weights_sha256: &str) -> Result<Self> {
         // an AFV runs to tens of GB, so its uuid and size stand for its content
         let afv_uuid = Afv::open(&args.afv)?.uuid()?;
         let afv_bytes = fs::metadata(&args.afv).wrap_err_with(|| format!("stat {}", args.afv.display()))?.len();
-        let umbilicus = fs::read(&args.umbilicus).wrap_err_with(|| format!("read {}", args.umbilicus.display()))?;
-        Ok(Self { afv_uuid, afv_bytes, umbilicus_sha256: sha256(&umbilicus), weights_sha256: weights.sha256.clone() })
+        let bytes = fs::read(&args.umbilicus).wrap_err_with(|| format!("read {}", args.umbilicus.display()))?;
+        let umbilicus = Umbilicus::parse(&bytes, &args.umbilicus)?;
+        Ok(Self {
+            afv_uuid,
+            afv_bytes,
+            umbilicus,
+            umbilicus_sha256: sha256(&bytes),
+            weights_sha256: weights_sha256.into(),
+        })
     }
 }
 
@@ -455,8 +508,23 @@ fn run_fields(args: &Args, shards: usize, tag: &str, inputs: &Inputs) -> Map<Str
 /// it and the rest check against it
 fn claim_run_json(out: &Path, fields: &Map<String, Value>, provenance: &Map<String, Value>, tag: &str) -> Result<()> {
     let path = out.join("run.json");
-    let tmp = out.join(format!("run.json.{}.tmp", std::process::id()));
-    fs::write(&tmp, run_json(fields, provenance, tag)).wrap_err_with(|| format!("write {}", tmp.display()))?;
+    // shards in separate containers can share an OUT and a pid (1 in each), so the temporary name adds the time
+    // and random bits, and create_new refuses a name already taken rather than write through it into run.json
+    let mut salt = [0u8; 8];
+    getrandom::fill(&mut salt).map_err(|e| eyre!("random temporary name: {e}"))?;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let tmp = out.join(format!("run.json.{}.{nanos}.{:016x}.tmp", std::process::id(), u64::from_le_bytes(salt)));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .wrap_err_with(|| format!("create {}", tmp.display()))?;
+    let written = file.write_all(run_json(fields, provenance, tag).as_bytes());
+    drop(file);
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).wrap_err_with(|| format!("write {}", tmp.display()));
+    }
     let linked = fs::hard_link(&tmp, &path);
     fs::remove_file(&tmp).wrap_err_with(|| format!("remove {}", tmp.display()))?;
     match linked {
@@ -659,7 +727,7 @@ mod tests {
     use clap::Parser;
     use serde_json::{Map, Value, json};
 
-    use super::{Afv, Args, Umbilicus, claim_run_json, indexed, provenance, validate};
+    use super::{Afv, Args, Inputs, claim_run_json, indexed, provenance, sha256, validate};
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("fibrs-strips-runner-{name}-{}", std::process::id()));
@@ -723,6 +791,113 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Shards in separate containers can share an OUT and a pid; threads of one process stand in for them. Exactly
+    /// one claim's file becomes run.json, whole, and no later claim writes through into it
+    #[test]
+    fn claims_sharing_a_pid_never_write_into_run_json() {
+        let dir = scratch("same-pid");
+        let fields = |workers: usize| -> Map<String, Value> {
+            json!({"ct": "s3://scroll.zarr", "workers": workers}).as_object().cloned().unwrap()
+        };
+        // a leftover under the old pid-only name is neither used nor removed
+        let stale = dir.join(format!("run.json.{}.tmp", std::process::id()));
+        fs::write(&stale, "stale").unwrap();
+
+        let start = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for workers in 1..=16 {
+                let (dir, start, fields) = (&dir, &start, &fields);
+                scope.spawn(move || {
+                    start.wait();
+                    claim_run_json(dir, &fields(workers), &Map::new(), "tag").unwrap();
+                });
+            }
+        });
+
+        let text = fs::read_to_string(dir.join("run.json")).unwrap();
+        let workers = serde_json::from_str::<Value>(&text).unwrap()["workers"].as_u64().unwrap() as usize;
+        assert_eq!(text, super::run_json(&fields(workers), &Map::new(), "tag"));
+        assert_eq!(fs::read_to_string(&stale).unwrap(), "stale");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 3, "index/, run.json and the stale file only");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A run whose startup fails on the GPU (an export without a frame-model tensor, or a cache too big to
+    /// allocate) leaves OUT without run.json, so the run with the right weights then starts in the same OUT and
+    /// finishes; a later rerun with other settings is refused for them, not for the GPU failing after
+    #[test]
+    #[ignore = "needs the GPU, the weights export, the PHerc0211 AFV and umbilicus, and the cached CT"]
+    fn startup_failure_leaves_no_run_json() {
+        let path = |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.into());
+        let weights = path(
+            "FIBRS_STRIPS_WEIGHTS",
+            "/build/vesuvius/strips-scale/speed/native/weights/fiber_strip_small_v1.safetensors",
+        );
+        let umbilicus = path(
+            "FIBRS_UMBILICUS",
+            "/home/praveen/code/private-workbench/ops/vesuvius/strips-scale/umbilici/PHerc0211_umbilicus.json",
+        );
+        let dir = scratch("startup");
+        let out = dir.join("out");
+
+        // the export less frame.features.0.weight: its source hashes still match, so only building the frame
+        // model on the GPU refuses it
+        let bytes = fs::read(&weights).unwrap();
+        let (_, header) = safetensors::SafeTensors::read_metadata(&bytes).unwrap();
+        let st = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let kept: Vec<_> = st.tensors().into_iter().filter(|(name, _)| name != "frame.features.0.weight").collect();
+        assert_eq!(kept.len() + 1, st.len());
+        let broken = dir.join("broken.safetensors");
+        safetensors::serialize_to_file(kept, header.metadata().clone(), &broken).unwrap();
+
+        let run =
+            |weights: &str, voxel_size_um: &str, gpu_chunks: &str| {
+                let args = Args::try_parse_from([
+                "run", "--afv", "/shared/allscrolls/publish/hf/PHerc0211/PHerc0211_afv_v2.afv", "--ct",
+                "s3://vesuvius-challenge-open-data/PHerc0211/volumes/20250821151803-9.362um-1.2m-113keV-masked.zarr",
+                "--ct-level", "0", "--ct-grid-scale", "1", "--grid-scale", "2", "--voxel-size-um", voxel_size_um,
+                "--umbilicus", &umbilicus, "--cache-dir", "/build/vesuvius/strips-scale/ctcache", "--weights", weights,
+                "--out", out.to_str().unwrap(), "--ids", "5109649", "--workers", "2", "--batch", "8",
+                "--gpu-chunks", gpu_chunks,
+            ])
+            .unwrap();
+                super::run(&args)
+            };
+        // 2^22 chunks of 2 MiB is 8 TiB, more than any GPU holds
+        let too_many = "4194304";
+
+        let err = run(broken.to_str().unwrap(), "9.362", "4096").unwrap_err();
+        assert!(format!("{err:#}").contains("features.0.weight"), "{err:#}");
+        assert!(!out.join("run.json").exists(), "a failed model build claimed run.json");
+        let err = run(&weights, "9.362", too_many).unwrap_err();
+        assert!(format!("{err:#}").contains("GPU engine"), "{err:#}");
+        assert!(!out.join("run.json").exists(), "a failed GPU cache allocation claimed run.json");
+
+        run(&weights, "9.362", "4096").unwrap();
+        let text = fs::read_to_string(out.join("run.json")).unwrap();
+        let recorded: Value = serde_json::from_str(&text).unwrap();
+        let wanted = super::sha256(&bytes);
+        assert_eq!(recorded["weights_sha256"].as_str(), Some(wanted.as_str()));
+        assert_eq!(indexed(&out.join("index"), 0).unwrap(), [5109649].into_iter().collect());
+
+        // a mismatched rerun names the mismatch, though its GPU cache couldn't be allocated either
+        let err = run(&weights, "9.4", too_many).unwrap_err();
+        assert!(format!("{err:#}").contains("voxel_size_um"), "{err:#}");
+        assert_eq!(fs::read_to_string(out.join("run.json")).unwrap(), text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A run.json that exists but can't be read refuses the run instead of skipping the resume check
+    #[test]
+    fn unreadable_run_json_refuses() {
+        let dir = scratch("unreadable");
+        fs::create_dir(dir.join("run.json")).unwrap();
+        let fields = json!({"workers": 16}).as_object().cloned().unwrap();
+        let err = claim_run_json(&dir, &fields, &Map::new(), "tag").unwrap_err();
+        assert!(format!("{err}").contains("read "), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Provenance may describe the run (production sets runner_commit, precision and weights) but not change what
     /// a resume compares
     #[test]
@@ -747,6 +922,9 @@ mod tests {
         let grid = validate(&args(&["--ct-grid-scale", "1", "--grid-scale", "4"])).unwrap_err();
         assert!(format!("{grid}").contains("two CT voxels per trace voxel"), "{grid}");
         assert!(validate(&args(&["--step", "0"])).is_err());
+        assert!(validate(&args(&["--ct-grid-scale", "inf", "--grid-scale", "inf"])).is_err());
+        // 2 x 1e308 overflows to inf, so a finite CT scale alone doesn't make the pair finite
+        assert!(validate(&args(&["--ct-grid-scale", "1e308", "--grid-scale", "inf"])).is_err());
         assert!(validate(&args(&["--blend=-1"])).is_err());
     }
 
@@ -778,16 +956,41 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// An umbilicus without control points is refused at load, not met as a panic in a worker
+    /// The inputs run.json records are read and checked before any claim: an umbilicus without control points is
+    /// refused there, so the corrected file then starts the same OUT, and its hash is of the bytes parsed
     #[test]
-    fn empty_umbilicus_is_refused() {
+    fn inputs_refuse_an_empty_umbilicus_before_the_claim() {
         let dir = scratch("umbilicus");
-        let path = dir.join("umbilicus.json");
-        fs::write(&path, r#"{"control_points": []}"#).unwrap();
-        let err = Umbilicus::read(&path).unwrap_err();
+        let (afv_path, umbilicus) = (dir.join("fibers.afv"), dir.join("umbilicus.json"));
+        afv(&afv_path);
+        let args = Args::try_parse_from([
+            "run",
+            "--afv",
+            afv_path.to_str().unwrap(),
+            "--out",
+            dir.to_str().unwrap(),
+            "--voxel-size-um",
+            "9.362",
+            "--weights",
+            "w",
+            "--ct",
+            "s3://c",
+            "--cache-dir",
+            "c",
+            "--umbilicus",
+            umbilicus.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        fs::write(&umbilicus, r#"{"control_points": []}"#).unwrap();
+        let err = Inputs::read(&args, "w").err().unwrap();
         assert!(format!("{err}").contains("control_points is empty"), "{err}");
-        fs::write(&path, r#"{"control_points": [{"x": 1, "y": 2, "z": 3}]}"#).unwrap();
-        Umbilicus::read(&path).unwrap();
+
+        let fixed = r#"{"control_points": [{"x": 1, "y": 2, "z": 3}]}"#;
+        fs::write(&umbilicus, fixed).unwrap();
+        let inputs = Inputs::read(&args, "w").unwrap();
+        assert_eq!(inputs.umbilicus_sha256, sha256(fixed.as_bytes()));
+        assert_eq!(inputs.afv_uuid, "836fb26c-a576-4540-ab75-df137bbc0e32");
         let _ = fs::remove_dir_all(&dir);
     }
 }

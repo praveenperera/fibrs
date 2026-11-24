@@ -68,9 +68,13 @@ pub struct Umbilicus {
 impl Umbilicus {
     /// Reads an `umbilicus.json`'s `control_points`
     pub fn read(path: &Path) -> Result<Self> {
+        Self::parse(&std::fs::read(path).wrap_err_with(|| format!("read {}", path.display()))?, path)
+    }
+
+    /// Parses an `umbilicus.json`'s bytes, read from `path`
+    pub fn parse(bytes: &[u8], path: &Path) -> Result<Self> {
         let doc: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path).wrap_err_with(|| format!("read {}", path.display()))?)
-                .wrap_err_with(|| format!("parse {}", path.display()))?;
+            serde_json::from_slice(bytes).wrap_err_with(|| format!("parse {}", path.display()))?;
         let pts = doc["control_points"].as_array().ok_or_else(|| eyre!("{}: no control_points", path.display()))?;
         ensure!(!pts.is_empty(), "{}: control_points is empty", path.display());
         let mut p: Vec<V3> = pts
