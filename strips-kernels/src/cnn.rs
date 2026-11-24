@@ -848,7 +848,7 @@ unsafe fn conv3<
     if (blockDim_x() != threads)
         | (NW * MT as u32 * 16 != TD * TH * TW)
         | (2 * CH * SL < CQ)
-        | ((PRO == 2) & (SL != 1))
+        | ((PRO == 2) & ((SL != 1) | (NW * 32 % (2 * CH) != 0)))
         | ((8 * NT as u32) < COUT)
         | (od * S != d)
         | (oh * S != h)
@@ -910,6 +910,24 @@ unsafe fn conv3<
             c += threads;
         }
         sync_threads();
+    }
+
+    // the stage-0 rebuild's parameters in registers: with `2 CH` quads per voxel dividing the block (checked above),
+    // a thread stages the same quad of every voxel, so it needs only its own four channels'. Read from shared memory
+    // per value they made the staging bound by shared loads (short scoreboard stalls, a quarter of the tensor rate)
+    let mut s0par = [[[0f32; 4]; 3]; 4];
+    if PRO == 2 {
+        let q = tid % (2 * CH);
+        if q < CQ {
+            let mut j = 0;
+            while j < 4 {
+                __unroll_config::<0>();
+                let c = (4 * q + j) as usize;
+                // SAFETY: c < cin, written before the barrier above
+                s0par[j as usize] = unsafe { [*par.add(c), *skpar.add(c), *wpar.add(c)] };
+                j += 1;
+            }
+        }
     }
 
     // SAFETY: `halo` is block-shared
@@ -998,13 +1016,10 @@ unsafe fn conv3<
                         v = U32x2([pack(f(lo(p0), 0), f(hi(p0), 1)), pack(f(lo(p1), 2), f(hi(p1), 3))]);
                     }
                     if ins[k] & (PRO == 2) {
-                        let c = 4 * q;
                         let (i0, i1) = (lo(pin[k]), hi(pin[k]));
-                        // SAFETY: c + 3 < cin
-                        let f = |val: f32, j: u32| {
-                            let ([m, is, g, bt], [sm, sis, sg, sbt], [w0, w1, _, _]) = unsafe {
-                                (*par.add((c + j) as usize), *skpar.add((c + j) as usize), *wpar.add((c + j) as usize))
-                            };
+                        // this thread's quad `q`, so its parameters are `s0par`'s
+                        let f = |val: f32, j: usize| {
+                            let [[m, is, g, bt], [sm, sis, sg, sbt], [w0, w1, _, _]] = s0par[j];
                             let sk = rbf(w1 * i1 + w0 * i0);
                             leaky(rbf(affine(val, [m, is], g, bt) + affine(sk, [sm, sis], sg, sbt)))
                         };
