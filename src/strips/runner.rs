@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -20,6 +20,7 @@ use std::time::Instant;
 use clap::Parser;
 use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use super::ct::{Uncached, Volume};
 use super::engine::{EngineConfig, LaunchError, Work, serve};
@@ -28,14 +29,15 @@ use super::geom::{Geometry, Umbilicus};
 use super::gpu::Weights;
 use super::out::{Record, Settings, run_json};
 use super::seed::{SeedHeadingError, Workspace};
-use super::stitch::stitched_strip;
+use super::stitch::{stitched_strip, strip_f};
 use super::types::{FrameRequest, StripRequest};
 
 /// The checkpoint the weights export is pinned to (its sha256 is checked at load), as trace.json records it
 const CHECKPOINT: &str = "hf://scrollprize/fiber_strip_small_v1@7bd163a22c839ff312879ae1916195d0c9729c0e/last.pt";
 /// Its training step
 const STEP: i64 = 15000;
-/// Trace voxels per patch voxel of that checkpoint
+/// Trace voxels per patch voxel (`ct_grid_scale / grid_scale`): the checkpoint takes one CT voxel per patch voxel,
+/// and the runner supports two CT voxels per trace voxel, the scale every scroll's AFV is traced at
 const TRACE_PER_PATCH: f64 = 0.5;
 
 /// The native sheet-strip runner
@@ -159,20 +161,41 @@ impl std::fmt::Display for Deferred {
 
 impl std::error::Error for Deferred {}
 
-/// Runs the shard; the progress lines go to stdout as the Python runner prints them
-pub fn run(args: &Args) -> Result<()> {
+/// Refuses settings the runner can't run correctly, before anything is read or written
+fn validate(args: &Args) -> Result<()> {
     ensure!(args.shard.len() == 2 && args.shard[1] > 0 && args.shard[0] < args.shard[1], "--shard K N with K < N");
     ensure!(args.workers > 0 && args.batch > 0, "--workers and --batch above 0");
     ensure!(args.step.is_finite() && args.step > 0.0, "--step: a positive number of patch voxels");
+    // decisions land on whole strip rows only when they are a whole number of rows apart
+    let f = strip_f();
+    let rows = args.step / (f[1] - f[0]);
+    ensure!(rows.fract() == 0.0, "--step {}: a multiple of the strip's row spacing, {}", args.step, f[1] - f[0]);
     ensure!(args.blend.is_finite() && args.blend >= 0.0, "--blend: zero or more patch voxels");
     ensure!(args.trim.is_finite() && args.trim >= 0.0, "--trim: zero or more patch voxels");
+    ensure!(
+        args.ct_grid_scale > 0.0 && args.grid_scale == 2.0 * args.ct_grid_scale,
+        "--grid-scale {} with --ct-grid-scale {}: the runner supports two CT voxels per trace voxel only",
+        args.grid_scale,
+        args.ct_grid_scale
+    );
+    Ok(())
+}
+
+/// `--provenance`: a JSON object, which run.json records over the run's own fields, so it may not set a field that
+/// decides whether an OUT can be resumed
+fn provenance(text: &str) -> Result<Map<String, Value>> {
+    let Ok(Value::Object(m)) = serde_json::from_str(text) else { bail!("--provenance: a JSON object") };
+    let reserved: Vec<&str> = RESUME_FIELDS.into_iter().filter(|key| m.contains_key(*key)).collect();
+    ensure!(reserved.is_empty(), "--provenance may not set {reserved:?}: the run itself records them");
+    Ok(m)
+}
+
+/// Runs the shard; the progress lines go to stdout as the Python runner prints them
+pub fn run(args: &Args) -> Result<()> {
+    validate(args)?;
     let (k, n) = (args.shard[0], args.shard[1]);
     let input_scale = args.grid_scale / args.ct_grid_scale;
-    ensure!(input_scale.fract() == 0.0, "CT sampling requires a whole number of CT voxels per trace voxel");
-    let provenance: Map<String, Value> = match serde_json::from_str(&args.provenance) {
-        Ok(Value::Object(m)) => m,
-        _ => bail!("--provenance: a JSON object"),
-    };
+    let provenance = provenance(&args.provenance)?;
     let tag = provenance.get("runner").and_then(Value::as_str).map_or_else(default_tag, str::to_string);
 
     let t0 = Instant::now();
@@ -180,13 +203,12 @@ pub fn run(args: &Args) -> Result<()> {
     let carried: f64 = weights.metadata.get("perturb").map_or(Ok(0.0), |p| p.parse()).wrap_err("weights perturb")?;
     ensure!(carried == args.perturb, "--perturb {} but the weights carry perturb {carried}", args.perturb);
 
-    let todo = select(args, k, n)?;
+    // every shard claims or checks run.json before it reads or repairs the index
     fs::create_dir_all(args.out.join("index")).wrap_err_with(|| format!("create {}", args.out.display()))?;
-    let fields = run_fields(args, n, &tag);
-    check_resume(&args.out, &tag, &fields)?;
-    if k == 0 {
-        write_run_json(&args.out, &fields, &provenance, &tag)?;
-    }
+    let inputs = Inputs::read(args, &weights)?;
+    let fields = run_fields(args, n, &tag, &inputs);
+    claim_run_json(&args.out, &fields, &provenance, &tag)?;
+    let todo = select(args, k, n)?;
 
     let vol = Arc::new(Volume::open(&args.cache_dir, &args.ct, args.ct_level)?);
     let umbilicus = Umbilicus::read(&args.umbilicus)?;
@@ -290,7 +312,7 @@ fn select(args: &Args, k: usize, n: usize) -> Result<Todo> {
     if let Some(limit) = args.limit {
         chosen.truncate(limit);
     }
-    let done = indexed(&args.out.join("index"))?;
+    let done = indexed(&args.out.join("index"), k)?;
     let total = chosen.len();
     Ok(Todo { rows: chosen.into_iter().filter(|r| !done.contains(&r.id)).collect(), total })
 }
@@ -300,8 +322,10 @@ fn read_ids(path: &Path) -> Result<Vec<i64>> {
     text.split_whitespace().map(|t| t.parse().wrap_err_with(|| format!("{}: id {t:?}", path.display()))).collect()
 }
 
-/// Every fibre id in `index/shard_*.jsonl`
-fn indexed(dir: &Path) -> Result<HashSet<i64>> {
+/// Every fibre id in `index/shard_*.jsonl`. Shard `own`'s index loses a torn last line for good; other shards may
+/// be writing theirs, so a partial last line there is only skipped
+fn indexed(dir: &Path, own: usize) -> Result<HashSet<i64>> {
+    let own = dir.join(format!("shard_{own}.jsonl"));
     let mut done = HashSet::new();
     let Ok(entries) = fs::read_dir(dir) else { return Ok(done) };
     for entry in entries {
@@ -310,7 +334,12 @@ fn indexed(dir: &Path) -> Result<HashSet<i64>> {
         if !(name.starts_with("shard_") && name.ends_with(".jsonl")) {
             continue;
         }
-        let text = repair_index(&path)?;
+        let text = if path == own {
+            repair_index(&path)?
+        } else {
+            let text = fs::read_to_string(&path).wrap_err_with(|| format!("read {}", path.display()))?;
+            whole_lines(text)
+        };
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
             let record: Value = serde_json::from_str(line).wrap_err_with(|| format!("{}: {line}", path.display()))?;
             done.insert(record["fiber"].as_i64().ok_or_else(|| eyre!("{}: no fiber in {line}", path.display()))?);
@@ -321,9 +350,13 @@ fn indexed(dir: &Path) -> Result<HashSet<i64>> {
 
 /// The run.json fields that change a strip's content: a resumed OUT must match them, so one index never mixes
 /// strips made from different inputs or settings
-const RESUME_FIELDS: [&str; 12] = [
+const RESUME_FIELDS: [&str; 16] = [
     "checkpoint",
     "afv",
+    "afv_uuid",
+    "afv_bytes",
+    "umbilicus_sha256",
+    "weights_sha256",
     "voxel_size_um",
     "decision_step",
     "blend",
@@ -339,15 +372,22 @@ const RESUME_FIELDS: [&str; 12] = [
 /// Drops a shard index's torn last line (a write cut short, as by a full disk), so the fibre reruns and later
 /// appends start on a line of their own; the file's text after the repair
 fn repair_index(path: &Path) -> Result<String> {
-    let mut text = fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
-    if text.is_empty() || text.ends_with('\n') {
+    let full = fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
+    let len = full.len();
+    let text = whole_lines(full);
+    if text.len() == len {
         return Ok(text);
     }
 
-    text.truncate(text.rfind('\n').map_or(0, |i| i + 1));
     let file = OpenOptions::new().write(true).open(path).wrap_err_with(|| format!("open {}", path.display()))?;
     file.set_len(text.len() as u64).wrap_err_with(|| format!("truncate {}", path.display()))?;
     Ok(text)
+}
+
+/// `text` up to its last newline: without a partial last line
+fn whole_lines(mut text: String) -> String {
+    text.truncate(text.rfind('\n').map_or(0, |i| i + 1));
+    text
 }
 
 /// Refuses an OUT begun under another runner tag (one scroll, one runner) or with other output-affecting settings
@@ -368,8 +408,30 @@ fn check_resume(out: &Path, tag: &str, fields: &Map<String, Value>) -> Result<()
     Ok(())
 }
 
-/// run.json's fields: the Python runner's, with this runner's values
-fn run_fields(args: &Args, shards: usize, tag: &str) -> Map<String, Value> {
+/// What the run reads, by content, so a resume can't mix strips made from other files under the same names
+struct Inputs {
+    afv_uuid: String,
+    afv_bytes: u64,
+    umbilicus_sha256: String,
+    weights_sha256: String,
+}
+
+impl Inputs {
+    fn read(args: &Args, weights: &Weights) -> Result<Self> {
+        // an AFV runs to tens of GB, so its uuid and size stand for its content
+        let afv_uuid = Afv::open(&args.afv)?.uuid()?;
+        let afv_bytes = fs::metadata(&args.afv).wrap_err_with(|| format!("stat {}", args.afv.display()))?.len();
+        let umbilicus = fs::read(&args.umbilicus).wrap_err_with(|| format!("read {}", args.umbilicus.display()))?;
+        Ok(Self { afv_uuid, afv_bytes, umbilicus_sha256: sha256(&umbilicus), weights_sha256: weights.sha256.clone() })
+    }
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// run.json's fields: the Python runner's, with this runner's values, then the inputs' identities
+fn run_fields(args: &Args, shards: usize, tag: &str, inputs: &Inputs) -> Map<String, Value> {
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
     let fields = json!({
         "checkpoint": CHECKPOINT, "step": STEP,
@@ -382,14 +444,26 @@ fn run_fields(args: &Args, shards: usize, tag: &str) -> Map<String, Value> {
         "runner_commit": format!("fibrs {}", env!("CARGO_PKG_VERSION")), "workers": args.workers, "ct": args.ct,
         "ct_level": args.ct_level, "ct_grid_scale": args.ct_grid_scale, "grid_scale": args.grid_scale,
         "perturb": args.perturb, "weights": args.weights.display().to_string(),
+        "afv_uuid": inputs.afv_uuid, "afv_bytes": inputs.afv_bytes, "umbilicus_sha256": inputs.umbilicus_sha256,
+        "weights_sha256": inputs.weights_sha256,
     });
     fields.as_object().cloned().unwrap_or_default()
 }
 
-/// run.json: the fields, then the provenance, then the tag
-fn write_run_json(out: &Path, fields: &Map<String, Value>, provenance: &Map<String, Value>, tag: &str) -> Result<()> {
+/// Writes run.json (the fields, then the provenance, then the tag) when OUT has none, else refuses a run that
+/// doesn't match the one it records. The file appears whole or not at all, so of shards starting together one writes
+/// it and the rest check against it
+fn claim_run_json(out: &Path, fields: &Map<String, Value>, provenance: &Map<String, Value>, tag: &str) -> Result<()> {
     let path = out.join("run.json");
-    fs::write(&path, run_json(fields, provenance, tag)).wrap_err_with(|| format!("write {}", path.display()))
+    let tmp = out.join(format!("run.json.{}.tmp", std::process::id()));
+    fs::write(&tmp, run_json(fields, provenance, tag)).wrap_err_with(|| format!("write {}", tmp.display()))?;
+    let linked = fs::hard_link(&tmp, &path);
+    fs::remove_file(&tmp).wrap_err_with(|| format!("remove {}", tmp.display()))?;
+    match linked {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => check_resume(out, tag, fields),
+        Err(e) => Err(e).wrap_err_with(|| format!("create {}", path.display())),
+    }
 }
 
 fn default_tag() -> String {
@@ -580,11 +654,12 @@ fn write_uncached(args: &Args, k: usize, n: usize, written: &Written) -> Result<
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
+    use clap::Parser;
     use serde_json::{Map, Value, json};
 
-    use super::{check_resume, indexed, repair_index, run_json};
+    use super::{Afv, Args, Umbilicus, claim_run_json, indexed, provenance, validate};
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("fibrs-strips-runner-{name}-{}", std::process::id()));
@@ -593,38 +668,126 @@ mod tests {
         dir
     }
 
-    /// A write cut short leaves a torn last line: resume drops it, so that fibre reruns, and the next append starts
-    /// on a line of its own
-    #[test]
-    fn torn_index_line_is_dropped() {
-        let dir = scratch("torn");
-        let path = dir.join("index").join("shard_0.jsonl");
-        fs::write(&path, "{\"fiber\": 1}\n{\"fiber\": 2}\n{\"fib").unwrap();
+    fn args(extra: &[&str]) -> Args {
+        let base =
+            ["run", "--afv", "a.afv", "--out", "o", "--voxel-size-um", "9.362", "--weights", "w", "--ct", "s3://c"];
+        let rest = ["--cache-dir", "c", "--umbilicus", "u.json"];
+        Args::try_parse_from(base.iter().chain(&rest).chain(extra)).unwrap()
+    }
 
-        let done = indexed(&dir.join("index")).unwrap();
-        assert_eq!(done, [1, 2].into_iter().collect());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"fiber\": 1}\n{\"fiber\": 2}\n");
-        assert_eq!(repair_index(&path).unwrap(), "{\"fiber\": 1}\n{\"fiber\": 2}\n");
+    /// A write cut short leaves a torn last line. The shard's own index drops it for good, so that fibre reruns and
+    /// the next append starts on a line of its own; another shard's index, which may be mid-write, is left as is
+    #[test]
+    fn torn_index_line_is_dropped_from_own_shard_only() {
+        let dir = scratch("torn");
+        let own = dir.join("index").join("shard_0.jsonl");
+        let other = dir.join("index").join("shard_1.jsonl");
+        fs::write(&own, "{\"fiber\": 1}\n{\"fiber\": 2}\n{\"fib").unwrap();
+        fs::write(&other, "{\"fiber\": 3}\n{\"fiber\": 4").unwrap();
+
+        let done = indexed(&dir.join("index"), 0).unwrap();
+        assert_eq!(done, [1, 2, 3].into_iter().collect());
+        assert_eq!(fs::read_to_string(&own).unwrap(), "{\"fiber\": 1}\n{\"fiber\": 2}\n");
+        assert_eq!(fs::read_to_string(&other).unwrap(), "{\"fiber\": 3}\n{\"fiber\": 4");
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// An OUT begun with another CT level is refused; the same settings and tag resume
+    /// The first shard to start writes run.json; every later one, any shard, resumes only with the same tag and
+    /// the same output-affecting settings and inputs, and leaves the file as it was
     #[test]
-    fn resume_refuses_other_settings() {
-        let dir = scratch("resume");
-        let fields = |level: u32| -> Map<String, Value> {
-            json!({"ct": "s3://scroll.zarr", "ct_level": level, "decision_step": 8.0, "workers": 16})
+    fn run_json_is_claimed_once_and_checked_by_every_shard() {
+        let dir = scratch("claim");
+        let fields = |level: u32, umbilicus: &str| -> Map<String, Value> {
+            json!({"ct": "s3://scroll.zarr", "ct_level": level, "umbilicus_sha256": umbilicus, "workers": 16})
                 .as_object()
                 .cloned()
                 .unwrap()
         };
-        fs::write(dir.join("run.json"), run_json(&fields(0), &Map::new(), "tag-a")).unwrap();
+        let run_json = || fs::read_to_string(dir.join("run.json")).unwrap();
 
-        check_resume(&dir, "tag-a", &fields(0)).unwrap();
-        let other = check_resume(&dir, "tag-a", &fields(1)).unwrap_err();
-        assert!(format!("{other}").contains("ct_level 0, not 1"), "{other}");
-        let tag = check_resume(&dir, "tag-b", &fields(0)).unwrap_err();
+        claim_run_json(&dir, &fields(0, "aa"), &Map::new(), "tag-a").unwrap();
+        let first = run_json();
+        let mut more_workers = fields(0, "aa");
+        more_workers.insert("workers".into(), json!(8));
+        claim_run_json(&dir, &more_workers, &Map::new(), "tag-a").unwrap();
+        assert_eq!(run_json(), first);
+
+        let level = claim_run_json(&dir, &fields(1, "aa"), &Map::new(), "tag-a").unwrap_err();
+        assert!(format!("{level}").contains("ct_level 0, not 1"), "{level}");
+        let umbilicus = claim_run_json(&dir, &fields(0, "bb"), &Map::new(), "tag-a").unwrap_err();
+        assert!(format!("{umbilicus}").contains("umbilicus_sha256"), "{umbilicus}");
+        let tag = claim_run_json(&dir, &fields(0, "aa"), &Map::new(), "tag-b").unwrap_err();
         assert!(format!("{tag}").contains("one scroll, one runner"), "{tag}");
+        assert_eq!(run_json(), first);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2, "only index/ and run.json, no temporary file");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Provenance may describe the run (production sets runner_commit, precision and weights) but not change what
+    /// a resume compares
+    #[test]
+    fn provenance_cannot_set_resume_fields() {
+        let ok = provenance(r#"{"runner": "r", "runner_commit": "c", "precision": "p", "weights": "w"}"#).unwrap();
+        assert_eq!(ok.len(), 4);
+        let err = provenance(r#"{"runner": "r", "decision_step": 4}"#).unwrap_err();
+        assert!(format!("{err}").contains("decision_step"), "{err}");
+        assert!(provenance("[1]").is_err());
+    }
+
+    /// The step must be whole strip rows, and the grid two CT voxels per trace voxel (PHerc0211's 1:2 and
+    /// PHercParis4's 4:8)
+    #[test]
+    fn settings_the_runner_cannot_run_are_refused() {
+        validate(&args(&[])).unwrap();
+        validate(&args(&["--ct-grid-scale", "4", "--grid-scale", "8"])).unwrap();
+        validate(&args(&["--step", "6"])).unwrap();
+
+        let step = validate(&args(&["--step", "7"])).unwrap_err();
+        assert!(format!("{step}").contains("row spacing, 2"), "{step}");
+        let grid = validate(&args(&["--ct-grid-scale", "1", "--grid-scale", "4"])).unwrap_err();
+        assert!(format!("{grid}").contains("two CT voxels per trace voxel"), "{grid}");
+        assert!(validate(&args(&["--step", "0"])).is_err());
+        assert!(validate(&args(&["--blend=-1"])).is_err());
+    }
+
+    fn afv(path: &Path) {
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch(
+            "create table metadata(key text, value text);
+             insert into metadata values ('uuid', '\"836fb26c-a576-4540-ab75-df137bbc0e32\"');
+             create table fibers(id integer, family text, length real, min_x real, max_x real, min_y real, max_y real,
+                                 min_z real, max_z real);
+             insert into fibers values (1, 'H', 900, 0, 1, 0, 1, 0, 1), (2, 'V', 900, 0, 1, 0, 1, 0, 1);",
+        )
+        .unwrap();
+    }
+
+    /// The AFV's identity is its uuid; ids are taken in the order given, and a repeated id is refused
+    #[test]
+    fn afv_uuid_and_repeated_ids() {
+        let dir = scratch("afv");
+        let path = dir.join("fibers.afv");
+        afv(&path);
+        let afv = Afv::open(&path).unwrap();
+
+        assert_eq!(afv.uuid().unwrap(), "836fb26c-a576-4540-ab75-df137bbc0e32");
+        let rows = afv.select(2.5, 9.362, Some(&[2, 1])).unwrap();
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [2, 1]);
+        let err = afv.select(2.5, 9.362, Some(&[1, 2, 1])).unwrap_err();
+        assert!(format!("{err}").contains("more than once: [1]"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An umbilicus without control points is refused at load, not met as a panic in a worker
+    #[test]
+    fn empty_umbilicus_is_refused() {
+        let dir = scratch("umbilicus");
+        let path = dir.join("umbilicus.json");
+        fs::write(&path, r#"{"control_points": []}"#).unwrap();
+        let err = Umbilicus::read(&path).unwrap_err();
+        assert!(format!("{err}").contains("control_points is empty"), "{err}");
+        fs::write(&path, r#"{"control_points": [{"x": 1, "y": 2, "z": 3}]}"#).unwrap();
+        Umbilicus::read(&path).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 }
