@@ -13,7 +13,9 @@
 
 use std::collections::BTreeMap;
 
-use super::layout::Cells;
+use color_eyre::eyre::{Result, ensure};
+
+use super::layout::{Cells, SECTOR_TOKENS};
 
 /// Cell lattice depth, height, width
 const CD: u32 = 36;
@@ -25,6 +27,8 @@ const BEHIND: f32 = 36.0;
 const DEPTH_HI: f32 = 35.5;
 /// Merged weights below this are dropped
 const DROP: f64 = 1.0 / (1 << 24) as f64;
+/// Points per sector token
+const SECTOR_POINTS: usize = 8;
 
 /// The operator: per point its entry range, output slot and support; per entry a lattice cell and its weight
 pub struct Gather {
@@ -32,6 +36,34 @@ pub struct Gather {
     pub points: Vec<[u32; 4]>,
     /// Per entry: the cell's index in the lattice (`(z * 32 + y) * 32 + x`), its weight (f32 bits)
     pub entries: Vec<[u32; 2]>,
+}
+
+impl Gather {
+    /// The sector tokens' points by slot, as `sm_sector_tokens` reads them: row `8 token + p` = first entry, entry
+    /// count, support (f32 bits), 0
+    pub fn sector_table(&self) -> Result<Vec<[u32; 4]>> {
+        let mut table = vec![None; SECTOR_TOKENS * SECTOR_POINTS];
+        for &[first, count, slot, support] in &self.points {
+            let (token, p) = ((slot / 16) as usize, (slot % 16) as usize);
+            if token >= SECTOR_TOKENS {
+                continue;
+            }
+            ensure!(p < SECTOR_POINTS, "sector token {token} has a point {p}");
+            let row = &mut table[token * SECTOR_POINTS + p];
+            ensure!(row.is_none(), "sector token {token} point {p} appears twice");
+            *row = Some([first, count, support, 0]);
+        }
+        table
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| row.ok_or_else(|| color_eyre::eyre::eyre!("sector slot {i} has no point")))
+            .collect()
+    }
+
+    /// The tube tokens' points, as `sm_tube_tokens` reads them
+    pub fn tube_points(&self) -> Vec<[u32; 4]> {
+        self.points.iter().filter(|p| p[2] / 16 >= SECTOR_TOKENS as u32).copied().collect()
+    }
 }
 
 /// `grid_sample`'s source index on one axis from a crop-local coordinate, as the device computes it
@@ -160,6 +192,8 @@ mod tests {
             }
         }
         println!("max |operator - sub-point mean|: {worst:.3e}");
+        let sector = op.sector_table().expect("every sector token has its 8 points once");
+        assert_eq!(sector.len() + op.tube_points().len(), op.points.len());
         // a bf16 value near 4 rounds by up to 2^-7; the operator must stay far inside that
         assert!(worst < 1.0 / 512.0 / 64.0, "operator error {worst}");
     }

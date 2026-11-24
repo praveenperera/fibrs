@@ -249,13 +249,7 @@ fn head_matches_pytorch() -> Result<()> {
         let r = &mut report;
         match stage {
             "token_inputs" => {
-                r.check(
-                    "sector_in",
-                    &rows_bf16(&dev, &x.xs, b * layout::SECTOR_TOKENS, 576, 520)?,
-                    "sector_in",
-                    1.0,
-                    true,
-                )?;
+                // the sector tokens' inputs never leave their projection's kernel; seq0 checks its output
                 r.check("tube_in", &rows_bf16(&dev, &x.xt, b * layout::TUBE_TOKENS, 960, 910)?, "tube_in", 1.0, true)?;
                 r.check("ref_in", &rows_bf16(&dev, &x.xr, b * 129, 128, 72)?, "ref_in", 1.0, true)?;
                 r.check("geom_in", &rows_bf16(&dev, &x.xg, b * 29, 128, 68)?, "geom_in", 1.0, true)?;
