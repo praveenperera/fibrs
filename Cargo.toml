@@ -95,3 +95,8 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 [profile.release]
 debug = 1
 codegen-units = 4
+
+# the sheet-strip runner (`fibrs strips`) needs volkit's device layer public, which only this local branch has
+# (strips-device, 3cebf80); not for release
+[patch.crates-io]
+volkit = { path = "/home/praveen/.t3/worktrees/volkit/strips-device/volkit" }
