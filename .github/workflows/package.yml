@@ -173,7 +173,8 @@ jobs:
           done
           # fibrs predict through the installed wheel: its command line, and a dry run of a fixture's plan (the
           # runners have no GPU). On Linux and Windows the predict extra (cuDNN and cuBLAS from pip) must resolve to
-          # NVIDIA's wheels; on macOS a real run must refuse with the platforms it needs
+          # NVIDIA's wheels; on macOS a real run must fail with an error: the Metal engine parses the model before it
+          # opens the GPU, so the empty placeholder plans stop it
           fixture="$workspace/tests/fixtures/predict"
           venv="venv-3.13/$bin"
           "$venv/fibrs$exe" predict --help > /dev/null
@@ -190,9 +191,9 @@ jobs:
             touch model/model.py model/plans.json model/dataset.json model/checkpoint_final.pth
             if "$venv/fibrs" predict --ct "$fixture/band.zarr" --z0 4 --z1 36 --model-dir model \
               --out predict-out 2> refused.txt; then
-              echo "fibrs predict ran without a GPU engine" >&2; exit 1
+              echo "fibrs predict ran on an empty model" >&2; exit 1
             fi
-            grep -q "needs an NVIDIA GPU on Linux or Windows x86_64" refused.txt
+            grep -q "load AFV v2 from .*plans.json" refused.txt
           fi
           ref="venv-ref/$bin"
           uv venv -q --python 3.12 venv-ref

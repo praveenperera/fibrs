@@ -1,9 +1,22 @@
 # Changelog
 
-## Unreleased
+## [0.6.0] - Unreleased
+
+fibrs 0.6.0 runs `fibrs predict` on Apple silicon Macs, on the GPU through volkit 0.2.0's Metal backend, with no
+PyTorch and nothing else to install, and adds `fibrs strips`, villa's sheet-strip inference run natively on NVIDIA
+GPUs.
 
 ### What's new
 
+- **`fibrs predict` on a Mac.** On an M1 or newer with macOS 26 or newer, `fibrs predict` runs AFV fibre model V2
+  on the GPU with `--device metal`, the default there. It runs fp32 in full float32, where NVIDIA GPUs use TF32,
+  so its output is within TF32's rounding of the NVIDIA output rather than byte-identical to it. On a
+  512 × 1024 × 1024 PHerc0826 crop it is within 1/255 of NVIDIA's strict float32 output (`NVIDIA_TF32_OVERRIDE=0`)
+  everywhere, with 0.004% of voxels differing. It is as far from the default TF32 output as TF32 is from strict
+  float32, and its traced fibres match that output's at 99.9% of length. bf16 is NVIDIA-only. On an M4 Pro the network runs 2.00× faster than PyTorch on MPS on the same
+  tiles (202.7 against 405.3 ms a 128³ tile). A Mac prediction's provenance records `device: metal` and the Winograd levels it ran,
+  so a resume under another `VOLKIT_METAL_WINOGRAD` setting is refused rather than mixing outputs. See
+  [Predict](docs/predict.md).
 - **`fibrs strips run`.** Runs villa's sheet-strip inference (`scrollprize/fiber_strip_small_v1`) over an AFV's
   fibres natively, with Rust and cuda-oxide kernels and cuDNN for the convolutions. It writes the Python runner's
   strip layout and index. On one RTX 5090 it ran the whole PHerc0211 scroll at 2,095 decisions/s, about 8× villa's
@@ -13,8 +26,8 @@
 
 ### Upgrading
 
-- fibrs now needs volkit 0.1.3, whose device layer is public so `fibrs strips` can run its own kernels on
-  volkit's GPU.
+- fibrs now needs volkit 0.2.0, which adds the Metal backend and keeps 0.1.3's public device layer, so
+  `fibrs strips` can run its own kernels on volkit's GPU.
 
 ## [0.5.0] - 2026-11-22
 
