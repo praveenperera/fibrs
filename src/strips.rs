@@ -7,6 +7,7 @@
 //! the CPU stitches the decisions into a strip and writes it (`out`). Decisions batch across fibres on the GPU;
 //! the CPU work runs on a thread pool. [`types`] holds the records that pass between the two sides
 
+pub mod bench;
 pub mod ct;
 pub mod fibre;
 pub mod geom;
@@ -17,6 +18,9 @@ pub mod seed;
 pub mod stitch;
 pub mod types;
 
+#[cfg(test)]
+mod tests;
+
 use std::ffi::OsString;
 
 /// Whether `argv` asks for `fibrs strips`
@@ -26,7 +30,19 @@ pub fn requested(argv: &[OsString]) -> bool {
 }
 
 /// Runs `fibrs strips` on the arguments after the subcommand; the process exit code
-pub fn main(_args: &[OsString]) -> i32 {
-    eprintln!("fibrs strips: not built yet");
-    2
+pub fn main(args: &[OsString]) -> i32 {
+    let result = match args.first().and_then(|a| a.to_str()) {
+        Some("bench-cpu") => bench::main(&args[1..]),
+        _ => {
+            eprintln!("usage: fibrs strips bench-cpu [OPTIONS] (the runner is not built yet)");
+            return 2;
+        }
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("fibrs strips: {e:?}");
+            1
+        }
+    }
 }
