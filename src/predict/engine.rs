@@ -93,15 +93,38 @@ pub struct Opened {
     pub engine: Box<dyn Engine>,
     /// The GPU's name
     pub gpu: String,
-    /// Device memory free once the engine has loaded
-    pub free_bytes: u64,
-    /// Device bytes one output voxel of a column takes at its peak
-    pub column_bytes_per_voxel: f64,
+    /// What a column may take on the device
+    pub column: ColumnMemory,
     /// Provenance fields naming the engine, its library and the weights it loaded
     pub provenance: Map<String, Value>,
     /// The cuDNN and cuBLAS files the process mapped
     pub libraries: Vec<String>,
 }
+
+/// What a column may take on the device once the engine has loaded
+#[cfg_attr(not(fibrs_engine), allow(dead_code))]
+pub struct ColumnMemory {
+    /// Device memory free once the engine has loaded
+    pub free_bytes: u64,
+    /// Device bytes one output voxel of a column takes at its peak
+    pub bytes_per_voxel: f64,
+    /// The device's limit on one buffer, where it has one below its memory
+    pub buffer_limit: Option<BufferLimit>,
+}
+
+/// A device's limit on one buffer (Metal's `maxBufferLength`), against the column's largest buffer
+// only the Metal engine has one
+#[cfg_attr(not(fibrs_engine = "metal"), allow(dead_code))]
+pub struct BufferLimit {
+    /// The most bytes one buffer holds
+    pub max_bytes: u64,
+    /// Bytes one output voxel takes in the column's largest buffer
+    pub bytes_per_voxel: f64,
+}
+
+// acc (2 x float32), wsum (float32), semantic (2 x uint8) and tracing (2 x uint8 at 1/8)
+#[cfg(fibrs_engine)]
+const COLUMN_BYTES_PER_VOXEL: f64 = 8.0 + 4.0 + 2.0 + 0.25;
 
 /// Most tiles one `add` takes
 pub const MAX_BATCH: usize = 16;
@@ -155,7 +178,7 @@ mod native {
     use volkit::dnn::Pick;
     use volkit::nnunet::afv2::{AfvPrecision, AfvV2, Options};
 
-    use super::{Buffers, ColumnOut, Engine, Opened, Origin, Precision};
+    use super::{Buffers, COLUMN_BYTES_PER_VOXEL, ColumnMemory, ColumnOut, Engine, Opened, Origin, Precision};
 
     /// The engine library this build links, for the provenance
     const LIBRARY: &str = concat!(env!("FIBRS_VOLKIT"), ", AfvV2");
@@ -201,13 +224,12 @@ mod native {
         // the convolution algorithms cuDNN chose, one per distinct convolution in forward order: they set the
         // rounding, so a resume whose choices differ (another cache, cuDNN or driver) is refused
         provenance.insert("cudnn_algos".into(), json!(load.algos));
-        // acc (2 x float32), wsum (float32), semantic (2 x uint8) and tracing (2 x uint8 at 1/8)
-        let column_bytes_per_voxel = 8.0 + 4.0 + 2.0 + 0.25;
+        // a CUDA allocation is bounded only by the free memory
+        let column = ColumnMemory { free_bytes: free, bytes_per_voxel: COLUMN_BYTES_PER_VOXEL, buffer_limit: None };
         Ok(Opened {
             gpu: load.gpu.clone(),
             engine: Box::new(Native(net)),
-            free_bytes: free,
-            column_bytes_per_voxel,
+            column,
             provenance,
             libraries: super::libs::mapped(),
         })
@@ -258,7 +280,9 @@ mod metal {
     use serde_json::{Map, json};
     use volkit::nnunet::afv2::{AfvPrecision, AfvV2, Options};
 
-    use super::{Buffers, ColumnOut, Engine, Opened, Origin, Precision};
+    use super::{
+        BufferLimit, Buffers, COLUMN_BYTES_PER_VOXEL, ColumnMemory, ColumnOut, Engine, Opened, Origin, Precision,
+    };
 
     /// The engine library this build links, for the provenance
     const LIBRARY: &str = concat!(env!("FIBRS_VOLKIT"), ", AfvV2 on Metal");
@@ -296,16 +320,10 @@ mod metal {
         // unified memory: the column's buffers come out of the working set Metal recommends for this process, less
         // what the model already holds
         let free = load.working_set.saturating_sub(load.model_bytes) as u64;
-        // acc (2 x float32), wsum (float32), semantic (2 x uint8) and tracing (2 x uint8 at 1/8)
-        let column_bytes_per_voxel = 8.0 + 4.0 + 2.0 + 0.25;
-        Ok(Opened {
-            gpu: load.gpu.clone(),
-            engine: Box::new(Metal(net)),
-            free_bytes: free,
-            column_bytes_per_voxel,
-            provenance,
-            libraries: Vec::new(),
-        })
+        // and each of its buffers within Metal's per-buffer limit, the accumulator (2 x float32) the largest
+        let buffer_limit = Some(BufferLimit { max_bytes: load.max_buffer as u64, bytes_per_voxel: 8.0 });
+        let column = ColumnMemory { free_bytes: free, bytes_per_voxel: COLUMN_BYTES_PER_VOXEL, buffer_limit };
+        Ok(Opened { gpu: load.gpu.clone(), engine: Box::new(Metal(net)), column, provenance, libraries: Vec::new() })
     }
 }
 

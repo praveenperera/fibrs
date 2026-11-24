@@ -19,7 +19,7 @@ use super::contract::{
     positions, prediction_identity, sha256,
 };
 use super::ct::Ct;
-use super::engine::{self, Engine, MAX_BATCH, MAX_COLUMN_VOXELS, Opened, Precision};
+use super::engine::{self, ColumnMemory, Engine, MAX_BATCH, MAX_COLUMN_VOXELS, Opened, Precision};
 use super::feed::{FeedPlan, Item, Rule, TileFeed};
 use super::out::{ColumnWriter, Finished, Output, now_unix};
 use super::villa::{self, VillaSelection};
@@ -319,30 +319,41 @@ fn dry_run(c: &Checked) -> Result<()> {
     Ok(())
 }
 
-/// Refuse, before the output is created or any column runs, pending columns the GPU can't hold. A column's
-/// accumulators span the whole band height, so a tall volume needs a narrower column. The estimate leaves out
-/// the network's activations, which the engine has already allocated
+/// Refuse, before the output is created or any column runs, pending columns the GPU can't hold
 fn check_column_memory(c: &Checked, p: &Plan, e: &Opened) -> Result<()> {
-    let voxels = |h: usize, w: usize| p.nz * h * w;
-    let bytes = |h: usize, w: usize| e.column_bytes_per_voxel * voxels(h, w) as f64;
-    let free = e.free_bytes as f64;
-    // a column must fit in the free device memory and within the engine's 32-bit indexing
-    let fits = |h: usize, w: usize| bytes(h, w) <= free && voxels(h, w) <= MAX_COLUMN_VOXELS;
     let Some([y0, y1, x0, x1]) = p.todo.iter().map(|t| t.1).max_by_key(|c| (c[1] - c[0]) * (c[3] - c[2])) else {
         return Ok(());
     };
-    let (h, w) = (y1 - y0, x1 - x0);
+    column_fits(&e.column, c.a.mode, &c.a.device, [p.nz, p.ny, p.nx], [y1 - y0, x1 - x0])
+}
+
+/// Refuses the widest pending column, `h` x `w` in a volume of `shape`, when the device can't hold it: past the
+/// free memory, the engine's 32-bit indexing or the device's limit on one buffer. A column's accumulators span the
+/// whole band height, so a tall volume needs a narrower column; the message names the largest size that fits. The
+/// estimate leaves out the network's activations, which the engine has already allocated
+fn column_fits(m: &ColumnMemory, mode: Mode, device: &str, shape: [usize; 3], [h, w]: [usize; 2]) -> Result<()> {
+    let [nz, ny, nx] = shape;
+    let voxels = |h: usize, w: usize| nz * h * w;
+    let bytes = |h: usize, w: usize| m.bytes_per_voxel * voxels(h, w) as f64;
+    let free = m.free_bytes as f64;
+    // the column's largest buffer and the device's limit on one, where it has one
+    let buffer = |h: usize, w: usize| {
+        m.buffer_limit.as_ref().map(|l| (l.bytes_per_voxel * voxels(h, w) as f64, l.max_bytes as f64))
+    };
+    let fits = |h: usize, w: usize| {
+        bytes(h, w) <= free && voxels(h, w) <= MAX_COLUMN_VOXELS && buffer(h, w).is_none_or(|(b, max)| b <= max)
+    };
     if fits(h, w) {
         return Ok(());
     }
 
     // the largest column size whose widest column fits; sizes are multiples of the tile core, and a column is
     // cut short where the volume ends
-    let top = p.ny.max(p.nx).div_ceil(CORE) * CORE;
-    let fits = (1..=top / CORE).rev().map(|k| k * CORE).find(|&n| fits(n.min(p.ny), n.min(p.nx)));
-    let hint = match (c.a.mode, fits) {
+    let top = ny.max(nx).div_ceil(CORE) * CORE;
+    let fits = (1..=top / CORE).rev().map(|k| k * CORE).find(|&n| fits(n.min(ny), n.min(nx)));
+    let hint = match (mode, fits) {
         (Mode::Villa, Some(n)) => format!("pass --column {n} or less, which leaves villa mode's output unchanged"),
-        (Mode::Villa, None) => format!("no column of {} planes fits", p.nz),
+        (Mode::Villa, None) => format!("no column of {nz} planes fits"),
         // in band mode the column size is part of the output, so a shorter band is the other way
         (Mode::Band, Some(n)) => {
             format!("run a shorter band, or pass --column {n} or less (band mode's output depends on it)")
@@ -350,7 +361,6 @@ fn check_column_memory(c: &Checked, p: &Plan, e: &Opened) -> Result<()> {
         (Mode::Band, None) => "run a shorter band".to_string(),
     };
     let gib = |b: f64| b / (1u64 << 30) as f64;
-    let nz = p.nz;
     if voxels(h, w) > MAX_COLUMN_VOXELS {
         bail!(
             "a {h} x {w} column of {nz} planes has {} voxels, more than the {MAX_COLUMN_VOXELS} the engine takes \
@@ -358,10 +368,17 @@ fn check_column_memory(c: &Checked, p: &Plan, e: &Opened) -> Result<()> {
             voxels(h, w)
         );
     }
+    if let Some((b, max)) = buffer(h, w).filter(|(b, max)| b > max) {
+        bail!(
+            "a {h} x {w} column of {nz} planes needs a {:.2} GiB buffer on {device}, past its {:.2} GiB limit on one \
+             buffer; {hint}",
+            gib(b),
+            gib(max)
+        );
+    }
     bail!(
-        "a {h} x {w} column of {nz} planes needs about {:.1} GiB on {}, which has {:.1} GiB free; {hint}",
+        "a {h} x {w} column of {nz} planes needs about {:.1} GiB on {device}, which has {:.1} GiB free; {hint}",
         gib(bytes(h, w)),
-        c.a.device,
         gib(free)
     )
 }
@@ -670,7 +687,8 @@ mod tests {
     use std::fs::{self, TryLockError};
     use std::io::{Read, Write};
 
-    use super::try_lock;
+    use super::{Mode, column_fits, try_lock};
+    use crate::predict::engine::{BufferLimit, ColumnMemory};
 
     /// The output lock turns away a second run, and on Windows, where locks are mandatory, still lets another
     /// handle read the attempt log while it is held
@@ -693,5 +711,24 @@ mod tests {
         drop(held);
         try_lock(&open()).unwrap();
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A column that fits the free memory but not one device buffer is refused, and the suggested column is the
+    /// largest whose accumulator fits that buffer: at 512 planes and a 1 GiB limit on 8 bytes a voxel, 576 x 576
+    /// needs 1.27 GiB and 480 x 480 0.88 GiB. Without a buffer limit (CUDA) the same column runs
+    #[test]
+    fn a_column_past_the_device_buffer_limit_is_refused_with_a_column_that_fits() {
+        let limit = |max_gib: u64| Some(BufferLimit { max_bytes: max_gib << 30, bytes_per_voxel: 8.0 });
+        let memory = |buffer_limit| ColumnMemory { free_bytes: 64 << 30, bytes_per_voxel: 14.25, buffer_limit };
+        let (shape, col) = ([512, 1024, 1024], [576, 576]);
+
+        let err = column_fits(&memory(limit(1)), Mode::Villa, "metal", shape, col).unwrap_err().to_string();
+        assert!(err.contains("needs a 1.27 GiB buffer on metal, past its 1.00 GiB limit on one buffer"), "{err}");
+        assert!(err.contains("pass --column 480 or less"), "{err}");
+        let err = column_fits(&memory(limit(1)), Mode::Band, "metal", shape, col).unwrap_err().to_string();
+        assert!(err.contains("or pass --column 480 or less"), "{err}");
+
+        column_fits(&memory(None), Mode::Villa, "cuda", shape, col).unwrap();
+        column_fits(&memory(limit(2)), Mode::Villa, "metal", shape, col).unwrap();
     }
 }
