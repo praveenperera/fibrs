@@ -8,9 +8,12 @@
 //! under a crop still reading it. A launch needing a chunk the disk cache lacks fails before any upload, with every
 //! such chunk in its [`Uncached`] error.
 //!
-//! [`Crops`] samples the strip model's input, NDHWC `(B, 144, 128, 128, 2)` float32 with the z-scored CT in
-//! channel 0 and villa's `render_tube` in channel 1, and the frame model's `(B, 32, 32, 32)` float32 crops, with
-//! vc_reader's CUDA sampler arithmetic and villa's float64 z-score (`strips-kernels/src/crops.rs`)
+//! [`Crops`] samples the strip model's input, NDHWC `(B, 144, 128, 128, 2)` float32 with the CT in channel 0 and
+//! villa's `render_tube` in channel 1, and the frame model's `(B, 32, 32, 32)` float32 crops, with vc_reader's CUDA
+//! sampler arithmetic and villa's float64 z-score (`strips-kernels/src/crops.rs`). The frame crop is written
+//! z-scored, in two sampling passes. The strip crop takes one: its CT channel is written raw beside each crop's
+//! statistics, and its readers (the CNN's first conv and the head's profile tokens) z-score it as they load it, to
+//! the same bits; [`StripInput`] says which of the two a strip-model input is
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -561,13 +564,60 @@ pub struct CropAt {
     pub frame: Mat3,
 }
 
+/// The strip model's input crop, NDHWC `(B, 144, 128, 128, 2)` float32 (CT, tube), as its readers take it
+#[derive(Clone, Copy)]
+pub enum StripInput<'a> {
+    /// The CT channel z-scored, as the reference crops are
+    ZScored(&'a Buf),
+    /// The CT channel raw (`value / 255`) as [`Crops::strip`] writes it, z-scored on load with each crop's
+    /// `[mean_hi, mean_lo, inv_hi, inv_lo]` in `stats`
+    Raw { crop: &'a Buf, stats: &'a Buf },
+}
+
+impl<'a> StripInput<'a> {
+    /// The crop buffer
+    pub fn crop(self) -> &'a Buf {
+        match self {
+            Self::ZScored(crop) | Self::Raw { crop, .. } => crop,
+        }
+    }
+
+    /// The readers' `stats` kernel argument: empty for a z-scored crop
+    pub fn stats(self) -> Arg {
+        match self {
+            Self::ZScored(_) => Arg::EMPTY,
+            Self::Raw { stats, .. } => stats.arg::<f32>(),
+        }
+    }
+}
+
+impl<'a> From<&'a Buf> for StripInput<'a> {
+    fn from(crop: &'a Buf) -> Self {
+        Self::ZScored(crop)
+    }
+}
+
+/// What [`Crops::sample`] writes
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pass {
+    /// The z-scored crop, sampled twice: once for its statistics, once to write it
+    ZScored,
+    /// The raw crop and its statistics in one sampling pass; needs the two-channel layout
+    Raw,
+    /// The z-scored write's ceiling: the same launch reading no CT
+    WriteCeiling,
+}
+
 /// The sampler's device buffers for up to `capacity` crops per launch
 pub struct Crops {
     capacity: usize,
     scale: f64,
     grids: Buf,
     partials: Buf,
+    /// The z-scored crops' statistics, used within their launch
     stats: Buf,
+    /// The raw strip crops' statistics, read with the crop by the strip model until the next strip launch
+    strip_stats: Buf,
     points: Buf,
     counts: Buf,
     offsets: Buf,
@@ -606,6 +656,7 @@ impl Crops {
             grids: gpu.alloc(capacity * GRID_WORDS * 4)?,
             partials: gpu.alloc(capacity * tiles * 16)?,
             stats: gpu.alloc(capacity * 16)?,
+            strip_stats: gpu.alloc(capacity * 16)?,
             points: gpu.alloc(capacity * TUBE_POINTS * 12)?,
             counts: gpu.alloc(capacity * 4)?,
             offsets: gpu.upload(&flat)?,
@@ -614,8 +665,9 @@ impl Crops {
         })
     }
 
-    /// The strip model's input for `at` into `out`: NDHWC `(B, 144, 128, 128, 2)` float32, channel 0 the
-    /// z-scored CT, channel 1 the tube of `tubes[b]` (crop-local (u, v, f) points, at most [`TUBE_POINTS`])
+    /// The strip model's input for `at` into `out`: NDHWC `(B, 144, 128, 128, 2)` float32, channel 0 the raw
+    /// CT (`value / 255`), channel 1 the tube of `tubes[b]` (crop-local (u, v, f) points, at most
+    /// [`TUBE_POINTS`]); [`Crops::strip_input`] pairs `out` with the crops' statistics for the strip model
     pub fn strip(
         &mut self,
         dev: &Device,
@@ -625,12 +677,17 @@ impl Crops {
         out: &Buf,
     ) -> Result<()> {
         ensure!(tubes.len() == at.len(), "{} tubes for {} crops", tubes.len(), at.len());
-        self.sample(dev, cache, &STRIP_CROP, at, Some(tubes), out, 0)
+        self.sample(dev, cache, &STRIP_CROP, at, Some(tubes), out, Pass::Raw)
+    }
+
+    /// `crop`, written by the last [`Crops::strip`], as the strip model's input: valid until the next one
+    pub fn strip_input<'a>(&'a self, crop: &'a Buf) -> StripInput<'a> {
+        StripInput::Raw { crop, stats: &self.strip_stats }
     }
 
     /// The frame model's crops for `at` (prior frames) into `out`: `(B, 32, 32, 32)` float32, z-scored
     pub fn frame(&mut self, dev: &Device, cache: &mut ChunkCache, at: &[CropAt], out: &Buf) -> Result<()> {
-        self.sample(dev, cache, &FRAME_CROP, at, None, out, 0)
+        self.sample(dev, cache, &FRAME_CROP, at, None, out, Pass::ZScored)
     }
 
     /// Starts reading ahead the CT chunks that crops of `spec` at `at` need and the cache lacks, for a later launch
@@ -644,8 +701,8 @@ impl Crops {
         cache.prefetch(&needed)
     }
 
-    /// Stages the grids (and tube points), makes their chunks resident and launches the sampler, writing one
-    /// channel without `tubes` and two with them: `mode` 1 is the write ceiling, which reads no CT
+    /// Stages the grids (and tube points), makes their chunks resident and launches the sampler for `pass`, writing
+    /// one channel without `tubes` and two with them
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn sample(
         &mut self,
@@ -655,11 +712,12 @@ impl Crops {
         at: &[CropAt],
         tubes: Option<&[&[[f32; 3]]]>,
         out: &Buf,
-        mode: u32,
+        pass: Pass,
     ) -> Result<()> {
         let b = at.len();
         ensure!(b > 0 && b <= self.capacity, "{b} crops for a sampler of {}", self.capacity);
         let channels = if tubes.is_some() { 2 } else { 1 };
+        ensure!(pass != Pass::Raw || channels == 2, "a raw crop needs the two-channel layout");
         let need = b * spec.samples() * channels * 4;
         ensure!(out.bytes() >= need, "crop output of {} bytes, {need} needed", out.bytes());
         let grids: Vec<CropGrid> = at.iter().map(|c| CropGrid::new(spec, c.pos, &c.frame, self.scale)).collect();
@@ -722,33 +780,36 @@ impl Crops {
         ];
         let k = &dev.kernels;
         let block = (SAMPLE_THREADS, 1, 1);
+        let dims = [spec.depth, spec.height, spec.width].map(|d| Arg::U32(d as u32));
         let mut args = ct.to_vec();
         args.push(Arg::Ptr(self.partials.ptr()));
-        k.launch(gpu, "sc_stats", (tiles, b as u32, 1), block, 0, &args)?;
+        if pass == Pass::Raw {
+            args.extend(dims);
+            args.push(Arg::Ptr(out.ptr()));
+            k.launch(gpu, "sc_raw", (tiles, b as u32, 1), block, 0, &args)?;
+        } else {
+            k.launch(gpu, "sc_stats", (tiles, b as u32, 1), block, 0, &args)?;
+        }
+        let stats = if pass == Pass::Raw { &self.strip_stats } else { &self.stats };
         k.launch(
             gpu,
             "sc_finalize",
             (b as u32, 1, 1),
             (256, 1, 1),
             0,
-            &[
-                Arg::Ptr(self.partials.ptr()),
-                Arg::U32(tiles),
-                Arg::U32(spec.samples() as u32),
-                Arg::Ptr(self.stats.ptr()),
-            ],
+            &[Arg::Ptr(self.partials.ptr()), Arg::U32(tiles), Arg::U32(spec.samples() as u32), Arg::Ptr(stats.ptr())],
         )?;
-        let mut args = ct.to_vec();
-        args.extend([
-            Arg::Ptr(self.stats.ptr()),
-            Arg::U32(spec.depth as u32),
-            Arg::U32(spec.height as u32),
-            Arg::U32(spec.width as u32),
-            Arg::U32(channels as u32),
-            Arg::U32(mode),
-            Arg::Ptr(out.ptr()),
-        ]);
-        k.launch(gpu, "sc_write", (tiles, b as u32, 1), block, 0, &args)?;
+        if pass != Pass::Raw {
+            let mut args = ct.to_vec();
+            args.push(Arg::Ptr(stats.ptr()));
+            args.extend(dims);
+            args.extend([
+                Arg::U32(channels as u32),
+                Arg::U32(u32::from(pass == Pass::WriteCeiling)),
+                Arg::Ptr(out.ptr()),
+            ]);
+            k.launch(gpu, "sc_write", (tiles, b as u32, 1), block, 0, &args)?;
+        }
         if tubes.is_some() {
             let n = TUBE_POINTS as u32 * self.noff;
             k.launch(

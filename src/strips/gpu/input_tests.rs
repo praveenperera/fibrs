@@ -14,11 +14,26 @@ use cudarc::driver::sys as cu;
 use serde_json::Value;
 use volkit::gpu::Buf;
 
-use super::crops::{ChunkCache, CropAt, Crops, FRAME_CROP, STRIP_CROP};
+use super::crops::{ChunkCache, CropAt, Crops, FRAME_CROP, Pass, STRIP_CROP, StripInput};
 use super::frame::FrameModel;
 use super::{Device, Weights};
 use crate::strips::ct::Volume;
 use crate::strips::types::{Family, FrameRequest, Mat3};
+
+/// `strips-kernels` `crops::zscore` on the host, op for op: `x - mean` exactly as a float32 pair, then the pair
+/// product with the reciprocal deviation, rounded once (Rust rounds each operation and fuses only `mul_add`)
+fn zscore(x: f32, [mh, ml, ih, il]: [f32; 4]) -> f32 {
+    let two_sum = |a: f32, b: f32| {
+        let s = a + b;
+        let bb = s - a;
+        (s, (a - (s - bb)) + (b - bb))
+    };
+    let (dh, de) = two_sum(x, -mh);
+    let dl = de + -ml;
+    let ph = dh * ih;
+    let pe = dh.mul_add(ih, -ph);
+    ph + (pe + dh.mul_add(il, dl * ih))
+}
 
 fn env_path(key: &str, default: &str) -> PathBuf {
     std::env::var_os(key).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(default))
@@ -256,9 +271,15 @@ fn input_parity() -> Result<()> {
         let tubes: Vec<&[[f32; 3]]> = s.dec.tubes[start..end].iter().map(Vec::as_slice).collect();
         gpu.fill(&strip_buf, 0xFF)?;
         s.crops.strip(&s.dev, &mut s.cache, &s.dec.strip_at[start..end], &tubes, &strip_buf)?;
+        // the crop's CT channel is raw; its readers z-score it on load, as this does on the host
+        let StripInput::Raw { stats, .. } = s.crops.strip_input(&strip_buf) else {
+            unreachable!("a strip crop is raw")
+        };
+        let stats: Vec<f32> = gpu.download_range(stats, 0, 4 * (end - start))?;
         for j in 0..end - start {
             let got: Vec<f32> = gpu.download_range(&strip_buf, j * sn * 2, sn * 2)?;
-            let ct: Vec<f32> = got.iter().step_by(2).copied().collect();
+            let st = [stats[4 * j], stats[4 * j + 1], stats[4 * j + 2], stats[4 * j + 3]];
+            let ct: Vec<f32> = got.iter().step_by(2).map(|&x| zscore(x, st)).collect();
             let i = start + j;
             let (m, f, bad) = compare(&ct, &ref_strip[i * sn..(i + 1) * sn]);
             ensure!(bad == 0, "strip crop {i}: {bad} non-finite values");
@@ -351,7 +372,7 @@ fn input_bench() -> Result<()> {
                     &s.dec.strip_at[r.clone()],
                     Some(&no_tubes),
                     &strip_buf,
-                    1,
+                    Pass::WriteCeiling,
                 )
             })?;
         }
