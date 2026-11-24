@@ -84,16 +84,19 @@ impl Kernel {
     }
 }
 
-/// Working buffers for one structure tensor, reused across seeds
+/// Working buffers for one structure tensor, reused across seeds: the cube, its image, and one z plane of each
+/// pass. The tensor is computed a plane at a time so a thread's working set stays near its cache (full-volume
+/// intermediates made the tensor memory-bound past four threads)
 pub struct Workspace {
     pub(super) cube: Vec<u8>,
     img: Vec<f64>,
-    a: Vec<f64>,
-    s0: Vec<f64>,
-    g: [Vec<f64>; 3],
+    /// The z passes of the current plane: derivative and smoothing
+    za: Vec<f64>,
+    zs: Vec<f64>,
     plane: Vec<f64>,
+    /// gz, gy, gx of the current plane
+    g: [Vec<f64>; 3],
     line: Vec<f64>,
-    weighted: Vec<f64>,
 }
 
 impl Default for Workspace {
@@ -101,31 +104,26 @@ impl Default for Workspace {
         Self {
             cube: vec![0; N],
             img: vec![0.0; N],
-            a: vec![0.0; N],
-            s0: vec![0.0; N],
-            g: [vec![0.0; N], vec![0.0; N], vec![0.0; N]],
+            za: vec![0.0; PLANE],
+            zs: vec![0.0; PLANE],
             plane: vec![0.0; PLANE],
+            g: [vec![0.0; PLANE], vec![0.0; PLANE], vec![0.0; PLANE]],
             line: vec![0.0; SIDE + 2 * HALF],
-            weighted: vec![0.0; N],
         }
     }
 }
 
-/// Along z (axis 0): `out[z] = in[z] * w0 + sum over k of (in[z-k] op in[z+k]) * w[-k]`, edges clamped; each
-/// z plane at once
-fn pass_z(input: &[f64], out: &mut [f64], k: Kernel) {
-    for z in 0..SIDE {
-        let o = &mut out[z * PLANE..(z + 1) * PLANE];
-        let centre = &input[z * PLANE..(z + 1) * PLANE];
-        for (d, &c) in o.iter_mut().zip(centre) {
-            *d = c * k.centre;
-        }
-        for (j, &w) in k.side.iter().enumerate() {
-            let off = HALF - j;
-            let before = &input[z.saturating_sub(off) * PLANE..][..PLANE];
-            let after = &input[(z + off).min(SIDE - 1) * PLANE..][..PLANE];
-            accumulate(o, before, after, w, k.symmetric);
-        }
+/// Plane `z` along z (axis 0): `out = in[z] * w0 + sum over k of (in[z-k] op in[z+k]) * w[-k]`, edges clamped
+fn pass_z(input: &[f64], z: usize, o: &mut [f64], k: Kernel) {
+    let centre = &input[z * PLANE..(z + 1) * PLANE];
+    for (d, &c) in o.iter_mut().zip(centre) {
+        *d = c * k.centre;
+    }
+    for (j, &w) in k.side.iter().enumerate() {
+        let off = HALF - j;
+        let before = &input[z.saturating_sub(off) * PLANE..][..PLANE];
+        let after = &input[(z + off).min(SIDE - 1) * PLANE..][..PLANE];
+        accumulate(o, before, after, w, k.symmetric);
     }
 }
 
@@ -177,111 +175,128 @@ fn pass_x(input: &[f64], out: &mut [f64], line: &mut [f64], k: Kernel) {
     }
 }
 
-/// NumPy's pairwise sum of `f(i)` for i in `range` (`np.add.reduce` without its identity)
-fn pairwise(a: &[f64]) -> f64 {
-    let n = a.len();
-    if n < 8 {
-        let mut res = -0.0;
-        for &x in a {
-            res += x;
-        }
-        return res;
+/// NumPy's pairwise sum (`np.add.reduce` without its identity) of `n` values in `L` lanes at once, the values
+/// produced in order by `fill`: its blocks of at most 128 are requested in ascending order, so a producer can
+/// stream them
+fn pairwise<const L: usize>(n: usize, fill: &mut impl FnMut(&mut [[f64; L]]), buf: &mut [[f64; L]; 128]) -> [f64; L] {
+    if n > 128 {
+        let mut n2 = n / 2;
+        n2 -= n2 % 8;
+        let a = pairwise(n2, fill, buf);
+        let b = pairwise(n - n2, fill, buf);
+        return std::array::from_fn(|l| a[l] + b[l]);
     }
-    if n <= 128 {
-        let mut r = [0.0f64; 8];
-        r.copy_from_slice(&a[..8]);
-        let full = n - n % 8;
-        for chunk in a[8..full].as_chunks::<8>().0 {
-            for (acc, &x) in r.iter_mut().zip(chunk) {
-                *acc += x;
+
+    let a = &mut buf[..n];
+    fill(a);
+    if n < 8 {
+        let mut res = [-0.0; L];
+        for x in a.iter() {
+            for l in 0..L {
+                res[l] += x[l];
             }
         }
-        let mut res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
-        for &x in &a[full..] {
-            res += x;
-        }
         return res;
     }
-    let mut n2 = n / 2;
-    n2 -= n2 % 8;
-    pairwise(&a[..n2]) + pairwise(&a[n2..])
+
+    let mut r: [[f64; L]; 8] = std::array::from_fn(|k| a[k]);
+    let full = n - n % 8;
+    for chunk in a[8..full].as_chunks::<8>().0 {
+        for (acc, x) in r.iter_mut().zip(chunk) {
+            for l in 0..L {
+                acc[l] += x[l];
+            }
+        }
+    }
+    let mut res: [f64; L] = std::array::from_fn(|l| {
+        ((r[0][l] + r[1][l]) + (r[2][l] + r[3][l])) + ((r[4][l] + r[5][l]) + (r[6][l] + r[7][l]))
+    });
+    for x in &a[full..] {
+        for l in 0..L {
+            res[l] += x[l];
+        }
+    }
+    res
 }
 
-/// `np.sum` of a float64 array
-fn np_sum(a: &[f64]) -> f64 {
-    0.0 + pairwise(a)
+/// `np.sum` of `n` float64 values per lane, streamed by `fill`
+fn np_sum<const L: usize>(n: usize, fill: &mut impl FnMut(&mut [[f64; L]])) -> [f64; L] {
+    let sums = pairwise(n, fill, &mut [[0.0; L]; 128]);
+    sums.map(|v| 0.0 + v)
+}
+
+/// The cube's voxels in row-major (z, y, x) order
+#[derive(Default)]
+struct Voxels(usize);
+
+impl Voxels {
+    fn next(&mut self) -> (usize, usize, usize) {
+        let i = self.0;
+        self.0 += 1;
+        (i / PLANE, i / SIDE % SIDE, i % SIDE)
+    }
 }
 
 impl Workspace {
     /// `ct_structure_tensor(cube, centre, derivative_sigma=2, integration_sigma=8)`, axes xyz, of the cube in
     /// `self.cube` (zyx, 77^3 uint8)
     pub fn structure_tensor(&mut self, centre_zyx: V3) -> M3 {
-        let smooth = Kernel::of(&SMOOTH, true);
-        let deriv = Kernel::of(&DERIV, false);
         for (d, &c) in self.img.iter_mut().zip(&self.cube) {
             *d = c as f64 / 255.0;
         }
-        // gz = x(y(z'(img))); gy = x(y'(s0)); gx = x'(y(s0)) with s0 = z(img)
-        pass_z(&self.img, &mut self.a, deriv);
-        pass_z(&self.img, &mut self.s0, smooth);
-        let [gz, gy, gx] = &mut self.g;
-        for z in 0..SIDE {
-            let at = z * PLANE..(z + 1) * PLANE;
-            pass_y(&self.a[at.clone()], &mut self.plane, smooth);
-            pass_x(&self.plane, &mut gz[at.clone()], &mut self.line, smooth);
-            pass_y(&self.s0[at.clone()], &mut self.plane, deriv);
-            pass_x(&self.plane, &mut gy[at.clone()], &mut self.line, smooth);
-            pass_y(&self.s0[at.clone()], &mut self.plane, smooth);
-            pass_x(&self.plane, &mut gx[at], &mut self.line, deriv);
-        }
         // the integration window: separable Gaussians, their outer product normalized by its sum
-        let window: [Vec<f64>; 3] = std::array::from_fn(|a| {
-            (0..SIDE)
-                .map(|i| {
-                    let t = (i as f64 - centre_zyx[a]) / 8.0;
-                    (-0.5 * (t * t)).exp()
-                })
-                .collect()
+        let window: [[f64; SIDE]; 3] = std::array::from_fn(|a| {
+            std::array::from_fn(|i| {
+                let t = (i as f64 - centre_zyx[a]) / 8.0;
+                (-0.5 * (t * t)).exp()
+            })
         });
-        let w = &mut self.weighted;
-        let mut i = 0;
-        for &wz in &window[0] {
-            for &wy in &window[1] {
-                let wzy = wz * wy;
-                for &wx in &window[2] {
-                    w[i] = wzy * wx;
-                    i += 1;
+        let [wz, wy, wx] = &window;
+        let mut voxels = Voxels::default();
+        let [total] = np_sum(N, &mut |out: &mut [[f64; 1]]| {
+            for o in out {
+                let (z, y, x) = voxels.next();
+                *o = [(wz[z] * wy[y]) * wx[x]];
+            }
+        });
+
+        // tensor[i][j] = sum((w * g_i) * g_j), zyx, each plane's gradients as the sum reaches it; LAPACK reads the
+        // lower triangle, so only it is summed
+        let mut voxels = Voxels::default();
+        let mut current = usize::MAX;
+        let sums = np_sum(N, &mut |out: &mut [[f64; 6]]| {
+            for o in out {
+                let (z, y, x) = voxels.next();
+                if z != current {
+                    self.gradients(z);
+                    current = z;
                 }
+                let e = y * SIDE + x;
+                let w = ((wz[z] * wy[y]) * wx[x]) / total;
+                let g = [self.g[0][e], self.g[1][e], self.g[2][e]];
+                let wg = g.map(|v| w * v);
+                *o = [wg[0] * g[0], wg[1] * g[0], wg[1] * g[1], wg[2] * g[0], wg[2] * g[1], wg[2] * g[2]];
             }
-        }
-        let total = np_sum(w);
-        for x in w.iter_mut() {
-            *x /= total;
-        }
-        // tensor[i][j] = sum((w * g_i) * g_j), zyx; LAPACK reads the lower triangle, so only it is summed
-        let mut t = [[0.0f64; 3]; 3];
-        let mut product = std::mem::take(&mut self.img);
-        let mut weighted = std::mem::take(&mut self.a);
-        for i in 0..3 {
-            for ((d, &wv), &g) in weighted.iter_mut().zip(self.weighted.iter()).zip(&self.g[i]) {
-                *d = wv * g;
-            }
-            for j in 0..=i {
-                for ((d, &a), &b) in product.iter_mut().zip(&weighted).zip(&self.g[j]) {
-                    *d = a * b;
-                }
-                t[i][j] = np_sum(&product);
-            }
-        }
-        self.img = product;
-        self.a = weighted;
-        for i in 0..3 {
-            for j in i + 1..3 {
-                t[i][j] = t[j][i];
-            }
-        }
+        });
+        let [t00, t10, t11, t20, t21, t22] = sums;
+        let t = [[t00, t10, t20], [t10, t11, t21], [t20, t21, t22]];
         // zyx array axes -> world xyz
         std::array::from_fn(|i| std::array::from_fn(|j| t[2 - i][2 - j]))
+    }
+
+    /// Plane `z` of gz = x(y(z'(img))), gy = x(y'(s0)) and gx = x'(y(s0)), with s0 = z(img)
+    fn gradients(&mut self, z: usize) {
+        let smooth = Kernel::of(&SMOOTH, true);
+        let deriv = Kernel::of(&DERIV, false);
+        pass_z(&self.img, z, &mut self.za, deriv);
+        pass_z(&self.img, z, &mut self.zs, smooth);
+        let [gz, gy, gx] = &mut self.g;
+        pass_y(&self.za, &mut self.plane, smooth);
+        pass_x(&self.plane, gz, &mut self.line, smooth);
+        pass_y(&self.zs, &mut self.plane, deriv);
+        pass_x(&self.plane, gy, &mut self.line, smooth);
+        pass_y(&self.zs, &mut self.plane, smooth);
+        pass_x(&self.plane, gx, &mut self.line, deriv);
     }
 }
 
