@@ -111,6 +111,8 @@ if ! "$ptxas" -arch=sm_$arch -v "$ptx" -o /dev/null 2> "$ptxdir/strips-ptxas-sm$
   echo "ptxas refuses the sm_$arch PTX" >&2
   exit 1
 fi
+# ptxas's compile times change on every run, and the report is committed and hashed, so they would dirty every rebuild
+sed -i '/Compile time = /d' "$ptxdir/strips-ptxas-sm$arch.txt"
 # a stack frame or a spill is a register array or a call that stayed local; none is expected
 if grep -qE '[1-9][0-9]* bytes (stack frame|spill)' "$ptxdir/strips-ptxas-sm$arch.txt"; then
   cat "$ptxdir/strips-ptxas-sm$arch.txt" >&2
