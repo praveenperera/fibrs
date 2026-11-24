@@ -12,9 +12,12 @@
 //! strips kernels (`strips-kernels/src/cnn.rs`), at PyTorch's bf16 rounding points. [`Stages01::Cudnn`] runs stages
 //! 0 and 1 the same way, for comparison.
 //!
-//! Two departures from PyTorch's order, both exact in real arithmetic: the stage-0 conv biases are dropped (each
-//! feeds an InstanceNorm, which removes them), and the context fuse convolves the context output before the
-//! upsample rather than after (both are linear and the upsample's weights sum to 1), on an eighth of the voxels
+//! Conv biases (stage 0's two convs and the context fuse) go on as PyTorch's cuDNN path adds them, to the bf16 conv
+//! output with a second rounding: the stage-0 ones feed InstanceNorms, which remove them in exact arithmetic but not
+//! their rounding, a fixed per-(position, channel) offset the trained head reads (it tilts the strip heights).
+//!
+//! One departure from PyTorch's order, exact in real arithmetic: the context fuse convolves the context output before
+//! the upsample rather than after (both are linear and the upsample's weights sum to 1), on an eighth of the voxels
 
 use std::collections::HashMap;
 
@@ -48,9 +51,11 @@ fn voxels(s: [usize; 3]) -> usize {
     s[0] * s[1] * s[2]
 }
 
-/// A Conv3d's weights as cuDNN's channels-last filter `[K, kd, kh, kw, C]` in bf16, and its geometry
+/// A Conv3d's weights as cuDNN's channels-last filter `[K, kd, kh, kw, C]` in bf16, its bias, and its geometry
 struct Conv {
     w: Buf,
+    /// The bias as bf16 holds it (float32 values), when the conv has one; cuDNN runs the conv without it
+    bias: Option<Buf>,
     cin: usize,
     cout: usize,
     k: usize,
@@ -60,7 +65,8 @@ struct Conv {
 }
 
 impl Conv {
-    /// Conv `name` (`.weight` of shape `[cout, cin, k, k, k]`), rounded to bf16 as autocast casts it
+    /// Conv `name` (`.weight` of shape `[cout, cin, k, k, k]`, and `.bias` when the export has one), rounded to bf16
+    /// as autocast casts it
     #[allow(clippy::too_many_arguments)]
     fn load(
         gpu: &Gpu,
@@ -85,7 +91,8 @@ impl Conv {
         }
 
         let w = gpu.upload(&w).wrap_err_with(|| format!("upload {name}"))?;
-        Ok(Self { w, cin, cout, k, stride, input })
+        let bias = bias(weights, name, cout)?.map(|b| gpu.upload(&b)).transpose()?;
+        Ok(Self { w, bias, cin, cout, k, stride, input })
     }
 
     fn output(&self) -> [usize; 3] {
@@ -111,6 +118,16 @@ impl Conv {
         let (xp, yp) = (x.ptr() + (s.first * xs) as u64, y.ptr() + (s.first * ys) as u64);
         plan.run(&dev.dnn, (xp, s.n * xs), (self.w.ptr(), self.w.bytes()), (yp, s.n * ys), ws)
     }
+}
+
+/// Conv `name`'s `.bias` rounded to bf16, as float32 values, when the export has one
+fn bias(weights: &Weights, name: &str, cout: usize) -> Result<Option<Vec<f32>>> {
+    let key = format!("{name}.bias");
+    if !weights.has(&key) {
+        return Ok(None);
+    }
+    let t = weights.get(&key, &[cout])?;
+    Ok(Some(t.values.iter().map(|&v| half::bf16::from_f32(v).to_f32()).collect()))
 }
 
 /// An affine InstanceNorm3d: its float32 weight and bias, and its `[B, C]` statistics buffer
@@ -208,6 +225,8 @@ struct MmaConv {
     kernel: &'static str,
     /// B fragments `[step][n tile][lane]` as bf16 pairs
     wf: Buf,
+    /// The bf16-rounded bias, for a kernel built with one
+    bias: Option<Buf>,
     cin: usize,
     cout: usize,
     stride: usize,
@@ -219,7 +238,8 @@ struct MmaConv {
 
 impl MmaConv {
     /// Conv `name`'s weights as the kernel's B fragments: input channels in `ch` 8-channel chunks per voxel,
-    /// output channels in `nt` 8-wide tiles, every (tap, chunk) pair a k16 half-step
+    /// output channels in `nt` 8-wide tiles, every (tap, chunk) pair a k16 half-step; and its bias when it has one,
+    /// which `kernel` must have been built to add (`conv_kernel!`'s last parameter)
     #[allow(clippy::too_many_arguments)]
     fn load(
         dev: &Device,
@@ -261,7 +281,8 @@ impl MmaConv {
         let smem = u32::try_from(smem)?;
         dev.kernels.set_max_dynamic_smem(kernel, smem)?;
         let wf = dev.gpu.upload(&wf)?;
-        Ok(Self { kernel, wf, cin, cout, stride, input, tile, warps, smem })
+        let bias = bias(weights, name, cout)?.map(|b| dev.gpu.upload(&b)).transpose()?;
+        Ok(Self { kernel, wf, bias, cin, cout, stride, input, tile, warps, smem })
     }
 
     fn output(&self) -> [usize; 3] {
@@ -316,6 +337,7 @@ impl MmaConv {
             wsk,
             pool,
             self.wf.arg::<[u32; 2]>(),
+            self.bias.as_ref().map_or(Arg::EMPTY, |b| b.arg::<f32>()),
             Arg::U32(d as u32),
             Arg::U32(h as u32),
             Arg::U32(w as u32),
@@ -419,8 +441,6 @@ pub type Tap<'a> = &'a mut dyn FnMut(&str, &Buf, [usize; 5]) -> Result<()>;
 pub struct CropCnn {
     blocks: Vec<Block>,
     fuse: Conv,
-    /// The context fuse's bias, as bf16 holds it
-    fuse_bias: Buf,
     native: Native,
     stages01: Stages01,
     /// The sample group stage 2 onward runs in, `None` for the whole batch
@@ -459,13 +479,8 @@ impl CropCnn {
         ];
         // the fuse runs on the context block's output, before the upsample (see `sn_upfuse`)
         let fuse = Conv::load(gpu, weights, &format!("{p}.context_fuse"), 64, 64, 1, 1, s2.map(|d| d / 2))?;
-        let bias: Vec<f32> = weights
-            .get(&format!("{p}.context_fuse.bias"), &[64])?
-            .values
-            .iter()
-            .map(|&v| half::bf16::from_f32(v).to_f32())
-            .collect();
-        let fuse_bias = gpu.upload(&bias)?;
+        ensure!(fuse.bias.is_some(), "the context fuse has no bias");
+        ensure!(blocks[0].conv1.bias.is_some() && blocks[0].conv2.bias.is_some(), "stage 0's convs have no bias");
         let native = Native::load(dev, weights)?;
 
         let n = max_batch;
@@ -476,7 +491,6 @@ impl CropCnn {
         Ok(Self {
             blocks,
             fuse,
-            fuse_bias,
             native,
             stages01: Stages01::Native,
             group: Some(DEFAULT_GROUP),
@@ -650,7 +664,7 @@ impl CropCnn {
             self.cells.view::<[u32; 2]>(at, cells),
             self.t[last].view::<[u32; 2]>(at, cells),
             fused.view::<[u32; 2]>(at / 8, cells / 8),
-            self.fuse_bias.arg::<f32>(),
+            self.fuse.bias.as_ref().expect("the fuse's bias, checked at load").arg::<f32>(),
             Arg::U32((CELL_CHANNELS / 4) as u32),
             Arg::U32(cd as u32),
             Arg::U32(ch as u32),
@@ -698,9 +712,11 @@ impl CropCnn {
         let cout = blk.conv1.cout;
 
         blk.conv1.run(dev, &bp.c1, xin, a, ws, n)?;
+        self.bias(dev, a, &blk.conv1, n, rows)?;
         self.stats(dev, a, &blk.norm1, n, rows)?;
         self.apply(dev, a, &blk.norm1, Residual::None, n, rows, true)?;
         blk.conv2.run(dev, &bp.c2, a, b, ws, n)?;
+        self.bias(dev, b, &blk.conv2, n, rows)?;
         self.stats(dev, b, &blk.norm2, n, rows)?;
         match (&blk.skip.proj, &bp.proj) {
             (Some((conv, norm)), Some(pp)) => {
@@ -759,6 +775,7 @@ impl CropCnn {
             input.view::<[f32; 2]>(0, n * voxels(CROP)),
             nat.conv0.view::<[f32; 4]>(0, 162),
             nat.skip0.arg::<f32>(),
+            b0.conv1.bias.as_ref().expect("stage 0's conv1 bias, checked at load").arg::<f32>(),
         ];
         dev.kernels.launch(&dev.gpu, "sn_conv0", (CONV0_TILES as u32, n as u32, 1), (256, 1, 1), 0, &args)?;
         self.merge(dev, &b0.norm1.stats, CONV0_TILES, 24, 0, 12, 256, n)?;
@@ -857,6 +874,15 @@ impl CropCnn {
             Arg::F32(EPS),
         ];
         dev.kernels.launch(&dev.gpu, "sn_merge", (cols as u32, n as u32, 1), (256, 1, 1), 0, &args)
+    }
+
+    /// Conv `conv`'s bias, if it has one, on its cuDNN output `y` (`[B, rows, conv.cout]` bf16) in place, samples `s`
+    fn bias(&self, dev: &Device, y: &Buf, conv: &Conv, s: Samples, rows: usize) -> Result<()> {
+        let Some(bias) = &conv.bias else { return Ok(()) };
+        let c = conv.cout;
+        let (at, quads) = (s.first * rows * c / 4, s.n * rows * c / 4);
+        let args = [y.view::<[u32; 2]>(at, quads), bias.arg::<f32>(), Arg::U32(c as u32)];
+        dev.kernels.launch(&dev.gpu, "sn_bias", grid(quads), (256, 1, 1), 0, &args)
     }
 
     /// InstanceNorm statistics of samples `s` of `y` (`[B, rows, norm.c]` bf16) into `norm.stats`
