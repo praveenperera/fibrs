@@ -6,9 +6,9 @@
 //!
 //! Stages 0, 1 and 2's 3x3x3 convs run on the strips kernels' own convs ([`Convs::Native`]): the first conv straight
 //! from the float32 crop, then bf16 tensor-core implicit-GEMM convs that apply the previous InstanceNorm and
-//! LeakyReLU on load and write per-tile statistics partials from their epilogues. The context block, the skips' 1x1
-//! projections and the fuse are channels-last bf16 cuDNN convolutions with float32
-//! accumulation, with InstanceNorm (float32 statistics per sample and channel), LeakyReLU, the residual adds and the
+//! LeakyReLU on load and write per-tile statistics partials from their epilogues; stage 2's first conv also computes
+//! its block's 1x1 skip projection from the input it holds. The context block, stage 1's skip projection and the
+//! fuse are channels-last bf16 cuDNN convolutions with float32 accumulation, with InstanceNorm (float32 statistics per sample and channel), LeakyReLU, the residual adds and the
 //! skips' average pools in the strips kernels (`strips-kernels/src/cnn.rs`), at PyTorch's bf16 rounding points.
 //! [`Convs::Cudnn`] runs every conv the latter way, for comparison.
 //!
@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 
-use color_eyre::eyre::{Result, WrapErr, bail, ensure};
+use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
 use volkit::dnn::{ConvPlan, ConvShape, Dtype, Pick};
 use volkit::gpu::{Arg, Buf, Gpu};
 
@@ -149,6 +149,23 @@ impl Conv {
     }
 }
 
+/// B fragments `[step][n tile][lane]` of `steps` k16 steps and `nt` 8-wide n tiles, `at(step, k, n)` the bf16 bits of
+/// the weight at row `k` of the step and output channel `n`
+fn fragments(steps: usize, nt: usize, at: impl Fn(usize, usize, usize) -> u16) -> Vec<[u32; 2]> {
+    let mut wf = Vec::with_capacity(steps * nt * 32);
+    for step in 0..steps {
+        for j in 0..nt {
+            for lane in 0..32 {
+                let (g, th) = (lane / 4, lane % 4);
+                let n = j * 8 + g;
+                let pair = |k: usize| u32::from(at(step, k, n)) | (u32::from(at(step, k + 1, n)) << 16);
+                wf.push([pair(2 * th), pair(2 * th + 8)]);
+            }
+        }
+    }
+    wf
+}
+
 /// Conv `name`'s `.bias` rounded to bf16, as float32 values, when the export has one
 fn bias(weights: &Weights, name: &str, cout: usize) -> Result<Option<Vec<f32>>> {
     let key = format!("{name}.bias");
@@ -231,7 +248,7 @@ pub enum Convs {
     Cudnn,
     /// Stages 0, 1 and 2's 3x3x3 convs on the strips kernels' own convs: the first conv straight from the float32
     /// input, the others on the tensor cores with the producer's InstanceNorm and LeakyReLU applied on load and their
-    /// own statistics written by their epilogues
+    /// own statistics written by their epilogues; stage 2 block 0's skip projection folded into its conv1
     Native,
 }
 
@@ -256,6 +273,9 @@ struct MmaConv {
     wf: Buf,
     /// The bf16-rounded bias, for a kernel built with one
     bias: Option<Buf>,
+    /// The block's 1x1 skip projection folded into the conv (a kernel built with `conv_kernel!`'s `skip`): its B
+    /// fragments, over the centre tap's chunks
+    skip: Option<Buf>,
     cin: usize,
     cout: usize,
     stride: usize,
@@ -268,8 +288,9 @@ struct MmaConv {
 impl MmaConv {
     /// Conv `name`'s weights as the kernel's B fragments: input channels in `slabs` slabs of `ch` 8-channel chunks
     /// per voxel, output channels in `nt` 8-wide tiles, every (tap, chunk) pair of a slab a k16 half-step, slab by
-    /// slab; and its bias when it has one, which `kernel` must have been built to add (`conv_kernel!`'s last
-    /// parameter)
+    /// slab; and its bias when it has one, which `kernel` must have been built to add (`conv_kernel!`'s `bias`).
+    /// `skip` names the block's 1x1 skip projection (no bias) for a kernel built to fold it in (`conv_kernel!`'s
+    /// `skip`; stride 1, one slab)
     #[allow(clippy::too_many_arguments)]
     fn load(
         dev: &Device,
@@ -280,6 +301,7 @@ impl MmaConv {
         input: [usize; 3],
         tile: [usize; 3],
         (ch, slabs, nt, warps): (usize, usize, usize, usize),
+        skip: Option<&str>,
     ) -> Result<Self> {
         let t = weights.get(&format!("{name}.weight"), &[cout, cin, 3, 3, 3])?;
         let pairs = 27 * ch;
@@ -295,17 +317,25 @@ impl MmaConv {
             }
             half::bf16::from_f32(t.values[(n * cin + c) * 27 + tap]).to_bits()
         };
-        let mut wf = Vec::with_capacity(steps * nt * 32);
-        for step in 0..steps {
-            for j in 0..nt {
-                for lane in 0..32 {
-                    let (g, th) = (lane / 4, lane % 4);
-                    let n = j * 8 + g;
-                    let pair = |k: usize| u32::from(at(step, k, n)) | (u32::from(at(step, k + 1, n)) << 16);
-                    wf.push([pair(2 * th), pair(2 * th + 8)]);
-                }
+        let wf = fragments(steps, nt, at);
+        let skip = match skip {
+            None => None,
+            Some(skip) => {
+                ensure!(stride == 1 && slabs == 1, "{name}: a folded skip needs stride 1 and one slab");
+                ensure!(!weights.has(&format!("{skip}.bias")), "{skip}: a folded skip has no bias");
+                let t = weights.get(&format!("{skip}.weight"), &[cout, cin, 1, 1, 1])?;
+                // the centre tap's chunks, two a k step
+                let at = |step: usize, k: usize, n: usize| -> u16 {
+                    let flat = 2 * step + k / 8;
+                    let c = flat * 8 + k % 8;
+                    if flat >= ch || c >= cin || n >= cout {
+                        return 0;
+                    }
+                    half::bf16::from_f32(t.values[n * cin + c]).to_bits()
+                };
+                Some(dev.gpu.upload(&fragments(ch.div_ceil(2), nt, at))?)
             }
-        }
+        };
 
         let hpx: usize = [0, 1, 2].iter().map(|&a| (tile[a] - 1) * stride + 3).product();
         // as `conv_smem` in the kernels: the halo, three cin param slots, the reduction scratch
@@ -314,7 +344,7 @@ impl MmaConv {
         dev.kernels.set_max_dynamic_smem(kernel, smem)?;
         let wf = dev.gpu.upload(&wf)?;
         let bias = bias(weights, name, cout)?.map(|b| dev.gpu.upload(&b)).transpose()?;
-        Ok(Self { kernel, wf, bias, cin, cout, stride, input, tile, warps, smem })
+        Ok(Self { kernel, wf, bias, skip, cin, cout, stride, input, tile, warps, smem })
     }
 
     fn output(&self) -> [usize; 3] {
@@ -332,9 +362,26 @@ impl MmaConv {
         voxels(self.tile)
     }
 
-    /// Queues `out = conv(prologue(x))` on samples `s` and the tile partials of `out` into `part` (from its start);
-    /// the kernel must have been built for `prologue`'s kind
-    fn run(&self, dev: &Device, x: &Buf, prologue: Prologue, out: &Buf, part: &Buf, s: Samples) -> Result<()> {
+    /// Statistics partial columns per tile: the conv's outputs, then a folded skip's
+    fn pcols(&self) -> usize {
+        self.cout * (1 + usize::from(self.skip.is_some()))
+    }
+
+    /// Queues `out = conv(prologue(x))` on samples `s` and the tile partials of `out` into `part` (from its start,
+    /// [`Self::pcols`] columns); with a folded skip, also the projection to `skip_out` and its partials. The kernel must
+    /// have been built for `prologue`'s kind
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        dev: &Device,
+        x: &Buf,
+        prologue: Prologue,
+        out: &Buf,
+        skip_out: Option<&Buf>,
+        part: &Buf,
+        s: Samples,
+    ) -> Result<()> {
+        ensure!(self.skip.is_some() == skip_out.is_some(), "{}: a folded skip goes with its output", self.kernel);
         let tiles = self.tiles();
         let (cin, i, o, n) = (self.cin, voxels(self.input), voxels(self.output()), s.n);
         let norm_args = |norm: &Norm| {
@@ -356,9 +403,10 @@ impl MmaConv {
         };
         let [p, wsk, pool] = rest;
         let [d, h, w] = self.input;
+        let outs = (s.first * o * self.cout / 2, n * o * self.cout / 2);
         let args = [
-            out.view::<u32>(s.first * o * self.cout / 2, n * o * self.cout / 2),
-            part.view::<[f32; 2]>(0, n * tiles * self.cout),
+            out.view::<u32>(outs.0, outs.1),
+            part.view::<[f32; 2]>(0, n * tiles * self.pcols()),
             x.view::<[u32; 2]>(s.first * i * cin / 4, n * i * cin / 4),
             norm.0,
             norm.1,
@@ -371,6 +419,8 @@ impl MmaConv {
             pool,
             self.wf.arg::<[u32; 2]>(),
             self.bias.as_ref().map_or(Arg::EMPTY, |b| b.arg::<f32>()),
+            skip_out.map_or(Arg::EMPTY, |b| b.view::<u32>(outs.0, outs.1)),
+            self.skip.as_ref().map_or(Arg::EMPTY, |f| f.arg::<[u32; 2]>()),
             Arg::U32(d as u32),
             Arg::U32(h as u32),
             Arg::U32(w as u32),
@@ -404,7 +454,7 @@ struct Native {
     s1c1: MmaConv,
     /// Stage 1's three 24 -> 24 convs: block 0's conv2, block 1's conv1 and conv2
     s1: [MmaConv; 3],
-    /// Stage 2 block 0's conv1, 24 -> 64
+    /// Stage 2 block 0's conv1, 24 -> 64, with the block's skip projection folded in
     s2c1: MmaConv,
     /// Stage 2's three 64 -> 64 convs: block 0's conv2, block 1's conv1 and conv2
     s2: [MmaConv; 3],
@@ -414,6 +464,12 @@ struct Native {
 const CONV0_TILES: usize = 1152;
 
 impl Native {
+    /// The most statistics partials a tensor-core conv writes per sample
+    fn partials(&self) -> usize {
+        let convs = [&self.s0c2, &self.s1c1, &self.s2c1].into_iter().chain(&self.s1).chain(&self.s2);
+        convs.map(|c| c.tiles() * c.pcols()).max().unwrap_or(0)
+    }
+
     fn load(dev: &Device, weights: &Weights) -> Result<Self> {
         let p = "strip.cnn.stages";
         let w = weights.get(&format!("{p}.0.blocks.0.conv1.conv.weight"), &[12, 2, 3, 3, 3])?;
@@ -435,11 +491,13 @@ impl Native {
 
         let s1 = CROP.map(|d| d / 2);
         let s2 = s1.map(|d| d / 2);
-        let c24 =
-            |name: &str, kernel| MmaConv::load(dev, weights, name, kernel, (24, 24, 1), s2, [2, 8, 16], (3, 1, 3, 8));
+        let c24 = |name: &str, kernel| {
+            MmaConv::load(dev, weights, name, kernel, (24, 24, 1), s2, [2, 8, 16], (3, 1, 3, 8), None)
+        };
         // four slabs of 16 channels
-        let c64 =
-            |name: &str, kernel| MmaConv::load(dev, weights, name, kernel, (64, 64, 1), s2, [2, 4, 16], (2, 4, 8, 4));
+        let c64 = |name: &str, kernel| {
+            MmaConv::load(dev, weights, name, kernel, (64, 64, 1), s2, [2, 4, 16], (2, 4, 8, 4), None)
+        };
         Ok(Self {
             conv0: dev.gpu.upload(&conv0)?,
             skip0: dev.gpu.upload(&skip0)?,
@@ -452,6 +510,7 @@ impl Native {
                 s1,
                 [4, 8, 16],
                 (2, 1, 2, 8),
+                None,
             )?,
             s1c1: MmaConv::load(
                 dev,
@@ -462,6 +521,7 @@ impl Native {
                 s1,
                 [2, 4, 16],
                 (2, 1, 3, 8),
+                None,
             )?,
             s1: [
                 c24(&format!("{p}.1.blocks.0.conv2.conv"), "sn_conv_24_24_n")?,
@@ -477,6 +537,7 @@ impl Native {
                 s2,
                 [2, 4, 16],
                 (3, 1, 8, 4),
+                Some(&format!("{p}.2.blocks.0.skip.0.conv")),
             )?,
             s2: [
                 c64(&format!("{p}.2.blocks.0.conv2.conv"), "sn_conv_64_64_n")?,
@@ -543,9 +604,9 @@ impl CropCnn {
 
         let n = capacity;
         let largest = voxels(s1) * 12;
-        // the larger of sn_conv0's tile partials and the statistics kernel's (at most STATS_CHUNKS per sample and
-        // channel, see `stats`)
-        let partial = (n * CONV0_TILES * 24).max(n * STATS_CHUNKS * 64) * 8;
+        // the largest of sn_conv0's tile partials, the tensor-core convs' and the statistics kernel's (at most
+        // STATS_CHUNKS per sample and channel, see `stats`)
+        let partial = n * (CONV0_TILES * 24).max(native.partials()).max(STATS_CHUNKS * 64) * 8;
         Ok(Self {
             blocks,
             fuse,
@@ -775,9 +836,19 @@ impl CropCnn {
         let s_in = blk.conv1.input;
         let rows = voxels(blk.conv1.output());
         let cout = blk.conv1.cout;
+        // a conv1 with the skip projection folded in writes it to a third buffer
+        let folded = match (conv1.is_some_and(|c| c.skip.is_some()), &blk.skip.proj) {
+            (false, _) => None,
+            (true, Some((_, norm))) => {
+                let buf =
+                    &self.t[*free.get(2).ok_or_else(|| eyre!("{}: a folded skip needs a third buffer", blk.name))?];
+                Some((buf, norm))
+            }
+            (true, None) => bail!("{}: conv1 folds a skip projection the block lacks", blk.name),
+        };
 
         match conv1 {
-            Some(c) => self.mma(dev, c, xin, Prologue::None, a, &blk.norm1, n)?,
+            Some(c) => self.mma(dev, c, xin, Prologue::None, a, &blk.norm1, folded, n)?,
             None => {
                 blk.conv1.run(dev, &bp.c1, xin, a, ws, n)?;
                 self.bias(dev, a, &blk.conv1, n, rows)?;
@@ -785,7 +856,7 @@ impl CropCnn {
             }
         }
         match conv2 {
-            Some(c) => self.mma(dev, c, a, Prologue::Norm(&blk.norm1), b, &blk.norm2, n)?,
+            Some(c) => self.mma(dev, c, a, Prologue::Norm(&blk.norm1), b, &blk.norm2, None, n)?,
             None => {
                 self.apply(dev, a, &blk.norm1, Residual::None, n, rows, true)?;
                 blk.conv2.run(dev, &bp.c2, a, b, ws, n)?;
@@ -793,8 +864,9 @@ impl CropCnn {
                 self.stats(dev, b, &blk.norm2, n, rows)?;
             }
         }
-        match (&blk.skip.proj, &bp.proj) {
-            (Some((conv, norm)), Some(pp)) => {
+        match (&blk.skip.proj, &bp.proj, folded) {
+            (_, _, Some((sk, norm))) => self.apply(dev, b, &blk.norm2, Residual::Norm(sk, norm), n, rows, true)?,
+            (Some((conv, norm)), Some(pp), None) => {
                 // the projection's input: the pooled input crop (stage 0), the pooled block input, or the input
                 let src = match (blk.skip.pool, x) {
                     (true, None) => &self.pooled,
@@ -859,14 +931,14 @@ impl CropCnn {
         dev.kernels.launch(&dev.gpu, "sn_conv0", (CONV0_TILES as u32, n as u32, 1), (256, 1, 1), 0, &args)?;
         self.merge(dev, &b0.norm1.stats, CONV0_TILES, 24, 0, 12, 256, all)?;
         self.merge(dev, &sk0.stats, CONV0_TILES, 24, 12, 12, 256, all)?;
-        self.mma(dev, &nat.s0c2, t0, Prologue::Norm(&b0.norm1), t1, &b0.norm2, all)?;
+        self.mma(dev, &nat.s0c2, t0, Prologue::Norm(&b0.norm1), t1, &b0.norm2, None, all)?;
 
         // stage 1 block 0: the strided conv1 on stage 0's output (rebuilt from conv2's in t1), which also writes
         // that output's average for the skip; the skip's 1x1 conv and statistics; conv2 with conv1's norm on load;
         // the block output in place of conv2's
         let stage0 =
             Prologue::Stage0 { norm2: &b0.norm2, skip: sk0, wsk: &nat.skip0, pooled_input: &self.pooled, pool: t2 };
-        self.mma(dev, &nat.s1c1, t1, stage0, t0, &b1.norm1, all)?;
+        self.mma(dev, &nat.s1c1, t1, stage0, t0, &b1.norm1, None, all)?;
         if let Some(tap) = tap.as_mut() {
             // only a tapped forward stores stage 0's output, in place of conv2's, which nothing reads any more
             self.apply_s0(dev, t1, b0, sk0, n)?;
@@ -880,7 +952,7 @@ impl CropCnn {
             proj.run(dev, pp, t2, t3, self.workspace.as_ref(), Samples { first: g, n: group })?;
         }
         self.stats(dev, t3, proj_norm, all, v2)?;
-        self.mma(dev, &nat.s1[0], t0, Prologue::Norm(&b1.norm1), t2, &b1.norm2, all)?;
+        self.mma(dev, &nat.s1[0], t0, Prologue::Norm(&b1.norm1), t2, &b1.norm2, None, all)?;
         self.apply(dev, t2, &b1.norm2, Residual::Norm(t3, proj_norm), all, v2, true)?;
         if let Some(tap) = tap.as_mut() {
             dev.gpu.sync()?;
@@ -888,8 +960,8 @@ impl CropCnn {
         }
 
         // stage 1 block 1: identity skip
-        self.mma(dev, &nat.s1[1], t2, Prologue::None, t0, &b2.norm1, all)?;
-        self.mma(dev, &nat.s1[2], t0, Prologue::Norm(&b2.norm1), t1, &b2.norm2, all)?;
+        self.mma(dev, &nat.s1[1], t2, Prologue::None, t0, &b2.norm1, None, all)?;
+        self.mma(dev, &nat.s1[2], t0, Prologue::Norm(&b2.norm1), t1, &b2.norm2, None, all)?;
         self.apply(dev, t1, &b2.norm2, Residual::Plain(t2), all, v2, true)?;
         if let Some(tap) = tap.as_mut() {
             dev.gpu.sync()?;
@@ -916,7 +988,8 @@ impl CropCnn {
         dev.kernels.launch(&dev.gpu, "sn_apply_s0", grid(n * v1 * 3), (256, 1, 1), 0, &args)
     }
 
-    /// One tensor-core conv and the merge of its tile partials into `norm`'s statistics
+    /// One tensor-core conv and the merge of its tile partials into `norm`'s statistics; with a folded skip, also
+    /// its projection into `skip`'s buffer and statistics
     #[allow(clippy::too_many_arguments)]
     fn mma(
         &self,
@@ -926,10 +999,16 @@ impl CropCnn {
         prologue: Prologue,
         out: &Buf,
         norm: &Norm,
+        skip: Option<(&Buf, &Norm)>,
         s: Samples,
     ) -> Result<()> {
-        conv.run(dev, x, prologue, out, &self.partial, s)?;
-        self.merge(dev, &norm.stats, conv.tiles(), conv.cout, 0, conv.cout, conv.count(), s)
+        conv.run(dev, x, prologue, out, skip.map(|(b, _)| b), &self.partial, s)?;
+        let (tiles, pcols, cout, count) = (conv.tiles(), conv.pcols(), conv.cout, conv.count());
+        self.merge(dev, &norm.stats, tiles, pcols, 0, cout, count, s)?;
+        match skip {
+            Some((_, sk)) => self.merge(dev, &sk.stats, tiles, pcols, cout, cout, count, s),
+            None => Ok(()),
+        }
     }
 
     /// `stats[b, c] = [mean, invstd]` for samples `s` from tile partials `[b - s.first, tile, pcols]` columns
