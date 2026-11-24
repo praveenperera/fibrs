@@ -2,11 +2,19 @@
 //! from the model input crop to the cell features, under PyTorch's bf16 autocast numerics
 //!
 //! Three stages of ResNet-D basic blocks (12, 24, 64 channels; strides 2, 2, 1; 1, 2, 2 blocks), then a stride-2
-//! context block on the last stage's map, upsampled (trilinear) back to it and added through a 1x1 conv. Every conv
-//! is a channels-last bf16 cuDNN convolution with float32 accumulation; InstanceNorm (float32 statistics per sample
-//! and channel), LeakyReLU, the residual adds, the skips' average pools, the upsample and the fuse run in the
-//! strips kernels (`strips-kernels/src/cnn.rs`), with PyTorch's bf16 rounding points. The stage-0 conv biases are
-//! dropped: each feeds an InstanceNorm, which removes them in exact arithmetic
+//! context block on the last stage's map, upsampled (trilinear) back to it and added through a 1x1 conv.
+//!
+//! Stages 0 and 1 run on the strips kernels' own convs ([`Stages01::Native`]): the first conv straight from the
+//! float32 crop, then bf16 tensor-core implicit-GEMM convs that apply the previous InstanceNorm and LeakyReLU on load
+//! and write per-tile statistics partials from their epilogues. Stage 2, the context block, the skips' 1x1
+//! projections and the fuse are channels-last bf16 cuDNN convolutions with float32 accumulation, with InstanceNorm
+//! (float32 statistics per sample and channel), LeakyReLU, the residual adds and the skips' average pools in the
+//! strips kernels (`strips-kernels/src/cnn.rs`), at PyTorch's bf16 rounding points. [`Stages01::Cudnn`] runs stages
+//! 0 and 1 the same way, for comparison.
+//!
+//! Two departures from PyTorch's order, both exact in real arithmetic: the stage-0 conv biases are dropped (each
+//! feeds an InstanceNorm, which removes them), and the context fuse convolves the context output before the
+//! upsample rather than after (both are linear and the upsample's weights sum to 1), on an eighth of the voxels
 
 use std::collections::HashMap;
 
@@ -25,6 +33,10 @@ pub const CELLS: [usize; 3] = [36, 32, 32];
 /// Channels of a cell feature
 pub const CELL_CHANNELS: usize = 64;
 
+/// The first block of stage 2, where sample groups start (see [`CropCnn::set_group`])
+const STAGE2: usize = 3;
+/// Stage 2's default sample group
+const DEFAULT_GROUP: usize = 16;
 /// InstanceNorm3d's epsilon
 const EPS: f32 = 1e-5;
 /// The most workspace a cuDNN algorithm may take
@@ -91,12 +103,13 @@ impl Conv {
             .wrap_err_with(|| format!("plan {shape}"))
     }
 
-    /// Queues `y = conv(x)` for batch `n`
-    fn run(&self, dev: &Device, plan: &ConvPlan, x: &Buf, y: &Buf, ws: Option<&Buf>, n: usize) -> Result<()> {
-        let xb = n * voxels(self.input) * self.cin * 2;
-        let yb = n * voxels(self.output()) * self.cout * 2;
-        ensure!(x.bytes() >= xb && y.bytes() >= yb, "conv buffers too small for batch {n}");
-        plan.run(&dev.dnn, (x.ptr(), xb), (self.w.ptr(), self.w.bytes()), (y.ptr(), yb), ws)
+    /// Queues `y = conv(x)` for samples `s` (planned for `s.n`)
+    fn run(&self, dev: &Device, plan: &ConvPlan, x: &Buf, y: &Buf, ws: Option<&Buf>, s: Samples) -> Result<()> {
+        let (xs, ys) = (voxels(self.input) * self.cin * 2, voxels(self.output()) * self.cout * 2);
+        let end = s.first + s.n;
+        ensure!(x.bytes() >= end * xs && y.bytes() >= end * ys, "conv buffers too small for samples {s:?}");
+        let (xp, yp) = (x.ptr() + (s.first * xs) as u64, y.ptr() + (s.first * ys) as u64);
+        plan.run(&dev.dnn, (xp, s.n * xs), (self.w.ptr(), self.w.bytes()), (yp, s.n * ys), ws)
     }
 }
 
@@ -165,9 +178,203 @@ impl Block {
     }
 }
 
-/// cuDNN plans for one batch size, in [`CropCnn::convs`] order
+/// How stages 0 and 1 (the 12- and 24-channel blocks) run
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stages01 {
+    /// Every conv through cuDNN, each InstanceNorm in its own statistics and apply passes
+    Cudnn,
+    /// The strips kernels' own convs: the first conv straight from the float32 input, the 3x3x3 convs on the
+    /// tensor cores with the producer's InstanceNorm and LeakyReLU applied on load and their own statistics
+    /// written by their epilogues
+    Native,
+}
+
+/// cuDNN plans of one block
+struct BlockPlans {
+    c1: ConvPlan,
+    c2: ConvPlan,
+    proj: Option<ConvPlan>,
+}
+
+/// cuDNN plans for one batch size
 struct Plans {
-    convs: Vec<ConvPlan>,
+    blocks: Vec<BlockPlans>,
+    fuse: ConvPlan,
+}
+
+/// One of the strips kernels' tensor-core 3x3x3 convs (`sn_conv_*`): its kernel, its B fragments and the tile
+/// geometry the kernel was instantiated with
+struct MmaConv {
+    kernel: &'static str,
+    /// B fragments `[step][n tile][lane]` as bf16 pairs
+    wf: Buf,
+    cin: usize,
+    cout: usize,
+    stride: usize,
+    input: [usize; 3],
+    tile: [usize; 3],
+    warps: usize,
+    smem: u32,
+}
+
+impl MmaConv {
+    /// Conv `name`'s weights as the kernel's B fragments: input channels in `ch` 8-channel chunks per voxel,
+    /// output channels in `nt` 8-wide tiles, every (tap, chunk) pair a k16 half-step
+    #[allow(clippy::too_many_arguments)]
+    fn load(
+        dev: &Device,
+        weights: &Weights,
+        name: &str,
+        kernel: &'static str,
+        (cin, cout, stride): (usize, usize, usize),
+        input: [usize; 3],
+        tile: [usize; 3],
+        (ch, nt, warps): (usize, usize, usize),
+    ) -> Result<Self> {
+        let t = weights.get(&format!("{name}.weight"), &[cout, cin, 3, 3, 3])?;
+        let pairs = 27 * ch;
+        let steps = pairs.div_ceil(2);
+        let at = |step: usize, k: usize, n: usize| -> u16 {
+            let flat = 2 * step + k / 8;
+            let c = (flat % ch) * 8 + k % 8;
+            let tap = flat / ch;
+            if flat >= pairs || c >= cin || n >= cout {
+                return 0;
+            }
+            half::bf16::from_f32(t.values[(n * cin + c) * 27 + tap]).to_bits()
+        };
+        let mut wf = Vec::with_capacity(steps * nt * 32);
+        for step in 0..steps {
+            for j in 0..nt {
+                for lane in 0..32 {
+                    let (g, th) = (lane / 4, lane % 4);
+                    let n = j * 8 + g;
+                    let pair = |k: usize| u32::from(at(step, k, n)) | (u32::from(at(step, k + 1, n)) << 16);
+                    wf.push([pair(2 * th), pair(2 * th + 8)]);
+                }
+            }
+        }
+
+        let hpx: usize = [0, 1, 2].iter().map(|&a| (tile[a] - 1) * stride + 3).product();
+        let smem = hpx * ch * 16 + cin * 16 + (warps * nt * 8 + nt * 8) * 4;
+        let smem = u32::try_from(smem)?;
+        dev.kernels.set_max_dynamic_smem(kernel, smem)?;
+        let wf = dev.gpu.upload(&wf)?;
+        Ok(Self { kernel, wf, cin, cout, stride, input, tile, warps, smem })
+    }
+
+    fn output(&self) -> [usize; 3] {
+        self.input.map(|d| d / self.stride)
+    }
+
+    /// Output tiles per sample
+    fn tiles(&self) -> usize {
+        let o = self.output();
+        (0..3).map(|a| o[a] / self.tile[a]).product()
+    }
+
+    /// Voxels per tile, the count of each statistics partial
+    fn count(&self) -> usize {
+        voxels(self.tile)
+    }
+
+    /// Queues `out = conv(prologue(x))` and the tile partials of `out` into `part`: `prologue` is the producer's
+    /// InstanceNorm (then LeakyReLU) when the kernel applies one on load
+    fn run(&self, dev: &Device, x: &Buf, prologue: Option<&Norm>, out: &Buf, part: &Buf, n: usize) -> Result<()> {
+        let tiles = self.tiles();
+        let (stats, gamma, beta) = match prologue {
+            Some(norm) => (norm.stats.view::<[f32; 2]>(0, n * self.cin), norm.w.arg::<f32>(), norm.b.arg::<f32>()),
+            None => (Arg::EMPTY, Arg::EMPTY, Arg::EMPTY),
+        };
+        let [d, h, w] = self.input;
+        let args = [
+            out.view::<u32>(0, n * voxels(self.output()) * self.cout / 2),
+            part.view::<[f32; 2]>(0, n * tiles * self.cout),
+            x.view::<[u32; 2]>(0, n * voxels(self.input) * self.cin / 4),
+            stats,
+            gamma,
+            beta,
+            self.wf.arg::<[u32; 2]>(),
+            Arg::U32(d as u32),
+            Arg::U32(h as u32),
+            Arg::U32(w as u32),
+        ];
+        let block = (self.warps * 32) as u32;
+        dev.kernels.launch(&dev.gpu, self.kernel, (tiles as u32, n as u32, 1), (block, 1, 1), self.smem, &args)
+    }
+}
+
+/// The native stages 0 and 1: the first conv's weights for `sn_conv0` and the tensor-core convs
+struct Native {
+    /// Stage 0's conv1, bf16-rounded, `[27 taps][2][12]`
+    conv0: Buf,
+    /// Stage 0's skip projection, bf16-rounded, `[2][12]`
+    skip0: Buf,
+    /// Stage 0's conv2
+    s0c2: MmaConv,
+    /// Stage 1 block 0's conv1 (stride 2)
+    s1c1: MmaConv,
+    /// Stage 1's three 24 -> 24 convs: block 0's conv2, block 1's conv1 and conv2
+    s1: [MmaConv; 3],
+}
+
+/// `sn_conv0`'s output tiles per sample (2 x 8 x 16 voxels of the 72 x 64 x 64 grid)
+const CONV0_TILES: usize = 1152;
+
+impl Native {
+    fn load(dev: &Device, weights: &Weights) -> Result<Self> {
+        let p = "strip.cnn.stages";
+        let w = weights.get(&format!("{p}.0.blocks.0.conv1.conv.weight"), &[12, 2, 3, 3, 3])?;
+        let mut conv0 = vec![0f32; 27 * 2 * 12];
+        for o in 0..12 {
+            for c in 0..2 {
+                for tap in 0..27 {
+                    conv0[(tap * 2 + c) * 12 + o] = half::bf16::from_f32(w.values[(o * 2 + c) * 27 + tap]).to_f32();
+                }
+            }
+        }
+        let w = weights.get(&format!("{p}.0.blocks.0.skip.1.conv.weight"), &[12, 2, 1, 1, 1])?;
+        let mut skip0 = vec![0f32; 24];
+        for o in 0..12 {
+            for c in 0..2 {
+                skip0[c * 12 + o] = half::bf16::from_f32(w.values[o * 2 + c]).to_f32();
+            }
+        }
+
+        let s1 = CROP.map(|d| d / 2);
+        let s2 = s1.map(|d| d / 2);
+        let c24 =
+            |name: &str, kernel| MmaConv::load(dev, weights, name, kernel, (24, 24, 1), s2, [2, 8, 16], (3, 3, 8));
+        Ok(Self {
+            conv0: dev.gpu.upload(&conv0)?,
+            skip0: dev.gpu.upload(&skip0)?,
+            s0c2: MmaConv::load(
+                dev,
+                weights,
+                &format!("{p}.0.blocks.0.conv2.conv"),
+                "sn_conv_12_12_n",
+                (12, 12, 1),
+                s1,
+                [4, 8, 16],
+                (2, 2, 8),
+            )?,
+            s1c1: MmaConv::load(
+                dev,
+                weights,
+                &format!("{p}.1.blocks.0.conv1.conv"),
+                "sn_conv_12_24_s2",
+                (12, 24, 2),
+                s1,
+                [2, 4, 16],
+                (2, 3, 8),
+            )?,
+            s1: [
+                c24(&format!("{p}.1.blocks.0.conv2.conv"), "sn_conv_24_24_n")?,
+                c24(&format!("{p}.1.blocks.1.conv1.conv"), "sn_conv_24_24")?,
+                c24(&format!("{p}.1.blocks.1.conv2.conv"), "sn_conv_24_24_n")?,
+            ],
+        })
+    }
 }
 
 /// What a forward's caller sees of each block's output (parity tests): the block name, the buffer, and its shape
@@ -181,22 +388,27 @@ pub struct CropCnn {
     fuse: Conv,
     /// The context fuse's bias, as bf16 holds it
     fuse_bias: Buf,
+    native: Native,
+    stages01: Stages01,
+    /// The sample group stage 2 onward runs in, `None` for the whole batch
+    group: Option<usize>,
     plans: HashMap<usize, Plans>,
     max_batch: usize,
-    /// The input crop in bf16 `[B, 144, 128, 128, 2]`
+    /// The input crop in bf16 `[B, 144, 128, 128, 2]` (cuDNN stage 0 only)
     xb: Buf,
     /// The input's 2x2x2 average in bf16 `[B, 72, 64, 64, 2]`
     pooled: Buf,
     /// Four activation buffers, each the largest activation (stage 0's `[B, 72, 64, 64, 12]`)
     t: [Buf; 4],
-    /// The statistics kernel's partial sums, shared by every norm
+    /// Statistics partials, shared by every norm
     partial: Buf,
     workspace: Option<Buf>,
     cells: Buf,
 }
 
 impl CropCnn {
-    /// Loads the strip model's CNN weights (`strip.cnn.*`) and allocates buffers for batches up to `max_batch`
+    /// Loads the strip model's CNN weights (`strip.cnn.*`) and allocates buffers for batches up to `max_batch`;
+    /// stages 0 and 1 run [`Stages01::Native`]
     pub fn new(dev: &Device, weights: &Weights, max_batch: usize) -> Result<Self> {
         ensure!(max_batch > 0, "max_batch 0");
         let gpu = &dev.gpu;
@@ -212,7 +424,8 @@ impl CropCnn {
             Block::load(gpu, weights, "stage2.block1", &format!("{p}.stages.2.blocks.1"), 64, 64, 1, s2, max_batch)?,
             Block::load(gpu, weights, "context", &format!("{p}.context_stage.blocks.0"), 64, 64, 2, s2, max_batch)?,
         ];
-        let fuse = Conv::load(gpu, weights, &format!("{p}.context_fuse"), 64, 64, 1, 1, s2)?;
+        // the fuse runs on the context block's output, before the upsample (see `sn_upfuse`)
+        let fuse = Conv::load(gpu, weights, &format!("{p}.context_fuse"), 64, 64, 1, 1, s2.map(|d| d / 2))?;
         let bias: Vec<f32> = weights
             .get(&format!("{p}.context_fuse.bias"), &[64])?
             .values
@@ -220,15 +433,20 @@ impl CropCnn {
             .map(|&v| half::bf16::from_f32(v).to_f32())
             .collect();
         let fuse_bias = gpu.upload(&bias)?;
+        let native = Native::load(dev, weights)?;
 
         let n = max_batch;
         let largest = voxels(s1) * 12;
-        // `n * chunks` stays under STATS_BLOCKS + n (see `stats`)
-        let partial = (STATS_BLOCKS + n) * 64 * 8;
+        // the larger of sn_conv0's tile partials and the statistics kernel's (`n * chunks` stays under
+        // STATS_BLOCKS + n, see `stats`)
+        let partial = (n * CONV0_TILES * 24).max((STATS_BLOCKS + n) * 64) * 8;
         Ok(Self {
             blocks,
             fuse,
             fuse_bias,
+            native,
+            stages01: Stages01::Native,
+            group: Some(DEFAULT_GROUP),
             plans: HashMap::new(),
             max_batch,
             xb: gpu.alloc(n * voxels(s0) * IN_CHANNELS * 2)?,
@@ -250,48 +468,56 @@ impl CropCnn {
         self.max_batch
     }
 
-    /// Every conv, in plan order: each block's conv1, conv2 and skip projection, then the context fuse
-    fn convs(&self) -> Vec<&Conv> {
-        let mut convs = Vec::new();
-        for b in &self.blocks {
-            convs.push(&b.conv1);
-            convs.push(&b.conv2);
-            if let Some((c, _)) = &b.skip.proj {
-                convs.push(c);
-            }
-        }
-        convs.push(&self.fuse);
-        convs
+    /// Chooses how stages 0 and 1 run from the next forward on
+    pub fn set_stages01(&mut self, mode: Stages01) {
+        self.stages01 = mode;
     }
 
-    /// Plans every conv for batch `n` (cuDNN's timed pick, replayed from volkit's algorithm cache when it has one),
-    /// and grows the shared workspace to fit
+    /// Runs stage 2, the context block and the cells `group` samples at a time from the next forward on (`None`:
+    /// the whole batch at once). A group's 64-channel activations (4.7 MB per sample) then stay in L2 between the
+    /// cuDNN convs and the norm passes that read them back, at the cost of smaller conv launches
+    pub fn set_group(&mut self, group: Option<usize>) {
+        self.group = group;
+    }
+
+    /// Plans every conv for batch `n` and for the sample groups it splits into (cuDNN's timed pick, replayed from
+    /// volkit's algorithm cache when it has one), and grows the shared workspace to fit
     pub fn prepare(&mut self, dev: &Device, n: usize) -> Result<()> {
         ensure!(n > 0 && n <= self.max_batch, "batch {n} outside 1..={}", self.max_batch);
-        if self.plans.contains_key(&n) {
+        let group = self.group(n);
+        for k in [n, group, n % group] {
+            self.plan(dev, k)?;
+        }
+        Ok(())
+    }
+
+    fn plan(&mut self, dev: &Device, n: usize) -> Result<()> {
+        if n == 0 || self.plans.contains_key(&n) {
             return Ok(());
         }
-        let convs = self.convs().iter().map(|c| c.plan(dev, n)).collect::<Result<Vec<_>>>()?;
-        let need = convs.iter().map(ConvPlan::workspace).max().unwrap_or(0);
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        for b in &self.blocks {
+            let proj = b.skip.proj.as_ref().map(|(c, _)| c.plan(dev, n)).transpose()?;
+            blocks.push(BlockPlans { c1: b.conv1.plan(dev, n)?, c2: b.conv2.plan(dev, n)?, proj });
+        }
+        let plans = Plans { blocks, fuse: self.fuse.plan(dev, n)? };
+        let all = plans.blocks.iter().flat_map(|b| [Some(&b.c1), Some(&b.c2), b.proj.as_ref()]).flatten();
+        let need = all.chain([&plans.fuse]).map(ConvPlan::workspace).max().unwrap_or(0);
         if self.workspace.as_ref().map_or(need > 0, |w| w.bytes() < need) {
             self.workspace = None;
             self.workspace = Some(dev.gpu.alloc(need)?);
         }
-        self.plans.insert(n, Plans { convs });
+        self.plans.insert(n, plans);
         Ok(())
     }
 
     /// The chosen cuDNN algorithm of every conv for batch `n`, as `shape: choice`, once [`CropCnn::prepare`]d
     pub fn algorithms(&self, n: usize) -> Vec<String> {
-        self.plans
-            .get(&n)
-            .map(|p| {
-                p.convs
-                    .iter()
-                    .map(|c| format!("{}: {}{}", c.shape, c.algo.choice(), if c.cached { " (cached)" } else { "" }))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let Some(plans) = self.plans.get(&n) else { return Vec::new() };
+        let all = plans.blocks.iter().flat_map(|b| [Some(&b.c1), Some(&b.c2), b.proj.as_ref()]).flatten();
+        all.chain([&plans.fuse])
+            .map(|c| format!("{}: {}{}", c.shape, c.algo.choice(), if c.cached { " (cached)" } else { "" }))
+            .collect()
     }
 
     /// Queues the CNN on `n` crops: `input` holds float32 `[n, 144, 128, 128, 2]` (channel 0 the z-scored CT,
@@ -311,15 +537,99 @@ impl CropCnn {
         self.prepare(dev, n)?;
         let need = n * voxels(CROP) * IN_CHANNELS * 4;
         ensure!(input.bytes() >= need, "CNN input: {} bytes, {n} crops need {need}", input.bytes());
-        let plans = &self.plans[&n].convs;
-        let ws = self.workspace.as_ref();
-        let k = &dev.kernels;
+        let plans = &self.plans[&n];
         let gpu = &dev.gpu;
 
-        // the bf16 input and its pooled copy for the first skip
-        let s0 = CROP;
-        let pooled = n * voxels(s0) / 8;
-        let [d, h, w] = s0;
+        // stages 0 and 1 leave their output in activation buffer `x`; then each block reads `x` and writes its
+        // output into one of the other activation buffers
+        let (first, mut x) = match self.stages01 {
+            Stages01::Native => (STAGE2, self.native01(dev, input, n, plans, &mut tap)?),
+            Stages01::Cudnn => {
+                self.cast_input(dev, input, n)?;
+                (0, None)
+            }
+        };
+        for i in first..STAGE2 {
+            let blk = &self.blocks[i];
+            x = Some(self.block(dev, blk, &plans.blocks[i], x, None, Samples::all(n))?);
+            self.tap_block(dev, blk, x, n, &mut tap)?;
+        }
+
+        // stage 2, the context block and the cells, a sample group at a time (see `CropCnn::set_group`); a tapped
+        // forward runs them on the whole batch, so each block's whole output exists when it is tapped. Stage 1's
+        // output, in `x`, is packed at its own per-sample size, so no group writes its buffer: a group's 64-channel
+        // tensors there would cover samples of later groups
+        let keep = x;
+        let group = if tap.is_some() { n } else { self.group(n) };
+        for g in (0..n).step_by(group) {
+            let s = Samples { first: g, n: group.min(n - g) };
+            let plans = &self.plans[&s.n];
+            let mut xg = x;
+            let mut outputs = Vec::with_capacity(self.blocks.len() - STAGE2);
+            for i in STAGE2..self.blocks.len() {
+                let blk = &self.blocks[i];
+                let out = self.block(dev, blk, &plans.blocks[i], xg, keep, s)?;
+                self.tap_block(dev, blk, Some(out), n, &mut tap)?;
+                xg = Some(out);
+                outputs.push(out);
+            }
+            self.cells(dev, plans, outputs[outputs.len() - 1], outputs[outputs.len() - 2], keep, s)?;
+        }
+        if let Some(tap) = tap.as_mut() {
+            gpu.sync()?;
+            tap("cells", &self.cells, [n, CELLS[0], CELLS[1], CELLS[2], CELL_CHANNELS])?;
+        }
+        Ok(())
+    }
+
+    /// The sample group stage 2 onward runs in, for batch `n`
+    fn group(&self, n: usize) -> usize {
+        self.group.map_or(n, |g| g.clamp(1, n))
+    }
+
+    /// Hands block `blk`'s output, in activation buffer `out`, to `tap` after a stream sync
+    fn tap_block(&self, dev: &Device, blk: &Block, out: Option<usize>, n: usize, tap: &mut Option<Tap>) -> Result<()> {
+        let (Some(tap), Some(out)) = (tap.as_mut(), out) else { return Ok(()) };
+        dev.gpu.sync()?;
+        let s = blk.conv1.output();
+        tap(&blk.name, &self.t[out], [n, s[0], s[1], s[2], blk.conv1.cout])
+    }
+
+    /// `cells = last + upsample(fuse(ctx))` for samples `s`, from the context block's output in activation buffer
+    /// `ctx` and the last stage's in `last`, writing no activation buffer but a fourth one besides `keep`
+    #[allow(clippy::too_many_arguments)]
+    fn cells(
+        &self,
+        dev: &Device,
+        plans: &Plans,
+        ctx: usize,
+        last: usize,
+        keep: Option<usize>,
+        s: Samples,
+    ) -> Result<()> {
+        let free = (0..4).find(|&i| i != ctx && i != last && Some(i) != keep);
+        let fused = &self.t[free.expect("a free activation buffer for the fuse")];
+        self.fuse.run(dev, &plans.fuse, &self.t[ctx], fused, self.workspace.as_ref(), s)?;
+        let [cd, ch, cw] = self.fuse.input;
+        let per = voxels(CELLS) * CELL_CHANNELS / 4;
+        let (at, cells) = (s.first * per, s.n * per);
+        let args = [
+            self.cells.view::<[u32; 2]>(at, cells),
+            self.t[last].view::<[u32; 2]>(at, cells),
+            fused.view::<[u32; 2]>(at / 8, cells / 8),
+            self.fuse_bias.arg::<f32>(),
+            Arg::U32((CELL_CHANNELS / 4) as u32),
+            Arg::U32(cd as u32),
+            Arg::U32(ch as u32),
+            Arg::U32(cw as u32),
+        ];
+        dev.kernels.launch(&dev.gpu, "sn_upfuse", grid(cells), (256, 1, 1), 0, &args)
+    }
+
+    /// The bf16 input and its pooled copy for the first skip, for cuDNN's stage 0
+    fn cast_input(&self, dev: &Device, input: &Buf, n: usize) -> Result<()> {
+        let pooled = n * voxels(CROP) / 8;
+        let [d, h, w] = CROP;
         let args = [
             self.pooled.view::<u32>(0, pooled),
             self.xb.view::<[u32; 2]>(0, pooled * 4),
@@ -328,95 +638,188 @@ impl CropCnn {
             Arg::U32((h / 2 * w / 2) as u32),
             Arg::U32((d / 2 * h / 2 * w / 2) as u32),
         ];
-        k.launch(gpu, "sn_input", grid(pooled), (256, 1, 1), 0, &args)?;
-
-        // block i reads `x` and writes its output into one of the other activation buffers
-        let mut plan = plans.iter();
-        let mut x: Option<usize> = None;
-        let mut outputs = Vec::with_capacity(self.blocks.len());
-        for blk in &self.blocks {
-            let free: Vec<usize> = (0..4).filter(|&i| Some(i) != x).collect();
-            let (a, b, c) = (&self.t[free[0]], &self.t[free[1]], &self.t[free[2]]);
-            let xin = x.map_or(&self.xb, |i| &self.t[i]);
-            let p1 = plan.next().expect("a plan per conv");
-            let p2 = plan.next().expect("a plan per conv");
-            let pp = blk.skip.proj.as_ref().map(|_| plan.next().expect("a plan per conv"));
-            let s_in = blk.conv1.input;
-            let s_out = blk.conv1.output();
-            let rows = voxels(s_out);
-            let cout = blk.conv1.cout;
-
-            blk.conv1.run(dev, p1, xin, a, ws, n)?;
-            self.stats(dev, a, &blk.norm1, n, rows)?;
-            self.apply(dev, a, &blk.norm1, Residual::None, n, rows, true)?;
-            blk.conv2.run(dev, p2, a, b, ws, n)?;
-            self.stats(dev, b, &blk.norm2, n, rows)?;
-            match (&blk.skip.proj, pp) {
-                (Some((conv, norm)), Some(pp)) => {
-                    // the projection's input: the pooled input crop (stage 0), the pooled block input, or the input
-                    let src = match (blk.skip.pool, x) {
-                        (true, None) => &self.pooled,
-                        (true, Some(_)) => {
-                            self.pool(dev, xin, c, n, s_in, blk.conv1.cin)?;
-                            c
-                        }
-                        (false, _) => xin,
-                    };
-                    conv.run(dev, pp, src, a, ws, n)?;
-                    self.stats(dev, a, norm, n, rows)?;
-                    self.apply(dev, b, &blk.norm2, Residual::Norm(a, norm), n, rows, true)?;
-                }
-                _ if blk.skip.pool => {
-                    self.pool(dev, xin, c, n, s_in, cout)?;
-                    self.apply(dev, b, &blk.norm2, Residual::Plain(c), n, rows, true)?;
-                }
-                _ => self.apply(dev, b, &blk.norm2, Residual::Plain(xin), n, rows, true)?,
-            }
-            if let Some(tap) = tap.as_mut() {
-                gpu.sync()?;
-                tap(&blk.name, b, [n, s_out[0], s_out[1], s_out[2], cout])?;
-            }
-            x = Some(free[1]);
-            outputs.push(free[1]);
-        }
-
-        // cells = stage output + fuse(upsample(context)), the context block's output in `x` and the last stage's
-        // output in the buffer the context block read
-        let (ctx, last) = (outputs[outputs.len() - 1], outputs[outputs.len() - 2]);
-        let stage = self.blocks.len() - 2;
-        let free: Vec<usize> = (0..4).filter(|&i| i != ctx && i != last).collect();
-        let (up, fused) = (&self.t[free[0]], &self.t[free[1]]);
-        let [cd, ch, cw] = self.blocks[stage + 1].conv1.output();
-        let quads = (CELL_CHANNELS / 4) as u32;
-        let cells = n * voxels(CELLS) * CELL_CHANNELS / 4;
-        let args = [
-            up.view::<[u32; 2]>(0, cells),
-            self.t[ctx].view::<[u32; 2]>(0, cells / 8),
-            Arg::U32(quads),
-            Arg::U32(cd as u32),
-            Arg::U32(ch as u32),
-            Arg::U32(cw as u32),
-        ];
-        k.launch(gpu, "sn_upsample", grid(cells), (256, 1, 1), 0, &args)?;
-        self.fuse.run(dev, plan.next().expect("a plan per conv"), up, fused, ws, n)?;
-        let args = [
-            self.cells.view::<[u32; 2]>(0, cells),
-            self.t[last].view::<[u32; 2]>(0, cells),
-            fused.view::<[u32; 2]>(0, cells),
-            self.fuse_bias.arg::<f32>(),
-            Arg::U32(quads),
-        ];
-        k.launch(gpu, "sn_fuse", grid(cells), (256, 1, 1), 0, &args)?;
-        if let Some(tap) = tap.as_mut() {
-            gpu.sync()?;
-            tap("cells", &self.cells, [n, CELLS[0], CELLS[1], CELLS[2], CELL_CHANNELS])?;
-        }
-        Ok(())
+        dev.kernels.launch(&dev.gpu, "sn_input", grid(pooled), (256, 1, 1), 0, &args)
     }
 
-    /// InstanceNorm statistics of `y` (`[n, rows, norm.c]` bf16) into `norm.stats`
-    fn stats(&self, dev: &Device, y: &Buf, norm: &Norm, n: usize, rows: usize) -> Result<()> {
-        let c = norm.c;
+    /// One block on cuDNN convs, reading activation buffer `x` (the bf16 input crop when `None`); returns the
+    /// activation buffer holding its output
+    ///
+    /// The block writes only activation buffers other than `x` and `keep`: two of them, or three for a block that
+    /// both pools and projects its skip
+    #[allow(clippy::too_many_arguments)]
+    fn block(
+        &self,
+        dev: &Device,
+        blk: &Block,
+        bp: &BlockPlans,
+        x: Option<usize>,
+        keep: Option<usize>,
+        n: Samples,
+    ) -> Result<usize> {
+        let ws = self.workspace.as_ref();
+        let free: Vec<usize> = (0..4).filter(|&i| Some(i) != x && Some(i) != keep).collect();
+        let (a, b) = (&self.t[free[0]], &self.t[free[1]]);
+        let xin = x.map_or(&self.xb, |i| &self.t[i]);
+        let s_in = blk.conv1.input;
+        let rows = voxels(blk.conv1.output());
+        let cout = blk.conv1.cout;
+
+        blk.conv1.run(dev, &bp.c1, xin, a, ws, n)?;
+        self.stats(dev, a, &blk.norm1, n, rows)?;
+        self.apply(dev, a, &blk.norm1, Residual::None, n, rows, true)?;
+        blk.conv2.run(dev, &bp.c2, a, b, ws, n)?;
+        self.stats(dev, b, &blk.norm2, n, rows)?;
+        match (&blk.skip.proj, &bp.proj) {
+            (Some((conv, norm)), Some(pp)) => {
+                // the projection's input: the pooled input crop (stage 0), the pooled block input, or the input
+                let src = match (blk.skip.pool, x) {
+                    (true, None) => &self.pooled,
+                    (true, Some(_)) => {
+                        let c = &self.t[*free.get(2).expect("a pooling projection needs a third activation buffer")];
+                        self.pool(dev, xin, c, n, s_in, blk.conv1.cin)?;
+                        c
+                    }
+                    (false, _) => xin,
+                };
+                conv.run(dev, pp, src, a, ws, n)?;
+                self.stats(dev, a, norm, n, rows)?;
+                self.apply(dev, b, &blk.norm2, Residual::Norm(a, norm), n, rows, true)?;
+            }
+            _ if blk.skip.pool => {
+                // conv1's buffer is free once conv2 has read it
+                self.pool(dev, xin, a, n, s_in, cout)?;
+                self.apply(dev, b, &blk.norm2, Residual::Plain(a), n, rows, true)?;
+            }
+            _ => self.apply(dev, b, &blk.norm2, Residual::Plain(xin), n, rows, true)?,
+        }
+        Ok(free[1])
+    }
+
+    /// Stages 0 and 1 on the strips kernels' convs (see [`Stages01::Native`]); returns the activation buffer
+    /// holding stage 1's output
+    fn native01(
+        &self,
+        dev: &Device,
+        input: &Buf,
+        n: usize,
+        plans: &Plans,
+        tap: &mut Option<Tap>,
+    ) -> Result<Option<usize>> {
+        let nat = &self.native;
+        let [t0, t1, t2, t3] = &self.t;
+        let [b0, b1, b2] = [&self.blocks[0], &self.blocks[1], &self.blocks[2]];
+        let (sk0, sk1) = match (&b0.skip.proj, &b1.skip.proj) {
+            (Some((_, a)), Some((c, b))) => (a, (c, b)),
+            _ => unreachable!("stages 0 and 1 open with projecting blocks"),
+        };
+        let s1 = CROP.map(|d| d / 2);
+        let s2 = s1.map(|d| d / 2);
+        let (v1, v2) = (voxels(s1), voxels(s2));
+        let all = Samples::all(n);
+
+        // stage 0: conv1 and the skip's pooled input from the float32 crop, conv2 with conv1's norm on load, then
+        // the block output in place of conv2's
+        let args = [
+            t0.view::<[u32; 2]>(0, n * v1 * 3),
+            self.pooled.view::<u32>(0, n * v1),
+            self.partial.view::<[f32; 2]>(0, n * CONV0_TILES * 24),
+            input.view::<[f32; 2]>(0, n * voxels(CROP)),
+            nat.conv0.view::<[f32; 4]>(0, 162),
+            nat.skip0.arg::<f32>(),
+        ];
+        dev.kernels.launch(&dev.gpu, "sn_conv0", (CONV0_TILES as u32, n as u32, 1), (256, 1, 1), 0, &args)?;
+        self.merge(dev, &b0.norm1.stats, CONV0_TILES, 24, 0, 12, 256, n)?;
+        self.merge(dev, &sk0.stats, CONV0_TILES, 24, 12, 12, 256, n)?;
+        self.mma(dev, &nat.s0c2, t0, Some(&b0.norm1), t1, &b0.norm2, n)?;
+        let args = [
+            t1.view::<[u32; 2]>(0, n * v1 * 3),
+            self.pooled.view::<u32>(0, n * v1),
+            b0.norm2.stats.view::<[f32; 2]>(0, n * 12),
+            b0.norm2.w.arg::<f32>(),
+            b0.norm2.b.arg::<f32>(),
+            sk0.stats.view::<[f32; 2]>(0, n * 12),
+            sk0.w.arg::<f32>(),
+            sk0.b.arg::<f32>(),
+            nat.skip0.arg::<f32>(),
+            Arg::U32(v1 as u32),
+        ];
+        dev.kernels.launch(&dev.gpu, "sn_apply_s0", grid(n * v1 * 3), (256, 1, 1), 0, &args)?;
+        if let Some(tap) = tap.as_mut() {
+            dev.gpu.sync()?;
+            tap(&b0.name, t1, [n, s1[0], s1[1], s1[2], 12])?;
+        }
+
+        // stage 1 block 0: the strided conv1, the skip (pool, cuDNN's 1x1 conv, its statistics), conv2 with conv1's
+        // norm on load, the block output in place of conv2's
+        self.mma(dev, &nat.s1c1, t1, None, t0, &b1.norm1, n)?;
+        self.pool(dev, t1, t2, all, s1, 12)?;
+        let (proj, proj_norm) = sk1;
+        let pp = plans.blocks[1].proj.as_ref().expect("stage 1 block 0 projects");
+        proj.run(dev, pp, t2, t3, self.workspace.as_ref(), all)?;
+        self.stats(dev, t3, proj_norm, all, v2)?;
+        self.mma(dev, &nat.s1[0], t0, Some(&b1.norm1), t2, &b1.norm2, n)?;
+        self.apply(dev, t2, &b1.norm2, Residual::Norm(t3, proj_norm), all, v2, true)?;
+        if let Some(tap) = tap.as_mut() {
+            dev.gpu.sync()?;
+            tap(&b1.name, t2, [n, s2[0], s2[1], s2[2], 24])?;
+        }
+
+        // stage 1 block 1: identity skip
+        self.mma(dev, &nat.s1[1], t2, None, t0, &b2.norm1, n)?;
+        self.mma(dev, &nat.s1[2], t0, Some(&b2.norm1), t1, &b2.norm2, n)?;
+        self.apply(dev, t1, &b2.norm2, Residual::Plain(t2), all, v2, true)?;
+        if let Some(tap) = tap.as_mut() {
+            dev.gpu.sync()?;
+            tap(&b2.name, t1, [n, s2[0], s2[1], s2[2], 24])?;
+        }
+        Ok(Some(1))
+    }
+
+    /// One tensor-core conv and the merge of its tile partials into `norm`'s statistics
+    #[allow(clippy::too_many_arguments)]
+    fn mma(
+        &self,
+        dev: &Device,
+        conv: &MmaConv,
+        x: &Buf,
+        prologue: Option<&Norm>,
+        out: &Buf,
+        norm: &Norm,
+        n: usize,
+    ) -> Result<()> {
+        conv.run(dev, x, prologue, out, &self.partial, n)?;
+        self.merge(dev, &norm.stats, conv.tiles(), conv.cout, 0, conv.cout, conv.count(), n)
+    }
+
+    /// `stats[b, c] = [mean, invstd]` from tile partials `[b, tile, pcols]` columns `c0..c0 + cols`
+    #[allow(clippy::too_many_arguments)]
+    fn merge(
+        &self,
+        dev: &Device,
+        stats: &Buf,
+        tiles: usize,
+        pcols: usize,
+        c0: usize,
+        cols: usize,
+        count: usize,
+        n: usize,
+    ) -> Result<()> {
+        let args = [
+            stats.view::<[f32; 2]>(0, n * cols),
+            self.partial.view::<[f32; 2]>(0, n * tiles * pcols),
+            Arg::U32(tiles as u32),
+            Arg::U32(pcols as u32),
+            Arg::U32(c0 as u32),
+            Arg::U32(cols as u32),
+            Arg::F32(count as f32),
+            Arg::F32(EPS),
+        ];
+        dev.kernels.launch(&dev.gpu, "sn_merge", (cols as u32, n as u32, 1), (256, 1, 1), 0, &args)
+    }
+
+    /// InstanceNorm statistics of samples `s` of `y` (`[B, rows, norm.c]` bf16) into `norm.stats`
+    fn stats(&self, dev: &Device, y: &Buf, norm: &Norm, s: Samples, rows: usize) -> Result<()> {
+        let (n, c) = (s.n, norm.c);
         let pairs = c / 2;
         let lanes = 256 / pairs;
         let want = STATS_BLOCKS.div_ceil(n).max(1);
@@ -425,7 +828,7 @@ impl CropCnn {
         ensure!(n * chunks * c * 8 <= self.partial.bytes(), "statistics partials overflow");
         let args = [
             self.partial.view::<[f32; 2]>(0, n * chunks * c),
-            y.view::<u32>(0, n * rows * pairs),
+            y.view::<u32>(s.first * rows * pairs, n * rows * pairs),
             Arg::U32(rows as u32),
             Arg::U32(c as u32),
             Arg::U32(lanes as u32),
@@ -440,9 +843,9 @@ impl CropCnn {
             &args,
         )?;
         let args = [
-            norm.stats.view::<[f32; 2]>(0, n * c),
+            norm.stats.view::<[f32; 2]>(s.first * c, n * c),
             self.partial.view::<[f32; 2]>(0, n * chunks * c),
-            y.view::<u32>(0, n * rows * pairs),
+            y.view::<u32>(s.first * rows * pairs, n * rows * pairs),
             Arg::U32(rows as u32),
             Arg::U32(c as u32),
             Arg::U32(chunks as u32),
@@ -451,23 +854,32 @@ impl CropCnn {
         dev.kernels.launch(&dev.gpu, "sn_finalize", grid(n * c), (256, 1, 1), 0, &args)
     }
 
-    /// `y = leaky?(rbf(norm(y) + residual))` in place
+    /// `y = leaky?(rbf(norm(y) + residual))` in place, on samples `s`
     #[allow(clippy::too_many_arguments)]
-    fn apply(&self, dev: &Device, y: &Buf, norm: &Norm, res: Residual, n: usize, rows: usize, act: bool) -> Result<()> {
+    fn apply(
+        &self,
+        dev: &Device,
+        y: &Buf,
+        norm: &Norm,
+        res: Residual,
+        s: Samples,
+        rows: usize,
+        act: bool,
+    ) -> Result<()> {
         let c = norm.c;
-        let quads = n * rows * c / 4;
+        let (at, quads) = (s.first * rows * c / 4, s.n * rows * c / 4);
         let (plain, rx, rnorm) = match res {
             Residual::None => (Arg::EMPTY, Arg::EMPTY, None),
-            Residual::Plain(r) => (r.view::<[u32; 2]>(0, quads), Arg::EMPTY, None),
-            Residual::Norm(r, rn) => (Arg::EMPTY, r.view::<[u32; 2]>(0, quads), Some(rn)),
+            Residual::Plain(r) => (r.view::<[u32; 2]>(at, quads), Arg::EMPTY, None),
+            Residual::Norm(r, rn) => (Arg::EMPTY, r.view::<[u32; 2]>(at, quads), Some(rn)),
         };
         let (rs, rw, rb) = match rnorm {
-            Some(rn) => (rn.stats.view::<[f32; 2]>(0, n * c), rn.w.arg::<f32>(), rn.b.arg::<f32>()),
+            Some(rn) => (rn.stats.view::<[f32; 2]>(s.first * c, s.n * c), rn.w.arg::<f32>(), rn.b.arg::<f32>()),
             None => (Arg::EMPTY, Arg::EMPTY, Arg::EMPTY),
         };
         let args = [
-            y.view::<[u32; 2]>(0, quads),
-            norm.stats.view::<[f32; 2]>(0, n * c),
+            y.view::<[u32; 2]>(at, quads),
+            norm.stats.view::<[f32; 2]>(s.first * c, s.n * c),
             norm.w.arg::<f32>(),
             norm.b.arg::<f32>(),
             plain,
@@ -482,14 +894,14 @@ impl CropCnn {
         dev.kernels.launch(&dev.gpu, "sn_apply", grid(quads), (256, 1, 1), 0, &args)
     }
 
-    /// AvgPool3d(2) of `x` (`[n, s, c]` bf16) into `out`
-    fn pool(&self, dev: &Device, x: &Buf, out: &Buf, n: usize, s: [usize; 3], c: usize) -> Result<()> {
+    /// AvgPool3d(2) of samples `n` of `x` (`[B, s, c]` bf16) into `out`
+    fn pool(&self, dev: &Device, x: &Buf, out: &Buf, n: Samples, s: [usize; 3], c: usize) -> Result<()> {
         let [d, h, w] = s.map(|v| v / 2);
         let quads = c / 4;
-        let total = n * d * h * w * quads;
+        let (at, total) = (n.first * d * h * w * quads, n.n * d * h * w * quads);
         let args = [
-            out.view::<[u32; 2]>(0, total),
-            x.view::<[u32; 2]>(0, total * 8),
+            out.view::<[u32; 2]>(at, total),
+            x.view::<[u32; 2]>(at * 8, total * 8),
             Arg::U32(quads as u32),
             Arg::U32(w as u32),
             Arg::U32((h * w) as u32),
@@ -513,6 +925,20 @@ fn grid(n: usize) -> (u32, u32, u32) {
     (n.div_ceil(256) as u32, 1, 1)
 }
 
+/// Samples `first..first + n` of the batch: every buffer is batch-major, so a kernel or conv acts on a run of samples
+/// through offsets into the whole batch's buffers
+#[derive(Clone, Copy, Debug)]
+struct Samples {
+    first: usize,
+    n: usize,
+}
+
+impl Samples {
+    fn all(n: usize) -> Self {
+        Self { first: 0, n }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! GPU checks, run through the GPU queue from a prebuilt test binary:
@@ -520,8 +946,9 @@ mod tests {
     //!   recorded inputs (`ops/vesuvius/strips-native/cnn_ref.py`), gated on PyTorch's own noise band
     //! - `bench`: ms per decision at batch 32, 64 and 128 (`STRIPS_CNN_BATCHES`), untraced
     //!
-    //! Both read `STRIPS_CNN_REF` (the reference directory) and `STRIPS_WEIGHTS` (the weights export), and write
-    //! JSON to `STRIPS_CNN_OUT` when it is set
+    //! Both read `STRIPS_CNN_REF` (the reference directory) and `STRIPS_WEIGHTS` (the weights export), run each
+    //! stage 0-1 mode in `STRIPS_CNN_MODES` (default `native,cudnn`), and write JSON per mode to `STRIPS_CNN_OUT`
+    //! when it is set
 
     use std::path::{Path, PathBuf};
     use std::time::Instant;
@@ -529,7 +956,7 @@ mod tests {
     use color_eyre::eyre::{Result, WrapErr, ensure};
     use serde_json::{Value, json};
 
-    use super::{CROP, CropCnn, IN_CHANNELS, voxels};
+    use super::{CELL_CHANNELS, CELLS, CROP, CropCnn, IN_CHANNELS, Stages01, voxels};
     use crate::strips::gpu::{Device, Weights};
 
     const WEIGHTS: &str = "/build/vesuvius/strips-scale/speed/native/weights/fiber_strip_small_v1.safetensors";
@@ -624,12 +1051,57 @@ mod tests {
         Ok(Setup { dev, weights, manifest, reference, input, batch })
     }
 
+    /// `got` (bf16 bits, shaped `shape`) against reference output `reference` from the manifest's `blocks`, as a
+    /// parity row named `name`
+    fn check(
+        s: &Setup,
+        blocks: &[Value],
+        name: &str,
+        reference: &str,
+        got: &[u16],
+        shape: [usize; 5],
+    ) -> Result<Value> {
+        let len = shape.iter().product::<usize>();
+        ensure!(got.len() == len, "{name}: {} values, shape {shape:?}", got.len());
+        let entry =
+            blocks.iter().find(|b| b["name"] == reference).unwrap_or_else(|| panic!("no reference for {reference}"));
+        let want: Vec<usize> =
+            entry["shape"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
+        ensure!(want == shape, "{name}: shape {shape:?}, reference {want:?}");
+        let rb = map(&s.reference.join(entry["bf16"].as_str().unwrap()))?;
+        let rf = map(&s.reference.join(entry["f32"].as_str().unwrap()))?;
+        let (rb, rf) = (typed::<u16>(&rb, len, reference)?, typed::<f32>(&rf, len, reference)?);
+        let vs_bf16 = compare(got, &|i| bf16(rb[i]));
+        let vs_f32 = compare(got, &|i| rf[i]);
+        let band = &s.manifest["band"][reference];
+        println!("{name}: vs bf16 {vs_bf16}\n  vs f32 {vs_f32}\n  band {band}");
+        Ok(json!({"name": name, "vs_bf16": vs_bf16, "vs_f32": vs_f32, "band": band}))
+    }
+
+    fn modes() -> Vec<(&'static str, Stages01)> {
+        let names = std::env::var("STRIPS_CNN_MODES").unwrap_or_else(|_| "native,cudnn".into());
+        let modes = names.split(',').map(|m| match m.trim() {
+            "native" => ("native", Stages01::Native),
+            "cudnn" => ("cudnn", Stages01::Cudnn),
+            other => panic!("STRIPS_CNN_MODES: unknown mode {other}"),
+        });
+        modes.collect()
+    }
+
     #[test]
     #[ignore = "needs the GPU and the reference dump"]
     fn parity() -> Result<()> {
         let s = setup()?;
+        // every mode runs before any gate fails, so one report covers both
+        let results: Vec<Result<()>> = modes().into_iter().map(|(name, mode)| parity_mode(&s, name, mode)).collect();
+        results.into_iter().collect()
+    }
+
+    fn parity_mode(s: &Setup, mode_name: &str, mode: Stages01) -> Result<()> {
+        println!("== stages 0-1: {mode_name}");
         let n = s.batch;
         let mut cnn = CropCnn::new(&s.dev, &s.weights, n)?;
+        cnn.set_stages01(mode);
         let input = s.dev.gpu.upload(typed::<f32>(&s.input, n * voxels(CROP) * IN_CHANNELS, "input")?)?;
         // NaN-prefilled activations and output, so a region a kernel skips cannot pass
         for t in &cnn.t {
@@ -640,42 +1112,43 @@ mod tests {
         let blocks = s.manifest["blocks"].as_array().expect("manifest blocks").clone();
         let mut rows = Vec::new();
         let mut seen = Vec::new();
+        // the tapped forward runs stage 2 on the whole batch, so every block is checked ungrouped
         let mut tap = |name: &str, buf: &volkit::gpu::Buf, shape: [usize; 5]| -> Result<()> {
-            let len = shape.iter().product::<usize>();
-            let entry = blocks.iter().find(|b| b["name"] == name).unwrap_or_else(|| panic!("no reference for {name}"));
-            let want: Vec<usize> =
-                entry["shape"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
-            ensure!(want == shape, "{name}: shape {shape:?}, reference {want:?}");
-            let got: Vec<u16> = s.dev.gpu.download_range(buf, 0, len)?;
-            let rb = map(&s.reference.join(entry["bf16"].as_str().unwrap()))?;
-            let rf = map(&s.reference.join(entry["f32"].as_str().unwrap()))?;
-            let (rb, rf) = (typed::<u16>(&rb, len, name)?, typed::<f32>(&rf, len, name)?);
-            let vs_bf16 = compare(&got, &|i| bf16(rb[i]));
-            let vs_f32 = compare(&got, &|i| rf[i]);
-            let band = &s.manifest["band"][name];
-            println!("{name}: vs bf16 {vs_bf16}\n  vs f32 {vs_f32}\n  band {band}");
-            rows.push(json!({"name": name, "vs_bf16": vs_bf16, "vs_f32": vs_f32, "band": band}));
+            let got: Vec<u16> = s.dev.gpu.download_range(buf, 0, shape.iter().product())?;
+            rows.push(check(s, &blocks, name, name, &got, shape)?);
             seen.push(name.to_string());
             Ok(())
         };
         cnn.forward_tapped(&s.dev, &input, n, &mut tap)?;
+
+        // then the cells of the forward as it runs untapped (stage 2 in sample groups), twice
+        let group = cnn.group(n);
+        let shape = [n, CELLS[0], CELLS[1], CELLS[2], CELL_CHANNELS];
+        s.dev.gpu.fill(&cnn.cells, 0xff)?;
+        cnn.forward(&s.dev, &input, n)?;
         let first: Vec<u16> = s.dev.gpu.download(&cnn.cells)?;
+        rows.push(check(s, &blocks, &format!("cells (group {group})"), "cells", &first, shape)?);
+        s.dev.gpu.fill(&cnn.cells, 0xff)?;
         cnn.forward(&s.dev, &input, n)?;
         let second: Vec<u16> = s.dev.gpu.download(&cnn.cells)?;
         let deterministic = first == second;
 
-        let out = json!({"batch": n, "blocks": rows, "deterministic": deterministic, "algorithms": cnn.algorithms(n),
-                         "loadavg": loadavg()});
-        write_out("parity.json", &out)?;
-        ensure!(seen.len() == blocks.len(), "checked {seen:?}, the reference has {} outputs", blocks.len());
-        ensure!(deterministic, "two forwards of the same input differ");
+        let out = json!({"batch": n, "mode": mode_name, "group": group, "blocks": rows,
+                         "deterministic": deterministic, "algorithms": cnn.algorithms(n), "loadavg": loadavg()});
+        write_out(&format!("parity_{mode_name}.json"), &out)?;
+        ensure!(
+            seen.len() == blocks.len(),
+            "{mode_name}: checked {seen:?}, the reference has {} outputs",
+            blocks.len()
+        );
+        ensure!(deterministic, "{mode_name}: two grouped forwards of the same input differ");
         // gate: against the float32 forward, our error stays within 1.5x PyTorch bf16's own (mean and p99)
         for r in &rows {
             let (ours, band) = (&r["vs_f32"], &r["band"]["bf16_vs_f32"]);
-            ensure!(ours["nonfinite"] == 0, "{}: non-finite outputs", r["name"]);
+            ensure!(ours["nonfinite"] == 0, "{mode_name} {}: non-finite outputs", r["name"]);
             for k in ["mean_abs", "p99_abs"] {
                 let (o, b) = (ours[k].as_f64().unwrap(), band[k].as_f64().unwrap());
-                ensure!(o <= 1.5 * b, "{}: {k} {o:.3e} vs float32, PyTorch bf16's is {b:.3e}", r["name"]);
+                ensure!(o <= 1.5 * b, "{mode_name} {}: {k} {o:.3e} vs float32, PyTorch bf16's is {b:.3e}", r["name"]);
             }
         }
         Ok(())
@@ -704,7 +1177,21 @@ mod tests {
         }
 
         let mut results = Vec::new();
-        for &n in &batches {
+        // stage 2's sample groups to time, 0 for the whole batch
+        let groups: Vec<usize> = std::env::var("STRIPS_CNN_GROUPS")
+            .unwrap_or_else(|_| "0,8,16".into())
+            .split(',')
+            .map(|v| v.trim().parse().expect("STRIPS_CNN_GROUPS: comma-separated sizes"))
+            .collect();
+        let mut runs = Vec::new();
+        for m in modes() {
+            for &g in &groups {
+                runs.extend(batches.iter().map(|&n| (m, g, n)));
+            }
+        }
+        for ((mode_name, mode), group, n) in runs {
+            cnn.set_stages01(mode);
+            cnn.set_group((group > 0).then_some(group));
             cnn.prepare(&s.dev, n)?;
             for _ in 0..3 {
                 cnn.forward(&s.dev, &input, n)?;
@@ -717,11 +1204,29 @@ mod tests {
             }
             s.dev.gpu.sync()?;
             let ms = t.elapsed().as_secs_f64() * 1e3 / (reps * n) as f64;
-            let row = json!({"batch": n, "reps": reps, "ms_per_decision": ms, "loadavg_before": load,
-                             "loadavg_after": loadavg(), "algorithms": cnn.algorithms(n)});
+            let cells = cells_print(&s, &cnn, n)?;
+            let row = json!({"mode": mode_name, "group": group, "batch": n, "reps": reps, "ms_per_decision": ms,
+                             "loadavg_before": load, "loadavg_after": loadavg(), "cells_fnv": cells,
+                             "algorithms": cnn.algorithms(n)});
             println!("{row}");
             results.push(row);
         }
         write_out("bench.json", &json!(results))
+    }
+
+    /// The last forward's cells as an output fingerprint: their FNV-1a 64 hash (returned), and, under
+    /// `STRIPS_CNN_OUT`, every 64th value in `cells.sample` (bf16 bits) for a gate that allows arithmetic changes
+    fn cells_print(s: &Setup, cnn: &CropCnn, n: usize) -> Result<String> {
+        let cells: Vec<u16> = s.dev.gpu.download_range(&cnn.cells, 0, n * voxels(CELLS) * CELL_CHANNELS)?;
+        let hash = cells
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3));
+        if let Some(dir) = std::env::var_os("STRIPS_CNN_OUT") {
+            let sample: Vec<u8> = cells.iter().step_by(64).flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(PathBuf::from(dir).join("cells.sample"), sample)?;
+        }
+        Ok(format!("{hash:016x}"))
     }
 }
