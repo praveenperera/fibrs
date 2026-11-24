@@ -101,4 +101,4 @@ codegen-units = 4
 # the Metal backend needs volkit 0.2.0 (praveenperera/volkit, branch metal), which is not released yet; replace with
 # the release before publishing
 [patch.crates-io]
-volkit = { git = "https://github.com/praveenperera/volkit", rev = "99c746e1935f21c1657942f292f640616153d57d" }
+volkit = { git = "https://github.com/praveenperera/volkit", rev = "4d06983ecbe0cd8a59d786ee514bf9d2894f0f06" }
