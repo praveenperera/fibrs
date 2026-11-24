@@ -100,7 +100,7 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 debug = 1
 codegen-units = 4
 
-# the sheet-strip runner (`fibrs strips`) needs volkit's device layer public, which only this local branch has
-# (strips-device, 3cebf80); not for release
+# the sheet-strip runner (`fibrs strips`) needs volkit's public device layer (praveenperera/volkit#3), which no
+# volkit release has yet; replace with the release that includes it before publishing
 [patch.crates-io]
-volkit = { path = "/home/praveen/.t3/worktrees/volkit/strips-device/volkit" }
+volkit = { git = "https://github.com/praveenperera/volkit", rev = "6716b4283f1acc69b9f874848fee09366003c640" }
