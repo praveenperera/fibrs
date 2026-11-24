@@ -369,3 +369,107 @@ fn input_bench() -> Result<()> {
     println!("warm cache: {:?}", s.cache.counts);
     Ok(())
 }
+
+/// What one pass of [`input_prefetch`] produced: a hash of every launch's output bits, and the cache's counts
+struct PrefetchPass {
+    launches: Vec<u64>,
+    uploads: u64,
+    fills: u64,
+    evictions: u64,
+    prefetched: u64,
+}
+
+/// The dump's frame launches then its strip subset's, at b64 in the engine's order, through a fresh cache of
+/// `slots` chunks; with `ahead`, each launch reads the next one's chunks ahead once its kernels are queued, as the
+/// engine does
+fn prefetch_pass(slots: usize, ahead: bool) -> Result<PrefetchPass> {
+    use std::hash::{DefaultHasher, Hasher};
+
+    let mut s = setup(slots)?;
+    let gpu = &s.dev.gpu;
+    let k = s.dec.requests.len();
+    let sub = s.dump.shape("subset_strip_crops")[0];
+    let frame_buf = gpu.alloc(BATCH * FRAME_CROP.samples() * 4)?;
+    let strip_buf = gpu.alloc(BATCH * STRIP_CROP.samples() * 2 * 4)?;
+    let tubes: Vec<&[[f32; 3]]> = s.dec.tubes.iter().map(Vec::as_slice).collect();
+    // (frame launch?, decision range) in launch order
+    let launches: Vec<(bool, std::ops::Range<usize>)> = (0..k)
+        .step_by(BATCH)
+        .map(|a| (true, a..(a + BATCH).min(k)))
+        .chain((0..sub).step_by(BATCH).map(|a| (false, a..(a + BATCH).min(sub))))
+        .collect();
+
+    let mut hashes = Vec::with_capacity(launches.len());
+    for (i, (frame, r)) in launches.iter().enumerate() {
+        let (buf, n) = if *frame {
+            s.crops.frame(&s.dev, &mut s.cache, &s.dec.req_at[r.clone()], &frame_buf)?;
+            (&frame_buf, FRAME_CROP.samples())
+        } else {
+            s.crops.strip(&s.dev, &mut s.cache, &s.dec.strip_at[r.clone()], &tubes[r.clone()], &strip_buf)?;
+            (&strip_buf, STRIP_CROP.samples() * 2)
+        };
+        if let Some((next_frame, next)) = launches.get(i + 1).filter(|_| ahead) {
+            let (spec, at) = if *next_frame { (&FRAME_CROP, &s.dec.req_at) } else { (&STRIP_CROP, &s.dec.strip_at) };
+            s.crops.prefetch(&mut s.cache, spec, &at[next.clone()])?;
+        }
+
+        let got: Vec<f32> = gpu.download_range(buf, 0, r.len() * n)?;
+        let mut h = DefaultHasher::new();
+        for v in &got {
+            h.write_u32(v.to_bits());
+        }
+        hashes.push(h.finish());
+    }
+
+    let c = s.cache.counts;
+    Ok(PrefetchPass {
+        launches: hashes,
+        uploads: c.uploads,
+        fills: c.fills,
+        evictions: c.evictions,
+        prefetched: c.prefetched,
+    })
+}
+
+/// Reading the next launch's chunks ahead changes no output bit and no cache decision: the dump's launches through
+/// a cache small enough to evict give the same crops, uploads, fills and evictions with read-ahead as without
+#[test]
+#[ignore]
+fn input_prefetch() -> Result<()> {
+    // 256 slots against up to 112 chunks per launch and 797 in all: every pass evicts
+    let slots = 256;
+    println!("prefetch: {slots} slots, load {}", load_avg());
+    let t = Instant::now();
+    let plain = prefetch_pass(slots, false)?;
+    let plain_s = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let ahead = prefetch_pass(slots, true)?;
+    let ahead_s = t.elapsed().as_secs_f64();
+    for (name, p, secs) in [("on demand", &plain, plain_s), ("read ahead", &ahead, ahead_s)] {
+        println!(
+            "{name}: {} launches in {secs:.2} s (cold disk reads included), {} uploads ({} read ahead), {} fills, {} \
+             evictions",
+            p.launches.len(),
+            p.uploads,
+            p.prefetched,
+            p.fills,
+            p.evictions
+        );
+    }
+
+    ensure!(plain.launches.len() == ahead.launches.len(), "launch counts differ");
+    let differ: Vec<usize> = (0..plain.launches.len()).filter(|&i| plain.launches[i] != ahead.launches[i]).collect();
+    ensure!(differ.is_empty(), "launches {differ:?} differ with read-ahead");
+    ensure!(plain.evictions > 0, "the pass evicted nothing: the cache is too large to test eviction");
+    ensure!(
+        plain.prefetched == 0 && ahead.prefetched > 0,
+        "read-ahead count {} (on demand {})",
+        ahead.prefetched,
+        plain.prefetched
+    );
+    ensure!(
+        (plain.uploads, plain.fills, plain.evictions) == (ahead.uploads, ahead.fills, ahead.evictions),
+        "the cache's uploads, fills and evictions differ with read-ahead"
+    );
+    Ok(())
+}

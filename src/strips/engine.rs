@@ -16,7 +16,7 @@ use color_eyre::eyre::{Result, WrapErr, ensure};
 
 use super::ct::Volume;
 use super::gpu::cnn::CropCnn;
-use super::gpu::crops::{CacheCounts, ChunkCache, CropAt, Crops, FRAME_CROP};
+use super::gpu::crops::{CacheCounts, ChunkCache, CropAt, CropSpec, Crops, FRAME_CROP, STRIP_CROP};
 use super::gpu::frame::FrameModel;
 use super::gpu::head::Head;
 use super::gpu::{Device, Weights};
@@ -86,21 +86,30 @@ impl Engine {
         Ok(Self { dev, cache, crops, frame, cnn, head, frame_crops, strip_input, batch: b })
     }
 
-    /// The frame model on up to `batch` requests
-    fn frames(&mut self, requests: &[FrameRequest]) -> Result<Vec<FrameResult>> {
+    /// The frame model on up to `batch` requests, reading `ahead`'s chunks while its kernels run
+    fn frames(&mut self, requests: &[FrameRequest], ahead: &Ahead) -> Result<Vec<FrameResult>> {
         let at: Vec<CropAt> = requests.iter().map(|r| CropAt { pos: r.pos, frame: r.frame }).collect();
         self.crops.frame(&self.dev, &mut self.cache, &at, &self.frame_crops)?;
+        self.crops.prefetch(&mut self.cache, ahead.spec, &ahead.at)?;
         self.frame.run(&self.dev, &self.frame_crops, requests)
     }
 
-    /// The strip model on up to `batch` requests
-    fn strips(&mut self, requests: &[StripRequest]) -> Result<Vec<StripResult>> {
+    /// The strip model on up to `batch` requests, reading `ahead`'s chunks while its kernels run
+    fn strips(&mut self, requests: &[StripRequest], ahead: &Ahead) -> Result<Vec<StripResult>> {
         let at: Vec<CropAt> = requests.iter().map(|r| CropAt { pos: r.pos, frame: r.frame }).collect();
         let tubes: Vec<&[[f32; 3]]> = requests.iter().map(|r| r.tube.as_slice()).collect();
         self.crops.strip(&self.dev, &mut self.cache, &at, &tubes, &self.strip_input)?;
+        self.crops.prefetch(&mut self.cache, ahead.spec, &ahead.at)?;
         let cells = self.cnn.forward(&self.dev, &self.strip_input, requests.len())?;
         self.head.forward(&self.dev, cells, &self.strip_input, requests)
     }
+}
+
+/// The crops the launch after this one will likely sample: a guess from the queues as they stand, whose CT chunks
+/// are read while this launch runs
+struct Ahead {
+    spec: &'static CropSpec,
+    at: Vec<CropAt>,
 }
 
 /// An item partly run: its requests, the results so far, where its reply goes
@@ -123,6 +132,11 @@ impl<Q: Clone, R> Queue<Q, R> {
     /// Decisions not yet run
     fn decisions(&self) -> usize {
         self.items.iter().map(|item| item.requests.len() - item.done.len()).sum()
+    }
+
+    /// `f` of up to `n` decisions not yet run, after the first `skip` of them, in launch order
+    fn peek<T>(&self, skip: usize, n: usize, f: impl Fn(&Q) -> T) -> Vec<T> {
+        self.items.iter().flat_map(|item| &item.requests[item.done.len()..]).skip(skip).take(n).map(f).collect()
     }
 
     fn push(&mut self, requests: Vec<Q>, reply: Sender<Result<Vec<R>, String>>) {
@@ -226,11 +240,21 @@ pub fn serve(
 
         let t = Instant::now();
         let batch = engine.batch;
+        let frame_at = |r: &FrameRequest| CropAt { pos: r.pos, frame: r.frame };
+        let strip_at = |r: &StripRequest| CropAt { pos: r.pos, frame: r.frame };
+        // the next launch runs frames while any are queued, so it takes the frames beyond this launch, else the
+        // front strips; work that arrives meanwhile can change it, which costs only the reads
         if frames.decisions() > 0 {
-            counts.frame_decisions += frames.launch(batch, |q| engine.frames(q));
+            let ahead = if frames.decisions() > batch {
+                Ahead { spec: &FRAME_CROP, at: frames.peek(batch, batch, frame_at) }
+            } else {
+                Ahead { spec: &STRIP_CROP, at: strips.peek(0, batch, strip_at) }
+            };
+            counts.frame_decisions += frames.launch(batch, |q| engine.frames(q, &ahead));
             counts.frame_launches += 1;
         } else {
-            counts.strip_decisions += strips.launch(batch, |q| engine.strips(q));
+            let ahead = Ahead { spec: &STRIP_CROP, at: strips.peek(batch, batch, strip_at) };
+            counts.strip_decisions += strips.launch(batch, |q| engine.strips(q, &ahead));
             counts.strip_launches += 1;
         }
         counts.busy += t.elapsed().as_secs_f64();
@@ -260,6 +284,9 @@ mod tests {
             })
             .collect();
         assert_eq!(q.decisions(), 10);
+        // the launch after a launch of 4 starts at decision 4, across the item boundary
+        assert_eq!(q.peek(4, 4, |v| v * 10), vec![40, 50, 60, 70]);
+        assert_eq!(q.peek(8, 4, |&v| v), vec![8, 9]);
 
         let mut launched = Vec::new();
         while q.decisions() > 0 {
@@ -269,6 +296,7 @@ mod tests {
             });
         }
         assert_eq!(launched, vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9]]);
+        assert!(q.peek(0, 4, |&v| v).is_empty());
         assert_eq!(replies[0].try_recv().unwrap().unwrap(), vec![0, 10, 20]);
         assert_eq!(replies[1].try_recv().unwrap().unwrap(), vec![30, 40, 50, 60, 70]);
         assert_eq!(replies[2].try_recv().unwrap().unwrap(), vec![80, 90]);
