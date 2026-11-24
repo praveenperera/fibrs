@@ -66,7 +66,8 @@ fibrs strips run \
 
 The run selects every fibre of at least `--min-length-mm` (default 2.5) in Morton order, and resumes from the
 index: run it again with the same `--out` and it takes up the fibres not yet written. An `--out` begun under
-another runner tag (the `runner` field of `--provenance`) is refused, so one scroll never mixes runners.
+another runner tag (the `runner` field of `--provenance`), or with a different AFV, CT, checkpoint or decision
+setting, is refused, so one index never mixes strips made differently.
 
 | Option | Meaning |
 |---|---|
@@ -84,12 +85,14 @@ another runner tag (the `runner` field of `--provenance`) is refused, so one scr
 | `--device` | CUDA device ordinal |
 | `--limit` | at most this many fibres |
 | `--provenance` | JSON recorded in `run.json`; its `runner` tags every index line |
+| `--no-write` | timing only: run and stitch, write no strips and no index lines |
 
 ### Missing CT chunks
 
-The runner reads the CT only from the disk cache, never from the network. A fibre that needs a chunk the cache
-lacks is deferred rather than written. The run finishes every other fibre, lists the missing chunks in
-`<out>/logs/uncached_chunks.txt` and exits with code 75. Fetch those chunks into the cache and run again; the
+The runner reads the CT only from the disk cache, never from the network. A GPU launch that needs a chunk the
+cache lacks fails before it uploads anything, and every fibre in that launch is deferred rather than written. The
+run finishes the other fibres, lists the missing chunks in `<out>/logs/uncached_chunks.txt` and exits with code
+75. Fetch those chunks into the cache and run again; the
 rerun takes up the deferred fibres.
 
 ## Requirements

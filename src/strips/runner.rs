@@ -108,7 +108,7 @@ pub struct Args {
     /// At most this many of the shard's fibres
     #[arg(long)]
     limit: Option<usize>,
-    /// Run and stitch, write no strips
+    /// Run and stitch, write no strips and no index lines (timing only)
     #[arg(long)]
     no_write: bool,
     /// Also write a per-fibre npz of every decision's raw results here
@@ -163,6 +163,9 @@ impl std::error::Error for Deferred {}
 pub fn run(args: &Args) -> Result<()> {
     ensure!(args.shard.len() == 2 && args.shard[1] > 0 && args.shard[0] < args.shard[1], "--shard K N with K < N");
     ensure!(args.workers > 0 && args.batch > 0, "--workers and --batch above 0");
+    ensure!(args.step.is_finite() && args.step > 0.0, "--step: a positive number of patch voxels");
+    ensure!(args.blend.is_finite() && args.blend >= 0.0, "--blend: zero or more patch voxels");
+    ensure!(args.trim.is_finite() && args.trim >= 0.0, "--trim: zero or more patch voxels");
     let (k, n) = (args.shard[0], args.shard[1]);
     let input_scale = args.grid_scale / args.ct_grid_scale;
     ensure!(input_scale.fract() == 0.0, "CT sampling requires a whole number of CT voxels per trace voxel");
@@ -179,9 +182,10 @@ pub fn run(args: &Args) -> Result<()> {
 
     let todo = select(args, k, n)?;
     fs::create_dir_all(args.out.join("index")).wrap_err_with(|| format!("create {}", args.out.display()))?;
-    check_tag(&args.out, &tag)?;
+    let fields = run_fields(args, n, &tag);
+    check_resume(&args.out, &tag, &fields)?;
     if k == 0 {
-        write_run_json(args, n, &provenance, &tag)?;
+        write_run_json(&args.out, &fields, &provenance, &tag)?;
     }
 
     let vol = Arc::new(Volume::open(&args.cache_dir, &args.ct, args.ct_level)?);
@@ -269,6 +273,8 @@ fn select(args: &Args, k: usize, n: usize) -> Result<Todo> {
     let mut ids = args.ids.clone();
     if let Some(path) = &args.ids_file {
         ids = read_ids(path)?;
+        // an empty list would otherwise select every fibre of the scroll
+        ensure!(!ids.is_empty(), "{} holds no fibre ids", path.display());
     }
     let afv = Afv::open(&args.afv)?;
     let rows = afv.select(args.min_length_mm, args.voxel_size_um, (!ids.is_empty()).then_some(ids.as_slice()))?;
@@ -303,7 +309,8 @@ fn indexed(dir: &Path) -> Result<HashSet<i64>> {
         if !(name.starts_with("shard_") && name.ends_with(".jsonl")) {
             continue;
         }
-        for line in fs::read_to_string(&path)?.lines().filter(|l| !l.trim().is_empty()) {
+        let text = repair_index(&path)?;
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
             let record: Value = serde_json::from_str(line).wrap_err_with(|| format!("{}: {line}", path.display()))?;
             done.insert(record["fiber"].as_i64().ok_or_else(|| eyre!("{}: no fiber in {line}", path.display()))?);
         }
@@ -311,21 +318,57 @@ fn indexed(dir: &Path) -> Result<HashSet<i64>> {
     Ok(done)
 }
 
-/// Refuses an OUT begun under another runner tag: one scroll, one runner
-fn check_tag(out: &Path, tag: &str) -> Result<()> {
+/// The run.json fields that change a strip's content: a resumed OUT must match them, so one index never mixes
+/// strips made from different inputs or settings
+const RESUME_FIELDS: [&str; 12] = [
+    "checkpoint",
+    "afv",
+    "voxel_size_um",
+    "decision_step",
+    "blend",
+    "trim_patch_voxels",
+    "trace_per_patch",
+    "ct",
+    "ct_level",
+    "ct_grid_scale",
+    "grid_scale",
+    "perturb",
+];
+
+/// Drops a shard index's torn last line (a write cut short, as by a full disk), so the fibre reruns and later
+/// appends start on a line of their own; the file's text after the repair
+fn repair_index(path: &Path) -> Result<String> {
+    let mut text = fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
+    if text.is_empty() || text.ends_with('\n') {
+        return Ok(text);
+    }
+
+    text.truncate(text.rfind('\n').map_or(0, |i| i + 1));
+    let file = OpenOptions::new().write(true).open(path).wrap_err_with(|| format!("open {}", path.display()))?;
+    file.set_len(text.len() as u64).wrap_err_with(|| format!("truncate {}", path.display()))?;
+    Ok(text)
+}
+
+/// Refuses an OUT begun under another runner tag (one scroll, one runner) or with other output-affecting settings
+fn check_resume(out: &Path, tag: &str, fields: &Map<String, Value>) -> Result<()> {
     let path = out.join("run.json");
     let Ok(text) = fs::read_to_string(&path) else { return Ok(()) };
     let previous: Value = serde_json::from_str(&text).wrap_err_with(|| format!("parse {}", path.display()))?;
-    match previous.get("runner").and_then(Value::as_str) {
-        Some(p) if p != tag => {
-            bail!("{} was started with runner {p:?}, not {tag:?}: one scroll, one runner", out.display())
-        }
-        _ => Ok(()),
+    if let Some(p) = previous.get("runner").and_then(Value::as_str)
+        && p != tag
+    {
+        bail!("{} was started with runner {p:?}, not {tag:?}: one scroll, one runner", out.display());
     }
+
+    for key in RESUME_FIELDS {
+        let (Some(was), Some(now)) = (previous.get(key), fields.get(key)) else { continue };
+        ensure!(was == now, "{} was started with {key} {was}, not {now}: use a new --out", out.display());
+    }
+    Ok(())
 }
 
-/// run.json, the Python runner's fields with this runner's values, then the provenance, then the tag
-fn write_run_json(args: &Args, shards: usize, provenance: &Map<String, Value>, tag: &str) -> Result<()> {
+/// run.json's fields: the Python runner's, with this runner's values
+fn run_fields(args: &Args, shards: usize, tag: &str) -> Map<String, Value> {
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
     let fields = json!({
         "checkpoint": CHECKPOINT, "step": STEP,
@@ -339,9 +382,13 @@ fn write_run_json(args: &Args, shards: usize, provenance: &Map<String, Value>, t
         "ct_level": args.ct_level, "ct_grid_scale": args.ct_grid_scale, "grid_scale": args.grid_scale,
         "perturb": args.perturb, "weights": args.weights.display().to_string(),
     });
-    let fields = fields.as_object().cloned().unwrap_or_default();
-    let path = args.out.join("run.json");
-    fs::write(&path, run_json(&fields, provenance, tag)).wrap_err_with(|| format!("write {}", path.display()))
+    fields.as_object().cloned().unwrap_or_default()
+}
+
+/// run.json: the fields, then the provenance, then the tag
+fn write_run_json(out: &Path, fields: &Map<String, Value>, provenance: &Map<String, Value>, tag: &str) -> Result<()> {
+    let path = out.join("run.json");
+    fs::write(&path, run_json(fields, provenance, tag)).wrap_err_with(|| format!("write {}", path.display()))
 }
 
 fn default_tag() -> String {
@@ -484,7 +531,8 @@ fn write_index(
                 None
             }
         };
-        if let Some(record) = record {
+        // a --no-write run indexes nothing, so a later run in the same OUT still writes those strips
+        if let Some(record) = record.filter(|_| !args.no_write) {
             let seconds = last_record.elapsed().as_secs_f64();
             if record.failed.is_none() {
                 last_record = Instant::now();
@@ -526,4 +574,56 @@ fn write_uncached(args: &Args, k: usize, n: usize, written: &Written) -> Result<
     let text: String = written.uncached.iter().map(|[z, y, x]| format!("{z}/{y}/{x}\n")).collect();
     fs::write(&path, text).wrap_err_with(|| format!("write {}", path.display()))?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use serde_json::{Map, Value, json};
+
+    use super::{check_resume, indexed, repair_index, run_json};
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fibrs-strips-runner-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("index")).unwrap();
+        dir
+    }
+
+    /// A write cut short leaves a torn last line: resume drops it, so that fibre reruns, and the next append starts
+    /// on a line of its own
+    #[test]
+    fn torn_index_line_is_dropped() {
+        let dir = scratch("torn");
+        let path = dir.join("index").join("shard_0.jsonl");
+        fs::write(&path, "{\"fiber\": 1}\n{\"fiber\": 2}\n{\"fib").unwrap();
+
+        let done = indexed(&dir.join("index")).unwrap();
+        assert_eq!(done, [1, 2].into_iter().collect());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"fiber\": 1}\n{\"fiber\": 2}\n");
+        assert_eq!(repair_index(&path).unwrap(), "{\"fiber\": 1}\n{\"fiber\": 2}\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An OUT begun with another CT level is refused; the same settings and tag resume
+    #[test]
+    fn resume_refuses_other_settings() {
+        let dir = scratch("resume");
+        let fields = |level: u32| -> Map<String, Value> {
+            json!({"ct": "s3://scroll.zarr", "ct_level": level, "decision_step": 8.0, "workers": 16})
+                .as_object()
+                .cloned()
+                .unwrap()
+        };
+        fs::write(dir.join("run.json"), run_json(&fields(0), &Map::new(), "tag-a")).unwrap();
+
+        check_resume(&dir, "tag-a", &fields(0)).unwrap();
+        let other = check_resume(&dir, "tag-a", &fields(1)).unwrap_err();
+        assert!(format!("{other}").contains("ct_level 0, not 1"), "{other}");
+        let tag = check_resume(&dir, "tag-b", &fields(0)).unwrap_err();
+        assert!(format!("{tag}").contains("one scroll, one runner"), "{tag}");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
