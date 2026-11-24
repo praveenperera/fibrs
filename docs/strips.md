@@ -69,7 +69,8 @@ index: run it again with the same `--out` and it takes up the fibres not yet wri
 another runner tag (the `runner` field of `--provenance`), or with a different AFV, CT, checkpoint or decision
 setting, is refused, so one index never mixes strips made differently. The AFV (by its uuid and size), the
 umbilicus and the weights (by their sha256) count as inputs, so another file under the same name is refused too.
-The first shard to start writes `run.json`, and every other shard checks against it.
+Every input is read and checked before anything is written. The first shard to start then writes `run.json`, and
+every other shard checks against it.
 
 | Option | Meaning |
 |---|---|
@@ -118,3 +119,7 @@ rerun takes up the deferred fibres.
   for a whole scroll.
 - The trace grid must be two CT voxels per trace voxel (`--grid-scale` twice `--ct-grid-scale`), as every scroll's
   AFV is traced, and `--step` a multiple of the strip's row spacing of 2.
+- An OUT begun by an older runner has no record of its inputs' identities (AFV uuid and size, umbilicus and
+  weights hashes), so resuming it checks only the settings it does record.
+- Shards started with different shard counts on one OUT at the same time (`--shard 0 2` beside `--shard 1 3`) can
+  each make the same fibre. Re-sharding a stopped run is fine: a resume skips every fibre in any shard's index.
