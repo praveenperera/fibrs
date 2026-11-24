@@ -5,6 +5,11 @@
 //! plans for that size are made: the CNN alone, then the whole model (CNN and head, including the head's record
 //! upload and result download). Parity runs every recorded decision once in batches of the smallest size and
 //! holds the final heights and log scales to PyTorch's own bf16 spread (track-c-native.md, 11:40 PM Nov 23)
+//!
+//! `--invariance` instead runs every recorded decision under several batchings (the smallest batch size in order,
+//! again, batches of 17, a fixed shuffle) and reports per stage (the CNN's cells, the head on those cells, the head
+//! alone on the reference's stock cells) how many decisions' output bits differ from the first run, with the first
+//! run's per-decision hashes for comparing separate processes
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -92,6 +97,9 @@ pub struct Args {
     /// `<file>.h1.f32`, and its column tilt against stock to the report
     #[arg(long)]
     head_cells: Vec<PathBuf>,
+    /// Checks batch invariance instead of timing and parity (module doc)
+    #[arg(long)]
+    invariance: bool,
 }
 
 /// Runs the bench; the report also goes to stdout, a line per result
@@ -106,6 +114,13 @@ pub fn run(args: &Args) -> Result<()> {
     let requests: Vec<StripRequest> = (0..refs.n).map(|i| refs.request(i)).collect();
     let input = dev.gpu.alloc(max * CROP_LEN * 4)?;
     let mut report = json!({"decisions": refs.n, "batches": args.batches, "reps": args.reps});
+    if args.invariance {
+        let b = *args.batches.iter().min().unwrap();
+        let probe = Probe { dev: &dev, head: &head, input: &input, refs: &refs, requests: &requests };
+        report["invariance"] = probe.invariance(&mut cnn, b)?;
+        return std::fs::write(&args.out, serde_json::to_vec_pretty(&report)?)
+            .wrap_err_with(|| format!("write {}", args.out.display()));
+    }
 
     // timing: the first decisions, repeated up to the largest batch
     for i in (0..max).step_by(refs.n) {
@@ -259,6 +274,103 @@ fn head_on_cells(
         }
     }
     Ok(h1)
+}
+
+/// Per decision, a hash of each stage's output bits under one batching
+struct Bits {
+    cells: Vec<u64>,
+    model: Vec<u64>,
+    head: Vec<u64>,
+}
+
+fn hash<T: std::hash::Hash>(v: &[T]) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
+
+fn hash_result(r: &super::types::StripResult) -> u64 {
+    let bits: Vec<u32> = r.heights.iter().flatten().chain(r.log_scale.iter().flatten()).map(|v| v.to_bits()).collect();
+    hash(&bits)
+}
+
+/// What every batching of the reference shares
+#[derive(Clone, Copy)]
+struct Probe<'a> {
+    dev: &'a Device,
+    head: &'a Head,
+    input: &'a volkit::gpu::Buf,
+    refs: &'a RefSet,
+    requests: &'a [StripRequest],
+}
+
+impl Probe<'_> {
+    /// One batching of the reference: decisions in `order`, launches of `b`
+    fn batching(&self, cnn: &mut CropCnn, order: &[usize], b: usize) -> Result<Bits> {
+        let Self { dev, head, input, refs, requests } = *self;
+        let n = refs.n;
+        let mut bits = Bits { cells: vec![0; n], model: vec![0; n], head: vec![0; n] };
+        let stock = dev.gpu.alloc(b * CELLS_LEN * 2)?;
+        for launch in order.chunks(b) {
+            for (j, &i) in launch.iter().enumerate() {
+                dev.gpu.upload_into(input, j * CROP_LEN * 4, refs.crop(i..i + 1))?;
+                dev.gpu.upload_into(&stock, j * CELLS_LEN * 2, refs.cells(i..i + 1))?;
+            }
+            let batch: Vec<StripRequest> = launch.iter().map(|&i| requests[i].clone()).collect();
+            let cells = cnn.forward(dev, input, launch.len())?;
+            let native: Vec<u16> = dev.gpu.download_range(cells, 0, launch.len() * CELLS_LEN)?;
+            let model = head.forward(dev, cells, input, &batch)?;
+            let alone = head.forward(dev, &stock, input, &batch)?;
+            for (j, &i) in launch.iter().enumerate() {
+                bits.cells[i] = hash(&native[j * CELLS_LEN..(j + 1) * CELLS_LEN]);
+                bits.model[i] = hash_result(&model[j]);
+                bits.head[i] = hash_result(&alone[j]);
+            }
+        }
+        Ok(bits)
+    }
+
+    /// Every decision under four batchings (`b` in order, again, 17 in order, `b` in a fixed shuffle), and per stage
+    /// the decisions whose bits differ from the first, with the CNN's algorithm choices for each launch size
+    fn invariance(&self, cnn: &mut CropCnn, b: usize) -> Result<Value> {
+        let n = self.refs.n;
+        let ordered: Vec<usize> = (0..n).collect();
+        // a fixed shuffle: stride by a prime coprime to n
+        let stride = [7919, 7907, 7901].into_iter().find(|p| !n.is_multiple_of(*p)).unwrap_or(1);
+        let shuffled: Vec<usize> = (0..n).map(|i| i * stride % n).collect();
+        let runs = [("b", &ordered, b), ("b again", &ordered, b), ("17", &ordered, 17), ("b shuffled", &shuffled, b)];
+
+        let base = self.batching(cnn, runs[0].1, runs[0].2)?;
+        let mut out = serde_json::Map::new();
+        for (name, order, size) in &runs[1..] {
+            let bits = self.batching(cnn, order, *size)?;
+            let differ = |a: &[u64], b: &[u64]| -> Vec<usize> { (0..n).filter(|&i| a[i] != b[i]).collect() };
+            let (cells, model, alone) =
+                (differ(&base.cells, &bits.cells), differ(&base.model, &bits.model), differ(&base.head, &bits.head));
+            let row = json!({
+                "launch_size": size,
+                "cells_differ": cells.len(), "model_differ": model.len(), "head_on_stock_cells_differ": alone.len(),
+                "cells_differ_first": &cells[..cells.len().min(8)],
+                "head_on_stock_cells_differ_first": &alone[..alone.len().min(8)],
+            });
+            println!("{}", json!({"invariance": name, "vs": format!("b={b} in order"), "result": row.clone()}));
+            out.insert(format!("{name} (b={b})"), row);
+        }
+        let mut sizes: Vec<usize> = [b, 17, n % b, n % 17].into_iter().filter(|&k| k > 0).collect();
+        sizes.dedup();
+        let algos: serde_json::Map<String, Value> =
+            sizes.iter().map(|&k| (k.to_string(), Value::from(cnn.algorithms(k)))).collect();
+        println!("{}", json!({"cnn_algorithms": algos.clone()}));
+        out.insert("cnn_algorithms".into(), Value::from(algos));
+        // the first batching's bits, to compare runs in separate processes (each plans its own algorithms)
+        let hex = |v: &[u64]| -> Vec<String> { v.iter().map(|h| format!("{h:016x}")).collect() };
+        out.insert(
+            "first_run_bits".into(),
+            json!({"cells": hex(&base.cells), "model": hex(&base.model), "head_on_stock_cells": hex(&base.head)}),
+        );
+        Ok(Value::from(out))
+    }
 }
 
 /// `values` as raw little-endian float32
