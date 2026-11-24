@@ -16,7 +16,7 @@ use color_eyre::eyre::{Result, WrapErr, ensure};
 
 use super::ct::Volume;
 use super::gpu::cnn::CropCnn;
-use super::gpu::crops::{ChunkCache, CropAt, Crops, FRAME_CROP};
+use super::gpu::crops::{CacheCounts, ChunkCache, CropAt, Crops, FRAME_CROP};
 use super::gpu::frame::FrameModel;
 use super::gpu::head::Head;
 use super::gpu::{Device, Weights};
@@ -53,6 +53,8 @@ pub struct EngineCounts {
     pub strip_launches: usize,
     /// Seconds the engine spent running work (the rest it waited for work)
     pub busy: f64,
+    /// The device CT cache's uploads, evictions and fills
+    pub cache: CacheCounts,
 }
 
 /// The device and every model and buffer on it
@@ -218,6 +220,7 @@ pub fn serve(
             if open {
                 continue;
             }
+            counts.cache = engine.cache.counts;
             return Ok(counts);
         }
 
