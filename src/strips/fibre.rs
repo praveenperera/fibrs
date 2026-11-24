@@ -1,4 +1,4 @@
-//! Fibres from an AFV as the strip runners read them: the selection and order of `strips_run.py`'s
+//! Fibres from an AFV as the strip runners read them: the selection and order of the Python reference runner's
 //! `select_fibres`, and villa's FiberStore geometry (`load_fiber`): blocks joined, base voxels to trace voxels,
 //! densified to one trace voxel, kinks repaired (`shared/annotations/repair.py`)
 

@@ -1,5 +1,5 @@
-//! PyTorch's reference for the strip model on recorded decisions, as `ops/vesuvius/strips-native/ref_strip.py`
-//! writes it, and the spread statistics the native outputs are judged by
+//! PyTorch's reference for the strip model on recorded decisions, as a PyTorch dump script outside this
+//! repository writes it, and the spread statistics the native outputs are judged by
 //!
 //! The directory holds `crop.f32` (N x 144 x 128 x 128 x 2 float32, NDHWC: the z-scored CT and the rendered tube),
 //! `cells.bf16` (N x 36 x 32 x 32 x 64 bfloat16 bits, NDHWC: the stock CNN output), `records.safetensors` (the

@@ -42,7 +42,7 @@ impl Bar {
 
 /// The most the heights may tilt across the strip's columns against stock: the least-squares slope of the per-column
 /// mean signed difference, times the strip's width. PyTorch b64 against stock tilts about 3e-4 on the reference; a
-/// CNN convention bug that failed the end-to-end gate (Q1) tilted 5e-3 while every spread bar passed
+/// CNN convention bug that failed the end-to-end strip-error gate tilted 5e-3 while every spread bar passed
 const TILT_BAR: f64 = 1.5e-3;
 
 /// The tilt of `ours - theirs` (row-major `[n, rows, cols]` grids) across the columns: the least-squares slope of the

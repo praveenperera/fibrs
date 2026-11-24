@@ -2,7 +2,7 @@
 //!
 //! vc_reader stores every chunk it fetched decoded, at `<cache>/s3/<bucket>/<key>/<level>/<z>/<y>/<x>` (the
 //! `dimension_separator` "/" layout), with an empty `<x>.missing` file for a chunk the source does not hold, which
-//! reads as the fill value. STRIPS-SCALE's `prefetch_ct.py` fills the cache before a scroll's run. Chunks are
+//! reads as the fill value. A separate prefetch fills the cache before a scroll's run. Chunks are
 //! memory-mapped, so threads share the page cache and nothing is copied until a crop reads it
 
 use std::collections::HashMap;

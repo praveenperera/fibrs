@@ -1,5 +1,5 @@
-//! Parity of the CPU stages against villa's batched path on fixtures from
-//! `private-workbench/ops/vesuvius/strips-native/dump_geom_fixtures.py`
+//! Parity of the CPU stages against villa's batched path on fixtures dumped from villa (`FIBRS_GEOM_FIXTURES`;
+//! the dump script is outside this repository)
 //!
 //! Each stage runs on the fixture's inputs for that stage, so a difference shows where it starts: load (AFV row,
 //! points, densify, kink repair, arcs), CT seed headings (cube, structure tensor, eigenpairs, heading or error),
@@ -543,13 +543,10 @@ fn check(env: &Env, fx: &Fixture, work: &mut Workspace) -> Stats {
 #[ignore = "needs the fixtures, the AFV and the cached CT"]
 fn fixture_parity() {
     let root = PathBuf::from(
-        std::env::var("FIBRS_GEOM_FIXTURES")
-            .unwrap_or("/home/praveen/code/research/_scratch/strips-native/geom/fx".into()),
+        std::env::var("FIBRS_GEOM_FIXTURES").expect("FIBRS_GEOM_FIXTURES: villa's dumped geometry fixtures"),
     );
     let run: Map<String, Value> = serde_json::from_slice(&fs::read(root.join("py_out/run.json")).unwrap()).unwrap();
-    let umbilicus = std::env::var("FIBRS_UMBILICUS").unwrap_or(
-        "/home/praveen/code/private-workbench/ops/vesuvius/strips-scale/umbilici/PHerc0211_umbilicus.json".into(),
-    );
+    let umbilicus = std::env::var("FIBRS_UMBILICUS").expect("FIBRS_UMBILICUS: the scroll's umbilicus JSON");
     let settings = Settings {
         out: None,
         npz: None,
@@ -609,8 +606,7 @@ fn fixture_parity() {
 #[ignore = "needs the fixtures and the AFV"]
 fn selection_order() {
     let root = PathBuf::from(
-        std::env::var("FIBRS_GEOM_FIXTURES")
-            .unwrap_or("/home/praveen/code/research/_scratch/strips-native/geom/fx".into()),
+        std::env::var("FIBRS_GEOM_FIXTURES").expect("FIBRS_GEOM_FIXTURES: villa's dumped geometry fixtures"),
     );
     let theirs: Vec<i64> = fs::read_to_string(root.join("selection_2.5mm.txt"))
         .unwrap()

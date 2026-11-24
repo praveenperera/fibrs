@@ -1,7 +1,7 @@
 //! GPU tests of the input stage, `#[ignore]`d since they need the GPU, the 0211 CT cache and villa's reference
-//! dump (`ops/vesuvius/strips-native/dump_input_ref.py`); run them through the GPU queue with `--ignored`
+//! dump (written by a script outside this repository); run them with `--ignored`
 //!
-//! Paths default to the STRIPS-SCALE layout and are overridden by `STRIPS_INPUT_REF` (the dump),
+//! Paths default to a local layout and are overridden by `STRIPS_INPUT_REF` (the dump),
 //! `STRIPS_CT_CACHE`, `STRIPS_CT_URL` and `STRIPS_WEIGHTS`
 
 use std::collections::HashMap;

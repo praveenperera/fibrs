@@ -1,12 +1,12 @@
-//! `fibrs strips run`: the native strip runner, with `strips_fast.py`'s command line and outputs
+//! `fibrs strips run`: the native strip runner, with the Python reference runner's command line and outputs
 //!
-//! Fibres are selected and sharded as `strips_run.py` does (Morton order, contiguous shards, `--exclude-ids-file`),
-//! and a shard resumes from every shard's index. CPU workers each take the next fibre: load it, plan its decisions
-//! (CT seed headings included), hand the frame requests to the GPU engine, finish the decisions from the frame
-//! model's output, hand the strip requests to the engine, then stitch and write the strip. The engine thread batches
-//! both models' work across the fibres in flight. The main thread writes the index: one line per fibre as it
-//! finishes, its `seconds` the time since the shard's previous line (fibres overlap, so the column sums to the
-//! shard's wall time, as `strips_fast.py`'s does)
+//! Fibres are selected and sharded as the Python reference runner does (Morton order, contiguous shards,
+//! `--exclude-ids-file`), and a shard resumes from every shard's index. CPU workers each take the next fibre: load
+//! it, plan its decisions (CT seed headings included), hand the frame requests to the GPU engine, finish the
+//! decisions from the frame model's output, hand the strip requests to the engine, then stitch and write the strip.
+//! The engine thread batches both models' work across the fibres in flight. The main thread writes the index: one
+//! line per fibre as it finishes, its `seconds` the time since the shard's previous line (fibres overlap, so the
+//! column sums to the shard's wall time, as the Python runner's does)
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, OpenOptions};
@@ -64,7 +64,7 @@ pub struct Args {
     /// Scan voxel size: AFV lengths and area_cm2
     #[arg(long)]
     voxel_size_um: f64,
-    /// The strip model's weights export (`export_weights.py`)
+    /// The strip model's weights export (the checkpoint's tensors as float32 safetensors)
     #[arg(long)]
     weights: PathBuf,
     /// The CT zarr (`s3://...`), read from vc_reader's disk cache
@@ -111,7 +111,7 @@ pub struct Args {
     /// Run and stitch, write no strips
     #[arg(long)]
     no_write: bool,
-    /// Also write Check A's per-fibre npz here
+    /// Also write a per-fibre npz of every decision's raw results here
     #[arg(long)]
     npz: Option<PathBuf>,
     /// The perturbation the weights export carries (negative controls); must match its metadata
@@ -159,7 +159,7 @@ impl std::fmt::Display for Deferred {
 
 impl std::error::Error for Deferred {}
 
-/// Runs the shard; the progress lines go to stdout as `strips_fast.py` prints them
+/// Runs the shard; the progress lines go to stdout as the Python runner prints them
 pub fn run(args: &Args) -> Result<()> {
     ensure!(args.shard.len() == 2 && args.shard[1] > 0 && args.shard[0] < args.shard[1], "--shard K N with K < N");
     ensure!(args.workers > 0 && args.batch > 0, "--workers and --batch above 0");
@@ -324,7 +324,7 @@ fn check_tag(out: &Path, tag: &str) -> Result<()> {
     }
 }
 
-/// run.json, `strips_fast.py`'s fields with this runner's values, then the provenance, then the tag
+/// run.json, the Python runner's fields with this runner's values, then the provenance, then the tag
 fn write_run_json(args: &Args, shards: usize, provenance: &Map<String, Value>, tag: &str) -> Result<()> {
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
     let fields = json!({

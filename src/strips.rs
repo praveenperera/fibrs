@@ -1,5 +1,5 @@
 //! `fibrs strips`: villa's sheet-strip inference (`fibers/sheet_strip`, checkpoint `scrollprize/fiber_strip_small_v1`)
-//! run natively, as STRIPS-SCALE's `strips_run.py` and `strips_fast.py` run it over an AFV's fibres
+//! run natively over an AFV's fibres, with the Python reference runner's command line and outputs
 //!
 //! Per fibre the CPU plans every decision (`geom`: the decision items, the CT seed heading and the frame-model
 //! request), the GPU runs the frame model on its crops (`gpu`), the CPU turns its output into each decision's
@@ -39,7 +39,7 @@ pub fn requested(argv: &[OsString]) -> bool {
 #[derive(Parser, Debug)]
 #[command(name = "fibrs strips", version = env!("CARGO_PKG_VERSION"))]
 enum Command {
-    /// Run the native strip runner over an AFV's fibres (`strips_fast.py`'s command line and outputs)
+    /// Run the native strip runner over an AFV's fibres (the Python reference runner's command line and outputs)
     Run(Box<runner::Args>),
     /// Time the native strip model and check it against PyTorch's reference
     BenchModel(bench_model::Args),

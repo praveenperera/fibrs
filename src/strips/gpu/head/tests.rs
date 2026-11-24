@@ -1,6 +1,6 @@
 //! The head against PyTorch: per-stage parity with villa's own forward on recorded decisions
-//! (`ops/vesuvius/strips-native/dump_head.py`), with the bf16-vs-fp32 and batch-4-vs-64 noise bands beside each
-//! stage, and the head's speed per stage at several batch sizes
+//! (dumped by a PyTorch script outside this repository), with the bf16-vs-fp32 and batch-4-vs-64 noise bands
+//! beside each stage, and the head's speed per stage at several batch sizes
 //!
 //! Both need an NVIDIA GPU and the dump: `FIBRS_HEAD_REF` (default the b64 dump under
 //! `/build/vesuvius/strips-scale/speed/native/head/`), `FIBRS_STRIP_WEIGHTS` (default the exported checkpoint)
@@ -395,7 +395,7 @@ fn map(path: &std::path::Path) -> Result<Mmap> {
     Ok(unsafe { Mmap::map(&file) }?)
 }
 
-/// The head on the shared strip-model reference's decisions (`ops/vesuvius/strips-native/ref_strip.py`;
+/// The head on the shared strip-model reference's decisions (see `refset`;
 /// `FIBRS_STRIP_REF`, default its 340-decision run) in batches of 64 on PyTorch's stock cells, against the stock
 /// (bf16, batch 4) and batch-64 PyTorch heights and log scales, with the reference's own variant distances beside;
 /// with `FIBRS_HEAD_DUMP` set, also writes the native grids there
@@ -506,7 +506,7 @@ fn column_tilt(ours: &[f32], theirs: &[f32]) -> f64 {
     num / den * 24.0
 }
 
-/// One gpu-ab arm (`ops/vesuvius/strips-native/gpu-ab-head.toml`): the head at batch `FIBRS_HEAD_BATCH` (default
+/// One gpu-ab arm: the head at batch `FIBRS_HEAD_BATCH` (default
 /// 64) on the dump's decisions, `FIBRS_HEAD_REPS` (default 50) untraced forwards after 5 warmups; writes the median
 /// ms/decision and the host load to `FIBRS_HEAD_OUT/metrics.json`, the sha256 of the last forward's heights and
 /// log scales to `fp.txt`, so arms that should match bit for bit are checked, and the values themselves (every

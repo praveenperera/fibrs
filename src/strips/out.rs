@@ -1,6 +1,7 @@
-//! A fibre's outputs as `strips_fast.py` writes them (`AFVJob.write`): the strip as a tifxyz directory
+//! A fibre's outputs as the Python reference runner writes them (`AFVJob.write`): the strip as a tifxyz directory
 //! (`write_surface(..., mmap_layout=True)`: x/y/z/mask TIFFs, meta.json with its area), trace.json,
-//! expected_error.tif, the index line, and optionally Check A's npz; and the run's run.json
+//! expected_error.tif, the index line, and optionally a per-fibre npz of every decision's raw results; and the
+//! run's run.json
 //!
 //! TIFFs are byte for byte what vc_reader's libtiff writer gives for uncompressed strips; JSON follows Python's
 //! `json.dumps` ([`crate::pyfmt`]). The surface uuid is a fresh uuid4 unless the directory already has one, as
@@ -173,7 +174,7 @@ fn mean_expected(strip: &Strip, (flip_rows, flip_cols): (bool, bool)) -> f64 {
 pub struct Settings {
     /// OUT: strips go to OUT/strips/BUCKET/fiber_ID; None writes no strips (`--no-write`)
     pub out: Option<PathBuf>,
-    /// Check A npz directory (`--npz`)
+    /// Per-fibre npz directory (`--npz`)
     pub npz: Option<PathBuf>,
     /// The checkpoint source and its training step, as trace.json records them
     pub checkpoint: String,
@@ -219,7 +220,8 @@ impl Record {
         }
     }
 
-    /// The index line `strips_fast.py` writes (no newline): `seconds` rounded to 3 decimals, `runner` the run's tag
+    /// The index line the Python reference runner writes (no newline): `seconds` rounded to 3 decimals, `runner`
+    /// the run's tag
     pub fn line(&self, seconds: f64, runner: &str) -> String {
         let mut m = Map::new();
         m.insert("fiber".into(), json!(self.fiber));
@@ -388,7 +390,7 @@ impl Settings {
         write_atomic(&dir.join("expected_error.tif"), &tiff_bytes(&expected, d.rows, d.cols, Sample::F32))
     }
 
-    /// Check A's npz (`AFVJob.write_npz`): the stitched strip untransposed and every decision's raw results
+    /// The per-fibre npz (`AFVJob.write_npz`): the stitched strip untransposed and every decision's raw results
     #[allow(clippy::too_many_arguments)]
     fn write_npz(
         &self,
@@ -544,8 +546,8 @@ impl Npz {
     }
 }
 
-/// run.json (`strips_fast.py`, shard 0): the fields in the runner's order, then `provenance` over them, then the
-/// runner tag; `json.dumps(..., indent=1)` and a newline
+/// run.json (as the Python reference runner writes it, shard 0): the fields in the runner's order, then
+/// `provenance` over them, then the runner tag; `json.dumps(..., indent=1)` and a newline
 pub fn run_json(fields: &Map<String, Value>, provenance: &Map<String, Value>, runner: &str) -> String {
     let mut m = fields.clone();
     for (k, v) in provenance {

@@ -69,7 +69,7 @@ pub struct Args {
     /// Strips are written under OUT/strips, as the runner writes them
     #[arg(long)]
     out: PathBuf,
-    /// Also write Check A's npz (the runner writes none in production)
+    /// Also write the per-fibre npz (the runner writes none in production)
     #[arg(long)]
     npz: bool,
     /// Pool sizes, comma-separated

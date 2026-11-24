@@ -1,7 +1,7 @@
 //! NumPy's arithmetic as villa's strip geometry runs it, on xyz points
 //!
 //! Each helper reproduces the operation order NumPy uses on this platform, measured against NumPy 2.4 with its
-//! bundled OpenBLAS (`ops/vesuvius/strips-native`'s probes): 1-D dots, `norm` and `sum(-1)` add left to right;
+//! bundled OpenBLAS: 1-D dots, `norm` and `sum(-1)` add left to right;
 //! `(K, 3) @ (3, 3)` products for K >= 2 go through `dgemm` and accumulate with fused multiply-adds, a single row
 //! through `dgemv` adds left to right; `einsum('ij,ij->i')` adds `(x0 x0 + x2 x2) + x1 x1`. NumPy's 3x3
 //! matrix-vector product and its 13-term vector-matrix products in `dgemv` mix both and are matched to the last bit
