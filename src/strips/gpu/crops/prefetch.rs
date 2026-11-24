@@ -11,24 +11,48 @@ use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use color_eyre::eyre::{Result, eyre};
-use cudarc::driver::CudaContext;
+use cudarc::driver::sys::{CUevent, CUresult};
+use cudarc::driver::{CudaContext, DriverError, result};
 
 use super::{CHUNK_BYTES, Pinned};
 use crate::strips::ct::Volume;
 
-/// A pinned buffer's address, handed to the reader that owns the buffer until it reports back
-struct BufPtr(*mut u8);
+/// A pinned buffer's address and the event of its last queued upload, handed to the reader that owns the buffer
+/// until it reports back
+struct BufRef {
+    ptr: *mut u8,
+    done: CUevent,
+}
 
-// SAFETY: a buffer is reached by one side at a time: the reader from the job's send until its result is received
-unsafe impl Send for BufPtr {}
+// SAFETY: a buffer is reached by one side at a time: the reader from the job's send until its result is received;
+// the event outlives the reader's use of it (the prefetcher waits for every read before freeing its buffers) and is
+// not recorded again until the buffer comes back
+unsafe impl Send for BufRef {}
+
+impl BufRef {
+    /// Waits for the buffer's last upload: it can still be queued behind the copy stream's wait on the previous
+    /// launch's crops, and a reader waiting here keeps that wait off the engine thread. Polls with short sleeps,
+    /// since a default event's synchronize spins a core
+    fn idle(&self) -> Result<(), DriverError> {
+        loop {
+            // SAFETY: a live event, see the Send impl
+            match unsafe { result::event::query(self.done) } {
+                Ok(()) => return Ok(()),
+                Err(DriverError(CUresult::CUDA_ERROR_NOT_READY)) => std::thread::sleep(Duration::from_micros(20)),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
 
 /// One chunk to read: chunk-grid zyx `c` into buffer `buf`
 struct Job {
     buf: usize,
     c: [usize; 3],
-    ptr: BufPtr,
+    to: BufRef,
 }
 
 /// A finished read: whether the source holds the chunk, or the read's error
@@ -66,13 +90,18 @@ impl Prefetcher {
         let queue = Arc::new(Mutex::new(queue));
         let readers = (0..readers)
             .map(|_| {
-                let (queue, done, vol) = (queue.clone(), done.clone(), vol.clone());
+                let (queue, done, vol, ctx) = (queue.clone(), done.clone(), vol.clone(), ctx.clone());
                 std::thread::spawn(move || {
+                    let bound = ctx.bind_to_thread().map_err(|e| format!("bind the CUDA context: {e:?}"));
                     // a closed queue (the prefetcher dropped) ends the reader
                     while let Ok(job) = queue.lock().map_err(drop).and_then(|q| q.recv().map_err(drop)) {
-                        // SAFETY: the buffer is CHUNK_BYTES long and this reader's until its result is received
-                        let buf = unsafe { std::slice::from_raw_parts_mut(job.ptr.0, CHUNK_BYTES) };
-                        let result = vol.read_chunk(job.c, buf).map_err(|e| format!("{e:#}"));
+                        let result = bound.clone().and_then(|()| {
+                            job.to.idle().map_err(|e| format!("wait for the buffer's last upload: {e:?}"))?;
+                            // SAFETY: the buffer is CHUNK_BYTES long, idle, and this reader's until its result is
+                            // received
+                            let buf = unsafe { std::slice::from_raw_parts_mut(job.to.ptr, CHUNK_BYTES) };
+                            vol.read_chunk(job.c, buf).map_err(|e| format!("{e:#}"))
+                        });
                         if done.send(Done { buf: job.buf, result }).is_err() {
                             return;
                         }
@@ -105,10 +134,10 @@ impl Prefetcher {
             let Some(buf) = self.claim() else {
                 break;
             };
-            // waits for the upload last queued from this buffer
-            let ptr = BufPtr(self.bufs[buf].slice_mut()?.as_mut_ptr());
+            // the reader, not this thread, waits for the upload last queued from this buffer
+            let to = BufRef { ptr: self.bufs[buf].ptr, done: self.bufs[buf].done.cu_event() };
             let jobs = self.jobs.as_ref().ok_or_else(|| eyre!("the chunk readers have stopped"))?;
-            jobs.send(Job { buf, c, ptr }).map_err(|_| eyre!("the chunk readers have stopped"))?;
+            jobs.send(Job { buf, c, to }).map_err(|_| eyre!("the chunk readers have stopped"))?;
             self.state[buf] = State::Reading { idx, generation: self.generation };
             self.held.insert(idx, buf);
         }

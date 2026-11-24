@@ -214,7 +214,8 @@ pub fn run(args: &Args) -> Result<()> {
                "dps": round2(decisions as f64 / wall.max(1e-9)), "gpu_busy_s": round2(counts.busy),
                "frame_launches": counts.frame_launches, "strip_launches": counts.strip_launches,
                "chunks": {"needed": counts.cache.needed, "uploads": counts.cache.uploads, "fills": counts.cache.fills,
-                          "evictions": counts.cache.evictions, "most_per_launch": counts.cache.most}})
+                          "evictions": counts.cache.evictions, "most_per_launch": counts.cache.most,
+                          "prefetched": counts.cache.prefetched}})
     );
     Ok(())
 }
