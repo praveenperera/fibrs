@@ -17,7 +17,7 @@ use super::gpu::cnn::CropCnn;
 use super::gpu::head::Head;
 use super::gpu::{Device, Weights};
 use super::refset::{CELLS_LEN, CROP_LEN, GRID_LEN, RefSet, Spread, spread};
-use super::types::StripRequest;
+use super::types::{STRIP_COLS, StripRequest};
 
 /// The parity bar against PyTorch's float32 forward, from PyTorch's own bf16-vs-fp32 spread on the reference
 /// (heights mean 0.0104, p99 0.059; log scales mean 0.0035, p99 0.013) with ~15% headroom
@@ -33,6 +33,30 @@ impl Bar {
     fn passes(&self, s: &Spread) -> bool {
         s.mean <= self.mean && s.p99 <= self.p99
     }
+}
+
+/// The most the heights may tilt across the strip's columns against stock: the least-squares slope of the per-column
+/// mean signed difference, times the strip's width. PyTorch b64 against stock tilts about 3e-4 on the reference; a
+/// CNN convention bug that failed the end-to-end gate (Q1) tilted 5e-3 while every spread bar passed
+const TILT_BAR: f64 = 1.5e-3;
+
+/// The tilt of `ours - theirs` (row-major `[n, rows, cols]` grids) across the columns: the least-squares slope of the
+/// per-column mean difference, times `cols - 1`
+fn column_tilt(ours: &[f32], theirs: &[f32]) -> f64 {
+    let mut sums = [0f64; STRIP_COLS];
+    for (k, (a, b)) in ours.iter().zip(theirs).enumerate() {
+        sums[k % STRIP_COLS] += f64::from(a - b);
+    }
+
+    let n = (ours.len() / STRIP_COLS) as f64;
+    let centre = (STRIP_COLS - 1) as f64 / 2.0;
+    let (mut num, mut den) = (0.0, 0.0);
+    for (c, sum) in sums.iter().enumerate() {
+        let x = c as f64 - centre;
+        num += x * sum / n;
+        den += x * x;
+    }
+    num / den * (STRIP_COLS - 1) as f64
 }
 
 /// Times the native strip model and checks it against PyTorch's reference
@@ -170,6 +194,13 @@ pub fn run(args: &Args) -> Result<()> {
             parity.insert(format!("{field}_vs_{variant}"), s.json());
         }
     }
+    // a signed check the spreads cannot make: no tilt across the strip against stock
+    let tilt = column_tilt(&h1, refs.output("stock.h1")?);
+    if tilt.abs() > TILT_BAR {
+        failed.push(format!("h1 tilts {tilt:+.2e} across the columns vs stock (bar {TILT_BAR:.1e})"));
+    }
+    parity.insert("h1_column_tilt_vs_stock".into(), Value::from(tilt));
+
     println!("{}", Value::from(parity.clone()));
     report["parity"] = Value::from(parity);
     report["parity_pass"] = Value::from(failed.is_empty());
@@ -189,4 +220,28 @@ fn bf16(bits: u16) -> f32 {
 fn loadavg() -> Value {
     let text = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
     Value::from(text.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A difference rising 1e-4 per column tilts 24e-4 across the 25 columns; a constant offset or a symmetric bow
+    /// tilts nothing
+    #[test]
+    fn column_tilt_reads_the_linear_part_across_columns() {
+        let theirs = vec![0.5f32; 3 * STRIP_COLS];
+        let shifted = |f: &dyn Fn(f64) -> f64| -> Vec<f32> {
+            theirs.iter().enumerate().map(|(k, t)| t + f((k % STRIP_COLS) as f64) as f32).collect()
+        };
+
+        let rising = shifted(&|c| 1e-4 * c);
+        assert!((column_tilt(&rising, &theirs) - 24e-4).abs() < 1e-7);
+
+        let offset = shifted(&|_| 3e-3);
+        assert!(column_tilt(&offset, &theirs).abs() < 1e-7);
+
+        let bow = shifted(&|c| 1e-5 * (c - 12.0).powi(2));
+        assert!(column_tilt(&bow, &theirs).abs() < 1e-7);
+    }
 }
