@@ -210,6 +210,16 @@ pub fn run(args: &Args) -> Result<()> {
     let vol = Arc::new(Volume::open(&args.cache_dir, &args.ct, args.ct_level)?);
     let chosen = choose(args, k, n)?;
     let fields = run_fields(args, n, &tag, &inputs);
+    // an OUT begun with other settings refuses here, before the GPU cache's allocation can fail on a busy GPU and
+    // hide why; this only reads, and the claim after startup checks again
+    if args
+        .out
+        .join("run.json")
+        .try_exists()
+        .wrap_err_with(|| format!("look for run.json in {}", args.out.display()))?
+    {
+        check_resume(&args.out, &tag, &fields)?;
+    }
 
     let geometry = Geometry { ct: &vol, input_scale, trace_per_patch: TRACE_PER_PATCH, umbilicus: &inputs.umbilicus };
     let settings = Settings {
@@ -426,7 +436,7 @@ fn whole_lines(mut text: String) -> String {
 /// Refuses an OUT begun under another runner tag (one scroll, one runner) or with other output-affecting settings
 fn check_resume(out: &Path, tag: &str, fields: &Map<String, Value>) -> Result<()> {
     let path = out.join("run.json");
-    // called once linking run.json found it present, so a file that can't be read is an error, never a pass
+    // called once run.json is known to be present, so a file that can't be read is an error, never a pass
     let text = fs::read_to_string(&path).wrap_err_with(|| format!("read {}", path.display()))?;
     let previous: Value = serde_json::from_str(&text).wrap_err_with(|| format!("parse {}", path.display()))?;
     if let Some(p) = previous.get("runner").and_then(Value::as_str)
@@ -812,8 +822,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A run whose startup fails on the GPU (an export without a frame-model tensor) leaves OUT without run.json,
-    /// so the run with the right weights then starts in the same OUT and finishes
+    /// A run whose startup fails on the GPU (an export without a frame-model tensor, or a cache too big to
+    /// allocate) leaves OUT without run.json, so the run with the right weights then starts in the same OUT and
+    /// finishes; a later rerun with other settings is refused for them, not for the GPU failing after
     #[test]
     #[ignore = "needs the GPU, the weights export, the PHerc0211 AFV and umbilicus, and the cached CT"]
     fn startup_failure_leaves_no_run_json() {
@@ -840,27 +851,39 @@ mod tests {
         safetensors::serialize_to_file(kept, header.metadata().clone(), &broken).unwrap();
 
         let run =
-            |weights: &str| {
+            |weights: &str, voxel_size_um: &str, gpu_chunks: &str| {
                 let args = Args::try_parse_from([
                 "run", "--afv", "/shared/allscrolls/publish/hf/PHerc0211/PHerc0211_afv_v2.afv", "--ct",
                 "s3://vesuvius-challenge-open-data/PHerc0211/volumes/20250821151803-9.362um-1.2m-113keV-masked.zarr",
-                "--ct-level", "0", "--ct-grid-scale", "1", "--grid-scale", "2", "--voxel-size-um", "9.362",
+                "--ct-level", "0", "--ct-grid-scale", "1", "--grid-scale", "2", "--voxel-size-um", voxel_size_um,
                 "--umbilicus", &umbilicus, "--cache-dir", "/build/vesuvius/strips-scale/ctcache", "--weights", weights,
                 "--out", out.to_str().unwrap(), "--ids", "5109649", "--workers", "2", "--batch", "8",
+                "--gpu-chunks", gpu_chunks,
             ])
             .unwrap();
                 super::run(&args)
             };
+        // 2^22 chunks of 2 MiB is 8 TiB, more than any GPU holds
+        let too_many = "4194304";
 
-        let err = run(broken.to_str().unwrap()).unwrap_err();
+        let err = run(broken.to_str().unwrap(), "9.362", "4096").unwrap_err();
         assert!(format!("{err:#}").contains("features.0.weight"), "{err:#}");
-        assert!(!out.join("run.json").exists(), "a failed startup claimed run.json");
+        assert!(!out.join("run.json").exists(), "a failed model build claimed run.json");
+        let err = run(&weights, "9.362", too_many).unwrap_err();
+        assert!(format!("{err:#}").contains("GPU engine"), "{err:#}");
+        assert!(!out.join("run.json").exists(), "a failed GPU cache allocation claimed run.json");
 
-        run(&weights).unwrap();
-        let recorded: Value = serde_json::from_str(&fs::read_to_string(out.join("run.json")).unwrap()).unwrap();
+        run(&weights, "9.362", "4096").unwrap();
+        let text = fs::read_to_string(out.join("run.json")).unwrap();
+        let recorded: Value = serde_json::from_str(&text).unwrap();
         let wanted = super::sha256(&bytes);
         assert_eq!(recorded["weights_sha256"].as_str(), Some(wanted.as_str()));
         assert_eq!(indexed(&out.join("index"), 0).unwrap(), [5109649].into_iter().collect());
+
+        // a mismatched rerun names the mismatch, though its GPU cache couldn't be allocated either
+        let err = run(&weights, "9.4", too_many).unwrap_err();
+        assert!(format!("{err:#}").contains("voxel_size_um"), "{err:#}");
+        assert_eq!(fs::read_to_string(out.join("run.json")).unwrap(), text);
         let _ = fs::remove_dir_all(&dir);
     }
 

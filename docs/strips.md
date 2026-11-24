@@ -71,7 +71,8 @@ setting, is refused, so one index never mixes strips made differently. The AFV (
 umbilicus and the weights (by their sha256) count as inputs, so another file under the same name is refused too.
 `run.json` marks a run that got going: a shard claims it only once every input is read and checked and the GPU
 engine is ready, so a run that fails to start leaves none. The first shard to get going writes it, and every other
-shard checks against it.
+shard checks against it. A shard also checks an existing `run.json` before it sets up the GPU, without writing,
+so a mismatch is reported as such even when the GPU is too busy to start.
 
 | Option | Meaning |
 |---|---|
@@ -124,5 +125,7 @@ rerun takes up the deferred fibres.
   weights hashes), so resuming it checks only the settings it does record.
 - Shards started with different shard counts on one OUT at the same time (`--shard 0 2` beside `--shard 1 3`) can
   each make the same fibre. Re-sharding a stopped run is fine: a resume skips every fibre in any shard's index.
-- Every shard of a run must get the same `--ids` and ids files, in the same order: shards split the list by
-  position, so `--ids 1 2 --shard 0 2` beside `--ids 2 1 --shard 1 2` would both make fibre 1.
+- Every shard of a run must get the same `--ids` and ids files, in the same order, and the same
+  `--exclude-ids-file` files and `--min-length-mm`: shards split the fibre list by position, so
+  `--ids 1 2 --shard 0 2` beside `--ids 2 1 --shard 1 2` would both make fibre 1, and another exclusion or
+  threshold shifts the list one shard splits.
