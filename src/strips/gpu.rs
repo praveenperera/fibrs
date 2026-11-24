@@ -4,6 +4,8 @@
 //! Stages live in submodules: `crops` (the CT device cache, the strip and frame crops, the tube), `frame` (the
 //! frame model), `cnn` (the crop CNN), `head` (cell tokens, transformer and strip heads)
 
+pub mod cnn;
+
 use std::collections::HashMap;
 use std::path::Path;
 
