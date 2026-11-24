@@ -8,6 +8,7 @@
 //! bf16 or fp32 and writes fp32; the context and first strip pass keep a bf16 residual stream, the refinement pass
 //! an fp32 one; feature sampling runs in fp32 on the bf16 cells
 
+mod gather;
 mod layout;
 #[cfg(test)]
 mod tests;
@@ -52,6 +53,8 @@ const K_QUERY: usize = 128;
 const K_ORIENT: usize = 64;
 const K_REFINE: usize = 192;
 const K_PROFILE: usize = 128;
+/// Decisions per warp of `sm_cell_tokens` (`strips-kernels` `head::tokens::CELL_DECISIONS`)
+const CELL_DECISIONS: u32 = 4;
 /// Epilogue activations and token modes of `sm_linear` and `sm_linear_tok`
 const ACT_NONE: u32 = 0;
 const ACT_GELU: u32 = 1;
@@ -132,11 +135,11 @@ struct Params {
 
 /// The fixed sampling tables
 struct Tables {
-    /// Per cell-token point: first sub-point, sub-point count, token, point within the token
+    /// The cell tokens' sampling operator (`gather.rs`): per point its entries, output slot and support
     points: Buf,
     npoints: usize,
-    /// Sub-points, crop-local xyz
-    subs: Buf,
+    /// Per operator entry: lattice cell, weight (f32 bits)
+    entries: Buf,
     /// Strip anchors `[450, 3]`
     anchors: Buf,
     /// Strip columns v (25), rows f (36), profile offsets (25)
@@ -283,12 +286,7 @@ impl Head {
         };
 
         let cells = layout::cells();
-        let mut points = Vec::with_capacity(cells.points.len() * 4);
-        let mut subs: Vec<f32> = Vec::new();
-        for pt in &cells.points {
-            points.extend([(subs.len() / 3) as u32, pt.subs.len() as u32, pt.token, pt.index]);
-            subs.extend(pt.subs.iter().flatten());
-        }
+        let op = gather::gather(&cells);
         let strip = layout::strip();
         let grid: Vec<f32> = strip.v.iter().chain(&strip.f).chain(&strip.offsets).copied().collect();
         ensure!(grid.len() == 86 && strip.anchors.len() == STRIPS, "the strip grid's shape");
@@ -296,9 +294,9 @@ impl Head {
         keymask[..CELLS].fill(1);
         keymask[CONTEXT..CONTEXT + STRIPS].fill(1);
         let tables = Tables {
-            points: dev.gpu.upload(&points)?,
-            npoints: cells.points.len(),
-            subs: dev.gpu.upload(&subs)?,
+            points: dev.gpu.upload(op.points.as_flattened())?,
+            npoints: op.points.len(),
+            entries: dev.gpu.upload(op.entries.as_flattened())?,
             anchors: dev.gpu.upload(&strip.anchors.concat())?,
             grid: dev.gpu.upload(&grid)?,
         };
@@ -401,7 +399,7 @@ impl Head {
         k.launch(
             &dev.gpu,
             "sm_cell_tokens",
-            warps(t.npoints),
+            (t.npoints.div_ceil(4) as u32, bu.div_ceil(CELL_DECISIONS), 1),
             (128, 1, 1),
             0,
             &[
@@ -409,8 +407,9 @@ impl Head {
                 x.xt.arg::<u16>(),
                 cells.arg::<u32>(),
                 t.points.arg::<u32>(),
-                t.subs.arg::<f32>(),
+                t.entries.arg::<u32>(),
                 Arg::U32(t.npoints as u32),
+                Arg::U32(bu),
             ],
         )?;
         let inv_log2049 = 1.0f32 / (2049f64.ln() as f32);
