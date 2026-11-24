@@ -67,7 +67,9 @@ fibrs strips run \
 The run selects every fibre of at least `--min-length-mm` (default 2.5) in Morton order, and resumes from the
 index: run it again with the same `--out` and it takes up the fibres not yet written. An `--out` begun under
 another runner tag (the `runner` field of `--provenance`), or with a different AFV, CT, checkpoint or decision
-setting, is refused, so one index never mixes strips made differently.
+setting, is refused, so one index never mixes strips made differently. The AFV (by its uuid and size), the
+umbilicus and the weights (by their sha256) count as inputs, so another file under the same name is refused too.
+The first shard to start writes `run.json`, and every other shard checks against it.
 
 | Option | Meaning |
 |---|---|
@@ -97,9 +99,9 @@ rerun takes up the deferred fibres.
 
 ## Requirements
 
-- Linux x86-64 (Windows builds, but hasn't been run on a GPU)
+- Linux x86-64: `fibrs strips` is built only there
 - NVIDIA GPU, compute capability 8.0+
-- CUDA 12+ driver, cuDNN 9
+- CUDA 12+ driver, cuDNN 9 and cuBLAS, which volkit loads at run time
 - the weights export and a CT disk cache, below
 
 ## Known limits
@@ -111,3 +113,8 @@ rerun takes up the deferred fibres.
 - The runner supports this one checkpoint, and refuses weights exported from any other.
 - One GPU per process. Use `--shard` to split a scroll across GPUs.
 - It has only been run on an RTX 5090. Other compute-capability 8.0+ GPUs should work but are untested.
+- The CPU side maps each CT chunk it reads for the seed headings, one mapping per chunk, and keeps them for the
+  run. Whole scrolls have finished with `vm.max_map_count` at 1,048,576; Linux's default of 65,530 may be too low
+  for a whole scroll.
+- The trace grid must be two CT voxels per trace voxel (`--grid-scale` twice `--ct-grid-scale`), as every scroll's
+  AFV is traced, and `--step` a multiple of the strip's row spacing of 2.

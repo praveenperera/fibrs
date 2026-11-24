@@ -64,6 +64,15 @@ impl Afv {
         Ok(Self { db })
     }
 
+    /// The fibre set's uuid, from its metadata (`uuid`, stored as JSON text)
+    pub fn uuid(&self) -> Result<String> {
+        let text: String = self
+            .db
+            .query_row("select value from metadata where key = 'uuid'", [], |r| r.get(0))
+            .wrap_err("the AFV metadata has no uuid")?;
+        serde_json::from_str(&text).wrap_err_with(|| format!("the AFV uuid {text}"))
+    }
+
     fn rows(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<FibreRow>> {
         let mut stmt = self.db.prepare(sql)?;
         let rows = stmt.query_map(params, |r| {
@@ -77,11 +86,15 @@ impl Afv {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The fibres to run, as `select_fibres`: `ids` in their order (an error naming up to 10 missing ids), else
+    /// The fibres to run, as `select_fibres`: `ids` in their order (an error naming up to 10 missing or repeated
+    /// ids, since a repeated id would run its fibre twice and index it twice), else
     /// every fibre longer than `min_length_mm` (AFV lengths are base voxels of `voxel_um`) in Morton order of its
     /// bbox centre, ties by id
     pub fn select(&self, min_length_mm: f64, voxel_um: f64, ids: Option<&[i64]>) -> Result<Vec<FibreRow>> {
         if let Some(ids) = ids {
+            let mut seen = std::collections::HashSet::new();
+            let repeated: Vec<i64> = ids.iter().copied().filter(|i| !seen.insert(*i)).take(10).collect();
+            ensure!(repeated.is_empty(), "fibre ids given more than once: {repeated:?}");
             let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
             let found = self.rows(&format!("select {COLUMNS} from fibers where id in ({list})"), [])?;
             let by_id: std::collections::HashMap<i64, FibreRow> = found.into_iter().map(|r| (r.id, r)).collect();

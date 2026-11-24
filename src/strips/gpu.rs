@@ -16,6 +16,7 @@ use std::path::Path;
 
 use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
 use cudakit::PtxTier;
+use sha2::{Digest, Sha256};
 use volkit::dnn::Dnn;
 use volkit::gpu::{Gpu, Module};
 
@@ -54,6 +55,8 @@ pub struct Tensor {
 /// `strip.`, the frame model's under `frame.`, and the sources' hashes and configs as metadata
 pub struct Weights {
     tensors: HashMap<String, Tensor>,
+    /// The sha256 of the export file
+    pub sha256: String,
     /// The export's metadata: `source`, `strip_sha256`, `frame_sha256`, `strip_cfg`, `frame_cfg`, `sample_cfg`,
     /// `vol_spec`
     pub metadata: HashMap<String, String>,
@@ -84,7 +87,8 @@ impl Weights {
             let values = view.data().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
             tensors.insert(name, Tensor { shape: view.shape().to_vec(), values });
         }
-        Ok(Self { tensors, metadata })
+        let sha256 = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        Ok(Self { tensors, sha256, metadata })
     }
 
     /// Tensor `name`, checked to have `shape`

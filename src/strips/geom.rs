@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use color_eyre::eyre::{Result, WrapErr, eyre};
+use color_eyre::eyre::{Result, WrapErr, ensure, eyre};
 
 use super::ct::Volume;
 use super::fibre::{Fibre, family_of};
@@ -72,6 +72,7 @@ impl Umbilicus {
             serde_json::from_slice(&std::fs::read(path).wrap_err_with(|| format!("read {}", path.display()))?)
                 .wrap_err_with(|| format!("parse {}", path.display()))?;
         let pts = doc["control_points"].as_array().ok_or_else(|| eyre!("{}: no control_points", path.display()))?;
+        ensure!(!pts.is_empty(), "{}: control_points is empty", path.display());
         let mut p: Vec<V3> = pts
             .iter()
             .map(|c| {
