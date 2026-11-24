@@ -730,6 +730,9 @@ fn swz<const CH: u32>(px: u32, k: u32) -> u32 {
     if CH == 2 { px * 2 + (k ^ ((px >> 2) & 1)) } else { px * CH + k }
 }
 
+/// Halo items each [`conv3`] thread loads before transforming any (its loads in flight at once)
+const STAGE_LOADS: usize = 4;
+
 /// The implicit-GEMM 3x3x3 conv ("same" padding, stride `S`) of every `sn_conv_*` kernel: bf16 channels-last in,
 /// float32 accumulation on the tensor cores (`mma.m16n8k16`), bf16 out with its InstanceNorm partials
 ///
@@ -856,52 +859,85 @@ unsafe fn conv3<
         sync_threads();
     }
 
-    // stage the halo, one 4-channel quad per item: `2 CH` quads per voxel, those past `CQ` zero
+    // stage the halo, one 4-channel quad per item: `2 CH` quads per voxel, those past `CQ` zero. Each thread issues
+    // the global loads of `STAGE_LOADS` items before transforming and storing any of them, so that many loads are in
+    // flight at once: one item at a time left the staging bound by load latency (long scoreboard stalls, a third of
+    // the DRAM rate in the stride-2 conv)
     let qpp = 2 * CH;
+    let total = hpx * qpp;
     let (iz0, iy0, ix0) = ((z0 * S) as i32 - 1, (y0 * S) as i32 - 1, (x0 * S) as i32 - 1);
-    let mut u = tid;
-    while u < hpx * qpp {
-        let (px, q) = (u / qpp, u % qpp);
-        let (hz, r) = (px / (hh * hw), px % (hh * hw));
-        let (hy, hx) = (r / hw, r % hw);
-        let (iz, iy, ix) = (iz0 + hz as i32, iy0 + hy as i32, ix0 + hx as i32);
-        let inside = (q < CQ) & (iz >= 0) & (iz < d as i32) & (iy >= 0) & (iy < h as i32) & (ix >= 0) & (ix < w as i32);
-        let mut v = U32x2([0, 0]);
-        if inside {
-            let o = (((b * d + iz as u32) * h + iy as u32) * w + ix as u32) * CQ + q;
-            // SAFETY: inside the sample, inside `x` by the check above
-            let [p0, p1] = unsafe { *x.get_unchecked(o as usize) }.0;
-            v = U32x2([p0, p1]);
-            if PRO == 1 {
-                let c = 4 * q;
-                // SAFETY: c + 3 < cin
-                let f = |val: f32, k: u32| {
-                    let [m, is, g, bt] = unsafe { *par.add((c + k) as usize) };
-                    leaky(affine(val, [m, is], g, bt))
-                };
-                v = U32x2([pack(f(lo(p0), 0), f(hi(p0), 1)), pack(f(lo(p1), 2), f(hi(p1), 3))]);
-            }
-            if PRO == 2 {
-                let c = 4 * q;
-                // SAFETY: the voxel is inside the sample, so inside `p` by the check above
-                let pp = unsafe {
-                    *p.get_unchecked(((b * d + iz as u32) * h + iy as u32) as usize * w as usize + ix as usize)
-                };
-                let (i0, i1) = (lo(pp), hi(pp));
-                // SAFETY: c + 3 < cin
-                let f = |val: f32, k: u32| {
-                    let ([m, is, g, bt], [sm, sis, sg, sbt], [w0, w1, _, _]) = unsafe {
-                        (*par.add((c + k) as usize), *skpar.add((c + k) as usize), *wpar.add((c + k) as usize))
+    let mut base = tid;
+    while base < total {
+        let mut raw = [[0u32; 2]; STAGE_LOADS];
+        let mut pin = [0u32; STAGE_LOADS];
+        let mut ins = [false; STAGE_LOADS];
+        let mut k = 0;
+        while k < STAGE_LOADS {
+            __unroll_config::<0>();
+            let u = base + k as u32 * threads;
+            let (px, q) = (u / qpp, u % qpp);
+            let (hz, r) = (px / (hh * hw), px % (hh * hw));
+            let (hy, hx) = (r / hw, r % hw);
+            let (iz, iy, ix) = (iz0 + hz as i32, iy0 + hy as i32, ix0 + hx as i32);
+            let inside = (u < total)
+                & (q < CQ)
+                & (iz >= 0)
+                & (iz < d as i32)
+                & (iy >= 0)
+                & (iy < h as i32)
+                & (ix >= 0)
+                & (ix < w as i32);
+            if inside {
+                let o = (((b * d + iz as u32) * h + iy as u32) * w + ix as u32) * CQ + q;
+                // SAFETY: inside the sample, inside `x` by the check above
+                raw[k] = unsafe { *x.get_unchecked(o as usize) }.0;
+                if PRO == 2 {
+                    // SAFETY: the voxel is inside the sample, so inside `p` by the check above
+                    pin[k] = unsafe {
+                        *p.get_unchecked(((b * d + iz as u32) * h + iy as u32) as usize * w as usize + ix as usize)
                     };
-                    let sk = rbf(w1 * i1 + w0 * i0);
-                    leaky(rbf(affine(val, [m, is], g, bt) + affine(sk, [sm, sis], sg, sbt)))
-                };
-                v = U32x2([pack(f(lo(p0), 0), f(hi(p0), 1)), pack(f(lo(p1), 2), f(hi(p1), 3))]);
+                }
             }
+            ins[k] = inside;
+            k += 1;
         }
-        // SAFETY: px < hpx and the chunk index stays inside the pixel's CH chunks
-        unsafe { *(halo.add(swz::<CH>(px, q / 2) as usize) as *mut U32x2).add((q % 2) as usize) = v };
-        u += threads;
+
+        let mut k = 0;
+        while k < STAGE_LOADS {
+            __unroll_config::<0>();
+            let u = base + k as u32 * threads;
+            if u < total {
+                let (px, q) = (u / qpp, u % qpp);
+                let [p0, p1] = raw[k];
+                let mut v = U32x2([p0, p1]);
+                if ins[k] & (PRO == 1) {
+                    let c = 4 * q;
+                    // SAFETY: c + 3 < cin
+                    let f = |val: f32, j: u32| {
+                        let [m, is, g, bt] = unsafe { *par.add((c + j) as usize) };
+                        leaky(affine(val, [m, is], g, bt))
+                    };
+                    v = U32x2([pack(f(lo(p0), 0), f(hi(p0), 1)), pack(f(lo(p1), 2), f(hi(p1), 3))]);
+                }
+                if ins[k] & (PRO == 2) {
+                    let c = 4 * q;
+                    let (i0, i1) = (lo(pin[k]), hi(pin[k]));
+                    // SAFETY: c + 3 < cin
+                    let f = |val: f32, j: u32| {
+                        let ([m, is, g, bt], [sm, sis, sg, sbt], [w0, w1, _, _]) = unsafe {
+                            (*par.add((c + j) as usize), *skpar.add((c + j) as usize), *wpar.add((c + j) as usize))
+                        };
+                        let sk = rbf(w1 * i1 + w0 * i0);
+                        leaky(rbf(affine(val, [m, is], g, bt) + affine(sk, [sm, sis], sg, sbt)))
+                    };
+                    v = U32x2([pack(f(lo(p0), 0), f(hi(p0), 1)), pack(f(lo(p1), 2), f(hi(p1), 3))]);
+                }
+                // SAFETY: px < hpx and the chunk index stays inside the pixel's CH chunks
+                unsafe { *(halo.add(swz::<CH>(px, q / 2) as usize) as *mut U32x2).add((q % 2) as usize) = v };
+            }
+            k += 1;
+        }
+        base += STAGE_LOADS as u32 * threads;
     }
     sync_threads();
 
