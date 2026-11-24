@@ -9,6 +9,7 @@
 
 mod bench_model;
 pub mod ct;
+pub mod engine;
 pub mod gpu;
 pub mod refset;
 pub mod types;

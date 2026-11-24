@@ -25,13 +25,16 @@ pub const CELLS_LEN: usize = 36 * 32 * 32 * 64;
 /// Grid points per decision output
 pub const GRID_LEN: usize = STRIP_ROWS * STRIP_COLS;
 
+/// A tensor of a safetensors file: its shape and its values as float32
+type Tensor = (Vec<usize>, Vec<f32>);
+
 /// A reference directory, memory-mapped
 pub struct RefSet {
     /// Decisions
     pub n: usize,
     crop: Mmap,
     cells: Mmap,
-    records: HashMap<String, (Vec<usize>, Vec<f32>)>,
+    records: HashMap<String, Tensor>,
     outputs: HashMap<String, Vec<f32>>,
 }
 
@@ -164,7 +167,7 @@ fn cast<T: Copy>(bytes: &[u8]) -> &[T] {
 }
 
 /// Every tensor of a safetensors file as float32 (booleans and bytes widened), with its shape
-fn read_f32_tensors(path: &Path) -> Result<HashMap<String, (Vec<usize>, Vec<f32>)>> {
+fn read_f32_tensors(path: &Path) -> Result<HashMap<String, Tensor>> {
     let bytes = fs::read(path).wrap_err_with(|| format!("read {}", path.display()))?;
     let st = safetensors::SafeTensors::deserialize(&bytes).wrap_err_with(|| format!("parse {}", path.display()))?;
     st.tensors()
