@@ -83,7 +83,8 @@ run's `summary-*.json` lists the libraries it loaded.
 
 - Very tall bands may not fit in GPU memory. fibrs checks before starting and suggests a smaller `--column`.
 - Output can differ slightly between GPU models and cuDNN versions, and between a Mac and an NVIDIA GPU.
-- On a Mac, the GPU shares the system's memory: a column has to fit in the share macOS gives the GPU, which fibrs
-  checks before starting.
+- On a Mac, the GPU shares the system's memory: a column has to fit in the share macOS gives the GPU, and its
+  largest buffer has to fit in Metal's per-buffer limit. fibrs checks both before starting and suggests a `--column`
+  that fits.
 
 Speed and accuracy against villa: [benchmarks](benchmarks.md#prediction).
