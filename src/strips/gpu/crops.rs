@@ -400,6 +400,17 @@ impl ChunkCache {
             return Err(Uncached(uncached).into());
         }
         let mut updates: Vec<(u32, u32)> = Vec::new();
+        let filled = self.fill(&missing, &mut updates);
+        // the device table takes every change the host table took, even when the fill stopped partway, so the two
+        // never disagree about a slot
+        self.write_entries(&mut updates)?;
+        self.uploaded.record(&self.copy)?;
+        gpu.inner.stream().wait(&self.uploaded)?;
+        filled
+    }
+
+    /// Uploads the chunks `missing` (table indices) into slots, recording each table change in `updates`
+    fn fill(&mut self, missing: &[u32], updates: &mut Vec<(u32, u32)>) -> Result<()> {
         for group in missing.chunks(self.staging.len()) {
             // chunks read ahead come from their prefetch buffers, the rest are read now into staging buffers `0..`;
             // either way the group is uploaded in order, so slots and evictions do not depend on what was read ahead
@@ -421,7 +432,7 @@ impl ChunkCache {
                     self.counts.fills += 1;
                     continue;
                 }
-                let slot = self.take_slot(&mut updates)?;
+                let slot = self.take_slot(updates)?;
                 let buf = match from {
                     Ok(buf) => {
                         self.counts.prefetched += 1;
@@ -437,9 +448,6 @@ impl ChunkCache {
                 self.counts.uploads += 1;
             }
         }
-        self.write_entries(&mut updates)?;
-        self.uploaded.record(&self.copy)?;
-        gpu.inner.stream().wait(&self.uploaded)?;
         Ok(())
     }
 
