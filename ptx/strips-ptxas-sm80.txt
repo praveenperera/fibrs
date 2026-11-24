@@ -54,7 +54,7 @@ ptxas info    : Used 79 registers, used 1 barriers, 588 bytes cmem[0]
 ptxas info    : Compiling entry function 'sn_conv0' for 'sm_80'
 ptxas info    : Function properties for sn_conv0
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 60 registers, used 1 barriers, 27280 bytes smem, 480 bytes cmem[0]
+ptxas info    : Used 61 registers, used 1 barriers, 27280 bytes smem, 480 bytes cmem[0]
 ptxas info    : Compiling entry function 'sn_bias' for 'sm_80'
 ptxas info    : Function properties for sn_bias
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads

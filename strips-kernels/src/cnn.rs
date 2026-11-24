@@ -597,8 +597,10 @@ pub fn sn_conv0(
     };
 
     // stage the 5 x 17 x 33 input halo (zero outside the crop) and the weights; loads first, then stores, so each
-    // thread's eleven loads are in flight together
+    // thread's eleven loads are in flight together. A raw crop's z-score is applied in the store pass: applied
+    // right after each load, it made every load wait for the one before it
     let mut vals = [F32x2([0.0; 2]); 11];
+    let mut ins = [false; 11];
     let mut k = 0;
     while k < 11 {
         __unroll_config::<0>();
@@ -611,12 +613,9 @@ pub fn sn_conv0(
         if inside {
             let o = ((b * D + iz as u32) * H + iy as u32) * W + ix as u32;
             // SAFETY: inside the sample, which the check above puts inside `x`
-            let mut v = unsafe { *x.get_unchecked(o as usize) };
-            if raw {
-                v.0[0] = zscore(v.0[0], st);
-            }
-            vals[k as usize] = v;
+            vals[k as usize] = unsafe { *x.get_unchecked(o as usize) };
         }
+        ins[k as usize] = inside;
         k += 1;
     }
     let mut k = 0;
@@ -624,8 +623,12 @@ pub fn sn_conv0(
         __unroll_config::<0>();
         let u = tid + 256 * k;
         if u < 2805 {
+            let mut v = vals[k as usize];
+            if raw & ins[k as usize] {
+                v.0[0] = zscore(v.0[0], st);
+            }
             // SAFETY: u < 2805, the halo's size
-            unsafe { *halo.add(u as usize) = vals[k as usize] };
+            unsafe { *halo.add(u as usize) = v };
         }
         k += 1;
     }
