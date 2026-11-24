@@ -13,10 +13,10 @@ manifest=ptx/sources.sha256
 crate=fibrs-kernels
 mapfile -t sources < <(find "$crate/src" -name '*.rs' | LC_ALL=C sort)
 files=("${sources[@]}" "$crate/Cargo.toml" "$crate/Cargo.lock" "$crate/rust-toolchain.toml" scripts/build-ptx.sh
-  ptx/tools.txt ptx/*.ptx ptx/ptxas-*.txt)
+  ptx/tools.txt ptx/fibrs.*.ptx ptx/ptxas-*.txt)
 
 # the PTX files on disk are exactly the tiers src/gpu/cuda.rs embeds
-if ! diff <(printf '%s\n' ptx/*.ptx | LC_ALL=C sort) \
+if ! diff <(printf '%s\n' ptx/fibrs.*.ptx | LC_ALL=C sort) \
   <(grep -o 'include_str!("\.\./\.\./ptx/[^"]*")' src/gpu/cuda.rs | sed 's|include_str!("\.\./\.\./\(.*\)")|\1|' | LC_ALL=C sort); then
   echo "ptx/*.ptx and the PTX src/gpu/cuda.rs embeds differ" >&2
   exit 1

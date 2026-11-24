@@ -381,6 +381,7 @@ dependencies = [
  "blosc-src",
  "clap",
  "color-eyre",
+ "cudakit",
  "cudarc",
  "flate2",
  "getrandom",
@@ -393,6 +394,7 @@ dependencies = [
  "mimalloc",
  "rayon",
  "rusqlite",
+ "safetensors",
  "serde_json",
  "sha2",
  "volkit",
@@ -1070,7 +1072,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "volkit"
 version = "0.2.0"
-source = "git+https://github.com/praveenperera/volkit?rev=ceac04419e017b793f9b606f5069b94041d7a192#ceac04419e017b793f9b606f5069b94041d7a192"
+source = "git+https://github.com/praveenperera/volkit?rev=5ab3cedaba06730dd37bf85071e3c99a662a71a9#5ab3cedaba06730dd37bf85071e3c99a662a71a9"
 dependencies = [
  "bytemuck",
  "color-eyre",

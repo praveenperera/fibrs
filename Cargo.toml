@@ -75,6 +75,10 @@ volkit = "0.2.0"
 # the free device memory for the column check, from the cudarc volkit already brings into the tree
 [target.'cfg(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64"))'.dependencies]
 cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12040"] }
+# `fibrs strips`: the PTX tier type volkit's module loader takes, and the checkpoint's exported weights; the
+# versions volkit already brings into the tree
+cudakit = { version = "0.1", features = ["libraries"] }
+safetensors = "0.6"
 
 # Windows' memory, module-list and loader calls: the brick store's pages, the predictor's record of the cuDNN and
 # cuBLAS DLLs it loaded; the version volkit already brings into the tree
@@ -98,7 +102,7 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 debug = 1
 codegen-units = 4
 
-# the Metal backend needs volkit 0.2.0 (praveenperera/volkit, branch metal), which is not released yet; replace with
-# the release before publishing
+# the Metal backend needs volkit 0.2.0 (praveenperera/volkit master), which is not released yet; replace with the
+# release before publishing
 [patch.crates-io]
-volkit = { git = "https://github.com/praveenperera/volkit", rev = "ceac04419e017b793f9b606f5069b94041d7a192" }
+volkit = { git = "https://github.com/praveenperera/volkit", rev = "5ab3cedaba06730dd37bf85071e3c99a662a71a9" }

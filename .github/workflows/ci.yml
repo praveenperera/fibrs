@@ -62,6 +62,10 @@ jobs:
         if: runner.os == 'Linux'
         run: scripts/check-ptx.sh
 
+      - name: Strips PTX matches its sources
+        if: runner.os == 'Linux'
+        run: scripts/check-strips-ptx.sh
+
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 

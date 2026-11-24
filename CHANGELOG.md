@@ -3,7 +3,8 @@
 ## [0.6.0] - Unreleased
 
 fibrs 0.6.0 runs `fibrs predict` on Apple silicon Macs, on the GPU through volkit 0.2.0's Metal backend, with no
-PyTorch and nothing else to install.
+PyTorch and nothing else to install, and adds `fibrs strips`, villa's sheet-strip inference run natively on NVIDIA
+GPUs.
 
 ### What's new
 
@@ -16,6 +17,17 @@ PyTorch and nothing else to install.
   tiles (202.7 against 405.3 ms a 128³ tile). A Mac prediction's provenance records `device: metal` and the Winograd levels it ran,
   so a resume under another `VOLKIT_METAL_WINOGRAD` setting is refused rather than mixing outputs. See
   [Predict](docs/predict.md).
+- **`fibrs strips run`.** Runs villa's sheet-strip inference (`scrollprize/fiber_strip_small_v1`) over an AFV's
+  fibres natively, with Rust and cuda-oxide kernels and cuDNN for the convolutions. It writes the Python runner's
+  strip layout and index. On one RTX 5090 it ran the whole PHerc0211 scroll at 2,095 decisions/s, about 8× villa's
+  PyTorch runner, with the strips' error measures matching PyTorch's. A run's output doesn't depend on its batch size
+  or worker count. Fibres whose CT chunks aren't in the disk cache are deferred and listed, and the run exits with
+  code 75. See [Strips](docs/strips.md).
+
+### Upgrading
+
+- fibrs now needs volkit 0.2.0, which adds the Metal backend and keeps 0.1.3's public device layer, so
+  `fibrs strips` can run its own kernels on volkit's GPU.
 
 ## [0.5.0] - 2026-11-22
 
