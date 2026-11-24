@@ -100,4 +100,4 @@ codegen-units = 4
 
 # the unreleased volkit 0.2.0 (Metal backend) from its branch checkout beside this one; drop once 0.2.0 is on crates.io
 [patch.crates-io]
-volkit = { path = "../volkit/volkit" }
+volkit = { path = "../volkit-neg/volkit" }
