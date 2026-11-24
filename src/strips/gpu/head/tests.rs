@@ -459,15 +459,26 @@ fn head_matches_strip_reference() -> Result<()> {
     }
 
     // bench-model's bars against the fp32 forward (PyTorch's own bf16 spread with ~15% headroom), and the worst
-    // single height no further from fp32 than stock's own worst. Against stock the worst item compounds two bf16
-    // errors: at |h| >= 16 a height step is 0.125, so native and stock rounding opposite ways reach 0.375
+    // single height no further from fp32 than PyTorch's own worst (stock or b64) plus one bf16 step at that
+    // height: PyTorch's run-to-run rounding moves a single item by a step (0.125 at |h| >= 16), so a bar without
+    // the step fails any change of summation order on a coin flip. Against stock alone the worst item compounds
+    // two bf16 errors (0.375 when the two round opposite ways)
     let (_, fp32) = get(&outputs, "fp32.h1")?;
     let (_, stock) = get(&outputs, "stock.h1")?;
-    let (h, own) = (Err3::of(&heights, &fp32), Err3::of(&stock, &fp32));
+    let (_, b64) = get(&outputs, "b64.h1")?;
+    let h = Err3::of(&heights, &fp32);
+    let own = Err3::of(&stock, &fp32).max.max(Err3::of(&b64, &fp32).max);
+    let (worst, _) = heights
+        .iter()
+        .zip(&fp32)
+        .map(|(&a, &b)| (a, (a - b).abs()))
+        .fold((0.0f32, -1.0f32), |w, x| if x.1 > w.1 { x } else { w });
+    let bar = own + f64::from(bf16_step(worst));
     let (_, fp32_logs) = get(&outputs, "fp32.logs")?;
     let l = Err3::of(&logs, &fp32_logs);
     ensure!(h.mean <= 0.012 && h.p99 <= 0.065, "heights: {h} against fp32, past bench-model's bar");
-    ensure!(h.max <= own.max, "heights: worst {} against fp32, past stock's own {}", h.max, own.max);
+    println!("h1 worst vs fp32 {:.4} at h {worst} (bar {bar:.4}: PyTorch's own worst {own:.4} + one bf16 step)", h.max);
+    ensure!(h.max <= bar, "heights: worst {} against fp32 at h {worst}, past {bar}", h.max);
     ensure!(l.mean <= 0.004 && l.p99 <= 0.015, "log scales: {l} against fp32, past bench-model's bar");
 
     // bench-model's column-tilt bar against stock: a lateral convention bug tilted 5e-3 with every spread in bar
@@ -475,6 +486,12 @@ fn head_matches_strip_reference() -> Result<()> {
     println!("h1 column tilt vs stock {tilt:+.3e} (bar 1.5e-3)");
     ensure!(tilt.abs() <= 1.5e-3, "heights tilt {tilt:+.3e} across the columns against stock");
     Ok(())
+}
+
+/// One bf16 step (the spacing of bf16 values) at `v`'s magnitude
+fn bf16_step(v: f32) -> f32 {
+    // the exponent alone is 2^e for |v| in [2^e, 2^(e+1)); bf16 keeps 7 fraction bits
+    f32::from_bits(v.to_bits() & 0x7f80_0000) / 128.0
 }
 
 /// The tilt of `ours - theirs` (row-major `[n, 36, 25]` grids) across the strip's columns: the least-squares slope
