@@ -7,6 +7,7 @@
 //! the CPU stitches the decisions into a strip and writes it (`out`). Decisions batch across fibres on the GPU;
 //! the CPU work runs on a thread pool. [`types`] holds the records that pass between the two sides
 
+pub mod gpu;
 pub mod types;
 
 use std::ffi::OsString;
