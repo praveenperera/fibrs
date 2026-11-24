@@ -4,6 +4,11 @@
 //! Stages live in submodules: `crops` (the CT device cache, the strip and frame crops, the tube), `frame` (the
 //! frame model), `cnn` (the crop CNN), `head` (cell tokens, transformer and strip heads)
 
+pub mod crops;
+pub mod frame;
+#[cfg(test)]
+mod input_tests;
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -77,7 +82,7 @@ impl Weights {
             if view.dtype() != safetensors::Dtype::F32 {
                 bail!("{name}: {:?}, expected F32", view.dtype());
             }
-            let values = view.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+            let values = view.data().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
             tensors.insert(name, Tensor { shape: view.shape().to_vec(), values });
         }
         Ok(Self { tensors, metadata })
