@@ -6,6 +6,11 @@
 //! unblocks workers whose strip requests then fill the next strip batch), and runs strip work in batches of up to
 //! the engine's batch size, splitting items across batches and sending each item's results once all of its
 //! decisions are done
+//!
+//! Frame requests mostly arrive while a launch runs, too late for its read-ahead, so a frame launch would often wait
+//! on the disk for its CT chunks with the GPU idle. When strips are queued, the engine starts those reads and runs
+//! one strip launch first; the frames follow it with their chunks read. The model's outputs do not depend on how
+//! decisions are grouped into launches, so the order changes no result
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -79,6 +84,8 @@ pub struct EngineCounts {
     pub frame_launches: usize,
     pub strip_decisions: usize,
     pub strip_launches: usize,
+    /// Strip launches run ahead of queued frames whose CT chunks were still being read
+    pub frame_deferrals: usize,
     /// Seconds the engine spent running work (the rest it waited for work)
     pub busy: f64,
     /// The device CT cache's uploads, evictions and fills
@@ -241,6 +248,8 @@ pub fn serve(
     let mut strips: Queue<StripRequest, StripResult> = Queue::new();
     let mut counts = EngineCounts::default();
     let mut open = true;
+    // the frames were put off for one strip launch: they run next whatever their reads
+    let mut deferred = false;
     loop {
         // take everything queued; block only when there is nothing to run
         loop {
@@ -271,9 +280,23 @@ pub fn serve(
         let batch = engine.batch;
         let frame_at = |r: &FrameRequest| CropAt { pos: r.pos, frame: r.frame };
         let strip_at = |r: &StripRequest| CropAt { pos: r.pos, frame: r.frame };
-        // the next launch runs frames while any are queued, so it takes the frames beyond this launch, else the
-        // front strips; work that arrives meanwhile can change it, which costs only the reads
-        if frames.decisions() > 0 {
+        // frames whose chunks are still unread wait for one strip launch, which reads them meanwhile; a failed read
+        // counts as read, and the frame launch reads the chunk itself and fails on its own error
+        let front = frames.peek(0, batch, frame_at);
+        let defer = !deferred
+            && !front.is_empty()
+            && strips.decisions() > 0
+            && engine.crops.unread(&mut engine.cache, &FRAME_CROP, &front).unwrap_or(0) > 0;
+        deferred = defer;
+        if defer {
+            // the frames are the next launch, so they are this one's read-ahead
+            let ahead = Ahead { spec: &FRAME_CROP, at: front };
+            counts.strip_decisions += strips.launch(batch, |q| engine.strips(q, &ahead));
+            counts.strip_launches += 1;
+            counts.frame_deferrals += 1;
+        } else if frames.decisions() > 0 {
+            // the next launch runs frames while any are queued, so it takes the frames beyond this launch, else the
+            // front strips; work that arrives meanwhile can change it, which costs only the reads
             let ahead = if frames.decisions() > batch {
                 Ahead { spec: &FRAME_CROP, at: frames.peek(batch, batch, frame_at) }
             } else {

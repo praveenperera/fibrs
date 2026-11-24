@@ -124,9 +124,7 @@ impl Prefetcher {
     /// buffers last: free ones first, then those holding chunks of earlier read-aheads
     pub(super) fn start(&mut self, missing: &[(u32, [usize; 3])]) -> Result<()> {
         self.generation += 1;
-        while let Ok(done) = self.results.try_recv() {
-            self.finish(done);
-        }
+        self.collect();
         for &(idx, c) in missing {
             if self.held.contains_key(&idx) {
                 continue;
@@ -162,6 +160,18 @@ impl Prefetcher {
         self.held.remove(&idx);
         self.state[buf] = State::Free;
         Some((buf, present))
+    }
+
+    /// Records every read finished so far, without waiting
+    pub(super) fn collect(&mut self) {
+        while let Ok(done) = self.results.try_recv() {
+            self.finish(done);
+        }
+    }
+
+    /// Whether chunk `idx` was read ahead and its read has finished, as of the last [`Prefetcher::collect`]
+    pub(super) fn ready(&self, idx: u32) -> bool {
+        self.held.get(&idx).is_some_and(|&buf| matches!(self.state[buf], State::Ready { .. }))
     }
 
     /// Buffer `buf`, for the upload of a chunk [`Prefetcher::take`] returned
