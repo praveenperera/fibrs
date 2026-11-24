@@ -312,11 +312,14 @@ fn source(dst: u32, size: u32) -> (u32, u32, f32) {
 }
 
 /// The CNN output from the last stage's output `x` and the context fuse's 1x1 conv `y` of the context block's
-/// output, at the context's size: `cells = rbf(x + rbf(up(y) + bias))`, `up` the 2x trilinear upsample
+/// output, at the context's size: `cells = rbf(x + rbf(rbf(up(y)) + bias))`, `up` the 2x trilinear upsample
 /// (align_corners False) in float32, `bias` the fuse's bias as bf16 holds it
 ///
 /// PyTorch upsamples first and convolves the upsampled tensor; both are linear and the upsample's weights sum to 1,
-/// so the order only moves bf16 rounding, and the conv runs on an eighth of the voxels
+/// so the order only moves bf16 rounding, and the conv runs on an eighth of the voxels. The bias goes on as PyTorch's
+/// cuDNN conv adds it: to the conv output already rounded to bf16, then rounded again. That second rounding snaps the
+/// small bias onto the coarser bf16 grid of the conv's values, a per-channel offset of up to a few 1e-3 the trained
+/// head expects; adding the bias in float32 before one rounding drops it and tilts the strip heights
 ///
 /// `x` and `cells` are `[B, 2D, 2H, 2W, C]` and `y` `[B, D, H, W, C]`, bf16 pairs as `U32x2`, `C % 4 == 0`. One
 /// thread per output `U32x2`: `quads` = C/4, `d`, `h`, `w` the context's size
@@ -360,7 +363,7 @@ pub fn sn_upfuse(
         let k = j as usize;
         let near = my * (mx * a000[k] + lx * a001[k]) + ly * (mx * a010[k] + lx * a011[k]);
         let far = my * (mx * a100[k] + lx * a101[k]) + ly * (mx * a110[k] + lx * a111[k]);
-        r[k] = rbf(skip[k] + rbf(mz * near + lz * far + bias[(4 * q) as usize + k]));
+        r[k] = rbf(skip[k] + rbf(rbf(mz * near + lz * far) + bias[(4 * q) as usize + k]));
         j += 1;
     }
     o.write(U32x2([pack(r[0], r[1]), pack(r[2], r[3])]));
@@ -712,7 +715,10 @@ fn swz<const CH: u32>(px: u32, k: u32) -> u32 {
 /// M is the output voxels of a `TD x TH x TW` tile, N the `COUT` output channels padded to `8 NT`, K the 27 taps
 /// times the input channels. The block stages the tile's input halo, all `4 CQ` channels, in shared memory as `CH`
 /// 16-byte chunks per voxel (channels past `4 CQ` zero), applying the producer's InstanceNorm and LeakyReLU on load
-/// when `PRO == 1` (`leaky(rbf(affine(x)))`, the post-norm zero padding included); then each warp runs `MT` 16-voxel
+/// when `PRO == 1` (`leaky(rbf(affine(x)))`, the post-norm zero padding included). `PRO == 2` loads the first block's
+/// output instead of its conv2 output `x`, as [`sn_apply_s0`] computes it from `x`, the pooled input `p` and the skip's
+/// norm (`skstats`, `skg`, `skb`, weights `wsk`), and also writes its 2x2x2 average (`S == 2`: each output voxel's
+/// window is in the halo) to `pool` (`[B, Do, Ho, Wo, 4 CQ]` bf16 as `U32x2`). Then each warp runs `MT` 16-voxel
 /// tiles against every (tap, chunk) pair as one k16 step, the A fragments loaded with `ldmatrix` from the halo at
 /// the tap's offset (each 8-channel half may come from a different tap, so 24-channel inputs pack without padding),
 /// the B fragments (`wf`, host-ordered `[step][n tile][lane]` `U32x2`) from global memory one step ahead.
@@ -744,6 +750,12 @@ unsafe fn conv3<
     stats: &[[f32; 2]],
     gamma: &[f32],
     beta: &[f32],
+    p: &[u32],
+    skstats: &[[f32; 2]],
+    skg: &[f32],
+    skb: &[f32],
+    wsk: &[f32],
+    pool: &mut DisjointSlice<U32x2>,
     wf: &[U32x2],
     d: u32,
     h: u32,
@@ -774,28 +786,45 @@ unsafe fn conv3<
         | ((steps * NT as u32 * 32) as usize > wf.len())
         | (((b + 1) * od * oh * ow * COUT / 2) as usize > out.len())
         | (((b * tiles + tile + 1) * COUT) as usize > part.len())
-        | ((PRO == 1)
+        | ((PRO != 0)
             & ((((b + 1) * cin) as usize > stats.len()) | (gamma.len() < cin as usize) | (beta.len() < cin as usize)))
+        | ((PRO == 2)
+            & ((S != 2)
+                | (((b + 1) * d * h * w) as usize > p.len())
+                | (((b + 1) * cin) as usize > skstats.len())
+                | (skg.len() < cin as usize)
+                | (skb.len() < cin as usize)
+                | (wsk.len() < 2 * cin as usize)
+                | (((b + 1) * od * oh * ow * CQ) as usize > pool.len())))
     {
         return;
     }
     let halo = smem;
-    // SAFETY: the layout `conv_smem` sizes: halo chunks, then cin params, then the reduction scratch
+    // SAFETY: the layout `conv_smem` sizes: halo chunks, then 3 cin params (the norm, and for `PRO == 2` the skip's
+    // norm and weights), then the reduction scratch
     let par = unsafe { halo.add((hpx * CH) as usize) } as *mut [f32; 4];
-    let red = unsafe { par.add(cin as usize) } as *mut f32;
+    let (skpar, wpar) = unsafe { (par.add(cin as usize), par.add(2 * cin as usize)) };
+    let red = unsafe { par.add(3 * cin as usize) } as *mut f32;
     let means = unsafe { red.add(NW as usize * NT * 8) };
     let (bz, rest) = (tile / (ty * tx), tile % (ty * tx));
     let (by, bx) = (rest / tx, rest % tx);
     let (z0, y0, x0) = (bz * TD, by * TH, bx * TW);
 
-    if PRO == 1 {
+    if PRO != 0 {
         let mut c = tid;
         while c < cin {
-            // SAFETY: c < cin; the stats, gamma and beta lengths are checked above
+            // SAFETY: c < cin; the stats, gamma and beta lengths (and for `PRO == 2` the skip's) are checked above
             unsafe {
                 let st = *stats.get_unchecked((b * cin + c) as usize);
                 *par.add(c as usize) =
                     [st[0], st[1], *gamma.get_unchecked(c as usize), *beta.get_unchecked(c as usize)];
+                if PRO == 2 {
+                    let st = *skstats.get_unchecked((b * cin + c) as usize);
+                    let (g, bt) = (*skg.get_unchecked(c as usize), *skb.get_unchecked(c as usize));
+                    *skpar.add(c as usize) = [st[0], st[1], g, bt];
+                    let (w0, w1) = (*wsk.get_unchecked(c as usize), *wsk.get_unchecked((cin + c) as usize));
+                    *wpar.add(c as usize) = [w0, w1, 0.0, 0.0];
+                }
             }
             c += threads;
         }
@@ -827,12 +856,54 @@ unsafe fn conv3<
                 };
                 v = U32x2([pack(f(lo(p0), 0), f(hi(p0), 1)), pack(f(lo(p1), 2), f(hi(p1), 3))]);
             }
+            if PRO == 2 {
+                let c = 4 * q;
+                // SAFETY: the voxel is inside the sample, so inside `p` by the check above
+                let pp = unsafe {
+                    *p.get_unchecked(((b * d + iz as u32) * h + iy as u32) as usize * w as usize + ix as usize)
+                };
+                let (i0, i1) = (lo(pp), hi(pp));
+                // SAFETY: c + 3 < cin
+                let f = |val: f32, k: u32| {
+                    let ([m, is, g, bt], [sm, sis, sg, sbt], [w0, w1, _, _]) = unsafe {
+                        (*par.add((c + k) as usize), *skpar.add((c + k) as usize), *wpar.add((c + k) as usize))
+                    };
+                    let sk = rbf(w1 * i1 + w0 * i0);
+                    leaky(rbf(affine(val, [m, is], g, bt) + affine(sk, [sm, sis], sg, sbt)))
+                };
+                v = U32x2([pack(f(lo(p0), 0), f(hi(p0), 1)), pack(f(lo(p1), 2), f(hi(p1), 3))]);
+            }
         }
         // SAFETY: px < hpx and the chunk index stays inside the pixel's CH chunks
         unsafe { *(halo.add(swz::<CH>(px, q / 2) as usize) as *mut U32x2).add((q % 2) as usize) = v };
         u += threads;
     }
     sync_threads();
+
+    if PRO == 2 {
+        // the 2x2x2 average of the block output under each output voxel: halo voxels 2o + 1 and 2o + 2 per axis
+        let mut u = tid;
+        while u < TD * TH * TW * CQ {
+            let (o, q) = (u / CQ, u % CQ);
+            let (oz, oy, ox) = (o / (TH * TW), (o / TW) % TH, o % TW);
+            let mut acc = [0f32; 4];
+            let mut k = 0;
+            while k < 8 {
+                __unroll_config::<0>();
+                let px = ((2 * oz + 1 + (k >> 2)) * hh + 2 * oy + 1 + ((k >> 1) & 1)) * hw + 2 * ox + 1 + (k & 1);
+                // SAFETY: px < hpx, chunk inside the pixel
+                let [a0, a1] =
+                    unsafe { *(halo.add(swz::<CH>(px, q / 2) as usize) as *const U32x2).add((q % 2) as usize) }.0;
+                acc = [acc[0] + lo(a0), acc[1] + hi(a0), acc[2] + lo(a1), acc[3] + hi(a1)];
+                k += 1;
+            }
+            let ov = ((b * od + z0 + oz) * oh + y0 + oy) * ow + x0 + ox;
+            let packed = U32x2([pack(acc[0] * 0.125, acc[1] * 0.125), pack(acc[2] * 0.125, acc[3] * 0.125)]);
+            // SAFETY: inside `pool` by the check above; each (voxel, quad) belongs to one thread of one tile
+            unsafe { *pool.get_unchecked_mut((ov * CQ + q) as usize) = packed };
+            u += threads;
+        }
+    }
 
     // SAFETY: `halo` is block-shared
     let halo_at = unsafe { cvta_generic_to_shared_u32(halo as *const u8) };
@@ -1004,7 +1075,7 @@ unsafe fn conv3<
 /// means
 pub const fn conv_smem(s: u32, ch: u32, cq: u32, nt: u32, td: u32, th: u32, tw: u32, nw: u32) -> u32 {
     let hpx = ((td - 1) * s + 3) * ((th - 1) * s + 3) * ((tw - 1) * s + 3);
-    hpx * ch * 16 + 4 * cq * 16 + (nw * nt * 8 + nt * 8) * 4
+    hpx * ch * 16 + 3 * 4 * cq * 16 + (nw * nt * 8 + nt * 8) * 4
 }
 
 /// One `sn_conv_*` kernel: [`conv3`] at fixed parameters, `out` bf16 pairs, `part` the tile partials
@@ -1021,6 +1092,12 @@ macro_rules! conv_kernel {
             stats: &[[f32; 2]],
             gamma: &[f32],
             beta: &[f32],
+            p: &[u32],
+            skstats: &[[f32; 2]],
+            skg: &[f32],
+            skb: &[f32],
+            wsk: &[f32],
+            mut pool: DisjointSlice<U32x2>,
             wf: &[U32x2],
             d: u32,
             h: u32,
@@ -1030,7 +1107,8 @@ macro_rules! conv_kernel {
             // SAFETY: the host launches with `conv_smem` bytes of dynamic shared memory
             unsafe {
                 conv3::<$s, $cq, $ch, $nt, $cout, $td, $th, $tw, $mt, $nw, $pro>(
-                    smem, &mut out, &mut part, x, stats, gamma, beta, wf, d, h, w,
+                    smem, &mut out, &mut part, x, stats, gamma, beta, p, skstats, skg, skb, wsk, &mut pool, wf, d,
+                    h, w,
                 )
             }
         }
@@ -1039,8 +1117,9 @@ macro_rules! conv_kernel {
 
 // s0b0 conv2: 12 -> 12 at 72x64x64, conv1's norm and LeakyReLU on load
 conv_kernel!(sn_conv_12_12_n, 1, 3, 2, 2, 12, 4, 8, 16, 4, 8, 1);
-// s1b0 conv1: 12 -> 24, stride 2, on the stage-0 output
-conv_kernel!(sn_conv_12_24_s2, 2, 3, 2, 3, 24, 2, 4, 16, 1, 8, 0);
+// s1b0 conv1: 12 -> 24, stride 2, on the stage-0 output rebuilt from s0b0's conv2 output, writing its average for
+// s1b0's skip
+conv_kernel!(sn_conv_12_24_s2, 2, 3, 2, 3, 24, 2, 4, 16, 1, 8, 2);
 // stage-1 conv2s: 24 -> 24, conv1's norm and LeakyReLU on load
 conv_kernel!(sn_conv_24_24_n, 1, 6, 3, 3, 24, 2, 8, 16, 2, 8, 1);
 // s1b1 conv1: 24 -> 24 on s1b0's output
