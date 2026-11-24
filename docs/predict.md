@@ -62,7 +62,9 @@ from villa near band edges.
 fibre sets.
 
 On a Mac, fp32 runs in full float32 where NVIDIA GPUs use TF32, so its output is within TF32's rounding of the
-NVIDIA output rather than byte-identical to it. bf16 isn't available on a Mac.
+NVIDIA output rather than byte-identical to it. On a PHerc0826 crop, a Mac's output is within 1/255 of an NVIDIA
+run with TF32 turned off (`NVIDIA_TF32_OVERRIDE=0`), and its traced fibres match the default NVIDIA run's at 99.9% of
+length. An M4 Pro and an M5 gave the same bytes. bf16 isn't available on a Mac.
 
 ## Resuming
 

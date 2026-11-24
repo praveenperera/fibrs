@@ -9,8 +9,10 @@ PyTorch and nothing else to install.
 
 - **`fibrs predict` on a Mac.** On an M1 or newer with macOS 26 or newer, `fibrs predict` runs AFV fibre model V2
   on the GPU with `--device metal`, the default there. It runs fp32 in full float32, where NVIDIA GPUs use TF32,
-  so its output is within TF32's rounding of the NVIDIA output rather than byte-identical to it; bf16 is
-  NVIDIA-only. On an M4 Pro the network runs 1.77× faster than PyTorch on MPS on the same tiles (226.6 against
+  so its output is within TF32's rounding of the NVIDIA output rather than byte-identical to it. On a
+  512 × 1024 × 1024 PHerc0826 crop it is within 1/255 of NVIDIA's strict float32 output (`NVIDIA_TF32_OVERRIDE=0`)
+  everywhere, with 0.004% of voxels differing. It is as far from the default TF32 output as TF32 is from strict
+  float32, and its traced fibres match that output's at 99.9% of length. bf16 is NVIDIA-only. On an M4 Pro the network runs 1.77× faster than PyTorch on MPS on the same tiles (226.6 against
   402.1 ms a 128³ tile). A Mac prediction's provenance records `device: metal` and the Winograd levels it ran,
   so a resume under another `VOLKIT_METAL_WINOGRAD` setting is refused rather than mixing outputs. See
   [Predict](docs/predict.md).
