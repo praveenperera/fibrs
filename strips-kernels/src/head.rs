@@ -10,5 +10,6 @@ pub mod attn;
 pub mod linear;
 pub mod mma;
 pub mod norm;
+pub mod sector;
 pub mod tokens;
 pub mod util;

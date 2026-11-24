@@ -3,9 +3,9 @@
 //!
 //! Feature sampling is villa's `sample_features` (models/follower.py): points outside the crop read zero features
 //! and zero support; inside, `grid_sample(cells.float(), bilinear, border, align_corners=True)` on the 36x32x32
-//! lattice, with PyTorch's fp32 coordinate arithmetic, corner weights and FMA accumulation order. The cell tokens'
+//! lattice, with PyTorch's fp32 coordinate arithmetic, corner weights and FMA accumulation order. The tube tokens'
 //! fixed points instead apply a precomputed sparse operator (host `gather.rs`) that merges their sub-points'
-//! corners per cell. Profile sampling is vc_reader's `sample_array` (order 1, zeros) on the fp32 input crop. One
+//! corners per cell; the sector tokens apply the same operator inside their projection (`sector.rs`). Profile sampling is vc_reader's `sample_array` (order 1, zeros) on the fp32 input crop. One
 //! warp per sampled point or token; lane `l` carries channels `2 l, 2 l + 1`
 //!
 //! The per-decision request record (`REQ` floats, laid out by the host's `head.rs`) holds the history, seed, path
@@ -38,12 +38,12 @@ pub const R_GEOM_VALID: usize = 752;
 pub const R_ORIENT: usize = 781;
 
 /// Cell lattice depth, height, width; channel pairs per cell
-const CD: u32 = 36;
-const CH: u32 = 32;
-const CW: u32 = 32;
-const CP: u32 = 32;
+pub(super) const CD: u32 = 36;
+pub(super) const CH: u32 = 32;
+pub(super) const CW: u32 = 32;
+pub(super) const CP: u32 = 32;
 /// u32 pairs per decision's cells
-const CELLS: usize = (CD * CH * CW * CP) as usize;
+pub(super) const CELLS: usize = (CD * CH * CW * CP) as usize;
 /// Crop depth, height, width (2 fp32 channels)
 const DD: i32 = 144;
 const DH: i32 = 128;
@@ -58,9 +58,8 @@ pub const REFS: u32 = 129;
 pub const GEOMS: u32 = 29;
 /// Strip tokens per decision
 pub const STRIPS: u32 = 450;
-/// Padded input widths of the projections: sector 520, tube 910, reference 72, geometry 68, strip query 67,
-/// orientation 5, refinement 132, profile 100
-pub const K_SECTOR: u32 = 576;
+/// Padded input widths of the projections: tube 910, reference 72, geometry 68, strip query 67, orientation 5,
+/// refinement 132, profile 100 (the sector projection's is `sector::K_SECTOR`)
 pub const K_TUBE: u32 = 960;
 pub const K_REF: u32 = 128;
 pub const K_GEOM: u32 = 128;
@@ -220,21 +219,20 @@ unsafe fn sample_crop(crop: *const f32, d: f32, h: f32, w: f32) -> (f32, f32) {
     (v0, v1)
 }
 
-/// Decisions per warp in `sm_cell_tokens`: each operator entry is read once for all of them, and their cell loads
+/// Decisions per warp in `sm_tube_tokens`: each operator entry is read once for all of them, and their cell loads
 /// are independent
 const CELL_DECISIONS: u32 = 4;
 
-/// The cell tokens' projection inputs from the fixed sampling operator (host `gather.rs`): per layout point
-/// (`points[4 i..4 i + 4]` = first entry, entry count, `token * 16 + point within the token`, support as f32 bits)
-/// the weighted sum of its entries' cells (`entries[2 e..2 e + 2]` = lattice cell, weight as f32 bits) and its
-/// support, written at columns `65 p..65 p + 65` of the token's row: tokens below 1404 in `xs` (`[B * 1404, 576]`),
-/// the 18 tube tokens in `xt` (`[B * 18, 960]`), bf16
+/// The tube tokens' projection inputs from the fixed sampling operator (host `gather.rs`; the sector tokens' go
+/// straight into their projection, `sector::sm_sector_tokens`): per tube point (`points[4 i..4 i + 4]` = first
+/// entry, entry count, `token * 16 + point within the token`, support as f32 bits) the weighted sum of its
+/// entries' cells (`entries[2 e..2 e + 2]` = lattice cell, weight as f32 bits) and its support, written at columns
+/// `65 p..65 p + 65` of the token's row of `xt` (`[B * 18, 960]`), bf16
 ///
 /// Grid `(ceil(npoints / 4), ceil(batch / 4))`, block 128: one warp per point and 4 decisions
 #[kernel]
 #[launch_contract(domain = 2, block = (128, 1, 1))]
-pub fn sm_cell_tokens(
-    mut xs: DisjointSlice<u16>,
+pub fn sm_tube_tokens(
     mut xt: DisjointSlice<u16>,
     cells: &[u32],
     points: &[u32],
@@ -245,7 +243,6 @@ pub fn sm_cell_tokens(
     let nb = batch as usize;
     require(
         (cells.len() >= nb * CELLS)
-            & (xs.len() >= nb * (SECTORS * K_SECTOR) as usize)
             & (xt.len() >= nb * (TUBES * K_TUBE) as usize)
             & (points.len() >= npoints as usize * 4),
     );
@@ -293,19 +290,15 @@ pub fn sm_cell_tokens(
         e += 1;
     }
     let (token, p) = (slot / 16, slot % 16);
-    let (ld, out) = if token < SECTORS { (K_SECTOR, xs.as_mut_ptr()) } else { (K_TUBE, xt.as_mut_ptr()) };
-    let col = (p * 65).min(ld - 65) as usize;
+    let (out, col) = (xt.as_mut_ptr(), (p * 65).min(K_TUBE - 65) as usize);
     let mut d = 0;
     while d < CELL_DECISIONS as usize {
         __unroll_config::<0>();
         let b = b0 as usize + d;
         if b < nb {
-            let row = if token < SECTORS {
-                (b * SECTORS as usize + token as usize) * K_SECTOR as usize
-            } else {
-                (b * TUBES as usize + (token - SECTORS).min(TUBES - 1) as usize) * K_TUBE as usize
-            };
-            // SAFETY: the row lies inside the checked output and col + 65 <= ld; each column is this lane's alone
+            // a token below the tube's writes the first tube token's row
+            let row = (b * TUBES as usize + token.saturating_sub(SECTORS).min(TUBES - 1) as usize) * K_TUBE as usize;
+            // SAFETY: the row lies inside the checked output and col + 65 <= K_TUBE; each column is this lane's alone
             unsafe {
                 let o = out.add(row + col);
                 *o.add(2 * lane as usize) = bf16_bits(v[d][0]);
