@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use color_eyre::eyre::{Result, WrapErr, bail, ensure};
 use cudarc::driver::result as cur;
+use cudarc::driver::sys::CUdevice_attribute;
 use cudarc::driver::{CudaContext, CudaEvent, CudaStream};
 use volkit::gpu::{Arg, Buf, Gpu};
 
@@ -487,10 +488,22 @@ pub struct CropAt {
     pub frame: Mat3,
 }
 
+/// strips-kernels `STRIP_TILES` and `STRIP_BLOCKS_PER_SM`: the most one-step tiles a block of the single-gather
+/// strip sampler takes per crop, and its blocks per SM
+const STRIP_TILES: u32 = 28;
+const STRIP_BLOCKS_PER_SM: u32 = 2;
+
 /// The sampler's device buffers for up to `capacity` crops per launch
 pub struct Crops {
     capacity: usize,
     scale: f64,
+    /// Blocks of the single-gather strip sampler (`sc_strip`), or `None` on a GPU with too few SMs for its
+    /// per-block tile limit, which samples strips twice (`sc_stats`, `sc_write`) instead
+    strip_blocks: Option<u32>,
+    strip_partials: Buf,
+    strip_sync: Buf,
+    /// `sc_strip`'s ablation bits, for the bench's ceilings only (0 in production)
+    pub(crate) strip_ablate: u32,
     grids: Buf,
     partials: Buf,
     stats: Buf,
@@ -526,9 +539,19 @@ impl Crops {
         ensure!(offsets.len() == 179, "tube stencil of {} offsets, expected 179", offsets.len());
         let flat: Vec<i32> = offsets.iter().flatten().copied().collect();
         let host_words = capacity * (GRID_WORDS + 1 + 3 * TUBE_POINTS);
+        let sms = gpu.inner.context().attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
+        let [tw, th, td] = STRIP_CROP.tiles()?;
+        // the single-gather sampler's tiles are one step deep
+        let strip_tiles = tw * th * td * STEPS;
+        let blocks = (sms * STRIP_BLOCKS_PER_SM).min(strip_tiles);
+        let strip_blocks = (strip_tiles.div_ceil(blocks) <= STRIP_TILES).then_some(blocks);
         Ok(Self {
             capacity,
             scale,
+            strip_blocks,
+            strip_partials: gpu.alloc(capacity * blocks as usize * 16)?,
+            strip_sync: gpu.alloc(capacity * 8)?,
+            strip_ablate: 0,
             grids: gpu.alloc(capacity * GRID_WORDS * 4)?,
             partials: gpu.alloc(capacity * tiles * 16)?,
             stats: gpu.alloc(capacity * 16)?,
@@ -538,6 +561,11 @@ impl Crops {
             noff: offsets.len() as u32,
             host: Pinned::new(gpu.inner.context(), host_words)?,
         })
+    }
+
+    /// Blocks of the single-gather strip sampler, or `None` where strips are sampled twice
+    pub fn strip_blocks(&self) -> Option<u32> {
+        self.strip_blocks
     }
 
     /// The strip model's input for `at` into `out`: NDHWC `(B, 144, 128, 128, 2)` float32, channel 0 the
@@ -621,6 +649,40 @@ impl Crops {
 
         let [tw, th, td] = spec.tiles()?;
         let tiles = tw * th * td;
+        let k = &dev.kernels;
+        if let (Some(blocks), Some(_), 0) = (self.strip_blocks, tubes, mode) {
+            ensure!(spec.depth == STRIP_CROP.depth, "the single-gather sampler is sized for strip crops");
+            gpu.fill(&self.strip_sync, 0)?;
+            k.launch(
+                gpu,
+                "sc_strip",
+                (blocks, 1, 1),
+                (SAMPLE_THREADS, 1, 1),
+                0,
+                &[
+                    Arg::Ptr(cache.table.ptr()),
+                    Arg::Ptr(cache.pool.ptr()),
+                    Arg::U32(cache.shape[0] as u32),
+                    Arg::U32(cache.shape[1] as u32),
+                    Arg::U32(cache.shape[2] as u32),
+                    Arg::U32(cache.grid[1] as u32),
+                    Arg::U32(cache.grid[2] as u32),
+                    Arg::F32(cache.fill as f32),
+                    Arg::Ptr(self.grids.ptr()),
+                    Arg::U32(b as u32),
+                    Arg::U32(tw),
+                    Arg::U32(th),
+                    Arg::U32(td * STEPS),
+                    Arg::Ptr(self.strip_partials.ptr()),
+                    Arg::Ptr(self.strip_sync.ptr()),
+                    Arg::Ptr(self.stats.ptr()),
+                    Arg::U32(self.strip_ablate),
+                    Arg::Ptr(out.ptr()),
+                ],
+            )?;
+            self.tube(dev, spec, b, out)?;
+            return cache.sampled(gpu);
+        }
         let ct = [
             Arg::Ptr(cache.table.ptr()),
             Arg::Ptr(cache.pool.ptr()),
@@ -635,7 +697,6 @@ impl Crops {
             Arg::U32(th),
             Arg::U32(STEPS),
         ];
-        let k = &dev.kernels;
         let block = (SAMPLE_THREADS, 1, 1);
         let mut args = ct.to_vec();
         args.push(Arg::Ptr(self.partials.ptr()));
@@ -665,33 +726,39 @@ impl Crops {
         ]);
         k.launch(gpu, "sc_write", (tiles, b as u32, 1), block, 0, &args)?;
         if tubes.is_some() {
-            let n = TUBE_POINTS as u32 * self.noff;
-            k.launch(
-                gpu,
-                "sc_tube",
-                (n.div_ceil(256), b as u32, 1),
-                (256, 1, 1),
-                0,
-                &[
-                    Arg::Ptr(self.points.ptr()),
-                    Arg::Ptr(self.counts.ptr()),
-                    Arg::U32(TUBE_POINTS as u32),
-                    Arg::Ptr(self.offsets.ptr()),
-                    Arg::U32(self.noff),
-                    Arg::U32(spec.depth as u32),
-                    Arg::U32(spec.height as u32),
-                    Arg::U32(spec.width as u32),
-                    Arg::F32(spec.spacing as f32),
-                    Arg::F32(spec.behind as f32),
-                    Arg::F32(((spec.height - 1) as f64 / 2.0) as f32),
-                    Arg::F32(((spec.width - 1) as f64 / 2.0) as f32),
-                    // villa's 2·sigma² with tube_sigma 1
-                    Arg::F32(2.0),
-                    Arg::Ptr(out.ptr()),
-                ],
-            )?;
+            self.tube(dev, spec, b, out)?;
         }
         cache.sampled(gpu)?;
+        Ok(())
+    }
+
+    /// Renders each crop's tube into channel 1 of the strip input `out`, whose channel 0 the sampler wrote
+    fn tube(&self, dev: &Device, spec: &CropSpec, b: usize, out: &Buf) -> Result<()> {
+        let n = TUBE_POINTS as u32 * self.noff;
+        dev.kernels.launch(
+            &dev.gpu,
+            "sc_tube",
+            (n.div_ceil(256), b as u32, 1),
+            (256, 1, 1),
+            0,
+            &[
+                Arg::Ptr(self.points.ptr()),
+                Arg::Ptr(self.counts.ptr()),
+                Arg::U32(TUBE_POINTS as u32),
+                Arg::Ptr(self.offsets.ptr()),
+                Arg::U32(self.noff),
+                Arg::U32(spec.depth as u32),
+                Arg::U32(spec.height as u32),
+                Arg::U32(spec.width as u32),
+                Arg::F32(spec.spacing as f32),
+                Arg::F32(spec.behind as f32),
+                Arg::F32(((spec.height - 1) as f64 / 2.0) as f32),
+                Arg::F32(((spec.width - 1) as f64 / 2.0) as f32),
+                // villa's 2·sigma² with tube_sigma 1
+                Arg::F32(2.0),
+                Arg::Ptr(out.ptr()),
+            ],
+        )?;
         Ok(())
     }
 }

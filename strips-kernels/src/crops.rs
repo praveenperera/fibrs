@@ -21,20 +21,22 @@
 //! fixed order), [`sc_finalize`] turns each crop's partials into its mean and reciprocal deviation as float32
 //! pairs, and [`sc_write`] samples again and writes the z-scored value, so the crop is written once: as channel 0
 //! of the strip model's NDHWC `(B, D, H, W, 2)` float32 input with channel 1 zeroed for [`sc_tube`], or as the
-//! frame model's `(B, D, H, W)` input. [`sc_tube`] then renders villa's `render_tube` into channel 1
+//! frame model's `(B, D, H, W)` input. The strip model's input takes [`sc_strip`] instead, which samples each
+//! crop once and holds the samples on chip until its statistics are known. [`sc_tube`] then renders villa's
+//! `render_tube` into channel 1
 //!
 //! Index math is 32-bit per crop; the host keeps a crop under 2^32 samples and the pool's offsets in 64 bits
 
 use core::ptr::addr_of_mut;
 
-use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32, DeviceAtomicU64};
 use cuda_device::float::{
     add_rn_f32, add_rn_f64, div_rn_f32, div_rn_f64, fma_rn_f32, mul_rn_f32, mul_rn_f64, sqrt_rn_f64,
 };
 use cuda_device::thread::{__unroll_config, blockDim_x, blockIdx_x, blockIdx_y, gridDim_x, sync_threads, threadIdx_x};
 use cuda_device::vector::F32x2;
-use cuda_device::warp::shuffle_xor_f32;
-use cuda_device::{SharedArray, kernel};
+use cuda_device::warp::{shuffle_xor_f32, shuffle_xor_f64};
+use cuda_device::{SharedArray, kernel, launch_bounds};
 
 unsafe extern "C" {
     fn __nv_floorf(x: f32) -> f32;
@@ -238,6 +240,57 @@ impl Pair {
     }
 }
 
+/// A block's sums of its threads' `sum` and `sq` pairs, in float64 and a fixed order; valid in thread 0
+#[inline(always)]
+fn block_sums(mut sum: Pair, mut sq: Pair, part: &mut SharedArray<f64, 16>) -> (f64, f64) {
+    let mut off = 16u32;
+    while off > 0 {
+        let (sh, sl) = (shuffle_xor_f32(sum.hi, off), shuffle_xor_f32(sum.lo, off));
+        let (qh, ql) = (shuffle_xor_f32(sq.hi, off), shuffle_xor_f32(sq.lo, off));
+        sum = sum.add(sh, sl);
+        sq = sq.add(qh, ql);
+        off >>= 1;
+    }
+    let (lane, warp) = (threadIdx_x() & 31, threadIdx_x() >> 5);
+    if lane == 0 {
+        part[2 * warp as usize] = sum.to_f64();
+        part[2 * warp as usize + 1] = sq.to_f64();
+    }
+    sync_threads();
+    let (mut s, mut q) = (0.0f64, 0.0f64);
+    if threadIdx_x() == 0 {
+        for k in 0..(SAMPLE_THREADS / 32) as usize {
+            __unroll_config::<0>();
+            s = add_rn_f64(s, part[2 * k]);
+            q = add_rn_f64(q, part[2 * k + 1]);
+        }
+    }
+    (s, q)
+}
+
+/// A crop's mean and `1 / max(std, 1e-6)` (population deviation) from its float64 sum `s` and sum of squares `q`
+/// over `n` samples, as float32 pairs `(mean_hi, mean_lo, inv_hi, inv_lo)`
+#[inline(always)]
+fn crop_stats(s: f64, q: f64, n: f64) -> [f32; 4] {
+    let mean = div_rn_f64(s, n);
+    let var = add_rn_f64(div_rn_f64(q, n), -mul_rn_f64(mean, mean));
+    let std = sqrt_rn_f64(if var > 0.0 { var } else { 0.0 });
+    let inv = div_rn_f64(1.0, if std > 1e-6 { std } else { 1e-6 });
+    let (mh, ih) = (mean as f32, inv as f32);
+    [mh, add_rn_f64(mean, -(mh as f64)) as f32, ih, add_rn_f64(inv, -(ih as f64)) as f32]
+}
+
+/// `(x - mean) · inv` with `x - mean` exact as a pair and the pair product with `inv`, rounded once to float32
+#[inline(always)]
+fn zscore(x: f32, st: [f32; 4]) -> f32 {
+    let [mh, ml, ih, il] = st;
+    let (dh, de) = two_sum(x, -mh);
+    let dl = add_rn_f32(de, -ml);
+    let ph = mul_rn_f32(dh, ih);
+    let pe = fma_rn_f32(dh, ih, -ph);
+    add_rn_f32(ph, add_rn_f32(pe, fma_rn_f32(dh, il, mul_rn_f32(dl, ih))))
+}
+
 /// The sampling kernels' thread layout: block `blockIdx.x` of crop `blockIdx.y` covers a (2·steps) x 8 x 16
 /// (d, h, w) tile; each warp a 2 x 4 x 4 brick of it per step, so a warp's corners stay within a few chunk rows
 #[derive(Clone, Copy)]
@@ -302,27 +355,9 @@ pub unsafe fn sc_stats(
         sq = sq.add(x2, fma_rn_f32(x, x, -x2));
     }
 
-    let mut off = 16u32;
-    while off > 0 {
-        let (sh, sl) = (shuffle_xor_f32(sum.hi, off), shuffle_xor_f32(sum.lo, off));
-        let (qh, ql) = (shuffle_xor_f32(sq.hi, off), shuffle_xor_f32(sq.lo, off));
-        sum = sum.add(sh, sl);
-        sq = sq.add(qh, ql);
-        off >>= 1;
-    }
-    let (lane, warp) = (threadIdx_x() & 31, threadIdx_x() >> 5);
     let part = unsafe { &mut *addr_of_mut!(PART) };
-    if lane == 0 {
-        part[2 * warp as usize] = sum.to_f64();
-        part[2 * warp as usize + 1] = sq.to_f64();
-    }
-    sync_threads();
+    let (s, q) = block_sums(sum, sq, part);
     if threadIdx_x() == 0 {
-        let (mut s, mut q) = (0.0f64, 0.0f64);
-        for k in 0..(SAMPLE_THREADS / 32) as usize {
-            s = add_rn_f64(s, part[2 * k]);
-            q = add_rn_f64(q, part[2 * k + 1]);
-        }
         let tiles = blockIdx_x() as usize + crop as usize * gridDim_x() as usize;
         // SAFETY: the host sizes `partials` at two per tile of the launch
         unsafe {
@@ -369,18 +404,14 @@ pub unsafe fn sc_finalize(partials: *const f64, tiles: u32, n: u32, stats: *mut 
         half >>= 1;
     }
     if t == 0 {
-        let mean = div_rn_f64(sum[0], n);
-        let var = add_rn_f64(div_rn_f64(sum[1], n), -mul_rn_f64(mean, mean));
-        let std = sqrt_rn_f64(if var > 0.0 { var } else { 0.0 });
-        let inv = div_rn_f64(1.0, if std > 1e-6 { std } else { 1e-6 });
-        let (mh, ih) = (mean as f32, inv as f32);
+        let st = crop_stats(sum[0], sum[1], n);
         // SAFETY: four floats per crop
         unsafe {
             let o = stats.add(4 * crop as usize);
-            *o = mh;
-            *o.add(1) = add_rn_f64(mean, -(mh as f64)) as f32;
-            *o.add(2) = ih;
-            *o.add(3) = add_rn_f64(inv, -(ih as f64)) as f32;
+            for k in 0..4 {
+                __unroll_config::<0>();
+                *o.add(k) = st[k];
+            }
         }
     }
 }
@@ -418,9 +449,9 @@ pub unsafe fn sc_write(
     let crop = blockIdx_y();
     // SAFETY: one grid record and four statistics per crop
     let grid = unsafe { Grid::load(grids, crop) };
-    let (mh, ml, ih, il) = unsafe {
+    let st = unsafe {
         let s = stats.add(4 * crop as usize);
-        (*s, *s.add(1), *s.add(2), *s.add(3))
+        [*s, *s.add(1), *s.add(2), *s.add(3)]
     };
     let tile = Tile::of(tiles_w, tiles_h, steps);
     let per_crop = (cd * ch * cw) as u64;
@@ -433,12 +464,7 @@ pub unsafe fn sc_write(
             // SAFETY: `sample` bounds every read
             mul_rn_f32(unsafe { grid.sample(&ct, d, tile.h, tile.w) }, INV255)
         };
-        // x - mean exactly as a pair, then the pair product with inv
-        let (dh, de) = two_sum(x, -mh);
-        let dl = add_rn_f32(de, -ml);
-        let ph = mul_rn_f32(dh, ih);
-        let pe = fma_rn_f32(dh, ih, -ph);
-        let y = add_rn_f32(ph, add_rn_f32(pe, fma_rn_f32(dh, il, mul_rn_f32(dl, ih))));
+        let y = zscore(x, st);
         let idx = crop as u64 * per_crop + at as u64;
         // SAFETY: the host sizes `out` at `channels` floats per sample of every crop
         unsafe {
@@ -446,6 +472,217 @@ pub unsafe fn sc_write(
                 *(out.add(2 * idx as usize) as *mut F32x2) = F32x2::new([y, 0.0]);
             } else {
                 *out.add(idx as usize) = y;
+            }
+        }
+    }
+}
+
+/// Most tiles of one step (2 x 8 x 16 samples) a block of [`sc_strip`] takes per crop: the samples each thread
+/// holds in registers, and again in shared memory for the crop before
+pub const STRIP_TILES: usize = 28;
+/// Blocks of [`sc_strip`] per SM that its launch bounds guarantee resident; the host launches at most this many
+/// per SM, as the per-crop barrier needs every block resident
+pub const STRIP_BLOCKS_PER_SM: u32 = 2;
+const HALF: usize = STRIP_TILES / 2;
+/// Polls of a crop's statistics before [`sc_strip`] traps: only a block that never became resident stalls them
+/// this long, and a trap fails the launch where a spin would hang the device
+const SPIN_LIMIT: u32 = 1 << 26;
+
+/// The strip model's input in one gather per crop: every crop of the launch, z-scored, as channel 0 of the NDHWC
+/// `(crops, 2 · dsteps, 8 · tiles_h, 16 · tiles_w, 2)` float32 `out`, channel 1 zeroed for [`sc_tube`]
+///
+/// [`sc_stats`] then [`sc_write`] sample every crop twice, and each gather is bound by L1 throughput. Here a
+/// persistent grid samples each crop once and keeps the samples on chip until the crop's statistics are known:
+/// every block takes a balanced run of the crop's tiles (contiguous along d, so consecutive tiles share CT rows in
+/// L1), holds its samples in registers, publishes its partial sums, and writes the crop out while it samples the
+/// next one, from shared memory, once the last block to arrive has turned the partials into the crop's mean and
+/// reciprocal deviation. That needs every block resident: the grid is at most [`STRIP_BLOCKS_PER_SM`] per SM. The
+/// statistics are waited for halfway through the next crop's samples, so blocks rarely wait. Partials are summed
+/// in a fixed order, so the output does not depend on timing; it does depend on the grid size, which fixes how the
+/// samples split into partials
+///
+/// `ablate` is for ceilings only: bit 0 skips the wait for the statistics (the output is wrong), bit 1 samples no CT.
+/// `partials` holds two float64 bit patterns per crop and block, `sync` a zeroed arrival counter per crop then a
+/// zeroed ready flag per crop, `stats` four float32 bit patterns per crop. Grid: x over blocks, one block per
+/// ceil(tiles / [`STRIP_TILES`]) at least; [`SAMPLE_THREADS`] threads
+#[kernel]
+#[launch_bounds(256, 2)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn sc_strip(
+    table: *const u32,
+    pool: *const u8,
+    sz: u32,
+    sy: u32,
+    sx: u32,
+    gy: u32,
+    gx: u32,
+    fill: f32,
+    grids: *const u32,
+    crops: u32,
+    tiles_w: u32,
+    tiles_h: u32,
+    dsteps: u32,
+    partials: *mut u64,
+    sync: *mut u32,
+    stats: *mut u32,
+    ablate: u32,
+    out: *mut f32,
+) {
+    static mut PART: SharedArray<f64, 16> = SharedArray::UNINIT;
+    static mut PREV: SharedArray<f32, { STRIP_TILES * SAMPLE_THREADS as usize }> = SharedArray::UNINIT;
+    static mut ST: SharedArray<f32, 4> = SharedArray::UNINIT;
+    static mut LAST: SharedArray<u32, 1> = SharedArray::UNINIT;
+    static mut START: SharedArray<u32, 1> = SharedArray::UNINIT;
+    let ct = Ct { table, pool, shape: [sz, sy, sx], gy, gx, fill };
+    let (blocks, r) = (gridDim_x(), blockIdx_x());
+    let tid = threadIdx_x();
+    let (lane, warp) = (tid & 31, tid >> 5);
+    // this block's run of tiles: `count` from `start`, in d-fastest order within each (h, w) column
+    let tiles = tiles_w * tiles_h * dsteps;
+    let (base, rem) = (tiles / blocks, tiles % blocks);
+    let start = r * base + if r < rem { r } else { rem };
+    let count = base + (r < rem) as u32;
+    let (ch, cw) = (8 * tiles_h, 16 * tiles_w);
+    let per_crop = 2 * dsteps * ch * cw;
+    let n = per_crop as f64;
+    let (ld, lh, lw) = ((lane >> 4) & 1, ((warp >> 2) & 1) * 4 + ((lane >> 2) & 3), (warp & 3) * 4 + (lane & 3));
+    let start_shared = unsafe { &mut *addr_of_mut!(START) };
+    if tid == 0 {
+        start_shared[0] = start;
+    }
+    sync_threads();
+    let part = unsafe { &mut *addr_of_mut!(PART) };
+    let prev = unsafe { &mut *addr_of_mut!(PREV) };
+    let st_shared = unsafe { &mut *addr_of_mut!(ST) };
+    let last = unsafe { &mut *addr_of_mut!(LAST) };
+    let mut cur = [0f32; STRIP_TILES];
+
+    // crop `c` is sampled in round `c` and written in round `c + 1`; the last round only writes
+    for c in 0..=crops {
+        let sampling = c < crops;
+        // the run's start, reloaded every round: the tiles' coordinates do not depend on the crop, and LLVM would
+        // otherwise hoist all of them out of this loop and hold them in registers (spilling at 128)
+        // SAFETY: written once before the loop
+        let start = unsafe { core::ptr::read_volatile(&start_shared[0]) };
+        // sample (d, h, w) of this thread in tile `j` of the run
+        let at = |j: u32| -> (u32, u32, u32) {
+            let t = start + j;
+            let col = t / dsteps;
+            let tw = col % tiles_w;
+            (2 * (t - col * dsteps) + ld, (col / tiles_w) * 8 + lh, tw * 16 + lw)
+        };
+        // SAFETY: one grid record per crop; the record of crop `crops` is never used
+        let grid = unsafe { Grid::load(grids, if sampling { c } else { 0 }) };
+        let (mut sum, mut sq) = (Pair::ZERO, Pair::ZERO);
+        let mut st = [0f32; 4];
+        #[unroll]
+        for j in 0..STRIP_TILES {
+            if sampling && (j as u32) < count {
+                let (d, h, w) = at(j as u32);
+                let x = if ablate & 2 != 0 {
+                    (d + h + w) as f32 * 1e-3
+                } else {
+                    // SAFETY: `sample` bounds every read
+                    mul_rn_f32(unsafe { grid.sample(&ct, d, h, w) }, INV255)
+                };
+                let x2 = mul_rn_f32(x, x);
+                sum = sum.add(x, 0.0);
+                sq = sq.add(x2, fma_rn_f32(x, x, -x2));
+                cur[j] = x;
+            }
+            if j == HALF && c > 0 {
+                if tid == 0 {
+                    // SAFETY: a ready flag per crop after the counters; Acquire pairs with the finalizer's Release
+                    let flag = unsafe { DeviceAtomicU32::from_ptr(sync.add((crops + c - 1) as usize)) };
+                    // relaxed polls, then one acquire: an acquire per poll would keep invalidating the SM's L1, which
+                    // the other block on the SM is gathering through
+                    let mut spins = 0u32;
+                    while ablate & 1 == 0 && flag.load(AtomicOrdering::Relaxed) == 0 {
+                        spins += 1;
+                        if spins > SPIN_LIMIT {
+                            cuda_device::debug::trap();
+                        }
+                    }
+                    flag.load(AtomicOrdering::Acquire);
+                    for k in 0..4 {
+                        __unroll_config::<0>();
+                        // SAFETY: four statistics per crop, published before the flag
+                        let bits = unsafe { DeviceAtomicU32::from_ptr(stats.add(4 * (c - 1) as usize + k)) };
+                        st_shared[k] = f32::from_bits(bits.load(AtomicOrdering::Relaxed));
+                    }
+                }
+                sync_threads();
+                st = [st_shared[0], st_shared[1], st_shared[2], st_shared[3]];
+            }
+            if j >= HALF && c > 0 {
+                // index loops, not array iterators: those keep the array in local memory
+                for kk in 0..2 {
+                    __unroll_config::<0>();
+                    let k = 2 * (j - HALF) + kk;
+                    if (k as u32) < count {
+                        let (d, h, w) = at(k as u32);
+                        let y = zscore(prev[k * SAMPLE_THREADS as usize + tid as usize], st);
+                        let idx = (c - 1) as u64 * per_crop as u64 + ((d * ch + h) * cw + w) as u64;
+                        // SAFETY: the host sizes `out` at two floats per sample of every crop
+                        unsafe { *(out.add(2 * idx as usize) as *mut F32x2) = F32x2::new([y, 0.0]) };
+                    }
+                }
+            }
+        }
+        if !sampling {
+            break;
+        }
+
+        // the crop's samples move to shared memory for the next round; each thread owns its slots, and the
+        // writes above have read the previous crop's
+        #[unroll]
+        for j in 0..STRIP_TILES {
+            if (j as u32) < count {
+                prev[j * SAMPLE_THREADS as usize + tid as usize] = cur[j];
+            }
+        }
+        let (s, q) = block_sums(sum, sq, part);
+        if tid == 0 {
+            let slot = 2 * (c * blocks + r) as usize;
+            // SAFETY: two partials per crop and block, published by the counter's Release
+            unsafe {
+                DeviceAtomicU64::from_ptr(partials.add(slot)).store(s.to_bits(), AtomicOrdering::Relaxed);
+                DeviceAtomicU64::from_ptr(partials.add(slot + 1)).store(q.to_bits(), AtomicOrdering::Relaxed);
+                let arrived = DeviceAtomicU32::from_ptr(sync.add(c as usize)).fetch_add(1, AtomicOrdering::AcqRel);
+                last[0] = (arrived + 1 == blocks) as u32;
+            }
+        }
+        sync_threads();
+        // the last block to arrive sums the partials in block order, one warp, and publishes the statistics
+        if last[0] != 0 && warp == 0 {
+            let (mut s, mut q) = (0.0f64, 0.0f64);
+            let mut i = lane;
+            while i < blocks {
+                let slot = 2 * (c * blocks + i) as usize;
+                // SAFETY: every block's partials, ordered before its arrival
+                unsafe {
+                    s = add_rn_f64(s, f64::from_bits(DeviceAtomicU64::from_ptr(partials.add(slot)).load(AtomicOrdering::Relaxed)));
+                    q = add_rn_f64(q, f64::from_bits(DeviceAtomicU64::from_ptr(partials.add(slot + 1)).load(AtomicOrdering::Relaxed)));
+                }
+                i += 32;
+            }
+            let mut off = 16u32;
+            while off > 0 {
+                // a butterfly: both lanes of a pair add the same two values, so every lane ends with one sum
+                s = add_rn_f64(s, shuffle_xor_f64(s, off));
+                q = add_rn_f64(q, shuffle_xor_f64(q, off));
+                off >>= 1;
+            }
+            if lane == 0 {
+                let st = crop_stats(s, q, n);
+                // SAFETY: four statistics per crop, then the crop's ready flag
+                unsafe {
+                    for k in 0..4 {
+                        __unroll_config::<0>();
+                        DeviceAtomicU32::from_ptr(stats.add(4 * c as usize + k)).store(st[k].to_bits(), AtomicOrdering::Relaxed);
+                    }
+                    DeviceAtomicU32::from_ptr(sync.add((crops + c) as usize)).store(1, AtomicOrdering::Release);
+                }
             }
         }
     }

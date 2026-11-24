@@ -153,6 +153,13 @@ fn setup(slots: usize) -> Result<Setup> {
         "/build/vesuvius/strips-scale/speed/native/weights/fiber_strip_small_v1.safetensors",
     ))?;
     let dev = Device::open(0)?;
+    // experiment: the context-wide L1 preference, to see whether sc_strip's gather is bound by the L1 its shared
+    // memory carveout leaves
+    if std::env::var_os("STRIPS_PREFER_L1").is_some() {
+        dev.gpu.inner.context().bind_to_thread()?;
+        cudarc::driver::result::ctx::set_cache_config(cudarc::driver::sys::CUfunc_cache::CU_FUNC_CACHE_PREFER_L1)?;
+        println!("context cache config: prefer L1");
+    }
     let cache = ChunkCache::new(&dev, Arc::new(vol), slots, 64)?;
     let crops = Crops::new(&dev, BATCH, 2.0)?;
     let frame = FrameModel::new(&dev, &weights, BATCH)?;
@@ -312,7 +319,11 @@ fn input_bench() -> Result<()> {
     let strip_buf: Buf = gpu.alloc(BATCH * STRIP_CROP.samples() * 2 * 4)?;
     let tubes: Vec<&[[f32; 3]]> = s.dec.tubes.iter().map(Vec::as_slice).collect();
     let no_tubes: Vec<&[[f32; 3]]> = vec![&[]; BATCH];
-    println!("bench: {k} decisions in batches of {BATCH}, load {}", load_avg());
+    println!(
+        "bench: {k} decisions in batches of {BATCH}, strip sampler {}, load {}",
+        s.crops.strip_blocks().map_or("two-pass".into(), |b| format!("single-gather x {b} blocks")),
+        load_avg()
+    );
 
     // cold pass: fills the cache and counts what each launch needs
     let started = Instant::now();
@@ -365,6 +376,21 @@ fn input_bench() -> Result<()> {
             per(ceil),
             load_avg()
         );
+    }
+    // the single-gather sampler's ceilings: no wait for the statistics, no CT reads, neither
+    if s.crops.strip_blocks().is_some() {
+        for (ablate, what) in [(1, "no stats wait"), (2, "no CT reads"), (3, "neither")] {
+            s.crops.strip_ablate = ablate;
+            let mut sc = 0f64;
+            for start in (0..k).step_by(BATCH) {
+                let r = start..start + BATCH;
+                sc += timed(&s.dev, || {
+                    s.crops.strip(&s.dev, &mut s.cache, &s.dec.strip_at[r.clone()], &tubes[r.clone()], &strip_buf)
+                })?;
+            }
+            println!("ceiling ({what}): strip crop + tube {:.4} ms/decision at b{BATCH}", sc * 1e3 / k as f64);
+        }
+        s.crops.strip_ablate = 0;
     }
     println!("warm cache: {:?}", s.cache.counts);
     Ok(())
