@@ -4,13 +4,13 @@
 //! Three stages of ResNet-D basic blocks (12, 24, 64 channels; strides 2, 2, 1; 1, 2, 2 blocks), then a stride-2
 //! context block on the last stage's map, upsampled (trilinear) back to it and added through a 1x1 conv.
 //!
-//! Stages 0 and 1 run on the strips kernels' own convs ([`Stages01::Native`]): the first conv straight from the
-//! float32 crop, then bf16 tensor-core implicit-GEMM convs that apply the previous InstanceNorm and LeakyReLU on load
-//! and write per-tile statistics partials from their epilogues. Stage 2, the context block, the skips' 1x1
-//! projections and the fuse are channels-last bf16 cuDNN convolutions with float32 accumulation, with InstanceNorm
-//! (float32 statistics per sample and channel), LeakyReLU, the residual adds and the skips' average pools in the
-//! strips kernels (`strips-kernels/src/cnn.rs`), at PyTorch's bf16 rounding points. [`Stages01::Cudnn`] runs stages
-//! 0 and 1 the same way, for comparison.
+//! Stages 0 and 1 and stage 2's first conv run on the strips kernels' own convs ([`Convs::Native`]): the first conv
+//! straight from the float32 crop, then bf16 tensor-core implicit-GEMM convs that apply the previous InstanceNorm and
+//! LeakyReLU on load and write per-tile statistics partials from their epilogues. The rest of stage 2, the context
+//! block, the skips' 1x1 projections and the fuse are channels-last bf16 cuDNN convolutions with float32
+//! accumulation, with InstanceNorm (float32 statistics per sample and channel), LeakyReLU, the residual adds and the
+//! skips' average pools in the strips kernels (`strips-kernels/src/cnn.rs`), at PyTorch's bf16 rounding points.
+//! [`Convs::Cudnn`] runs every conv the latter way, for comparison.
 //!
 //! Conv biases (stage 0's two convs and the context fuse) go on as PyTorch's cuDNN path adds them, to the bf16 conv
 //! output with a second rounding: the stage-0 ones feed InstanceNorms, which remove them in exact arithmetic but not
@@ -195,14 +195,14 @@ impl Block {
     }
 }
 
-/// How stages 0 and 1 (the 12- and 24-channel blocks) run
+/// Which convs run on the strips kernels
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Stages01 {
+pub enum Convs {
     /// Every conv through cuDNN, each InstanceNorm in its own statistics and apply passes
     Cudnn,
-    /// The strips kernels' own convs: the first conv straight from the float32 input, the 3x3x3 convs on the
-    /// tensor cores with the producer's InstanceNorm and LeakyReLU applied on load and their own statistics
-    /// written by their epilogues
+    /// Stages 0 and 1 and stage 2's first conv on the strips kernels' own convs: the first conv straight from the
+    /// float32 input, the 3x3x3 convs on the tensor cores with the producer's InstanceNorm and LeakyReLU applied on
+    /// load and their own statistics written by their epilogues
     Native,
 }
 
@@ -300,13 +300,14 @@ impl MmaConv {
         voxels(self.tile)
     }
 
-    /// Queues `out = conv(prologue(x))` and the tile partials of `out` into `part`; the kernel must have been
-    /// built for `prologue`'s kind
-    fn run(&self, dev: &Device, x: &Buf, prologue: Prologue, out: &Buf, part: &Buf, n: usize) -> Result<()> {
+    /// Queues `out = conv(prologue(x))` on samples `s` and the tile partials of `out` into `part` (from its start);
+    /// the kernel must have been built for `prologue`'s kind
+    fn run(&self, dev: &Device, x: &Buf, prologue: Prologue, out: &Buf, part: &Buf, s: Samples) -> Result<()> {
         let tiles = self.tiles();
-        let (cin, o) = (self.cin, voxels(self.output()));
-        let norm_args =
-            |norm: &Norm| (norm.stats.view::<[f32; 2]>(0, n * cin), norm.w.arg::<f32>(), norm.b.arg::<f32>());
+        let (cin, i, o, n) = (self.cin, voxels(self.input), voxels(self.output()), s.n);
+        let norm_args = |norm: &Norm| {
+            (norm.stats.view::<[f32; 2]>(s.first * cin, n * cin), norm.w.arg::<f32>(), norm.b.arg::<f32>())
+        };
         let empty = (Arg::EMPTY, Arg::EMPTY, Arg::EMPTY);
         let (norm, skip, rest) = match prologue {
             Prologue::None => (empty, empty, [Arg::EMPTY, Arg::EMPTY, Arg::EMPTY]),
@@ -315,18 +316,18 @@ impl MmaConv {
                 norm_args(norm2),
                 norm_args(skip),
                 [
-                    pooled_input.view::<u32>(0, n * voxels(self.input)),
+                    pooled_input.view::<u32>(s.first * i, n * i),
                     wsk.arg::<f32>(),
-                    pool.view::<[u32; 2]>(0, n * o * cin / 4),
+                    pool.view::<[u32; 2]>(s.first * o * cin / 4, n * o * cin / 4),
                 ],
             ),
         };
         let [p, wsk, pool] = rest;
         let [d, h, w] = self.input;
         let args = [
-            out.view::<u32>(0, n * o * self.cout / 2),
+            out.view::<u32>(s.first * o * self.cout / 2, n * o * self.cout / 2),
             part.view::<[f32; 2]>(0, n * tiles * self.cout),
-            x.view::<[u32; 2]>(0, n * voxels(self.input) * cin / 4),
+            x.view::<[u32; 2]>(s.first * i * cin / 4, n * i * cin / 4),
             norm.0,
             norm.1,
             norm.2,
@@ -359,7 +360,7 @@ enum Prologue<'a> {
     Stage0 { norm2: &'a Norm, skip: &'a Norm, wsk: &'a Buf, pooled_input: &'a Buf, pool: &'a Buf },
 }
 
-/// The native stages 0 and 1: the first conv's weights for `sn_conv0` and the tensor-core convs
+/// The native convs: the first conv's weights for `sn_conv0` and the tensor-core convs
 struct Native {
     /// Stage 0's conv1, bf16-rounded, `[27 taps][2][12]`
     conv0: Buf,
@@ -371,6 +372,8 @@ struct Native {
     s1c1: MmaConv,
     /// Stage 1's three 24 -> 24 convs: block 0's conv2, block 1's conv1 and conv2
     s1: [MmaConv; 3],
+    /// Stage 2 block 0's conv1, 24 -> 64
+    s2c1: MmaConv,
 }
 
 /// `sn_conv0`'s output tiles per sample (2 x 8 x 16 voxels of the 72 x 64 x 64 grid)
@@ -428,6 +431,16 @@ impl Native {
                 c24(&format!("{p}.1.blocks.1.conv1.conv"), "sn_conv_24_24")?,
                 c24(&format!("{p}.1.blocks.1.conv2.conv"), "sn_conv_24_24_n")?,
             ],
+            s2c1: MmaConv::load(
+                dev,
+                weights,
+                &format!("{p}.2.blocks.0.conv1.conv"),
+                "sn_conv_24_64",
+                (24, 64, 1),
+                s2,
+                [2, 4, 16],
+                (3, 8, 4),
+            )?,
         })
     }
 }
@@ -442,7 +455,7 @@ pub struct CropCnn {
     blocks: Vec<Block>,
     fuse: Conv,
     native: Native,
-    stages01: Stages01,
+    convs: Convs,
     /// The sample group stage 2 onward runs in, `None` for the whole batch
     group: Option<usize>,
     plans: HashMap<usize, Plans>,
@@ -461,7 +474,7 @@ pub struct CropCnn {
 
 impl CropCnn {
     /// Loads the strip model's CNN weights (`strip.cnn.*`) and allocates buffers for batches up to `max_batch`;
-    /// stages 0 and 1 run [`Stages01::Native`]
+    /// stages 0 and 1 run [`Convs::Native`]
     pub fn new(dev: &Device, weights: &Weights, max_batch: usize) -> Result<Self> {
         ensure!(max_batch > 0, "max_batch 0");
         let gpu = &dev.gpu;
@@ -492,7 +505,7 @@ impl CropCnn {
             blocks,
             fuse,
             native,
-            stages01: Stages01::Native,
+            convs: Convs::Native,
             group: Some(DEFAULT_GROUP),
             plans: HashMap::new(),
             max_batch,
@@ -516,8 +529,8 @@ impl CropCnn {
     }
 
     /// Chooses how stages 0 and 1 run from the next forward on
-    pub fn set_stages01(&mut self, mode: Stages01) {
-        self.stages01 = mode;
+    pub fn set_convs(&mut self, mode: Convs) {
+        self.convs = mode;
     }
 
     /// Runs stage 2, the context block and the cells `group` samples at a time from the next forward on (`None`:
@@ -589,16 +602,16 @@ impl CropCnn {
 
         // stages 0 and 1 leave their output in activation buffer `x`; then each block reads `x` and writes its
         // output into one of the other activation buffers
-        let (first, mut x) = match self.stages01 {
-            Stages01::Native => (STAGE2, self.native01(dev, input, n, plans, &mut tap)?),
-            Stages01::Cudnn => {
+        let (first, mut x) = match self.convs {
+            Convs::Native => (STAGE2, self.native01(dev, input, n, plans, &mut tap)?),
+            Convs::Cudnn => {
                 self.cast_input(dev, input, n)?;
                 (0, None)
             }
         };
         for i in first..STAGE2 {
             let blk = &self.blocks[i];
-            x = Some(self.block(dev, blk, &plans.blocks[i], x, None, Samples::all(n))?);
+            x = Some(self.block(dev, blk, &plans.blocks[i], None, x, None, Samples::all(n))?);
             self.tap_block(dev, blk, x, n, &mut tap)?;
         }
 
@@ -615,7 +628,8 @@ impl CropCnn {
             let mut outputs = Vec::with_capacity(self.blocks.len() - STAGE2);
             for i in STAGE2..self.blocks.len() {
                 let blk = &self.blocks[i];
-                let out = self.block(dev, blk, &plans.blocks[i], xg, keep, s)?;
+                let conv1 = (i == STAGE2 && self.convs == Convs::Native).then_some(&self.native.s2c1);
+                let out = self.block(dev, blk, &plans.blocks[i], conv1, xg, keep, s)?;
                 self.tap_block(dev, blk, Some(out), n, &mut tap)?;
                 xg = Some(out);
                 outputs.push(out);
@@ -688,8 +702,8 @@ impl CropCnn {
         dev.kernels.launch(&dev.gpu, "sn_input", grid(pooled), (256, 1, 1), 0, &args)
     }
 
-    /// One block on cuDNN convs, reading activation buffer `x` (the bf16 input crop when `None`); returns the
-    /// activation buffer holding its output
+    /// One block on cuDNN convs, conv1 on `conv1` instead when given, reading activation buffer `x` (the bf16 input
+    /// crop when `None`); returns the activation buffer holding its output
     ///
     /// The block writes only activation buffers other than `x` and `keep`: two of them, or three for a block that
     /// both pools and projects its skip
@@ -699,6 +713,7 @@ impl CropCnn {
         dev: &Device,
         blk: &Block,
         bp: &BlockPlans,
+        conv1: Option<&MmaConv>,
         x: Option<usize>,
         keep: Option<usize>,
         n: Samples,
@@ -711,9 +726,14 @@ impl CropCnn {
         let rows = voxels(blk.conv1.output());
         let cout = blk.conv1.cout;
 
-        blk.conv1.run(dev, &bp.c1, xin, a, ws, n)?;
-        self.bias(dev, a, &blk.conv1, n, rows)?;
-        self.stats(dev, a, &blk.norm1, n, rows)?;
+        match conv1 {
+            Some(c) => self.mma(dev, c, xin, Prologue::None, a, &blk.norm1, n)?,
+            None => {
+                blk.conv1.run(dev, &bp.c1, xin, a, ws, n)?;
+                self.bias(dev, a, &blk.conv1, n, rows)?;
+                self.stats(dev, a, &blk.norm1, n, rows)?;
+            }
+        }
         self.apply(dev, a, &blk.norm1, Residual::None, n, rows, true)?;
         blk.conv2.run(dev, &bp.c2, a, b, ws, n)?;
         self.bias(dev, b, &blk.conv2, n, rows)?;
@@ -744,7 +764,7 @@ impl CropCnn {
         Ok(free[1])
     }
 
-    /// Stages 0 and 1 on the strips kernels' convs (see [`Stages01::Native`]); returns the activation buffer
+    /// Stages 0 and 1 on the strips kernels' convs (see [`Convs::Native`]); returns the activation buffer
     /// holding stage 1's output
     fn native01(
         &self,
@@ -778,16 +798,16 @@ impl CropCnn {
             b0.conv1.bias.as_ref().expect("stage 0's conv1 bias, checked at load").arg::<f32>(),
         ];
         dev.kernels.launch(&dev.gpu, "sn_conv0", (CONV0_TILES as u32, n as u32, 1), (256, 1, 1), 0, &args)?;
-        self.merge(dev, &b0.norm1.stats, CONV0_TILES, 24, 0, 12, 256, n)?;
-        self.merge(dev, &sk0.stats, CONV0_TILES, 24, 12, 12, 256, n)?;
-        self.mma(dev, &nat.s0c2, t0, Prologue::Norm(&b0.norm1), t1, &b0.norm2, n)?;
+        self.merge(dev, &b0.norm1.stats, CONV0_TILES, 24, 0, 12, 256, all)?;
+        self.merge(dev, &sk0.stats, CONV0_TILES, 24, 12, 12, 256, all)?;
+        self.mma(dev, &nat.s0c2, t0, Prologue::Norm(&b0.norm1), t1, &b0.norm2, all)?;
 
         // stage 1 block 0: the strided conv1 on stage 0's output (rebuilt from conv2's in t1), which also writes
         // that output's average for the skip; the skip's 1x1 conv and statistics; conv2 with conv1's norm on load;
         // the block output in place of conv2's
         let stage0 =
             Prologue::Stage0 { norm2: &b0.norm2, skip: sk0, wsk: &nat.skip0, pooled_input: &self.pooled, pool: t2 };
-        self.mma(dev, &nat.s1c1, t1, stage0, t0, &b1.norm1, n)?;
+        self.mma(dev, &nat.s1c1, t1, stage0, t0, &b1.norm1, all)?;
         if let Some(tap) = tap.as_mut() {
             // only a tapped forward stores stage 0's output, in place of conv2's, which nothing reads any more
             self.apply_s0(dev, t1, b0, sk0, n)?;
@@ -798,7 +818,7 @@ impl CropCnn {
         let pp = plans.blocks[1].proj.as_ref().expect("stage 1 block 0 projects");
         proj.run(dev, pp, t2, t3, self.workspace.as_ref(), all)?;
         self.stats(dev, t3, proj_norm, all, v2)?;
-        self.mma(dev, &nat.s1[0], t0, Prologue::Norm(&b1.norm1), t2, &b1.norm2, n)?;
+        self.mma(dev, &nat.s1[0], t0, Prologue::Norm(&b1.norm1), t2, &b1.norm2, all)?;
         self.apply(dev, t2, &b1.norm2, Residual::Norm(t3, proj_norm), all, v2, true)?;
         if let Some(tap) = tap.as_mut() {
             dev.gpu.sync()?;
@@ -806,8 +826,8 @@ impl CropCnn {
         }
 
         // stage 1 block 1: identity skip
-        self.mma(dev, &nat.s1[1], t2, Prologue::None, t0, &b2.norm1, n)?;
-        self.mma(dev, &nat.s1[2], t0, Prologue::Norm(&b2.norm1), t1, &b2.norm2, n)?;
+        self.mma(dev, &nat.s1[1], t2, Prologue::None, t0, &b2.norm1, all)?;
+        self.mma(dev, &nat.s1[2], t0, Prologue::Norm(&b2.norm1), t1, &b2.norm2, all)?;
         self.apply(dev, t1, &b2.norm2, Residual::Plain(t2), all, v2, true)?;
         if let Some(tap) = tap.as_mut() {
             dev.gpu.sync()?;
@@ -844,13 +864,14 @@ impl CropCnn {
         prologue: Prologue,
         out: &Buf,
         norm: &Norm,
-        n: usize,
+        s: Samples,
     ) -> Result<()> {
-        conv.run(dev, x, prologue, out, &self.partial, n)?;
-        self.merge(dev, &norm.stats, conv.tiles(), conv.cout, 0, conv.cout, conv.count(), n)
+        conv.run(dev, x, prologue, out, &self.partial, s)?;
+        self.merge(dev, &norm.stats, conv.tiles(), conv.cout, 0, conv.cout, conv.count(), s)
     }
 
-    /// `stats[b, c] = [mean, invstd]` from tile partials `[b, tile, pcols]` columns `c0..c0 + cols`
+    /// `stats[b, c] = [mean, invstd]` for samples `s` from tile partials `[b - s.first, tile, pcols]` columns
+    /// `c0..c0 + cols`
     #[allow(clippy::too_many_arguments)]
     fn merge(
         &self,
@@ -861,10 +882,11 @@ impl CropCnn {
         c0: usize,
         cols: usize,
         count: usize,
-        n: usize,
+        s: Samples,
     ) -> Result<()> {
+        let n = s.n;
         let args = [
-            stats.view::<[f32; 2]>(0, n * cols),
+            stats.view::<[f32; 2]>(s.first * cols, n * cols),
             self.partial.view::<[f32; 2]>(0, n * tiles * pcols),
             Arg::U32(tiles as u32),
             Arg::U32(pcols as u32),
@@ -1024,7 +1046,7 @@ mod tests {
     use color_eyre::eyre::{Result, WrapErr, ensure};
     use serde_json::{Value, json};
 
-    use super::{CELL_CHANNELS, CELLS, CROP, CropCnn, IN_CHANNELS, Stages01, voxels};
+    use super::{CELL_CHANNELS, CELLS, CROP, Convs, CropCnn, IN_CHANNELS, voxels};
     use crate::strips::gpu::{Device, Weights};
 
     const WEIGHTS: &str = "/build/vesuvius/strips-scale/speed/native/weights/fiber_strip_small_v1.safetensors";
@@ -1158,11 +1180,11 @@ mod tests {
         Ok(std::fs::write(dir.join(format!("{mode}_{name}.bf16")), bytes)?)
     }
 
-    fn modes() -> Vec<(&'static str, Stages01)> {
+    fn modes() -> Vec<(&'static str, Convs)> {
         let names = std::env::var("STRIPS_CNN_MODES").unwrap_or_else(|_| "native,cudnn".into());
         let modes = names.split(',').map(|m| match m.trim() {
-            "native" => ("native", Stages01::Native),
-            "cudnn" => ("cudnn", Stages01::Cudnn),
+            "native" => ("native", Convs::Native),
+            "cudnn" => ("cudnn", Convs::Cudnn),
             other => panic!("STRIPS_CNN_MODES: unknown mode {other}"),
         });
         modes.collect()
@@ -1177,11 +1199,11 @@ mod tests {
         results.into_iter().collect()
     }
 
-    fn parity_mode(s: &Setup, mode_name: &str, mode: Stages01) -> Result<()> {
+    fn parity_mode(s: &Setup, mode_name: &str, mode: Convs) -> Result<()> {
         println!("== stages 0-1: {mode_name}");
         let n = s.batch;
         let mut cnn = CropCnn::new(&s.dev, &s.weights, n)?;
-        cnn.set_stages01(mode);
+        cnn.set_convs(mode);
         let input = s.dev.gpu.upload(typed::<f32>(&s.input, n * voxels(CROP) * IN_CHANNELS, "input")?)?;
         // NaN-prefilled activations and output, so a region a kernel skips cannot pass
         for t in &cnn.t {
@@ -1271,7 +1293,7 @@ mod tests {
             }
         }
         for ((mode_name, mode), group, n) in runs {
-            cnn.set_stages01(mode);
+            cnn.set_convs(mode);
             cnn.set_group((group > 0).then_some(group));
             cnn.prepare(&s.dev, n)?;
             for _ in 0..3 {

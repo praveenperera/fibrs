@@ -3,74 +3,79 @@ ptxas info    : Compiling entry function 'sp_probe' for 'sm_80'
 ptxas info    : Function properties for sp_probe
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 12 registers, used 0 barriers, 392 bytes cmem[0]
-ptxas info    : Compile time = 6.528 ms
+ptxas info    : Compile time = 115.643 ms
 ptxas info    : Compiling entry function 'sn_bias' for 'sm_80'
 ptxas info    : Function properties for sn_bias
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 16 registers, used 0 barriers, 388 bytes cmem[0]
-ptxas info    : Compile time = 1.549 ms
+ptxas info    : Compile time = 3.167 ms
 ptxas info    : Compiling entry function 'sn_conv_24_24' for 'sm_80'
 ptxas info    : Function properties for sn_conv_24_24
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 64 registers, used 1 barriers, 588 bytes cmem[0]
-ptxas info    : Compile time = 47.200 ms
+ptxas info    : Compile time = 362.670 ms
 ptxas info    : Compiling entry function 'sn_conv_12_24_s2' for 'sm_80'
 ptxas info    : Function properties for sn_conv_12_24_s2
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 40 registers, used 1 barriers, 588 bytes cmem[0]
-ptxas info    : Compile time = 23.596 ms
+ptxas info    : Compile time = 144.831 ms
+ptxas info    : Compiling entry function 'sn_conv_24_64' for 'sm_80'
+ptxas info    : Function properties for sn_conv_24_64
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 133 registers, used 1 barriers, 588 bytes cmem[0]
+ptxas info    : Compile time = 529.715 ms
 ptxas info    : Compiling entry function 'sn_apply' for 'sm_80'
 ptxas info    : Function properties for sn_apply
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 32 registers, used 0 barriers, 508 bytes cmem[0]
-ptxas info    : Compile time = 5.131 ms
+ptxas info    : Compile time = 29.197 ms
 ptxas info    : Compiling entry function 'sn_merge' for 'sm_80'
 ptxas info    : Function properties for sn_merge
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 21 registers, used 1 barriers, 32 bytes smem, 408 bytes cmem[0]
-ptxas info    : Compile time = 8.346 ms
+ptxas info    : Compile time = 39.831 ms
 ptxas info    : Compiling entry function 'sn_conv0' for 'sm_80'
 ptxas info    : Function properties for sn_conv0
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 64 registers, used 1 barriers, 27280 bytes smem, 464 bytes cmem[0]
-ptxas info    : Compile time = 44.022 ms
+ptxas info    : Compile time = 146.286 ms
 ptxas info    : Compiling entry function 'sn_upfuse' for 'sm_80'
 ptxas info    : Function properties for sn_upfuse
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 32 registers, used 0 barriers, 432 bytes cmem[0]
-ptxas info    : Compile time = 5.207 ms
+ptxas info    : Compile time = 13.665 ms
 ptxas info    : Compiling entry function 'sn_apply_s0' for 'sm_80'
 ptxas info    : Function properties for sn_apply_s0
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 38 registers, used 0 barriers, 500 bytes cmem[0]
-ptxas info    : Compile time = 4.338 ms
+ptxas info    : Compile time = 17.579 ms
 ptxas info    : Compiling entry function 'sn_finalize' for 'sm_80'
 ptxas info    : Function properties for sn_finalize
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 32 registers, used 0 barriers, 416 bytes cmem[0]
-ptxas info    : Compile time = 6.328 ms
+ptxas info    : Compile time = 18.769 ms
 ptxas info    : Compiling entry function 'sn_stats' for 'sm_80'
 ptxas info    : Function properties for sn_stats
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 32 registers, used 1 barriers, 4096 bytes smem, 400 bytes cmem[0]
-ptxas info    : Compile time = 4.589 ms
+ptxas info    : Compile time = 11.896 ms
 ptxas info    : Compiling entry function 'sn_conv_24_24_n' for 'sm_80'
 ptxas info    : Function properties for sn_conv_24_24_n
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 64 registers, used 1 barriers, 588 bytes cmem[0]
-ptxas info    : Compile time = 42.897 ms
+ptxas info    : Compile time = 156.125 ms
 ptxas info    : Compiling entry function 'sn_input' for 'sm_80'
 ptxas info    : Function properties for sn_input
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 24 registers, used 0 barriers, 412 bytes cmem[0]
-ptxas info    : Compile time = 2.923 ms
+ptxas info    : Compile time = 10.336 ms
 ptxas info    : Compiling entry function 'sn_conv_12_12_n' for 'sm_80'
 ptxas info    : Function properties for sn_conv_12_12_n
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 79 registers, used 1 barriers, 588 bytes cmem[0]
-ptxas info    : Compile time = 53.414 ms
+ptxas info    : Compile time = 69.906 ms
 ptxas info    : Compiling entry function 'sn_pool' for 'sm_80'
 ptxas info    : Function properties for sn_pool
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 24 registers, used 0 barriers, 400 bytes cmem[0]
-ptxas info    : Compile time = 3.275 ms
+ptxas info    : Compile time = 3.446 ms

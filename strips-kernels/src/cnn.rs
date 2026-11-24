@@ -1176,6 +1176,8 @@ conv_kernel!(sn_conv_12_24_s2, 2, 3, 2, 3, 24, 2, 4, 16, 1, 8, 2, false);
 conv_kernel!(sn_conv_24_24_n, 1, 6, 3, 3, 24, 2, 8, 16, 2, 8, 1, false);
 // s1b1 conv1: 24 -> 24 on s1b0's output
 conv_kernel!(sn_conv_24_24, 1, 6, 3, 3, 24, 2, 8, 16, 2, 8, 0, false);
+// s2b0 conv1: 24 -> 64 on stage 1's output
+conv_kernel!(sn_conv_24_64, 1, 6, 3, 8, 64, 2, 4, 16, 2, 4, 0, false);
 
 /// The first block's output in place of its conv2 output: `y = leaky(rbf(rbf(affine(y)) + rbf(affine(sk))))`, the
 /// skip `sk = rbf(wsk p)` recomputed from the pooled input `p` (as [`sn_conv0`] computed it for its statistics)
