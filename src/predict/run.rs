@@ -78,9 +78,8 @@ pub struct Args {
     /// Tile reader threads (output unchanged)
     #[arg(long, default_value_t = 4, allow_negative_numbers = true)]
     readers: i64,
-    /// fp32 (default): float32 tensors with TF32 tensor-core convolutions, the precision PyTorch uses for the
-    /// reference by default. bf16 (opt-in): faster, small output differences (measured in docs/benchmarks.md)
-    #[arg(long, default_value = "fp32")]
+    // the help names the engine's precisions (fp32 and bf16 on CUDA, fp32 alone on Metal)
+    #[arg(long, default_value = "fp32", help = engine::PRECISION_HELP)]
     precision: String,
     /// Comma list of column indices (in column order) to run; for timing subsets
     #[arg(long)]

@@ -32,10 +32,17 @@ impl Precision {
                 Err("--precision bf16 runs on CUDA only; the Metal engine runs fp32 (the default)".into())
             }
             "bf16" => Ok(Self::Bf16),
+            "fp32-ieee" | "fp16" if cfg!(fibrs_engine = "metal") => Err(format!(
+                "--precision {name} is a PyTorch mode the native engine does not run; the Metal engine runs fp32 \
+                 only (the default)"
+            )),
             "fp32-ieee" | "fp16" => Err(format!(
                 "--precision {name} is a PyTorch mode the native engine does not run; it runs fp32 (the reference \
                  contract, the default) or bf16"
             )),
+            _ if cfg!(fibrs_engine = "metal") => {
+                Err(format!("--precision {name:?}: the Metal engine runs fp32 only (the default)"))
+            }
             _ => Err(format!("--precision {name:?}: the native engine runs fp32 (the default) or bf16")),
         }
     }
@@ -65,6 +72,15 @@ impl Precision {
         }
     }
 }
+
+/// `--precision`'s help, for the engine this build runs
+pub const PRECISION_HELP: &str = if cfg!(fibrs_engine = "metal") {
+    "fp32, the default and the only precision on Metal: float32 tensors with float32 convolutions, within TF32's \
+     rounding of the NVIDIA reference (measured in docs/predict.md)"
+} else {
+    "fp32 (default): float32 tensors with TF32 tensor-core convolutions, the precision PyTorch uses for the reference \
+     by default. bf16 (opt-in): faster, small output differences (measured in docs/benchmarks.md)"
+};
 
 /// One column's outputs, `None` when no tile ran
 // built only by the GPU engine, which other targets lack
