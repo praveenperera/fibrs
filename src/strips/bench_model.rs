@@ -139,6 +139,25 @@ pub fn run(args: &Args) -> Result<()> {
         }
     }
     ensure!(h1.len() == refs.n * GRID_LEN && logs.len() == h1.len(), "the model returned {} grid values", h1.len());
+    // the raw heights beside the report, for signed (bias) comparisons the spreads cannot show
+    let raw = args.out.with_extension("h1.f32");
+    std::fs::write(&raw, h1.iter().flat_map(|v: &f32| v.to_le_bytes()).collect::<Vec<u8>>())
+        .wrap_err_with(|| format!("write {}", raw.display()))?;
+
+    // the head alone: the same decisions on the stock CNN's own cells, to split a bias between the CNN and the head
+    let stock_cells = dev.gpu.alloc(b * CELLS_LEN * 2)?;
+    let mut h1_head = Vec::with_capacity(refs.n * GRID_LEN);
+    for a in (0..refs.n).step_by(b) {
+        let e = (a + b).min(refs.n);
+        dev.gpu.upload_into(&input, 0, refs.crop(a..e))?;
+        dev.gpu.upload_into(&stock_cells, 0, refs.cells(a..e))?;
+        for r in head.forward(&dev, &stock_cells, &input, &requests[a..e])? {
+            h1_head.extend(r.heights.iter().flatten());
+        }
+    }
+    let raw = args.out.with_extension("h1_stockcells.f32");
+    std::fs::write(&raw, h1_head.iter().flat_map(|v: &f32| v.to_le_bytes()).collect::<Vec<u8>>())
+        .wrap_err_with(|| format!("write {}", raw.display()))?;
 
     let mut parity = serde_json::Map::new();
     let mut failed = Vec::new();
