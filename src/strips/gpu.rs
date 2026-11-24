@@ -12,6 +12,8 @@ use cudakit::PtxTier;
 use volkit::dnn::{Blas, Dnn};
 use volkit::gpu::{Gpu, Module};
 
+pub mod head;
+
 /// The strips kernels, built from `strips-kernels` by `scripts/build-strips-ptx.sh`
 pub const PTX: &[(PtxTier, &str)] = &[(PtxTier::Sm80, include_str!("../../ptx/strips.sm80.ptx"))];
 
