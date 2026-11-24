@@ -71,9 +71,9 @@ Zarr filters and other compressors are not supported.
 ## Memory
 
 fibrs uses more memory than the original: 7.1 GiB against 4.6 GiB on a 512-plane band of PHerc0826 at
-`--threads 4`. On PHerc0358's densest 1,024-plane window (z 1536–2560) with `--threads 8` and
-`--field-cache-mib 4096` it is 14.1 GiB, against 20.6 GiB when whole 16³ bricks were stored. A smaller
-`--native-cache-mib` or `--field-cache-mib` lowers the peak, at some cost in speed.
+`--threads 4`. On PHerc0358's densest 1,024-plane window (z 1536–2560) at `--threads 8` it peaks at 11.2 GiB, or
+14.2 GiB with `--field-cache-mib 4096`. A smaller `--native-cache-mib` or `--field-cache-mib` lowers the peak, at
+some cost in speed.
 
 The volume traced at once (the window, or with `--tiles-yx` each tile with its halo), with each axis rounded up
 to a multiple of 32 voxels, must hold a little fewer than 2⁴¹ voxels (32,768 × 8,192 × 8,192). PHerc1545's whole
