@@ -8,7 +8,13 @@
 //! the CPU work runs on a thread pool. [`types`] holds the records that pass between the two sides
 
 pub mod ct;
+pub mod fibre;
+pub mod geom;
 pub mod gpu;
+pub mod np;
+pub mod out;
+pub mod seed;
+pub mod stitch;
 pub mod types;
 
 use std::ffi::OsString;
