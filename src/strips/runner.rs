@@ -8,7 +8,7 @@
 //! finishes, its `seconds` the time since the shard's previous line (fibres overlap, so the column sums to the
 //! shard's wall time, as `strips_fast.py`'s does)
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -21,8 +21,8 @@ use clap::Parser;
 use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
 use serde_json::{Map, Value, json};
 
-use super::ct::Volume;
-use super::engine::{EngineConfig, Work, serve};
+use super::ct::{Uncached, Volume};
+use super::engine::{EngineConfig, LaunchError, Work, serve};
 use super::fibre::{Afv, FibreRow};
 use super::geom::{Geometry, Umbilicus};
 use super::gpu::Weights;
@@ -122,9 +122,42 @@ pub struct Args {
     provenance: String,
 }
 
-/// What a worker hands the index writer for one fibre: its record (None for a fibre too short to run) and its
-/// decisions
-type Done = Result<(Option<Record>, usize)>;
+/// What a worker hands the index writer for one fibre
+enum Outcome {
+    /// Its record (None for a fibre too short to run) and its decisions
+    Indexed(Option<Record>, usize),
+    /// Deferred: it needs CT chunks the disk cache lacks (these, or those of a launch it shared). It is not indexed,
+    /// so the run after their fetch takes it up again
+    Uncached(Vec<[usize; 3]>),
+}
+
+type Done = Result<Outcome>;
+
+/// The exit code of a run that finished every fibre it could but deferred some for uncached CT chunks, listed in
+/// `<out>/logs/uncached_chunks.txt`: fetch them and run again
+pub const EXIT_UNCACHED: i32 = 75;
+
+/// A run that deferred fibres for uncached CT chunks; `fibrs strips` exits with [`EXIT_UNCACHED`]
+#[derive(Debug)]
+pub struct Deferred {
+    pub fibres: usize,
+    pub chunks: usize,
+    pub list: PathBuf,
+}
+
+impl std::fmt::Display for Deferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} fibres deferred: {} CT chunks are not in the disk cache, listed in {}; fetch them and run again",
+            self.fibres,
+            self.chunks,
+            self.list.display()
+        )
+    }
+}
+
+impl std::error::Error for Deferred {}
 
 /// Runs the shard; the progress lines go to stdout as `strips_fast.py` prints them
 pub fn run(args: &Args) -> Result<()> {
@@ -191,7 +224,7 @@ pub fn run(args: &Args) -> Result<()> {
     let stop = AtomicBool::new(false);
     let (done_tx, done_rx) = channel::<Done>();
     let started = Instant::now();
-    let decisions = std::thread::scope(|scope| -> Result<usize> {
+    let written = std::thread::scope(|scope| -> Result<Written> {
         for _ in 0..args.workers.min(todo.rows.len()) {
             let (work_tx, done_tx) = (work_tx.clone(), done_tx.clone());
             let (rows, next, stop, geometry, settings) = (&todo.rows, &next, &stop, &geometry, &settings);
@@ -205,7 +238,9 @@ pub fn run(args: &Args) -> Result<()> {
         written
     });
     let counts = engine.join().map_err(|_| eyre!("the GPU engine panicked"))??;
-    let decisions = decisions?;
+    let written = written?;
+    let list = write_uncached(args, k, n, &written)?;
+    let decisions = written.decisions;
 
     let wall = started.elapsed().as_secs_f64();
     println!(
@@ -215,8 +250,12 @@ pub fn run(args: &Args) -> Result<()> {
                "frame_launches": counts.frame_launches, "strip_launches": counts.strip_launches,
                "chunks": {"needed": counts.cache.needed, "uploads": counts.cache.uploads, "fills": counts.cache.fills,
                           "evictions": counts.cache.evictions, "most_per_launch": counts.cache.most,
-                          "prefetched": counts.cache.prefetched}})
+                          "prefetched": counts.cache.prefetched},
+               "deferred": written.deferred, "uncached_chunks": written.uncached.len()})
     );
+    if written.deferred > 0 {
+        return Err(Deferred { fibres: written.deferred, chunks: written.uncached.len(), list }.into());
+    }
     Ok(())
 }
 
@@ -353,21 +392,28 @@ fn fibre(
     settings: &Settings,
     space: &mut Workspace,
     work: &Sender<Work>,
-) -> Result<(Option<Record>, usize)> {
+) -> Result<Outcome> {
     let fibre = afv.fibre(row, args.grid_scale)?;
-    let Some(arcs) = fibre.arcs(args.step) else { return Ok((None, 0)) };
+    let Some(arcs) = fibre.arcs(args.step) else { return Ok(Outcome::Indexed(None, 0)) };
     let plans = match geometry.plan(&fibre, &arcs, space) {
         Ok(plans) => plans,
         Err(e) => {
+            if let Some(Uncached(chunks)) = e.downcast_ref::<Uncached>() {
+                return Ok(Outcome::Uncached(chunks.clone()));
+            }
             let Some(reason) = e.downcast_ref::<SeedHeadingError>() else { return Err(e) };
-            return Ok((Some(Record::failed(row, settings, &reason.to_string())), 0));
+            return Ok(Outcome::Indexed(Some(Record::failed(row, settings, &reason.to_string())), 0));
         }
     };
 
     let requests: Vec<FrameRequest> = plans.iter().map(|p| p.request.clone()).collect();
     let (tx, rx) = channel();
     work.send(Work::Frames(requests, tx)).map_err(|_| eyre!("the GPU engine stopped"))?;
-    let frames = rx.recv().map_err(|_| eyre!("the GPU engine stopped"))?.map_err(|e| eyre!("frame model: {e}"))?;
+    let frames = match rx.recv().map_err(|_| eyre!("the GPU engine stopped"))? {
+        Ok(frames) => frames,
+        Err(LaunchError::Uncached(chunks)) => return Ok(Outcome::Uncached(chunks)),
+        Err(LaunchError::Failed(e)) => bail!("frame model: {e}"),
+    };
     ensure!(frames.len() == plans.len(), "{} frame results for {} decisions", frames.len(), plans.len());
 
     let requests: Vec<StripRequest> = plans.iter().zip(&frames).map(|(p, f)| p.finish(geometry, &fibre, f)).collect();
@@ -375,7 +421,11 @@ fn fibre(
     let positions: Vec<_> = requests.iter().map(|r| r.pos).collect();
     let (tx, rx) = channel();
     work.send(Work::Strips(requests, tx)).map_err(|_| eyre!("the GPU engine stopped"))?;
-    let results = rx.recv().map_err(|_| eyre!("the GPU engine stopped"))?.map_err(|e| eyre!("strip model: {e}"))?;
+    let results = match rx.recv().map_err(|_| eyre!("the GPU engine stopped"))? {
+        Ok(results) => results,
+        Err(LaunchError::Uncached(chunks)) => return Ok(Outcome::Uncached(chunks)),
+        Err(LaunchError::Failed(e)) => bail!("strip model: {e}"),
+    };
     ensure!(results.len() == plans.len(), "{} strip results for {} decisions", results.len(), plans.len());
 
     let heights: Vec<_> = results.iter().map(|r| r.heights).collect();
@@ -392,10 +442,17 @@ fn fibre(
         TRACE_PER_PATCH,
     );
     let record = settings.write_fibre(&fibre, &arcs, &strip, &heights, &log_scale, &final_frames, &positions)?;
-    Ok((Some(record), arcs.len()))
+    Ok(Outcome::Indexed(Some(record), arcs.len()))
 }
 
-/// Writes each finished fibre's index line and the progress lines until every fibre is done; the decisions run
+/// What the index writer saw: the decisions run, and the fibres deferred with the uncached chunks they need
+struct Written {
+    decisions: usize,
+    deferred: usize,
+    uncached: BTreeSet<[usize; 3]>,
+}
+
+/// Writes each finished fibre's index line and the progress lines until every fibre is done or deferred
 fn write_index(
     args: &Args,
     k: usize,
@@ -403,20 +460,30 @@ fn write_index(
     total: usize,
     done: std::sync::mpsc::Receiver<Done>,
     started: Instant,
-) -> Result<usize> {
+) -> Result<Written> {
     let path = args.out.join("index").join(format!("shard_{k}.jsonl"));
     let mut log = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .wrap_err_with(|| format!("open {}", path.display()))?;
-    let (mut count, mut decisions) = (0usize, 0usize);
+    let (mut count, mut decisions, mut deferred) = (0usize, 0usize, 0usize);
+    let mut uncached = BTreeSet::new();
     let mut last_record = Instant::now();
     let mut last_print = Instant::now();
     for result in done {
-        let (record, n) = result?;
         count += 1;
-        decisions += n;
+        let record = match result? {
+            Outcome::Indexed(record, n) => {
+                decisions += n;
+                record
+            }
+            Outcome::Uncached(chunks) => {
+                deferred += 1;
+                uncached.extend(chunks);
+                None
+            }
+        };
         if let Some(record) = record {
             let seconds = last_record.elapsed().as_secs_f64();
             if record.failed.is_none() {
@@ -439,5 +506,24 @@ fn write_index(
         }
     }
     ensure!(count == total, "{count} of {total} fibres finished");
-    Ok(decisions)
+    Ok(Written { decisions, deferred, uncached })
+}
+
+/// Lists `uncached` (chunk-grid `z/y/x`, one per line, the cache's own layout) in `<out>/logs/`, where the next pass's
+/// fetch reads them; a run that deferred nothing removes a stale list
+fn write_uncached(args: &Args, k: usize, n: usize, written: &Written) -> Result<PathBuf> {
+    let name = if n == 1 { "uncached_chunks.txt".to_string() } else { format!("uncached_chunks_shard{k}.txt") };
+    let path = args.out.join("logs").join(name);
+    if written.deferred == 0 {
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).wrap_err_with(|| format!("remove {}", path.display()));
+            }
+            _ => return Ok(path),
+        }
+    }
+    fs::create_dir_all(args.out.join("logs")).wrap_err_with(|| format!("create {}", args.out.display()))?;
+    let text: String = written.uncached.iter().map(|[z, y, x]| format!("{z}/{y}/{x}\n")).collect();
+    fs::write(&path, text).wrap_err_with(|| format!("write {}", path.display()))?;
+    Ok(path)
 }

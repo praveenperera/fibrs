@@ -59,6 +59,10 @@ pub fn main(args: &[OsString]) -> i32 {
     };
     match result {
         Ok(()) => 0,
+        Err(e) if e.downcast_ref::<runner::Deferred>().is_some() => {
+            eprintln!("fibrs strips: {e:#}");
+            runner::EXIT_UNCACHED
+        }
         Err(e) => {
             eprintln!("fibrs strips: {e:#}");
             1

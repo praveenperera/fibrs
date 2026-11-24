@@ -5,7 +5,8 @@
 //! read ([`CropGrid::chunks`]), uploads the missing ones from vc_reader's disk cache through pinned staging on a
 //! copy stream, evicting the least recently used chunks no crop of the launch needs, and makes the compute stream
 //! wait for the uploads. The copy stream in turn waits for the last sampler launch, so a slot is never rewritten
-//! under a crop still reading it.
+//! under a crop still reading it. A launch needing a chunk the disk cache lacks fails before any upload, with every
+//! such chunk in its [`Uncached`] error.
 //!
 //! [`Crops`] samples the strip model's input, NDHWC `(B, 144, 128, 128, 2)` float32 with the z-scored CT in
 //! channel 0 and villa's `render_tube` in channel 1, and the frame model's `(B, 32, 32, 32)` float32 crops, with
@@ -21,7 +22,7 @@ use volkit::gpu::{Arg, Buf, Gpu};
 
 use self::prefetch::Prefetcher;
 use super::Device;
-use crate::strips::ct::Volume;
+use crate::strips::ct::{Uncached, Volume};
 
 mod prefetch;
 use crate::strips::types::{Mat3, TUBE_POINTS};
@@ -398,6 +399,13 @@ impl ChunkCache {
         }
 
         let missing: Vec<u32> = needed.iter().copied().filter(|&idx| self.host_table[idx as usize] == ABSENT).collect();
+        // every chunk the disk cache lacks, before any slot or table entry changes, so the launch fails whole and
+        // names them all for one fetch
+        let uncached: Vec<[usize; 3]> =
+            missing.iter().map(|&idx| self.coords(idx)).filter(|&c| !self.vol.cached(c)).collect();
+        if !uncached.is_empty() {
+            return Err(Uncached(uncached).into());
+        }
         let mut updates: Vec<(u32, u32)> = Vec::new();
         for group in missing.chunks(self.staging.len()) {
             // chunks read ahead come from their prefetch buffers, the rest are read now into staging buffers `0..`;

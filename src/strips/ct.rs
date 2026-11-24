@@ -10,12 +10,26 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
+use color_eyre::eyre::{Result, WrapErr, ensure, eyre};
 use memmap2::Mmap;
 use serde_json::Value;
 
 /// One chunk: its bytes, or `None` where the source holds none (every voxel the fill value)
 pub type Chunk = Option<Arc<Mmap>>;
+
+/// CT chunks (chunk-grid zyx) the disk cache holds neither decoded nor as a missing marker: the prefetch did not
+/// reach them. Never read as the fill value; the runner defers the fibres that need them and lists them for a fetch
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Uncached(pub Vec<[usize; 3]>);
+
+impl std::fmt::Display for Uncached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let first = self.0.first().map(|c| format!("{c:?}")).unwrap_or_default();
+        write!(f, "{} CT chunks are not in the disk cache (first {first}); prefetch them", self.0.len())
+    }
+}
+
+impl std::error::Error for Uncached {}
 
 /// A uint8 CT level in a vc_reader disk cache
 pub struct Volume {
@@ -85,7 +99,7 @@ impl Volume {
                 let mut marker = path.clone().into_os_string();
                 marker.push(".missing");
                 if !Path::new(&marker).exists() {
-                    bail!("CT chunk {c:?} is not in the disk cache {} (prefetch the scroll first)", self.dir.display());
+                    return Err(Uncached(vec![c]).into());
                 }
                 None
             }
@@ -112,7 +126,7 @@ impl Volume {
                 let mut marker = path.clone().into_os_string();
                 marker.push(".missing");
                 if !Path::new(&marker).exists() {
-                    bail!("CT chunk {c:?} is not in the disk cache {} (prefetch the scroll first)", self.dir.display());
+                    return Err(Uncached(vec![c]).into());
                 }
                 return Ok(false);
             }
@@ -122,6 +136,14 @@ impl Volume {
         ensure!(len == want as u64, "{}: {len} bytes, expected {want}", path.display());
         file.read_exact(out).wrap_err_with(|| format!("read {}", path.display()))?;
         Ok(true)
+    }
+
+    /// Whether the cache holds chunk `c` (chunk-grid zyx), decoded or as a missing marker
+    pub fn cached(&self, c: [usize; 3]) -> bool {
+        let path = self.dir.join(c[0].to_string()).join(c[1].to_string()).join(c[2].to_string());
+        let mut marker = path.clone().into_os_string();
+        marker.push(".missing");
+        path.exists() || Path::new(&marker).exists()
     }
 
     /// Copies the box `start .. start + size` (zyx, inside the level) into `out`, zyx C order
@@ -203,7 +225,15 @@ mod tests {
         }
         fs::remove_dir_all(level.join("0/0/0")).ok();
         fs::remove_file(level.join("0/0/0")).ok();
-        assert!(Volume::open(&root, "s3://bucket/v.zarr", 0).unwrap().chunk([0, 0, 0]).is_err());
+        // an uncached chunk is a typed error, never the fill value
+        let vol = Volume::open(&root, "s3://bucket/v.zarr", 0).unwrap();
+        assert!(vol.cached([1, 0, 1]) && vol.cached([1, 1, 1]) && !vol.cached([0, 0, 0]));
+        let err = vol.chunk([0, 0, 0]).unwrap_err();
+        assert_eq!(err.downcast_ref::<Uncached>(), Some(&Uncached(vec![[0, 0, 0]])));
+        let err = vol.read_chunk([0, 0, 0], &mut [0u8; 64]).unwrap_err();
+        assert_eq!(err.downcast_ref::<Uncached>(), Some(&Uncached(vec![[0, 0, 0]])));
+        let err = vol.read_region([0, 0, 0], [2, 2, 2], &mut [0u8; 8]).unwrap_err();
+        assert_eq!(err.downcast_ref::<Uncached>(), Some(&Uncached(vec![[0, 0, 0]])));
         fs::remove_dir_all(&root).unwrap();
     }
 }

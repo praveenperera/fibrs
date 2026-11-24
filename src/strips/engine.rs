@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use color_eyre::eyre::{Result, WrapErr, ensure};
 
-use super::ct::Volume;
+use super::ct::{Uncached, Volume};
 use super::gpu::cnn::CropCnn;
 use super::gpu::crops::{CacheCounts, ChunkCache, CropAt, CropSpec, Crops, FRAME_CROP, STRIP_CROP};
 use super::gpu::frame::FrameModel;
@@ -40,8 +40,36 @@ pub struct EngineConfig {
 
 /// A fibre's requests for one model and the channel its results go back on, in request order
 pub enum Work {
-    Frames(Vec<FrameRequest>, Sender<Result<Vec<FrameResult>, String>>),
-    Strips(Vec<StripRequest>, Sender<Result<Vec<StripResult>, String>>),
+    Frames(Vec<FrameRequest>, Sender<Result<Vec<FrameResult>, LaunchError>>),
+    Strips(Vec<StripRequest>, Sender<Result<Vec<StripResult>, LaunchError>>),
+}
+
+/// Why a launch failed, as each item it touched hears it
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchError {
+    /// Its crops need CT chunks the disk cache does not hold; nothing else went wrong, so its fibres can run once
+    /// they are fetched
+    Uncached(Vec<[usize; 3]>),
+    /// Anything else, with its error chain
+    Failed(String),
+}
+
+impl LaunchError {
+    fn new(e: &color_eyre::eyre::Report) -> Self {
+        match e.downcast_ref::<Uncached>() {
+            Some(Uncached(chunks)) => Self::Uncached(chunks.clone()),
+            None => Self::Failed(format!("{e:#}")),
+        }
+    }
+}
+
+impl std::fmt::Display for LaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Uncached(chunks) => Uncached(chunks.clone()).fmt(f),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
 }
 
 /// What the engine did, for the run's report
@@ -116,7 +144,7 @@ struct Ahead {
 struct Pending<Q, R> {
     requests: Vec<Q>,
     done: Vec<R>,
-    reply: Sender<Result<Vec<R>, String>>,
+    reply: Sender<Result<Vec<R>, LaunchError>>,
 }
 
 /// A queue of pending items of one model, cut into launches of up to `batch` decisions across items
@@ -139,7 +167,7 @@ impl<Q: Clone, R> Queue<Q, R> {
         self.items.iter().flat_map(|item| &item.requests[item.done.len()..]).skip(skip).take(n).map(f).collect()
     }
 
-    fn push(&mut self, requests: Vec<Q>, reply: Sender<Result<Vec<R>, String>>) {
+    fn push(&mut self, requests: Vec<Q>, reply: Sender<Result<Vec<R>, LaunchError>>) {
         if requests.is_empty() {
             let _ = reply.send(Ok(Vec::new()));
             return;
@@ -178,9 +206,9 @@ impl<Q: Clone, R> Queue<Q, R> {
                 }
             }
             Err(e) => {
-                let message = format!("{e:#}");
+                let error = LaunchError::new(&e);
                 for item in self.items.drain(..touched) {
-                    let _ = item.reply.send(Err(message.clone()));
+                    let _ = item.reply.send(Err(error.clone()));
                 }
             }
         }
@@ -315,8 +343,14 @@ mod tests {
         q.launch(4, |b| Ok(b.to_vec()));
         q.launch(4, |_| Err(eyre!("device lost")));
         assert_eq!(rx[0].try_recv().unwrap().unwrap(), vec![0, 1, 2]);
-        assert_eq!(rx[1].try_recv().unwrap().unwrap_err(), "device lost");
-        assert_eq!(rx[2].try_recv().unwrap().unwrap_err(), "device lost");
+        assert_eq!(rx[1].try_recv().unwrap().unwrap_err(), LaunchError::Failed("device lost".into()));
+        assert_eq!(rx[2].try_recv().unwrap().unwrap_err(), LaunchError::Failed("device lost".into()));
         assert_eq!(q.decisions(), 0);
+
+        // a launch that needs uncached chunks tells each item it touched which, even under added context
+        let (tx, rx) = channel();
+        q.push(vec![1, 2], tx);
+        q.launch(4, |_| Err(color_eyre::eyre::Report::new(Uncached(vec![[1, 2, 3]])).wrap_err("crops")));
+        assert_eq!(rx.try_recv().unwrap().unwrap_err(), LaunchError::Uncached(vec![[1, 2, 3]]));
     }
 }
