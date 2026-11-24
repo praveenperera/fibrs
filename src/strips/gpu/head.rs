@@ -12,7 +12,9 @@ mod layout;
 #[cfg(test)]
 mod tests;
 
-use color_eyre::eyre::{Result, WrapErr, ensure};
+use std::sync::Mutex;
+
+use color_eyre::eyre::{Result, WrapErr, ensure, eyre};
 use volkit::gpu::{Arg, Buf};
 
 use super::{Device, Weights};
@@ -139,13 +141,20 @@ struct Tables {
     anchors: Buf,
     /// Strip columns v (25), rows f (36), profile offsets (25)
     grid: Buf,
-    /// The key mask every batch starts from: cells and strip tokens valid, padding invalid
-    keymask: Vec<u8>,
+}
+
+/// Host memory one forward reuses: the packed decision records and the downloaded heights and log scales
+struct Staging {
+    records: Vec<f32>,
+    heights: Vec<f32>,
+    logs: Vec<f32>,
 }
 
 /// Activations, sized for the largest batch. The projection inputs' pad columns stay zero from allocation
 pub(crate) struct Buffers {
     pub(crate) req: Buf,
+    /// One byte per key and decision `[B, 2048]`: the cells and strip tokens valid and the padding invalid from
+    /// allocation on, the reference and geometry keys rewritten by their token kernels every batch
     pub(crate) keymask: Buf,
     pub(crate) xs: Buf,
     pub(crate) xt: Buf,
@@ -187,6 +196,8 @@ pub struct Head {
     params: Params,
     tables: Tables,
     pub(crate) bufs: Buffers,
+    /// Held for a whole forward, which also keeps two forwards from sharing the device buffers at once
+    staging: Mutex<Staging>,
     max_batch: usize,
 }
 
@@ -290,7 +301,6 @@ impl Head {
             subs: dev.gpu.upload(&subs)?,
             anchors: dev.gpu.upload(&strip.anchors.concat())?,
             grid: dev.gpu.upload(&grid)?,
-            keymask,
         };
 
         let b = max_batch;
@@ -298,7 +308,7 @@ impl Head {
         let kv = || (0..LAYERS).map(|_| zeros(b * 4 * LDK * 32 * 2)).collect::<Result<Vec<_>>>();
         let bufs = Buffers {
             req: zeros(b * REQ * 4)?,
-            keymask: dev.gpu.upload(&tables.keymask.repeat(b))?,
+            keymask: dev.gpu.upload(&keymask.repeat(b))?,
             xs: zeros(b * layout::SECTOR_TOKENS * K_SECTOR * 2)?,
             xt: zeros(b * layout::TUBE_TOKENS * K_TUBE * 2)?,
             xr: zeros(b * REFS * K_REF * 2)?,
@@ -323,7 +333,12 @@ impl Head {
             ls_hid: zeros(b * STRIPS * 64 * 2)?,
             logs: zeros(b * STRIPS * 2 * 4)?,
         };
-        let head = Self { params, tables, bufs, max_batch };
+        let staging = Staging {
+            records: vec![0.0; b * REQ],
+            heights: Vec::with_capacity(b * STRIPS * 2),
+            logs: Vec::with_capacity(b * STRIPS * 2),
+        };
+        let head = Self { params, tables, bufs, staging: Mutex::new(staging), max_batch };
 
         // cell_position(cell_xyz / 16) through the same kernels: the centres / 16 as bf16 rows of 64
         let mut xyz = vec![0u16; CELLS * 64];
@@ -372,12 +387,12 @@ impl Head {
         ensure!(cells.bytes() >= b * 36 * 32 * 32 * 64 * 2, "cells hold fewer than {b} decisions");
         ensure!(crop.bytes() >= b * 144 * 128 * 128 * 2 * 4, "the crop holds fewer than {b} decisions");
         let (p, t, x) = (&self.params, &self.tables, &self.bufs);
-        let mut records = vec![0f32; b * REQ];
+        let mut staging = self.staging.lock().map_err(|_| eyre!("a forward on this head panicked"))?;
+        let Staging { records, heights, logs } = &mut *staging;
         for (r, q) in records.as_chunks_mut::<REQ>().0.iter_mut().zip(requests) {
             pack(r, q);
         }
-        dev.gpu.upload_into(&x.req, 0, &records)?;
-        dev.gpu.upload_into(&x.keymask, 0, &t.keymask.repeat(b))?;
+        dev.gpu.upload_into(&x.req, 0, &records[..b * REQ])?;
         let bu = b as u32;
 
         // tokens
@@ -518,8 +533,8 @@ impl Head {
         self.linear_f32(dev, (&x.ls_hid, 64), ms, &p.log_scale.l2, &x.logs, 1.0)?;
         trace("decoded2", self)?;
 
-        let heights: Vec<f32> = dev.gpu.download_range(&x.h1, 0, ms * 2)?;
-        let logs: Vec<f32> = dev.gpu.download_range(&x.logs, 0, ms * 2)?;
+        dev.gpu.download_range_into(&x.h1, 0, ms * 2, heights)?;
+        dev.gpu.download_range_into(&x.logs, 0, ms * 2, logs)?;
         Ok(heights
             .as_chunks::<{ STRIPS * 2 }>()
             .0
