@@ -11,6 +11,11 @@
   or worker count. Fibres whose CT chunks aren't in the disk cache are deferred and listed, and the run exits with
   code 75. See [Strips](docs/strips.md).
 
+### Upgrading
+
+- fibrs now needs volkit 0.1.3, whose device layer is public so `fibrs strips` can run its own kernels on
+  volkit's GPU.
+
 ## [0.5.0] - 2026-11-22
 
 fibrs 0.5.0 adds `fibrs subset`, which cuts a whole-scroll fibre set down to a box, a minimum length or a family

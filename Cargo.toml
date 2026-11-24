@@ -70,7 +70,7 @@ zstd = "0.13"
 # elsewhere `fibrs predict` plans a run (--dry-run) but refuses to start one. Cargo.lock pins the release; build.rs
 # records it in the provenance from there
 [target.'cfg(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64"))'.dependencies]
-volkit = "0.1.2"
+volkit = "0.1.3"
 # the free device memory for the column check, from the cudarc volkit already brings into the tree
 cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12040"] }
 # `fibrs strips`: the PTX tier type volkit's module loader takes, and the checkpoint's exported weights; the
@@ -99,8 +99,3 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 [profile.release]
 debug = 1
 codegen-units = 4
-
-# the sheet-strip runner (`fibrs strips`) needs volkit's public device layer (praveenperera/volkit#3), which no
-# volkit release has yet; replace with the release that includes it before publishing
-[patch.crates-io]
-volkit = { git = "https://github.com/praveenperera/volkit", rev = "6716b4283f1acc69b9f874848fee09366003c640" }
