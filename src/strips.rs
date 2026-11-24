@@ -7,12 +7,22 @@
 //! the CPU stitches the decisions into a strip and writes it (`out`). Decisions batch across fibres on the GPU;
 //! the CPU work runs on a thread pool. [`types`] holds the records that pass between the two sides
 
+mod bench_cpu;
 mod bench_model;
 pub mod ct;
 pub mod engine;
+pub mod fibre;
+pub mod geom;
 pub mod gpu;
+pub mod np;
+pub mod out;
 pub mod refset;
+pub mod seed;
+pub mod stitch;
 pub mod types;
+
+#[cfg(test)]
+mod tests;
 
 use std::ffi::OsString;
 
@@ -34,9 +44,14 @@ enum Command {
 
 /// Runs `fibrs strips` on the arguments after the subcommand; the process exit code
 pub fn main(args: &[OsString]) -> i32 {
-    let command = Command::parse_from(std::iter::once(OsString::from("fibrs strips")).chain(args.iter().cloned()));
-    let result = match &command {
-        Command::BenchModel(args) => bench_model::run(args),
+    // bench-cpu parses its own arguments
+    let result = if args.first().and_then(|a| a.to_str()) == Some("bench-cpu") {
+        bench_cpu::main(&args[1..])
+    } else {
+        let command = Command::parse_from(std::iter::once(OsString::from("fibrs strips")).chain(args.iter().cloned()));
+        match &command {
+            Command::BenchModel(args) => bench_model::run(args),
+        }
     };
     match result {
         Ok(()) => 0,
