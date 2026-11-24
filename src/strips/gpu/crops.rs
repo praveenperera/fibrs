@@ -19,8 +19,11 @@ use cudarc::driver::result as cur;
 use cudarc::driver::{CudaContext, CudaEvent, CudaStream};
 use volkit::gpu::{Arg, Buf, Gpu};
 
+use self::prefetch::Prefetcher;
 use super::Device;
 use crate::strips::ct::Volume;
+
+mod prefetch;
 use crate::strips::types::{Mat3, TUBE_POINTS};
 
 /// Table entry of a chunk the source holds none of (strips-kernels `FILL`)
@@ -277,6 +280,8 @@ pub struct CacheCounts {
     pub evictions: u64,
     /// The most chunks one launch needed
     pub most: u64,
+    /// Uploads whose chunk [`ChunkCache::prefetch`] had read ahead
+    pub prefetched: u64,
 }
 
 /// The device CT cache: a pool of chunk slots, the dense chunk table the sampler reads, and the host's LRU
@@ -298,12 +303,14 @@ pub struct ChunkCache {
     entries: Pinned<u32>,
     uploaded: CudaEvent,
     sampled: CudaEvent,
+    prefetch: Prefetcher,
     /// Totals since the cache was made
     pub counts: CacheCounts,
 }
 
 impl ChunkCache {
-    /// A cache of `slots` chunks (2 MiB each) of `vol`, uploading through `staging` pinned chunk buffers
+    /// A cache of `slots` chunks (2 MiB each) of `vol`, uploading through `staging` pinned chunk buffers, and as
+    /// many again for chunks read ahead
     pub fn new(dev: &Device, vol: Arc<Volume>, slots: usize, staging: usize) -> Result<Self> {
         ensure!(vol.chunk_shape() == [CHUNK; 3], "the device CT cache needs 128^3 chunks, not {:?}", vol.chunk_shape());
         ensure!(slots > 0 && slots < FILL as usize && staging > 0, "cache of {slots} slots, {staging} staging");
@@ -317,6 +324,7 @@ impl ChunkCache {
         let pool = gpu.alloc(slots * CHUNK_BYTES).wrap_err_with(|| format!("allocate {slots} CT chunk slots"))?;
         // the table fill runs on the compute stream, the updates on the copy stream
         gpu.sync()?;
+        let prefetch = Prefetcher::new(ctx, vol.clone(), staging, READERS)?;
         let staging = (0..staging).map(|_| Pinned::new(ctx, CHUNK_BYTES)).collect::<Result<Vec<_>>>()?;
         Ok(Self {
             fill: vol.fill(),
@@ -336,6 +344,7 @@ impl ChunkCache {
             entries: Pinned::new(ctx, 1 << 16)?,
             uploaded: ctx.new_event(None)?,
             sampled: ctx.new_event(None)?,
+            prefetch,
             counts: CacheCounts::default(),
         })
     }
@@ -361,6 +370,17 @@ impl ChunkCache {
         out
     }
 
+    /// Starts reading, on background threads, the chunks of `needed` (table indices) that are not resident, for a
+    /// later [`ChunkCache::prepare`]; call it once the current launch is queued, with the next launch's chunks
+    pub fn prefetch(&mut self, needed: &[u32]) -> Result<()> {
+        let missing: Vec<(u32, [usize; 3])> = needed
+            .iter()
+            .filter(|&&idx| self.host_table[idx as usize] == ABSENT)
+            .map(|&idx| (idx, self.coords(idx)))
+            .collect();
+        self.prefetch.start(&missing)
+    }
+
     /// Makes the chunks `needed` (table indices) resident and the compute stream wait for their uploads
     pub fn prepare(&mut self, gpu: &Gpu, needed: &[u32]) -> Result<()> {
         self.epoch += 1;
@@ -380,8 +400,20 @@ impl ChunkCache {
         let missing: Vec<u32> = needed.iter().copied().filter(|&idx| self.host_table[idx as usize] == ABSENT).collect();
         let mut updates: Vec<(u32, u32)> = Vec::new();
         for group in missing.chunks(self.staging.len()) {
-            let present = self.read_group(group)?;
-            for (k, (&idx, present)) in group.iter().zip(present).enumerate() {
+            // chunks read ahead come from their prefetch buffers, the rest are read now into staging buffers `0..`;
+            // either way the group is uploaded in order, so slots and evictions do not depend on what was read ahead
+            let ahead: Vec<Option<(usize, bool)>> = group.iter().map(|&idx| self.prefetch.take(idx)).collect();
+            let rest: Vec<u32> = group.iter().zip(&ahead).filter(|(_, a)| a.is_none()).map(|(&idx, _)| idx).collect();
+            let read = if rest.is_empty() { Vec::new() } else { self.read_group(&rest)? };
+            let mut read = read.into_iter().enumerate();
+            for (&idx, ahead) in group.iter().zip(ahead) {
+                let (present, from) = match ahead {
+                    Some((buf, present)) => (present, Ok(buf)),
+                    None => {
+                        let (k, present) = read.next().ok_or_else(|| eyre!("chunk read count mismatch"))?;
+                        (present, Err(k))
+                    }
+                };
                 if !present {
                     self.host_table[idx as usize] = FILL;
                     updates.push((idx, FILL));
@@ -389,12 +421,14 @@ impl ChunkCache {
                     continue;
                 }
                 let slot = self.take_slot(&mut updates)?;
-                upload(
-                    &self.copy,
-                    self.pool.ptr() + (slot as u64) * CHUNK_BYTES as u64,
-                    &mut self.staging[k],
-                    CHUNK_BYTES,
-                )?;
+                let buf = match from {
+                    Ok(buf) => {
+                        self.counts.prefetched += 1;
+                        self.prefetch.buf_mut(buf)
+                    }
+                    Err(k) => &mut self.staging[k],
+                };
+                upload(&self.copy, self.pool.ptr() + (slot as u64) * CHUNK_BYTES as u64, buf, CHUNK_BYTES)?;
                 self.host_table[idx as usize] = slot;
                 self.owner[slot as usize] = idx;
                 self.last_use[slot as usize] = self.epoch;
@@ -589,6 +623,17 @@ impl Crops {
     /// The frame model's crops for `at` (prior frames) into `out`: `(B, 32, 32, 32)` float32, z-scored
     pub fn frame(&mut self, dev: &Device, cache: &mut ChunkCache, at: &[CropAt], out: &Buf) -> Result<()> {
         self.sample(dev, cache, &FRAME_CROP, at, None, out, 0)
+    }
+
+    /// Starts reading ahead the CT chunks that crops of `spec` at `at` need and the cache lacks, for a later launch
+    /// on them; see [`ChunkCache::prefetch`]
+    pub fn prefetch(&self, cache: &mut ChunkCache, spec: &CropSpec, at: &[CropAt]) -> Result<()> {
+        if at.is_empty() {
+            return Ok(());
+        }
+        let grids: Vec<CropGrid> = at.iter().map(|c| CropGrid::new(spec, c.pos, &c.frame, self.scale)).collect();
+        let needed = cache.needed(spec, &grids);
+        cache.prefetch(&needed)
     }
 
     /// Stages the grids (and tube points), makes their chunks resident and launches the sampler, writing one
