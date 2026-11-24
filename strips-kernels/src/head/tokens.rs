@@ -15,6 +15,7 @@ use cuda_device::thread::{__unroll_config, blockIdx_x, blockIdx_y, gridDim_y, th
 use cuda_device::{DisjointSlice, kernel, launch_contract};
 
 use super::util::{hi_f32, lo_f32, math, pack_bf16, require};
+use crate::crops::zscore;
 
 /// Floats per decision record, and the offsets of its fields
 pub const REQ: usize = 800;
@@ -158,12 +159,13 @@ unsafe fn sample_cells(cells: *const u32, x: f32, y: f32, z: f32, lane: u32) -> 
 /// vc_reader `sample_array` (order 1, zeros boundary) of both channels of a decision's `[144, 128, 128, 2]` fp32
 /// crop at array index `(d, h, w)`: zero when any coordinate is `<= -1` or `>= size`, NaN when one isn't finite;
 /// else the multilinear sum over the axes with a nonzero fraction, corners z-fastest, weights multiplied in z, y, x
-/// order, corners outside the crop zero
+/// order, corners outside the crop zero. With `st`, the crop's CT channel is a raw [`crate::crops::sc_raw`] crop
+/// and each corner's value is z-scored with those statistics as it is read, to the z-scored crop's bits
 ///
 /// # Safety
 /// `crop` points to one decision's whole crop
 #[inline(always)]
-unsafe fn sample_crop(crop: *const f32, d: f32, h: f32, w: f32) -> (f32, f32) {
+unsafe fn sample_crop(crop: *const f32, st: Option<[f32; 4]>, d: f32, h: f32, w: f32) -> (f32, f32) {
     let c = [d, h, w];
     let shape = [DD, DH, DW];
     let mut finite = true;
@@ -209,10 +211,13 @@ unsafe fn sample_crop(crop: *const f32, d: f32, h: f32, w: f32) -> (f32, f32) {
         if !skip && inside {
             // SAFETY: every coordinate is inside the crop
             let p = unsafe { crop.add(at as usize * 2) };
-            unsafe {
-                v0 = weight * *p + v0;
-                v1 = weight * *p.add(1) + v1;
-            }
+            let (c0, c1) = unsafe { (*p, *p.add(1)) };
+            let c0 = match st {
+                Some(st) => zscore(c0, st),
+                None => c0,
+            };
+            v0 = weight * c0 + v0;
+            v1 = weight * c1 + v1;
         }
         corner += 1;
     }
@@ -498,7 +503,8 @@ pub fn sm_query_tokens(
 /// height (`h0` `[B * 450, 2]` fp32). `xf` rows `[B * 450, 192]`: the evidence of both points (features, support),
 /// then both `h0 / 16`. `xp` rows `[B * 450, 128]`: at `(n * 25 + k) * 2 + c`, channel `c` of the crop (`[B, 144,
 /// 128, 128, 2]` fp32) at `u = h0 + offsets[k]`, all bf16. `grid` holds the 25 column `v`, the 36 row `f` and the 25
-/// profile offsets
+/// profile offsets. `stats` is empty when the crop's CT channel is z-scored, else each crop's
+/// [`crate::crops::zscore`] statistics `[B][4]` for a raw [`crate::crops::sc_raw`] crop
 ///
 /// Grid `(ceil(450 / 4), B)`, block 128: one warp per token
 #[kernel]
@@ -510,12 +516,14 @@ pub fn sm_refine_tokens(
     crop: &[f32],
     h0: &[f32],
     grid: &[f32],
+    stats: &[f32],
 ) {
     let b = blockIdx_y() as usize;
     let nb = gridDim_y() as usize;
     require(
         (cells.len() >= nb * CELLS)
             & (crop.len() >= nb * CROP)
+            & (stats.is_empty() | (stats.len() >= nb * 4))
             & (h0.len() >= nb * STRIPS as usize * 2)
             & (grid.len() >= 86)
             & (xf.len() >= nb * (STRIPS * K_REFINE) as usize)
@@ -554,12 +562,18 @@ pub fn sm_refine_tokens(
         }
 
         let cr = crop.as_ptr().add(b * CROP);
+        let st = if stats.is_empty() {
+            None
+        } else {
+            let p = stats.as_ptr().add(4 * b);
+            Some([*p, *p.add(1), *p.add(2), *p.add(3)])
+        };
         let o = xp.as_mut_ptr().add(tok * K_PROFILE as usize);
         let mut i = lane;
         while i < 50 {
             let (n, k) = (i / 25, (i % 25) as usize);
             let w = (pick(u, n) + *grid.as_ptr().add(61 + k)) * 2.0 + 63.5;
-            let (c0, c1) = sample_crop(cr, pick(f, n) * 2.0 + 72.0, v * 2.0 + 63.5, w);
+            let (c0, c1) = sample_crop(cr, st, pick(f, n) * 2.0 + 72.0, v * 2.0 + 63.5, w);
             *o.add(2 * i as usize) = bf16_bits(c0);
             *o.add(2 * i as usize + 1) = bf16_bits(c1);
             i += 32;

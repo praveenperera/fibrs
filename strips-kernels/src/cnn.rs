@@ -28,6 +28,8 @@ use cuda_device::vector::{F32x2, F32x4, U32x2, U32x4};
 use cuda_device::wmma::{ldmatrix_x4_shared_u32, mma_m16n8k16_f32_bf16};
 use cuda_device::{DisjointSlice, SharedArray, kernel, launch_contract, thread, warp};
 
+use crate::crops::zscore;
+
 /// The low bf16 of a pair
 #[inline(always)]
 fn lo(p: u32) -> f32 {
@@ -527,8 +529,10 @@ fn reduce_scatter64(v: &[f32; 64], lane: u32) -> [f32; 2] {
 ///   `rbf(wsk p)`, for [`sn_merge`] (count 256).
 ///
 /// `x` is the float32 `[B, 144, 128, 128]` (CT, tube) pairs; `w` the bf16-rounded conv weights `[27 taps][2][12]`
-/// as 162 `F32x4`; `wsk` the skip's `[2][12]`; `bias` conv1's bf16-rounded bias `[12]`. Grid `(1152, B)`: block `t` owns the output tile `2 x 8 x 16` at
-/// `(t / 32, t / 4 % 8, t % 4)` tiles; 256 threads, one output voxel each
+/// as 162 `F32x4`; `wsk` the skip's `[2][12]`; `bias` conv1's bf16-rounded bias `[12]`; `stats` empty when `x`'s
+/// CT channel is z-scored, else each crop's [`crate::crops::zscore`] statistics `[B][4]` for a raw
+/// [`crate::crops::sc_raw`] crop, applied as the halo is staged. Grid `(1152, B)`: block `t` owns the output tile
+/// `2 x 8 x 16` at `(t / 32, t / 4 % 8, t % 4)` tiles; 256 threads, one output voxel each
 #[kernel]
 pub fn sn_conv0(
     mut y: DisjointSlice<U32x2>,
@@ -538,6 +542,7 @@ pub fn sn_conv0(
     w: &[F32x4],
     wsk: &[f32],
     bias: &[f32],
+    stats: &[f32],
 ) {
     static mut HALO: SharedArray<F32x2, 2805> = SharedArray::UNINIT;
     static mut WS: SharedArray<F32x4, 162> = SharedArray::UNINIT;
@@ -560,6 +565,7 @@ pub fn sn_conv0(
         | (((b + 1) * out_voxels * 3) as usize > y.len())
         | (((b + 1) * out_voxels) as usize > p.len())
         | ((((b * TILES + tile) + 1) * 24) as usize > part.len())
+        | (!stats.is_empty() & (((b + 1) * 4) as usize > stats.len()))
     {
         return;
     }
@@ -571,6 +577,17 @@ pub fn sn_conv0(
     let (bz, by, bx) = (tile / 32, (tile / 4) % 8, tile % 4);
     // the halo's input origin: the tile's output origin times 2, minus the padding
     let (iz0, iy0, ix0) = ((bz * 4) as i32 - 1, (by * 16) as i32 - 1, (bx * 32) as i32 - 1);
+
+    // a raw crop's z-score, applied to the CT channel of every staged sample; the padding stays zero, as the
+    // z-scored crop's did
+    let raw = !stats.is_empty();
+    // SAFETY: four statistics per crop when `raw`, checked above
+    let st = if raw {
+        let i = (4 * b) as usize;
+        unsafe { [*stats.get_unchecked(i), *stats.get_unchecked(i + 1), *stats.get_unchecked(i + 2), *stats.get_unchecked(i + 3)] }
+    } else {
+        [0.0; 4]
+    };
 
     // stage the 5 x 17 x 33 input halo (zero outside the crop) and the weights; loads first, then stores, so each
     // thread's eleven loads are in flight together
@@ -587,7 +604,11 @@ pub fn sn_conv0(
         if inside {
             let o = ((b * D + iz as u32) * H + iy as u32) * W + ix as u32;
             // SAFETY: inside the sample, which the check above puts inside `x`
-            vals[k as usize] = unsafe { *x.get_unchecked(o as usize) };
+            let mut v = unsafe { *x.get_unchecked(o as usize) };
+            if raw {
+                v.0[0] = zscore(v.0[0], st);
+            }
+            vals[k as usize] = v;
         }
         k += 1;
     }

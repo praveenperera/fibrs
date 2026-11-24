@@ -26,10 +26,11 @@
 
 use std::collections::HashMap;
 
-use color_eyre::eyre::{Result, WrapErr, ensure};
+use color_eyre::eyre::{Result, WrapErr, bail, ensure};
 use volkit::dnn::{ConvPlan, ConvShape, Dtype, Pick};
 use volkit::gpu::{Arg, Buf, Gpu};
 
+use super::crops::StripInput;
 use super::{Device, Weights};
 
 /// The input crop's depth, height and width (villa `cfg.fine`: 144 x 128 x 128 samples)
@@ -614,20 +615,27 @@ impl CropCnn {
             .collect()
     }
 
-    /// Queues the CNN on `n` crops: `input` holds float32 `[n, 144, 128, 128, 2]` (channel 0 the z-scored CT,
-    /// 1 the tube); returns the cells, bf16 `[n, 36, 32, 32, 64]`, valid until the next forward
-    pub fn forward(&mut self, dev: &Device, input: &Buf, n: usize) -> Result<&Buf> {
-        self.run(dev, input, n, None)?;
+    /// Queues the CNN on `n` crops: `input` holds float32 `[n, 144, 128, 128, 2]` (channel 0 the CT, z-scored or
+    /// raw with its statistics, 1 the tube); returns the cells, bf16 `[n, 36, 32, 32, 64]`, valid until the next
+    /// forward
+    pub fn forward<'a>(&mut self, dev: &Device, input: impl Into<StripInput<'a>>, n: usize) -> Result<&Buf> {
+        self.run(dev, input.into(), n, None)?;
         Ok(&self.cells)
     }
 
     /// [`CropCnn::forward`], also handing each block's output to `tap` (after a stream sync) as it is written
-    pub fn forward_tapped(&mut self, dev: &Device, input: &Buf, n: usize, tap: Tap) -> Result<&Buf> {
-        self.run(dev, input, n, Some(tap))?;
+    pub fn forward_tapped<'a>(
+        &mut self,
+        dev: &Device,
+        input: impl Into<StripInput<'a>>,
+        n: usize,
+        tap: Tap,
+    ) -> Result<&Buf> {
+        self.run(dev, input.into(), n, Some(tap))?;
         Ok(&self.cells)
     }
 
-    fn run(&mut self, dev: &Device, input: &Buf, n: usize, mut tap: Option<Tap>) -> Result<()> {
+    fn run(&mut self, dev: &Device, input: StripInput, n: usize, mut tap: Option<Tap>) -> Result<()> {
         // a tapped forward runs every block on the whole batch, so each block's whole output exists when tapped
         let group = if tap.is_some() { n } else { self.group(n) };
         let padded = n.next_multiple_of(group);
@@ -639,7 +647,8 @@ impl CropCnn {
         self.prepare(dev, n)?;
         self.plan(dev, group)?;
         let need = n * voxels(CROP) * IN_CHANNELS * 4;
-        ensure!(input.bytes() >= need, "CNN input: {} bytes, {n} crops need {need}", input.bytes());
+        let bytes = input.crop().bytes();
+        ensure!(bytes >= need, "CNN input: {bytes} bytes, {n} crops need {need}");
         let plans = self.plans.get(&n);
         let gplans = &self.plans[&group];
         let gpu = &dev.gpu;
@@ -649,6 +658,9 @@ impl CropCnn {
         let (first, mut x) = match self.convs {
             Convs::Native => (STAGE2, self.native01(dev, input, n, (gplans, group, padded), &mut tap)?),
             Convs::Cudnn => {
+                let StripInput::ZScored(input) = input else {
+                    bail!("cuDNN's stage 0 casts the crop as stored, so it takes a z-scored crop only")
+                };
                 self.cast_input(dev, input, n)?;
                 (0, None)
             }
@@ -820,7 +832,7 @@ impl CropCnn {
     fn native01(
         &self,
         dev: &Device,
-        input: &Buf,
+        input: StripInput,
         n: usize,
         (plans, group, padded): (&Plans, usize, usize),
         tap: &mut Option<Tap>,
@@ -843,10 +855,11 @@ impl CropCnn {
             t0.view::<[u32; 2]>(0, n * v1 * 3),
             self.pooled.view::<u32>(0, n * v1),
             self.partial.view::<[f32; 2]>(0, n * CONV0_TILES * 24),
-            input.view::<[f32; 2]>(0, n * voxels(CROP)),
+            input.crop().view::<[f32; 2]>(0, n * voxels(CROP)),
             nat.conv0.view::<[f32; 4]>(0, 162),
             nat.skip0.arg::<f32>(),
             b0.conv1.bias.as_ref().expect("stage 0's conv1 bias, checked at load").arg::<f32>(),
+            input.stats(),
         ];
         dev.kernels.launch(&dev.gpu, "sn_conv0", (CONV0_TILES as u32, n as u32, 1), (256, 1, 1), 0, &args)?;
         self.merge(dev, &b0.norm1.stats, CONV0_TILES, 24, 0, 12, 256, all)?;
@@ -1096,7 +1109,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
-    use color_eyre::eyre::{Result, WrapErr, ensure};
+    use color_eyre::eyre::{Result, WrapErr, bail, ensure};
     use serde_json::{Value, json};
 
     use super::{CELL_CHANNELS, CELLS, CROP, Convs, CropCnn, IN_CHANNELS, voxels};

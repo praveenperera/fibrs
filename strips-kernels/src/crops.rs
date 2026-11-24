@@ -19,9 +19,11 @@
 //! `zscore_crops_float64`): `(x - mean) · (1 / max(std, 1e-6))` rounded to float32. [`sc_stats`] samples every
 //! crop once for its sum and sum of squares (float32 pairs per thread, float64 across the block, partials in a
 //! fixed order), [`sc_finalize`] turns each crop's partials into its mean and reciprocal deviation as float32
-//! pairs, and [`sc_write`] samples again and writes the z-scored value, so the crop is written once: as channel 0
-//! of the strip model's NDHWC `(B, D, H, W, 2)` float32 input with channel 1 zeroed for [`sc_tube`], or as the
-//! frame model's `(B, D, H, W)` input. [`sc_tube`] then renders villa's `render_tube` into channel 1
+//! pairs, and [`sc_write`] samples again and writes the z-scored value: the frame model's `(B, D, H, W)` input. The
+//! strip model's NDHWC `(B, D, H, W, 2)` float32 input takes one sampling pass instead: [`sc_raw`] writes the raw
+//! `x` as channel 0 (channel 1 zeroed for [`sc_tube`]) beside [`sc_stats`]' partials, and the crop's readers
+//! apply [`zscore`] as they load it, to the bits [`sc_write`] would have written. [`sc_tube`] then renders villa's
+//! `render_tube` into channel 1
 //!
 //! Index math is 32-bit per crop; the host keeps a crop under 2^32 samples and the pool's offsets in 64 bits
 
@@ -215,6 +217,20 @@ fn two_sum(a: f32, b: f32) -> (f32, f32) {
     (s, add_rn_f32(add_rn_f32(a, -add_rn_f32(s, -bb)), add_rn_f32(b, -bb)))
 }
 
+/// villa's z-score of `x` from a crop's float32-pair statistics `[mean_hi, mean_lo, inv_hi, inv_lo]`
+/// ([`sc_finalize`]): `x - mean` exactly as a pair, then the pair product with `inv`, rounded once to float32.
+/// [`sc_write`] applies it as it writes a crop; readers of an [`sc_raw`] crop apply it as they load one, to the
+/// same bits
+#[inline(always)]
+pub fn zscore(x: f32, s: [f32; 4]) -> f32 {
+    let [mh, ml, ih, il] = s;
+    let (dh, de) = two_sum(x, -mh);
+    let dl = add_rn_f32(de, -ml);
+    let ph = mul_rn_f32(dh, ih);
+    let pe = fma_rn_f32(dh, ih, -ph);
+    add_rn_f32(ph, add_rn_f32(pe, fma_rn_f32(dh, il, mul_rn_f32(dl, ih))))
+}
+
 /// An unevaluated float32 sum `hi + lo`
 #[derive(Clone, Copy)]
 struct Pair {
@@ -263,40 +279,41 @@ impl Tile {
     }
 }
 
-/// Pass 1: each block's sum and sum of squares of `x = value · float32(1/255)` over its tile, as two float64
-/// partials at `partials[2 · (crop · tiles + tile)]`
-///
-/// Grid: x over a crop's `tiles_w · tiles_h · tiles_d` tiles, y over crops; [`SAMPLE_THREADS`] threads. The crop
-/// is `cd x ch x cw` with `cw % 16 == 0`, `ch % 8 == 0` and `cd % (2 · steps) == 0`
-#[kernel]
+/// Samples block `blockIdx.x`'s tile of crop `blockIdx.y` and writes the tile's sum and sum of squares of
+/// `x = value · float32(1/255)` as two float64 partials at `partials[2 · (crop · tiles + tile)]`; with a non-null
+/// `out`, also writes every `x` raw as channel 0 of the NDHWC `(B, cd, ch, cw, 2)` float32 `out`, channel 1 zeroed.
+/// [`sc_stats`] and [`sc_raw`] share it, so their partials are the same bits
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn sc_stats(
-    table: *const u32,
-    pool: *const u8,
-    sz: u32,
-    sy: u32,
-    sx: u32,
-    gy: u32,
-    gx: u32,
-    fill: f32,
+unsafe fn tile_stats(
+    ct: &Ct,
     grids: *const u32,
     tiles_w: u32,
     tiles_h: u32,
     steps: u32,
     partials: *mut f64,
+    out: *mut f32,
+    dims: [u32; 3],
 ) {
     static mut PART: SharedArray<f64, 16> = SharedArray::UNINIT;
-    let ct = Ct { table, pool, shape: [sz, sy, sx], gy, gx, fill };
     let crop = blockIdx_y();
     // SAFETY: one grid record per crop
     let grid = unsafe { Grid::load(grids, crop) };
     let tile = Tile::of(tiles_w, tiles_h, steps);
+    let [cd, ch, cw] = dims;
+    let per_crop = (cd * ch * cw) as u64;
     let mut sum = Pair::ZERO;
     let mut sq = Pair::ZERO;
     for i in 0..steps {
+        let d = tile.d0 + 2 * i;
         // SAFETY: `sample` bounds every read
-        let v = unsafe { grid.sample(&ct, tile.d0 + 2 * i, tile.h, tile.w) };
+        let v = unsafe { grid.sample(ct, d, tile.h, tile.w) };
         let x = mul_rn_f32(v, INV255);
+        if !out.is_null() {
+            let idx = crop as u64 * per_crop + ((d * ch + tile.h) * cw + tile.w) as u64;
+            // SAFETY: the host sizes `out` at two floats per sample of every crop
+            unsafe { *(out.add(2 * idx as usize) as *mut F32x2) = F32x2::new([x, 0.0]) };
+        }
         let x2 = mul_rn_f32(x, x);
         sum = sum.add(x, 0.0);
         sq = sq.add(x2, fma_rn_f32(x, x, -x2));
@@ -330,6 +347,65 @@ pub unsafe fn sc_stats(
             *partials.add(2 * tiles + 1) = q;
         }
     }
+}
+
+/// Pass 1: each block's sum and sum of squares of `x = value · float32(1/255)` over its tile, as two float64
+/// partials at `partials[2 · (crop · tiles + tile)]`
+///
+/// Grid: x over a crop's `tiles_w · tiles_h · tiles_d` tiles, y over crops; [`SAMPLE_THREADS`] threads. The crop
+/// is `cd x ch x cw` with `cw % 16 == 0`, `ch % 8 == 0` and `cd % (2 · steps) == 0`
+#[kernel]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn sc_stats(
+    table: *const u32,
+    pool: *const u8,
+    sz: u32,
+    sy: u32,
+    sx: u32,
+    gy: u32,
+    gx: u32,
+    fill: f32,
+    grids: *const u32,
+    tiles_w: u32,
+    tiles_h: u32,
+    steps: u32,
+    partials: *mut f64,
+) {
+    let ct = Ct { table, pool, shape: [sz, sy, sx], gy, gx, fill };
+    // SAFETY: as the kernel's contract; no raw output
+    unsafe { tile_stats(&ct, grids, tiles_w, tiles_h, steps, partials, core::ptr::null_mut(), [0; 3]) }
+}
+
+/// The strip crop in one sampling pass: [`sc_stats`]' partials, and every sample's raw `x = value ·
+/// float32(1/255)` as channel 0 of the NDHWC `(B, cd, ch, cw, 2)` float32 `out` with channel 1 zeroed for
+/// [`sc_tube`]. The crop's readers z-score channel 0 as they load it ([`zscore`] with [`sc_finalize`]'s
+/// statistics), so the second sampling pass of [`sc_write`] is not needed
+///
+/// Grid and tile as [`sc_stats`]
+#[kernel]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn sc_raw(
+    table: *const u32,
+    pool: *const u8,
+    sz: u32,
+    sy: u32,
+    sx: u32,
+    gy: u32,
+    gx: u32,
+    fill: f32,
+    grids: *const u32,
+    tiles_w: u32,
+    tiles_h: u32,
+    steps: u32,
+    partials: *mut f64,
+    cd: u32,
+    ch: u32,
+    cw: u32,
+    out: *mut f32,
+) {
+    let ct = Ct { table, pool, shape: [sz, sy, sx], gy, gx, fill };
+    // SAFETY: as the kernel's contract
+    unsafe { tile_stats(&ct, grids, tiles_w, tiles_h, steps, partials, out, [cd, ch, cw]) }
 }
 
 /// Each crop's mean and `1 / max(std, 1e-6)` (population deviation) from its `tiles` partials, as float32 pairs
@@ -418,9 +494,9 @@ pub unsafe fn sc_write(
     let crop = blockIdx_y();
     // SAFETY: one grid record and four statistics per crop
     let grid = unsafe { Grid::load(grids, crop) };
-    let (mh, ml, ih, il) = unsafe {
+    let st = unsafe {
         let s = stats.add(4 * crop as usize);
-        (*s, *s.add(1), *s.add(2), *s.add(3))
+        [*s, *s.add(1), *s.add(2), *s.add(3)]
     };
     let tile = Tile::of(tiles_w, tiles_h, steps);
     let per_crop = (cd * ch * cw) as u64;
@@ -433,12 +509,7 @@ pub unsafe fn sc_write(
             // SAFETY: `sample` bounds every read
             mul_rn_f32(unsafe { grid.sample(&ct, d, tile.h, tile.w) }, INV255)
         };
-        // x - mean exactly as a pair, then the pair product with inv
-        let (dh, de) = two_sum(x, -mh);
-        let dl = add_rn_f32(de, -ml);
-        let ph = mul_rn_f32(dh, ih);
-        let pe = fma_rn_f32(dh, ih, -ph);
-        let y = add_rn_f32(ph, add_rn_f32(pe, fma_rn_f32(dh, il, mul_rn_f32(dl, ih))));
+        let y = zscore(x, st);
         let idx = crop as u64 * per_crop + at as u64;
         // SAFETY: the host sizes `out` at `channels` floats per sample of every crop
         unsafe {

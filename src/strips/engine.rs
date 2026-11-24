@@ -128,8 +128,9 @@ impl Engine {
         let tubes: Vec<&[[f32; 3]]> = requests.iter().map(|r| r.tube.as_slice()).collect();
         self.crops.strip(&self.dev, &mut self.cache, &at, &tubes, &self.strip_input)?;
         self.crops.prefetch(&mut self.cache, ahead.spec, &ahead.at)?;
-        let cells = self.cnn.forward(&self.dev, &self.strip_input, requests.len())?;
-        self.head.forward(&self.dev, cells, &self.strip_input, requests)
+        let input = self.crops.strip_input(&self.strip_input);
+        let cells = self.cnn.forward(&self.dev, input, requests.len())?;
+        self.head.forward(&self.dev, cells, input, requests)
     }
 }
 

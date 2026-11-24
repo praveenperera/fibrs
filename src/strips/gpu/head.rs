@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use color_eyre::eyre::{Result, WrapErr, ensure, eyre};
 use volkit::gpu::{Arg, Buf};
 
+use super::crops::StripInput;
 use super::{Device, Weights};
 use crate::strips::types::{STRIP_COLS, STRIP_ROWS, StripRequest, StripResult};
 
@@ -388,12 +389,13 @@ impl Head {
     }
 
     /// Heights and log error scales of the last strip pass for each request: `cells` bf16 NDHWC `(B, 36, 32, 32,
-    /// 64)`, `crop` f32 NDHWC `(B, 144, 128, 128, 2)` (CT, tube), B = `requests.len()`
-    pub fn forward(
+    /// 64)`, `crop` f32 NDHWC `(B, 144, 128, 128, 2)` (CT, tube; the CT z-scored or raw with its statistics), B =
+    /// `requests.len()`
+    pub fn forward<'a>(
         &self,
         dev: &Device,
         cells: &Buf,
-        crop: &Buf,
+        crop: impl Into<StripInput<'a>>,
         requests: &[StripRequest],
     ) -> Result<Vec<StripResult>> {
         self.forward_traced(dev, cells, crop, requests, &mut |_, _| Ok(()))
@@ -401,14 +403,16 @@ impl Head {
 
     /// [`Head::forward`], calling `trace(stage, self)` after each stage once its kernels are queued (the parity
     /// tests download the stage's buffers there)
-    pub(crate) fn forward_traced(
+    pub(crate) fn forward_traced<'a>(
         &self,
         dev: &Device,
         cells: &Buf,
-        crop: &Buf,
+        crop: impl Into<StripInput<'a>>,
         requests: &[StripRequest],
         trace: &mut dyn FnMut(&str, &Self) -> Result<()>,
     ) -> Result<Vec<StripResult>> {
+        let input = crop.into();
+        let crop = input.crop();
         let b = requests.len();
         ensure!(b > 0 && b <= self.max_batch, "a batch of {b} decisions, the head holds 1 to {}", self.max_batch);
         ensure!(cells.bytes() >= b * 36 * 32 * 32 * 64 * 2, "cells hold fewer than {b} decisions");
@@ -562,6 +566,7 @@ impl Head {
                 crop.arg::<f32>(),
                 x.h0.arg::<f32>(),
                 t.grid.arg::<f32>(),
+                input.stats(),
             ],
         )?;
         self.linear(dev, (&x.xf, K_REFINE), ms, &p.refinement.l0, (&x.hid, WIDTH), ACT_SILU)?;
