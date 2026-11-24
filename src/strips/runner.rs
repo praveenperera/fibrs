@@ -173,7 +173,10 @@ fn validate(args: &Args) -> Result<()> {
     ensure!(args.blend.is_finite() && args.blend >= 0.0, "--blend: zero or more patch voxels");
     ensure!(args.trim.is_finite() && args.trim >= 0.0, "--trim: zero or more patch voxels");
     ensure!(
-        args.ct_grid_scale.is_finite() && args.ct_grid_scale > 0.0 && args.grid_scale == 2.0 * args.ct_grid_scale,
+        args.ct_grid_scale.is_finite()
+            && args.grid_scale.is_finite()
+            && args.ct_grid_scale > 0.0
+            && args.grid_scale == 2.0 * args.ct_grid_scale,
         "--grid-scale {} with --ct-grid-scale {}: the runner supports two CT voxels per trace voxel only",
         args.grid_scale,
         args.ct_grid_scale
@@ -203,17 +206,10 @@ pub fn run(args: &Args) -> Result<()> {
     let carried: f64 = weights.metadata.get("perturb").map_or(Ok(0.0), |p| p.parse()).wrap_err("weights perturb")?;
     ensure!(carried == args.perturb, "--perturb {} but the weights carry perturb {carried}", args.perturb);
 
-    // every input is read and checked before run.json records it: a refusal after the claim would leave an OUT
-    // that refuses the corrected input
     let inputs = Inputs::read(args, &weights.sha256)?;
     let vol = Arc::new(Volume::open(&args.cache_dir, &args.ct, args.ct_level)?);
     let chosen = choose(args, k, n)?;
-
-    // every shard claims or checks run.json before it reads or repairs the index
-    fs::create_dir_all(args.out.join("index")).wrap_err_with(|| format!("create {}", args.out.display()))?;
     let fields = run_fields(args, n, &tag, &inputs);
-    claim_run_json(&args.out, &fields, &provenance, &tag)?;
-    let todo = remaining(args, k, chosen)?;
 
     let geometry = Geometry { ct: &vol, input_scale, trace_per_patch: TRACE_PER_PATCH, umbilicus: &inputs.umbilicus };
     let settings = Settings {
@@ -243,6 +239,19 @@ pub fn run(args: &Args) -> Result<()> {
         Ok(Err(e)) => bail!("the GPU engine: {e}"),
         Err(_) => bail!("the GPU engine stopped before it was ready"),
     }
+
+    // run.json marks a run that got going: only now, with every input read and the GPU cache and models built,
+    // does the shard claim or check it, so a startup failure leaves OUT without one and the corrected rerun starts
+    // it. Every shard claims or checks run.json before it reads or repairs the index
+    let todo = match begin_shard(args, k, &fields, &provenance, &tag, chosen) {
+        Ok(todo) => todo,
+        Err(e) => {
+            // the engine stops once its work channel closes
+            drop(work_tx);
+            let _ = engine.join();
+            return Err(e);
+        }
+    };
     println!(
         "{}",
         json!({"load_s": round2(t0.elapsed().as_secs_f64()), "shard": [k, n], "fibres": todo.total,
@@ -287,6 +296,20 @@ pub fn run(args: &Args) -> Result<()> {
         return Err(Deferred { fibres: written.deferred, chunks: written.uncached.len(), list }.into());
     }
     Ok(())
+}
+
+/// Claims or checks run.json, then takes the shard's fibres not yet indexed
+fn begin_shard(
+    args: &Args,
+    k: usize,
+    fields: &Map<String, Value>,
+    provenance: &Map<String, Value>,
+    tag: &str,
+    chosen: Vec<FibreRow>,
+) -> Result<Todo> {
+    fs::create_dir_all(args.out.join("index")).wrap_err_with(|| format!("create {}", args.out.display()))?;
+    claim_run_json(&args.out, fields, provenance, tag)?;
+    remaining(args, k, chosen)
 }
 
 /// The shard's fibres not yet in any shard's index, and the shard's size before that
@@ -789,6 +812,58 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A run whose startup fails on the GPU (an export without a frame-model tensor) leaves OUT without run.json,
+    /// so the run with the right weights then starts in the same OUT and finishes
+    #[test]
+    #[ignore = "needs the GPU, the weights export, the PHerc0211 AFV and umbilicus, and the cached CT"]
+    fn startup_failure_leaves_no_run_json() {
+        let path = |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.into());
+        let weights = path(
+            "FIBRS_STRIPS_WEIGHTS",
+            "/build/vesuvius/strips-scale/speed/native/weights/fiber_strip_small_v1.safetensors",
+        );
+        let umbilicus = path(
+            "FIBRS_UMBILICUS",
+            "/home/praveen/code/private-workbench/ops/vesuvius/strips-scale/umbilici/PHerc0211_umbilicus.json",
+        );
+        let dir = scratch("startup");
+        let out = dir.join("out");
+
+        // the export less frame.features.0.weight: its source hashes still match, so only building the frame
+        // model on the GPU refuses it
+        let bytes = fs::read(&weights).unwrap();
+        let (_, header) = safetensors::SafeTensors::read_metadata(&bytes).unwrap();
+        let st = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let kept: Vec<_> = st.tensors().into_iter().filter(|(name, _)| name != "frame.features.0.weight").collect();
+        assert_eq!(kept.len() + 1, st.len());
+        let broken = dir.join("broken.safetensors");
+        safetensors::serialize_to_file(kept, header.metadata().clone(), &broken).unwrap();
+
+        let run =
+            |weights: &str| {
+                let args = Args::try_parse_from([
+                "run", "--afv", "/shared/allscrolls/publish/hf/PHerc0211/PHerc0211_afv_v2.afv", "--ct",
+                "s3://vesuvius-challenge-open-data/PHerc0211/volumes/20250821151803-9.362um-1.2m-113keV-masked.zarr",
+                "--ct-level", "0", "--ct-grid-scale", "1", "--grid-scale", "2", "--voxel-size-um", "9.362",
+                "--umbilicus", &umbilicus, "--cache-dir", "/build/vesuvius/strips-scale/ctcache", "--weights", weights,
+                "--out", out.to_str().unwrap(), "--ids", "5109649", "--workers", "2", "--batch", "8",
+            ])
+            .unwrap();
+                super::run(&args)
+            };
+
+        let err = run(broken.to_str().unwrap()).unwrap_err();
+        assert!(format!("{err:#}").contains("features.0.weight"), "{err:#}");
+        assert!(!out.join("run.json").exists(), "a failed startup claimed run.json");
+
+        run(&weights).unwrap();
+        let recorded: Value = serde_json::from_str(&fs::read_to_string(out.join("run.json")).unwrap()).unwrap();
+        let wanted = super::sha256(&bytes);
+        assert_eq!(recorded["weights_sha256"].as_str(), Some(wanted.as_str()));
+        assert_eq!(indexed(&out.join("index"), 0).unwrap(), [5109649].into_iter().collect());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A run.json that exists but can't be read refuses the run instead of skipping the resume check
     #[test]
     fn unreadable_run_json_refuses() {
@@ -825,6 +900,8 @@ mod tests {
         assert!(format!("{grid}").contains("two CT voxels per trace voxel"), "{grid}");
         assert!(validate(&args(&["--step", "0"])).is_err());
         assert!(validate(&args(&["--ct-grid-scale", "inf", "--grid-scale", "inf"])).is_err());
+        // 2 x 1e308 overflows to inf, so a finite CT scale alone doesn't make the pair finite
+        assert!(validate(&args(&["--ct-grid-scale", "1e308", "--grid-scale", "inf"])).is_err());
         assert!(validate(&args(&["--blend=-1"])).is_err());
     }
 
