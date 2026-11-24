@@ -7,6 +7,7 @@
 pub mod cnn;
 pub mod crops;
 pub mod frame;
+pub mod head;
 #[cfg(test)]
 mod input_tests;
 
