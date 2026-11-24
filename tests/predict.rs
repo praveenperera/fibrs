@@ -216,13 +216,20 @@ fn check(extra: &[&str]) -> (i32, String) {
     (run.status.code().unwrap(), text(&run))
 }
 
+/// What `--device cpu` is refused with, naming the engine this build runs
+const DEVICE_REFUSED: &str = if cfg!(fibrs_engine = "metal") {
+    "runs on a Metal device (metal, metal:N), not \"cpu\""
+} else {
+    "runs on a CUDA device (cuda, cuda:N), not \"cpu\""
+};
+
 #[test]
 fn bad_arguments_are_refused_with_the_reference_messages() {
     let cases: &[(&[&str], i32, &str)] = &[
         (&["--z0", "0"], 2, "band mode needs --z0 and --z1"),
         (&["--mode", "villa", "--batch", "4"], 2, "villa mode runs batches of 1; leave --batch out or pass 1"),
         (&["--z0", "0", "--z1", "8", "--precision", "fp16"], 2, "fp32 (the reference contract, the default) or bf16"),
-        (&["--z0", "0", "--z1", "8", "--device", "cpu"], 2, "runs on a CUDA device (cuda, cuda:N), not \"cpu\""),
+        (&["--z0", "0", "--z1", "8", "--device", "cpu"], 2, DEVICE_REFUSED),
         (&["--z0", "0", "--z1", "8", "--voxel-size-um", "0"], 2, "--voxel-size-um must be a positive number"),
         (&["--z0", "0", "--z1", "8", "--voxel-size-um", "nan"], 2, "--voxel-size-um must be a positive number"),
         (&["--z0", "0", "--z1", "8", "--batch", "0"], 1, "--batch and --readers must be at least 1"),

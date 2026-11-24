@@ -113,6 +113,9 @@ pub const MAX_COLUMN_VOXELS: usize = u32::MAX as usize / 2;
 /// The kind of device the engine runs on, `cuda` or `metal`, for `--device` and the provenance
 pub const DEVICE_KIND: &str = if cfg!(fibrs_engine = "metal") { "metal" } else { "cuda" };
 
+/// The engine's device as messages name it, `CUDA` or `Metal`
+const DEVICE_NAME: &str = if cfg!(fibrs_engine = "metal") { "Metal" } else { "CUDA" };
+
 /// The device ordinal of `--device`: `cuda`, `cuda:N` or `N` on CUDA builds, `metal`, `metal:N` or `N` on Metal ones
 pub fn device_index(device: &str) -> Result<usize, String> {
     let n = if device == DEVICE_KIND {
@@ -121,7 +124,7 @@ pub fn device_index(device: &str) -> Result<usize, String> {
         device.strip_prefix(DEVICE_KIND).and_then(|d| d.strip_prefix(':')).unwrap_or(device)
     };
     n.parse().map_err(|_| {
-        format!("fibrs predict runs on a {DEVICE_KIND} device ({DEVICE_KIND}, {DEVICE_KIND}:N), not {device:?}")
+        format!("fibrs predict runs on a {DEVICE_NAME} device ({DEVICE_KIND}, {DEVICE_KIND}:N), not {device:?}")
     })
 }
 
