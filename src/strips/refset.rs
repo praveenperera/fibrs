@@ -138,18 +138,21 @@ impl RefSet {
     }
 }
 
-/// |a - b| statistics; NaN anywhere (a gap the native side never wrote) reads as an infinite max
+/// |a - b| statistics; NaN anywhere (a gap the native side never wrote) reads as an infinite max. Differences are
+/// held in f32 (cell comparisons run to tens of millions of values), summed in f64
 pub fn spread(a: &[f32], b: &[f32]) -> Spread {
     assert_eq!(a.len(), b.len(), "spread of unequal lengths");
-    let mut d: Vec<f64> = a.iter().zip(b).map(|(&x, &y)| (f64::from(x) - f64::from(y)).abs()).collect();
+    assert!(!a.is_empty(), "spread of nothing");
+    let mut d: Vec<f32> = a.iter().zip(b).map(|(&x, &y)| (x - y).abs()).collect();
     if d.iter().any(|v| v.is_nan()) {
         return Spread { mean: f64::NAN, p99: f64::INFINITY, max: f64::INFINITY };
     }
 
-    let mean = d.iter().sum::<f64>() / d.len() as f64;
-    d.sort_unstable_by(f64::total_cmp);
-    let p99 = d[((d.len() - 1) as f64 * 0.99).round() as usize];
-    Spread { mean, p99, max: d[d.len() - 1] }
+    let mean = d.iter().map(|&v| f64::from(v)).sum::<f64>() / d.len() as f64;
+    let max = d.iter().copied().fold(0.0f32, f32::max);
+    let k = ((d.len() - 1) as f64 * 0.99).round() as usize;
+    let (_, p99, _) = d.select_nth_unstable_by(k, f32::total_cmp);
+    Spread { mean, p99: f64::from(*p99), max: f64::from(max) }
 }
 
 /// The page-aligned bytes of a map as `T`s

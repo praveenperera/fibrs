@@ -7,6 +7,7 @@
 //! the CPU stitches the decisions into a strip and writes it (`out`). Decisions batch across fibres on the GPU;
 //! the CPU work runs on a thread pool. [`types`] holds the records that pass between the two sides
 
+mod bench;
 pub mod ct;
 pub mod gpu;
 pub mod refset;
@@ -14,14 +15,33 @@ pub mod types;
 
 use std::ffi::OsString;
 
+use clap::Parser;
+
 /// Whether `argv` asks for `fibrs strips`
 pub fn requested(argv: &[OsString]) -> bool {
     let Some(arg0) = argv.first() else { return false };
     !crate::run::dropin(arg0.as_encoded_bytes()) && argv.get(1).map(|a| a.as_encoded_bytes()) == Some(b"strips")
 }
 
+/// `fibrs strips` subcommands
+#[derive(Parser, Debug)]
+#[command(name = "fibrs strips", version = env!("CARGO_PKG_VERSION"))]
+enum Command {
+    /// Time the native strip model and check it against PyTorch's reference
+    BenchModel(bench::Args),
+}
+
 /// Runs `fibrs strips` on the arguments after the subcommand; the process exit code
-pub fn main(_args: &[OsString]) -> i32 {
-    eprintln!("fibrs strips: not built yet");
-    2
+pub fn main(args: &[OsString]) -> i32 {
+    let command = Command::parse_from(std::iter::once(OsString::from("fibrs strips")).chain(args.iter().cloned()));
+    let result = match &command {
+        Command::BenchModel(args) => bench::run(args),
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("fibrs strips: {e:#}");
+            1
+        }
+    }
 }
