@@ -55,12 +55,7 @@ impl FragA {
     /// without a trip through shared memory
     #[inline(always)]
     pub fn from_acc_pair(lo: [f32; 4], hi: [f32; 4]) -> Self {
-        Self([
-            pack_bf16(lo[0], lo[1]),
-            pack_bf16(lo[2], lo[3]),
-            pack_bf16(hi[0], hi[1]),
-            pack_bf16(hi[2], hi[3]),
-        ])
+        Self([pack_bf16(lo[0], lo[1]), pack_bf16(lo[2], lo[3]), pack_bf16(hi[0], hi[1]), pack_bf16(hi[2], hi[3])])
     }
 }
 
@@ -90,9 +85,7 @@ impl<const LD: usize> SharedTile<LD> {
     /// rows of `LD` as callers address
     #[inline(always)]
     pub unsafe fn new(base: *mut u16) -> Self {
-        Self {
-            base: SharedAddr(unsafe { cvta_generic_to_shared_u32(base as *const u8) }),
-        }
+        Self { base: SharedAddr(unsafe { cvta_generic_to_shared_u32(base as *const u8) }) }
     }
 
     /// The address of element `(row, col)`
@@ -110,11 +103,8 @@ impl<const LD: usize> SharedTile<LD> {
     fn ldsm_addr<const ROW_HALF_FIRST: bool>(self, row: usize, col: usize) -> SharedAddr {
         let lane = threadIdx_x() % 32;
         let (mi, ri) = (lane / 8, lane % 8);
-        let (lr, lc) = if ROW_HALF_FIRST {
-            ((mi & 1) * 8 + ri, (mi / 2) * 8)
-        } else {
-            ((mi / 2) * 8 + ri, (mi & 1) * 8)
-        };
+        let (lr, lc) =
+            if ROW_HALF_FIRST { ((mi & 1) * 8 + ri, (mi / 2) * 8) } else { ((mi / 2) * 8 + ri, (mi & 1) * 8) };
         // the lane's part first and the fragment's constant offset last: summed the other
         // way, LLVM merges the two into an `or` per load, which ptxas can't fold into the
         // load's immediate

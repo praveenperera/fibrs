@@ -11,9 +11,33 @@ use cuda_device::{DisjointSlice, kernel, launch_contract};
 use super::util::{hi_f32, lo_f32, math, pack_bf16, require, warp_sum};
 
 /// Width
-const C: usize = 128;
+pub(super) const C: usize = 128;
 /// LayerNorm epsilon (PyTorch's default)
 const EPS: f32 = 1e-5;
+
+/// One row's LayerNorm, called by a whole warp on its row with lane `l` holding columns `4 l..4 l + 4` in `x`:
+/// the lane's four outputs. `g` and `b` point at the lane's four gamma and beta values. The fused block kernels
+/// call it too, so their normalized rows equal this kernel's bit for bit
+///
+/// # Safety
+/// `g` and `b` each point at four readable floats
+#[inline(always)]
+pub(super) unsafe fn ln4(x: [f32; 4], g: *const f32, b: *const f32) -> [f32; 4] {
+    let mean = warp_sum((x[0] + x[1]) + (x[2] + x[3])) / C as f32;
+    let d = [x[0] - mean, x[1] - mean, x[2] - mean, x[3] - mean];
+    let var = warp_sum((d[0] * d[0] + d[1] * d[1]) + (d[2] * d[2] + d[3] * d[3])) / C as f32;
+    let rstd = math::rsqrtf(var + EPS);
+    let mut y = [0.0f32; 4];
+    let mut i = 0;
+    while i < 4 {
+        __unroll_config::<0>();
+        // SAFETY: i < 4, inside the caller's four values
+        let (g, b) = unsafe { (*g.add(i), *b.add(i)) };
+        y[i] = g * (rstd * d[i]) + b;
+        i += 1;
+    }
+    y
+}
 
 /// LayerNorm of `rows` rows of 128: from `xb` (bf16 as `u32` pairs, `[rows, 64]`) or `xf` (`[rows, 128]` fp32),
 /// whichever isn't empty, to `yb` (bf16 pairs) and/or `yf` (fp32), each skipped when empty
@@ -59,19 +83,8 @@ pub fn sm_layernorm(
             [lo_f32(a), hi_f32(a), lo_f32(b), hi_f32(b)]
         }
     };
-    let mean = warp_sum((x[0] + x[1]) + (x[2] + x[3])) / C as f32;
-    let d = [x[0] - mean, x[1] - mean, x[2] - mean, x[3] - mean];
-    let var = warp_sum((d[0] * d[0] + d[1] * d[1]) + (d[2] * d[2] + d[3] * d[3])) / C as f32;
-    let rstd = math::rsqrtf(var + EPS);
-    let mut y = [0.0f32; 4];
-    let mut i = 0;
-    while i < 4 {
-        __unroll_config::<0>();
-        // SAFETY: c0 + i < 128 <= gamma.len(), beta.len()
-        let (g, b) = unsafe { (*gamma.get_unchecked(c0 + i), *beta.get_unchecked(c0 + i)) };
-        y[i] = g * (rstd * d[i]) + b;
-        i += 1;
-    }
+    // SAFETY: c0 + 4 <= 128 <= gamma.len(), beta.len()
+    let y = unsafe { ln4(x, gamma.as_ptr().add(c0), beta.as_ptr().add(c0)) };
     // SAFETY: each output row's columns c0..c0 + 4 are this lane's alone, inside the checked outputs
     unsafe {
         if yf.len() != 0 {

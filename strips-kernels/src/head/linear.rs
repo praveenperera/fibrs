@@ -14,9 +14,9 @@ use cuda_device::{DisjointSlice, SharedArray, kernel, launch_contract, thread};
 use super::mma::{SharedTile, mma, sts4};
 use super::util::{Bf16, hi_f32, ldg_u4, lo_f32, math, pack_bf16, require, round_bf16};
 
-const THREADS: usize = 128;
+pub(super) const THREADS: usize = 128;
 /// Rows and columns per block tile, and depth per chunk
-const T: usize = 64;
+pub(super) const T: usize = 64;
 /// Shared rows padded by 8 bf16, which keeps the `ldmatrix` loads bank-conflict free
 const LDT: usize = T + 8;
 /// 16-byte chunks each thread stages per 64 x 64 tile
@@ -114,7 +114,15 @@ unsafe fn gemm_tile(
 /// Calls `f(row, col, y0, y1)` for each pair of columns `col, col + 1` this thread holds that lies inside `m` rows
 /// and `n` columns, with `y = bf16(acc + bias)` as f32. `n` is even, so a pair is whole or absent
 #[inline(always)]
-fn each_pair(acc: &[[f32; 4]; NJ], m0: u32, n0: u32, m: u32, n: u32, bias: &[f32], mut f: impl FnMut(u32, u32, f32, f32)) {
+fn each_pair(
+    acc: &[[f32; 4]; NJ],
+    m0: u32,
+    n0: u32,
+    m: u32,
+    n: u32,
+    bias: &[f32],
+    mut f: impl FnMut(u32, u32, f32, f32),
+) {
     let lane = threadIdx_x() % 32;
     let (g, t, wr) = (lane / 4, lane % 4, (threadIdx_x() / 32) * 16);
     let mut j = 0;
@@ -140,7 +148,7 @@ fn each_pair(acc: &[[f32; 4]; NJ], m0: u32, n0: u32, m: u32, n: u32, bias: &[f32
 
 /// `act` of a bf16 value, rounded to bf16, as PyTorch's CUDA GELU (exact) and SiLU compute them in fp32
 #[inline(always)]
-fn activate(y: f32, act: u32) -> f32 {
+pub(super) fn activate(y: f32, act: u32) -> f32 {
     match act {
         ACT_GELU => round_bf16(y * 0.5 * (1.0 + math::erff(y * core::f32::consts::FRAC_1_SQRT_2))),
         ACT_SILU => round_bf16(y / (1.0 + math::expf(-y))),
@@ -167,10 +175,7 @@ macro_rules! tiles {
         static mut WS: SharedArray<u16, { T * LDT }, 16> = SharedArray::UNINIT;
         // SAFETY: each array is this kernel's own, 16-byte aligned and 64 rows of LDT
         unsafe {
-            (
-                SharedTile::<LDT>::new(addr_of_mut!(AS) as *mut u16),
-                SharedTile::<LDT>::new(addr_of_mut!(WS) as *mut u16),
-            )
+            (SharedTile::<LDT>::new(addr_of_mut!(AS) as *mut u16), SharedTile::<LDT>::new(addr_of_mut!(WS) as *mut u16))
         }
     }};
 }
@@ -508,7 +513,8 @@ pub fn sm_linear_tok(
             & ((mode == TOK_PLAIN)
                 | ((mode == TOK_PER_TOKEN) & ((off + rpd) as usize * 64 <= tab.len()))
                 | ((mode == TOK_PER_DECISION) & (decisions as usize * 64 <= tab.len())))
-            & (flag.is_empty() | (decisions.saturating_sub(1) as usize * flag_ld as usize + (flag_off + rpd) as usize <= flag.len())),
+            & (flag.is_empty()
+                | (decisions.saturating_sub(1) as usize * flag_ld as usize + (flag_off + rpd) as usize <= flag.len())),
     );
     // SAFETY: as in sm_linear
     let acc = unsafe {

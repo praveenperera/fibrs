@@ -54,7 +54,6 @@ const K_REFINE: usize = 192;
 const K_PROFILE: usize = 128;
 /// Epilogue activations and token modes of `sm_linear` and `sm_linear_tok`
 const ACT_NONE: u32 = 0;
-const ACT_GELU: u32 = 1;
 const ACT_SILU: u32 = 2;
 const TOK_PLAIN: u32 = 0;
 const TOK_PER_TOKEN: u32 = 1;
@@ -170,15 +169,13 @@ pub(crate) struct Buffers {
     pub(crate) orient: Buf,
     /// The context sequence, bf16 `[B, 1580, 128]`
     pub(crate) seq: Buf,
-    /// LayerNorm output, bf16 `[B, 1580, 128]`
+    /// The strip passes' final LayerNorm output, bf16 `[B, 450, 128]`
     pub(crate) ln: Buf,
     pub(crate) q: Buf,
     pub(crate) k: Vec<Buf>,
     pub(crate) v: Vec<Buf>,
     /// Attention output, merged heads, bf16 `[B, 1580, 128]`
     pub(crate) att: Buf,
-    /// FFN hidden, bf16 `[B, 1580, 256]`
-    pub(crate) ffh: Buf,
     /// The first strip pass's residual stream, bf16 `[B, 450, 128]`
     pub(crate) strip1: Buf,
     /// The refinement pass's residual stream, f32 `[B, 450, 128]`
@@ -320,12 +317,11 @@ impl Head {
             hid: zeros((b * STRIPS).max(CELLS) * WIDTH * 2)?,
             orient: zeros(b * WIDTH * 2)?,
             seq: zeros(b * CONTEXT * WIDTH * 2)?,
-            ln: zeros(b * CONTEXT * WIDTH * 2)?,
+            ln: zeros(b * STRIPS * WIDTH * 2)?,
             q: zeros(b * 4 * CONTEXT * 32 * 2)?,
             k: kv()?,
             v: kv()?,
             att: zeros(b * CONTEXT * WIDTH * 2)?,
-            ffh: zeros(b * CONTEXT * 2 * WIDTH * 2)?,
             strip1: zeros(b * STRIPS * WIDTH * 2)?,
             strip2: zeros(b * STRIPS * WIDTH * 4)?,
             h0: zeros(b * STRIPS * 2 * 4)?,
@@ -464,17 +460,14 @@ impl Head {
         // the context pass: layers 0-2 in full, layer 3 only its keys and values
         let m = b * CONTEXT;
         for (i, layer) in p.layers.iter().enumerate() {
-            self.layernorm(dev, Stream::Bf16(&x.seq), m, &layer.norm1, Some(&x.ln), None)?;
             let n0 = if i == LAYERS - 1 { WIDTH } else { 0 };
-            self.qkv(dev, m, CONTEXT, 0, n0, &layer.qkv, i)?;
+            self.ln_qkv(dev, Stream::Bf16(&x.seq), m, (CONTEXT, 0, n0), layer, i)?;
             if i == LAYERS - 1 {
                 break;
             }
             self.attention(dev, b, CONTEXT, CONTEXT, i)?;
             self.residual(dev, Stream::Bf16(&x.seq), (&x.att, WIDTH), m, &layer.out, None)?;
-            self.layernorm(dev, Stream::Bf16(&x.seq), m, &layer.norm2, Some(&x.ln), None)?;
-            self.linear(dev, (&x.ln, WIDTH), m, &layer.ffn0, (&x.ffh, 2 * WIDTH), ACT_GELU)?;
-            self.residual(dev, Stream::Bf16(&x.seq), (&x.ffh, 2 * WIDTH), m, &layer.ffn2, None)?;
+            self.ffn(dev, Stream::Bf16(&x.seq), m, layer)?;
             trace(["ctx0", "ctx1", "ctx2"][i], self)?;
         }
         trace("context", self)?;
@@ -557,13 +550,10 @@ impl Head {
         let x = &self.bufs;
         let ms = b * STRIPS;
         for (i, layer) in self.params.layers.iter().enumerate() {
-            self.layernorm(dev, stream, ms, &layer.norm1, Some(&x.ln), None)?;
-            self.qkv(dev, ms, STRIPS, CONTEXT, 0, &layer.qkv, i)?;
+            self.ln_qkv(dev, stream, ms, (STRIPS, CONTEXT, 0), layer, i)?;
             self.attention(dev, b, STRIPS, CONTEXT + STRIPS, i)?;
             self.residual(dev, stream, (&x.att, WIDTH), ms, &layer.out, None)?;
-            self.layernorm(dev, stream, ms, &layer.norm2, Some(&x.ln), None)?;
-            self.linear(dev, (&x.ln, WIDTH), ms, &layer.ffn0, (&x.ffh, 2 * WIDTH), ACT_GELU)?;
-            self.residual(dev, stream, (&x.ffh, 2 * WIDTH), ms, &layer.ffn2, None)?;
+            self.ffn(dev, stream, ms, layer)?;
             trace(["p1l0", "p1l1", "p1l2", "p1l3", "p2l0", "p2l1", "p2l2", "p2l3"][(pass - 1) * 4 + i], self)?;
         }
         Ok(())
@@ -712,29 +702,63 @@ impl Head {
         )
     }
 
-    /// The qkv projection of `m` rows of `ln` (`ntok` per decision) into q and rows `koff..` of layer `layer`'s keys
-    /// and values; columns from `n0`
-    #[allow(clippy::too_many_arguments)]
-    fn qkv(&self, dev: &Device, m: usize, ntok: usize, koff: usize, n0: usize, l: &Linear, layer: usize) -> Result<()> {
+    /// `norm1` of `m` rows of `stream` (`ntok` per decision), then the qkv projection into q and rows `koff..` of
+    /// layer `index`'s keys and values; columns from `n0` (128: keys and values only)
+    fn ln_qkv(
+        &self,
+        dev: &Device,
+        stream: Stream,
+        m: usize,
+        (ntok, koff, n0): (usize, usize, usize),
+        layer: &Layer,
+        index: usize,
+    ) -> Result<()> {
         let x = &self.bufs;
+        let (xb, xf) = stream.args();
         dev.kernels.launch(
             &dev.gpu,
-            "sm_linear_qkv",
-            (m.div_ceil(64) as u32, ((3 * WIDTH - n0) / 64) as u32, 1),
+            "sm_ln_qkv",
+            (m.div_ceil(64) as u32, 1, 1),
             (128, 1, 1),
             0,
             &[
                 x.q.arg::<u32>(),
-                x.k[layer].arg::<u32>(),
-                x.v[layer].arg::<u32>(),
-                x.ln.arg::<u16>(),
-                l.w.arg::<u16>(),
-                l.b.arg::<f32>(),
+                x.k[index].arg::<u32>(),
+                x.v[index].arg::<u32>(),
+                xb,
+                xf,
+                layer.norm1.g.arg::<f32>(),
+                layer.norm1.b.arg::<f32>(),
+                layer.qkv.w.arg::<u16>(),
+                layer.qkv.b.arg::<f32>(),
                 Arg::U32(m as u32),
                 Arg::U32(ntok as u32),
                 Arg::U32(LDK as u32),
                 Arg::U32(koff as u32),
                 Arg::U32(n0 as u32),
+            ],
+        )
+    }
+
+    /// The FFN sublayer on `m` rows of `stream` in place: `x += ffn.2(gelu(ffn.0(norm2(x))))`
+    fn ffn(&self, dev: &Device, stream: Stream, m: usize, layer: &Layer) -> Result<()> {
+        let (xb, xf) = stream.args();
+        dev.kernels.launch(
+            &dev.gpu,
+            "sm_ffn",
+            (m.div_ceil(64) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            &[
+                xb,
+                xf,
+                layer.norm2.g.arg::<f32>(),
+                layer.norm2.b.arg::<f32>(),
+                layer.ffn0.w.arg::<u16>(),
+                layer.ffn0.b.arg::<f32>(),
+                layer.ffn2.w.arg::<u16>(),
+                layer.ffn2.b.arg::<f32>(),
+                Arg::U32(m as u32),
             ],
         )
     }
@@ -773,10 +797,7 @@ impl Head {
         bf: Option<&Buf>,
         f32: Option<&Buf>,
     ) -> Result<()> {
-        let (xb, xf) = match stream {
-            Stream::Bf16(s) => (s.arg::<u32>(), Arg::EMPTY),
-            Stream::F32(s) => (Arg::EMPTY, s.arg::<f32>()),
-        };
+        let (xb, xf) = stream.args();
         dev.kernels.launch(
             &dev.gpu,
             "sm_layernorm",
@@ -801,6 +822,16 @@ impl Head {
 enum Stream<'a> {
     Bf16(&'a Buf),
     F32(&'a Buf),
+}
+
+impl Stream<'_> {
+    /// The stream as a kernel's `(bf16 pairs, fp32)` argument pair, the other one empty
+    fn args(self) -> (Arg, Arg) {
+        match self {
+            Stream::Bf16(s) => (s.arg::<u32>(), Arg::EMPTY),
+            Stream::F32(s) => (Arg::EMPTY, s.arg::<f32>()),
+        }
+    }
 }
 
 fn grid(m: usize, n: usize) -> (u32, u32, u32) {

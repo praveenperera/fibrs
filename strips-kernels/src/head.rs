@@ -7,6 +7,7 @@
 //! channels]`; attention reads q `[B, 4, nq, 32]` and k/v `[B, 4, ldk, 32]`
 
 pub mod attn;
+pub mod block;
 pub mod linear;
 pub mod mma;
 pub mod norm;

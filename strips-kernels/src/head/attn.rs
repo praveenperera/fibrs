@@ -235,11 +235,7 @@ pub fn sm_attn(
                     let mut e = 0;
                     while e < 4 {
                         __unroll_config::<0>();
-                        let x = if (owner >> (e & 1)) & 1 != 0 {
-                            s[j][e] * scale_log2
-                        } else {
-                            f32::NEG_INFINITY
-                        };
+                        let x = if (owner >> (e & 1)) & 1 != 0 { s[j][e] * scale_log2 } else { f32::NEG_INFINITY };
                         s[j][e] = x;
                         mx[e / 2] = math::fmaxf(mx[e / 2], x);
                         e += 1;
@@ -251,11 +247,7 @@ pub fn sm_attn(
                     __unroll_config::<0>();
                     mx[r] = math::fmaxf(mx[r], warp::shuffle_xor_f32(mx[r], 1));
                     mx[r] = math::fmaxf(mx[r], warp::shuffle_xor_f32(mx[r], 2));
-                    corr[r] = if mx[r] == f32::NEG_INFINITY {
-                        1.0
-                    } else {
-                        ex2(m[r] - mx[r])
-                    };
+                    corr[r] = if mx[r] == f32::NEG_INFINITY { 1.0 } else { ex2(m[r] - mx[r]) };
                     m[r] = mx[r];
                     l[r] *= corr[r];
                     r += 1;
@@ -266,11 +258,7 @@ pub fn sm_attn(
                     let mut e = 0;
                     while e < 4 {
                         __unroll_config::<0>();
-                        let p = if m[e / 2] == f32::NEG_INFINITY {
-                            0.0
-                        } else {
-                            ex2(s[j][e] - m[e / 2])
-                        };
+                        let p = if m[e / 2] == f32::NEG_INFINITY { 0.0 } else { ex2(s[j][e] - m[e / 2]) };
                         s[j][e] = p;
                         l[e / 2] += p;
                         e += 1;
@@ -323,9 +311,7 @@ pub fn sm_attn(
     // each thread stores its own two rows at slots h * 16 + 4 dj + t, which no other thread of any block writes,
     // inside the rows checked up front
     let o_ld = HEADS as usize * D / 2;
-    let op = o
-        .as_mut_ptr()
-        .wrapping_add((b as usize * nq as usize + q0 as usize) * o_ld + h as usize * (D / 2));
+    let op = o.as_mut_ptr().wrapping_add((b as usize * nq as usize + q0 as usize) * o_ld + h as usize * (D / 2));
     let mut r = 0;
     while r < 2 {
         __unroll_config::<0>();
