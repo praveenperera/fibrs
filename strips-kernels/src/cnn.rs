@@ -311,14 +311,28 @@ fn source(dst: u32, size: u32) -> (u32, u32, f32) {
     (i0, i1, src - i0 as f32)
 }
 
-/// 2x trilinear upsample (align_corners False) of a bf16 tensor, rounded once to bf16 as ATen's
-/// upsample_trilinear3d computes it in float32
+/// The CNN output from the last stage's output `x` and the context fuse's 1x1 conv `y` of the context block's
+/// output, at the context's size: `cells = rbf(x + rbf(up(y) + bias))`, `up` the 2x trilinear upsample
+/// (align_corners False) in float32, `bias` the fuse's bias as bf16 holds it
 ///
-/// `x` is `[B, D, H, W, C]` bf16 pairs as `U32x2`, `C % 4 == 0`; `out` is `[B, 2D, 2H, 2W, C]`. One thread per
-/// output `U32x2`: `quads` = C/4, `d`, `h`, `w` the input size
+/// PyTorch upsamples first and convolves the upsampled tensor; both are linear and the upsample's weights sum to 1,
+/// so the order only moves bf16 rounding, and the conv runs on an eighth of the voxels
+///
+/// `x` and `cells` are `[B, 2D, 2H, 2W, C]` and `y` `[B, D, H, W, C]`, bf16 pairs as `U32x2`, `C % 4 == 0`. One
+/// thread per output `U32x2`: `quads` = C/4, `d`, `h`, `w` the context's size
 #[kernel(launch_context = lc)]
 #[launch_contract(domain = 1, coordinates = u32)]
-pub fn sn_upsample(mut out: DisjointSlice<U32x2>, x: &[U32x2], quads: u32, d: u32, h: u32, w: u32) {
+#[allow(clippy::too_many_arguments)]
+pub fn sn_upfuse(
+    mut cells: DisjointSlice<U32x2>,
+    x: &[U32x2],
+    y: &[U32x2],
+    bias: &[f32],
+    quads: u32,
+    d: u32,
+    h: u32,
+    w: u32,
+) {
     let t = thread::index_1d_u32(lc);
     let i = t.get();
     let (v, q) = (i / quads, i % quads);
@@ -326,16 +340,18 @@ pub fn sn_upsample(mut out: DisjointSlice<U32x2>, x: &[U32x2], quads: u32, d: u3
     let (b, r) = (v / (2 * d * hw2), v % (2 * d * hw2));
     let (oz, r) = (r / hw2, r % hw2);
     let (oy, ox) = (r / w2, r % w2);
-    let Some(mut o) = out.element_thread32(t) else { return };
+    let Some(mut o) = cells.element_thread32(t) else { return };
     let (z0, z1, lz) = source(oz, d);
     let (y0, y1, ly) = source(oy, h);
     let (x0, x1, lx) = source(ox, w);
-    let at = |z: u32, y: u32, xx: u32| -> [f32; 4] {
-        let [p0, p1] = x[((((b * d + z) * h + y) * w + xx) * quads + q) as usize].0;
+    let at = |z: u32, yy: u32, xx: u32| -> [f32; 4] {
+        let [p0, p1] = y[((((b * d + z) * h + yy) * w + xx) * quads + q) as usize].0;
         [lo(p0), hi(p0), lo(p1), hi(p1)]
     };
     let (a000, a001, a010, a011) = (at(z0, y0, x0), at(z0, y0, x1), at(z0, y1, x0), at(z0, y1, x1));
     let (a100, a101, a110, a111) = (at(z1, y0, x0), at(z1, y0, x1), at(z1, y1, x0), at(z1, y1, x1));
+    let [s0, s1] = x[i as usize].0;
+    let skip = [lo(s0), hi(s0), lo(s1), hi(s1)];
     let (mz, my, mx) = (1.0 - lz, 1.0 - ly, 1.0 - lx);
     let mut r = [0f32; 4];
     let mut j = 0;
@@ -344,62 +360,94 @@ pub fn sn_upsample(mut out: DisjointSlice<U32x2>, x: &[U32x2], quads: u32, d: u3
         let k = j as usize;
         let near = my * (mx * a000[k] + lx * a001[k]) + ly * (mx * a010[k] + lx * a011[k]);
         let far = my * (mx * a100[k] + lx * a101[k]) + ly * (mx * a110[k] + lx * a111[k]);
-        r[k] = mz * near + lz * far;
+        r[k] = rbf(skip[k] + rbf(mz * near + lz * far + bias[(4 * q) as usize + k]));
         j += 1;
     }
     o.write(U32x2([pack(r[0], r[1]), pack(r[2], r[3])]));
 }
 
-/// The CNN output: `cells = rbf(x + rbf(y + bias))`, `y` the context fuse's bf16 1x1 conv output and `bias` its
-/// bias as bf16 holds it, `x` the last stage's output
-///
-/// `x`, `y` and `cells` are `[B, S, C]` bf16 pairs as `U32x2`, `C % 4 == 0`; one thread per `U32x2`, `quads` = C/4
-#[kernel(launch_context = lc)]
-#[launch_contract(domain = 1, coordinates = u32)]
-pub fn sn_fuse(mut cells: DisjointSlice<U32x2>, x: &[U32x2], y: &[U32x2], bias: &[f32], quads: u32) {
-    let t = thread::index_1d_u32(lc);
-    let i = t.get();
-    let c = (4 * (i % quads)) as usize;
-    let Some(mut o) = cells.element_thread32(t) else { return };
-    let [x0, x1] = x[i as usize].0;
-    let [y0, y1] = y[i as usize].0;
-    let f = |xv: f32, yv: f32, k: usize| rbf(xv + rbf(yv + bias[c + k]));
-    o.write(U32x2([
-        pack(f(lo(x0), lo(y0), 0), f(hi(x0), hi(y0), 1)),
-        pack(f(lo(x1), lo(y1), 2), f(hi(x1), hi(y1), 3)),
-    ]));
+/// Sums `v` over the block (256 threads) in a fixed order through `red` (8 slots); every thread gets the total
+#[inline(always)]
+fn block_sum256(v: f32, red: *mut f32, tid: u32) -> f32 {
+    let mut v = v;
+    let mut m = 16;
+    while m > 0 {
+        v += warp::shuffle_xor_f32(v, m);
+        m >>= 1;
+    }
+    // SAFETY: lane 0 of each warp writes its own slot, every thread reads after the barrier
+    unsafe {
+        if tid % 32 == 0 {
+            *red.add((tid / 32) as usize) = v;
+        }
+        sync_threads();
+        let mut s = 0f32;
+        let mut w = 0;
+        while w < 8 {
+            s += *red.add(w);
+            w += 1;
+        }
+        // the next reduction reuses `red`
+        sync_threads();
+        s
+    }
 }
 
-/// Chan's merge of per-tile `[mean, M2]` partials of equal `count` into per (sample, channel) `[mean, invstd]`,
-/// in float64, tiles in order
+/// Merges per-tile `[mean, M2]` partials of equal `count` into per (sample, channel) `[mean, invstd]`: the mean of
+/// the tile means, then `M2 = sum(M2_t) + count * sum((mean_t - mean)^2)`, both as fixed-order block sums
 ///
-/// `part` is `[B, tiles, cols]`, `stats` `[B, cols]`. One thread per (sample, channel)
-#[kernel(launch_context = lc)]
-#[launch_contract(domain = 1, coordinates = u32)]
-pub fn sn_merge(mut stats: DisjointSlice<[f32; 2]>, part: &[[f32; 2]], tiles: u32, cols: u32, count: f32, eps: f32) {
-    let t = thread::index_1d_u32(lc);
-    let i = t.get();
-    let (b, c) = (i / cols, i % cols);
-    let Some(mut out) = stats.element_thread32(t) else { return };
-    let base = b * tiles * cols + c;
-    let mut s = 0f64;
-    let mut k = 0;
-    while k < tiles {
-        s += part[(base + k * cols) as usize][0] as f64;
-        k += 1;
+/// `part` is `[B, tiles, pcols]`; `stats` `[B, cols]` takes partial columns `c0..c0 + cols`. Grid `(cols, B)`,
+/// block 256 threads, each striding over the tiles
+#[kernel]
+pub fn sn_merge(
+    mut stats: DisjointSlice<[f32; 2]>,
+    part: &[[f32; 2]],
+    tiles: u32,
+    pcols: u32,
+    c0: u32,
+    cols: u32,
+    count: f32,
+    eps: f32,
+) {
+    static mut RED: SharedArray<f32, 8> = SharedArray::UNINIT;
+    let (c, b, tid) = (blockIdx_x(), blockIdx_y(), threadIdx_x());
+    // block-uniform, so a block that fails it never reaches a barrier
+    if (blockDim_x() != 256)
+        | (c >= cols)
+        | (c0 + cols > pcols)
+        | (tiles == 0)
+        | ((((b + 1) * tiles * pcols) as usize) > part.len())
+        | ((((b + 1) * cols) as usize) > stats.len())
+    {
+        return;
     }
-    let mean = s / tiles as f64;
-    let mut q = 0f64;
-    let mut k = 0;
+    let red = addr_of_mut!(RED) as *mut f32;
+    let base = b * tiles * pcols + c0 + c;
+
+    let mut s = 0f32;
+    let mut k = tid;
     while k < tiles {
-        let [m, m2] = part[(base + k * cols) as usize];
-        let d = m as f64 - mean;
-        q += m2 as f64 + count as f64 * d * d;
-        k += 1;
+        s += part[(base + k * pcols) as usize][0];
+        k += 256;
     }
-    let var = (q / (count as f64 * tiles as f64)) as f32;
+    let mean = block_sum256(s, red, tid) / tiles as f32;
+
+    let mut q = 0f32;
+    let mut k = tid;
+    while k < tiles {
+        let [m, m2] = part[(base + k * pcols) as usize];
+        let d = m - mean;
+        q += m2 + count * d * d;
+        k += 256;
+    }
+    let q = block_sum256(q, red, tid);
+    if tid != 0 {
+        return;
+    }
+    let var = q / (count * tiles as f32);
     let var = if var > 0.0 { var } else { 0.0 };
-    out.write([mean as f32, 1.0 / sqrt_rn_f32(var + eps)]);
+    // SAFETY: `b * cols + c < stats.len()` by the check above, and only thread 0 of block (c, b) writes it
+    unsafe { *stats.get_unchecked_mut((b * cols + c) as usize) = [mean, 1.0 / sqrt_rn_f32(var + eps)] };
 }
 
 /// Sums 64 per-lane values over the warp as a reduce-scatter: five butterfly steps, each sending half of what the
@@ -1002,8 +1050,8 @@ conv_kernel!(sn_conv_24_24, 1, 6, 3, 3, 24, 2, 8, 16, 2, 8, 0);
 /// skip `sk = rbf(wsk p)` recomputed from the pooled input `p` (as [`sn_conv0`] computed it for its statistics)
 ///
 /// `y` is `[B, S, 12]` bf16 as `U32x2` (three per voxel), `p` `[B, S]` bf16 pairs, `stats` `[B, 12]` conv2's
-/// statistics and `skstats` `[B, 24]` [`sn_conv0`]'s (the skip's at 12..24), `w`/`b` and `skw`/`skb` the affines.
-/// One thread per `U32x2`
+/// statistics and `skstats` `[B, 12]` the skip's, `w`/`b` and `skw`/`skb` the affines, `wsk` the skip's weights
+/// `[2][12]`. One thread per `U32x2`
 #[kernel(launch_context = lc)]
 #[launch_contract(domain = 1, coordinates = u32)]
 pub fn sn_apply_s0(
@@ -1034,7 +1082,7 @@ pub fn sn_apply_s0(
         let c = (4 * q + j) as usize;
         let k = rbf(wsk[12 + c] * p1 + wsk[c] * p0);
         let main = affine(v[j as usize], stats[(s * 12) as usize + c], w[c], b[c]);
-        let skip = affine(k, skstats[(s * 24 + 12) as usize + c], skw[c], skb[c]);
+        let skip = affine(k, skstats[(s * 12) as usize + c], skw[c], skb[c]);
         r[j as usize] = leaky(rbf(main + skip));
         j += 1;
     }
