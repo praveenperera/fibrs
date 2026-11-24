@@ -125,7 +125,7 @@ impl Engine {
     fn frames(&mut self, requests: &[FrameRequest], ahead: &Ahead) -> Result<Vec<FrameResult>> {
         let at: Vec<CropAt> = requests.iter().map(|r| CropAt { pos: r.pos, frame: r.frame }).collect();
         self.crops.frame(&self.dev, &mut self.cache, &at, &self.frame_crops)?;
-        self.crops.prefetch(&mut self.cache, ahead.spec, &ahead.at)?;
+        self.crops.prefetch(&mut self.cache, &ahead.reads())?;
         self.frame.run(&self.dev, &self.frame_crops, requests)
     }
 
@@ -134,18 +134,25 @@ impl Engine {
         let at: Vec<CropAt> = requests.iter().map(|r| CropAt { pos: r.pos, frame: r.frame }).collect();
         let tubes: Vec<&[[f32; 3]]> = requests.iter().map(|r| r.tube.as_slice()).collect();
         self.crops.strip(&self.dev, &mut self.cache, &at, &tubes, &self.strip_input)?;
-        self.crops.prefetch(&mut self.cache, ahead.spec, &ahead.at)?;
+        self.crops.prefetch(&mut self.cache, &ahead.reads())?;
         let input = self.crops.strip_input(&self.strip_input);
         let cells = self.cnn.forward(&self.dev, input, requests.len())?;
         self.head.forward(&self.dev, cells, input, requests)
     }
 }
 
-/// The crops the launch after this one will likely sample: a guess from the queues as they stand, whose CT chunks
-/// are read while this launch runs
-struct Ahead {
-    spec: &'static CropSpec,
-    at: Vec<CropAt>,
+/// The crops the launches after this one will likely sample, the next launch's first: a guess from the queues as
+/// they stand, whose CT chunks are read while this launch runs
+struct Ahead(Vec<(&'static CropSpec, Vec<CropAt>)>);
+
+impl Ahead {
+    fn one(spec: &'static CropSpec, at: Vec<CropAt>) -> Self {
+        Self(vec![(spec, at)])
+    }
+
+    fn reads(&self) -> Vec<(&CropSpec, &[CropAt])> {
+        self.0.iter().map(|(spec, at)| (*spec, at.as_slice())).collect()
+    }
 }
 
 /// An item partly run: its requests, the results so far, where its reply goes
@@ -289,8 +296,9 @@ pub fn serve(
             && engine.crops.unread(&mut engine.cache, &FRAME_CROP, &front).unwrap_or(0) > 0;
         deferred = defer;
         if defer {
-            // the frames are the next launch, so they are this one's read-ahead
-            let ahead = Ahead { spec: &FRAME_CROP, at: front };
+            // the frames are the next launch, so they are read first; the strips after them come next, since the
+            // launch after the frames is often a strip launch, which would otherwise wait on its own reads
+            let ahead = Ahead(vec![(&FRAME_CROP, front), (&STRIP_CROP, strips.peek(batch, batch, strip_at))]);
             counts.strip_decisions += strips.launch(batch, |q| engine.strips(q, &ahead));
             counts.strip_launches += 1;
             counts.frame_deferrals += 1;
@@ -298,14 +306,14 @@ pub fn serve(
             // the next launch runs frames while any are queued, so it takes the frames beyond this launch, else the
             // front strips; work that arrives meanwhile can change it, which costs only the reads
             let ahead = if frames.decisions() > batch {
-                Ahead { spec: &FRAME_CROP, at: frames.peek(batch, batch, frame_at) }
+                Ahead::one(&FRAME_CROP, frames.peek(batch, batch, frame_at))
             } else {
-                Ahead { spec: &STRIP_CROP, at: strips.peek(0, batch, strip_at) }
+                Ahead::one(&STRIP_CROP, strips.peek(0, batch, strip_at))
             };
             counts.frame_decisions += frames.launch(batch, |q| engine.frames(q, &ahead));
             counts.frame_launches += 1;
         } else {
-            let ahead = Ahead { spec: &STRIP_CROP, at: strips.peek(batch, batch, strip_at) };
+            let ahead = Ahead::one(&STRIP_CROP, strips.peek(batch, batch, strip_at));
             counts.strip_decisions += strips.launch(batch, |q| engine.strips(q, &ahead));
             counts.strip_launches += 1;
         }

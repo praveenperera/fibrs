@@ -700,20 +700,25 @@ impl Crops {
     /// How many CT chunks crops of `spec` at `at` need that are neither resident nor read ahead yet, after starting
     /// their reads; see [`ChunkCache::unread`]
     pub fn unread(&self, cache: &mut ChunkCache, spec: &CropSpec, at: &[CropAt]) -> Result<usize> {
-        let grids: Vec<CropGrid> = at.iter().map(|c| CropGrid::new(spec, c.pos, &c.frame, self.scale)).collect();
-        let needed = cache.needed(spec, &grids);
+        let needed = self.needed(cache, spec, at);
         cache.unread(&needed)
     }
 
-    /// Starts reading ahead the CT chunks that crops of `spec` at `at` need and the cache lacks, for a later launch
-    /// on them; see [`ChunkCache::prefetch`]
-    pub fn prefetch(&self, cache: &mut ChunkCache, spec: &CropSpec, at: &[CropAt]) -> Result<()> {
-        if at.is_empty() {
+    /// Starts reading ahead the CT chunks that the crops of `reads` (each a spec and its crops) need and the cache
+    /// lacks, for later launches on them, as one read-ahead: when buffers run short, the earlier reads keep theirs;
+    /// see [`ChunkCache::prefetch`]
+    pub fn prefetch(&self, cache: &mut ChunkCache, reads: &[(&CropSpec, &[CropAt])]) -> Result<()> {
+        let needed: Vec<u32> = reads.iter().flat_map(|&(spec, at)| self.needed(cache, spec, at)).collect();
+        if needed.is_empty() {
             return Ok(());
         }
-        let grids: Vec<CropGrid> = at.iter().map(|c| CropGrid::new(spec, c.pos, &c.frame, self.scale)).collect();
-        let needed = cache.needed(spec, &grids);
         cache.prefetch(&needed)
+    }
+
+    /// The table indices of the CT chunks crops of `spec` at `at` need
+    fn needed(&self, cache: &ChunkCache, spec: &CropSpec, at: &[CropAt]) -> Vec<u32> {
+        let grids: Vec<CropGrid> = at.iter().map(|c| CropGrid::new(spec, c.pos, &c.frame, self.scale)).collect();
+        cache.needed(spec, &grids)
     }
 
     /// Stages the grids (and tube points), makes their chunks resident and launches the sampler for `pass`, writing

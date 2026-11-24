@@ -120,11 +120,18 @@ impl Prefetcher {
         })
     }
 
-    /// Starts reading the chunks `missing` (table index, chunk-grid zyx) not already read or being read, while
-    /// buffers last: free ones first, then those holding chunks of earlier read-aheads
+    /// Starts reading the chunks `missing` (table index, chunk-grid zyx) not already read or being read, in order
+    /// while buffers last: free ones first, then those holding chunks of earlier read-aheads that this one does not
+    /// ask for
     pub(super) fn start(&mut self, missing: &[(u32, [usize; 3])]) -> Result<()> {
         self.generation += 1;
         self.collect();
+        // chunks asked for again join this read-ahead first, so no claim below reclaims a buffer it still wants
+        for &(idx, _) in missing {
+            if let Some(&buf) = self.held.get(&idx) {
+                self.renew(buf);
+            }
+        }
         for &(idx, c) in missing {
             if self.held.contains_key(&idx) {
                 continue;
@@ -190,6 +197,15 @@ impl Prefetcher {
                 self.state[done.buf] = State::Free;
                 self.held.remove(&idx);
             }
+        }
+    }
+
+    /// Moves buffer `buf`'s read or chunk into the current read-ahead
+    fn renew(&mut self, buf: usize) {
+        let generation = self.generation;
+        match &mut self.state[buf] {
+            State::Reading { generation: g, .. } | State::Ready { generation: g, .. } => *g = generation,
+            State::Free => {}
         }
     }
 
