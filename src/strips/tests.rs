@@ -602,3 +602,24 @@ fn fixture_parity() {
     let bad: Vec<&String> = total.0.iter().filter(|(_, s)| s.mismatches > 0).map(|(k, _)| k).collect();
     assert!(bad.is_empty(), "fields over the bar: {bad:?}");
 }
+
+/// Selection without ids: every fibre over 2.5 mm in villa's Morton order (`select_fibres`), against the order
+/// dumped from it (fixtures' selection_2.5mm.txt)
+#[test]
+#[ignore = "needs the fixtures and the AFV"]
+fn selection_order() {
+    let root = PathBuf::from(
+        std::env::var("FIBRS_GEOM_FIXTURES")
+            .unwrap_or("/home/praveen/code/research/_scratch/strips-native/geom/fx".into()),
+    );
+    let theirs: Vec<i64> = fs::read_to_string(root.join("selection_2.5mm.txt"))
+        .unwrap()
+        .split_whitespace()
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let ours: Vec<i64> =
+        Afv::open(Path::new(AFV)).unwrap().select(2.5, 9.362, None).unwrap().iter().map(|r| r.id).collect();
+    assert_eq!(ours.len(), theirs.len());
+    let first = ours.iter().zip(&theirs).position(|(a, b)| a != b);
+    assert_eq!(first, None, "orders part at {first:?}");
+}
