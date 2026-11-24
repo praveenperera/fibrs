@@ -256,7 +256,8 @@ impl MmaConv {
         }
 
         let hpx: usize = [0, 1, 2].iter().map(|&a| (tile[a] - 1) * stride + 3).product();
-        let smem = hpx * ch * 16 + cin * 16 + (warps * nt * 8 + nt * 8) * 4;
+        // as `conv_smem` in the kernels: the halo, three cin param slots, the reduction scratch
+        let smem = hpx * ch * 16 + 3 * cin.next_multiple_of(4) * 16 + (warps * nt * 8 + nt * 8) * 4;
         let smem = u32::try_from(smem)?;
         dev.kernels.set_max_dynamic_smem(kernel, smem)?;
         let wf = dev.gpu.upload(&wf)?;
@@ -278,22 +279,42 @@ impl MmaConv {
         voxels(self.tile)
     }
 
-    /// Queues `out = conv(prologue(x))` and the tile partials of `out` into `part`: `prologue` is the producer's
-    /// InstanceNorm (then LeakyReLU) when the kernel applies one on load
-    fn run(&self, dev: &Device, x: &Buf, prologue: Option<&Norm>, out: &Buf, part: &Buf, n: usize) -> Result<()> {
+    /// Queues `out = conv(prologue(x))` and the tile partials of `out` into `part`; the kernel must have been
+    /// built for `prologue`'s kind
+    fn run(&self, dev: &Device, x: &Buf, prologue: Prologue, out: &Buf, part: &Buf, n: usize) -> Result<()> {
         let tiles = self.tiles();
-        let (stats, gamma, beta) = match prologue {
-            Some(norm) => (norm.stats.view::<[f32; 2]>(0, n * self.cin), norm.w.arg::<f32>(), norm.b.arg::<f32>()),
-            None => (Arg::EMPTY, Arg::EMPTY, Arg::EMPTY),
+        let (cin, o) = (self.cin, voxels(self.output()));
+        let norm_args =
+            |norm: &Norm| (norm.stats.view::<[f32; 2]>(0, n * cin), norm.w.arg::<f32>(), norm.b.arg::<f32>());
+        let empty = (Arg::EMPTY, Arg::EMPTY, Arg::EMPTY);
+        let (norm, skip, rest) = match prologue {
+            Prologue::None => (empty, empty, [Arg::EMPTY, Arg::EMPTY, Arg::EMPTY]),
+            Prologue::Norm(norm) => (norm_args(norm), empty, [Arg::EMPTY, Arg::EMPTY, Arg::EMPTY]),
+            Prologue::Stage0 { norm2, skip, wsk, pooled_input, pool } => (
+                norm_args(norm2),
+                norm_args(skip),
+                [
+                    pooled_input.view::<u32>(0, n * voxels(self.input)),
+                    wsk.arg::<f32>(),
+                    pool.view::<[u32; 2]>(0, n * o * cin / 4),
+                ],
+            ),
         };
+        let [p, wsk, pool] = rest;
         let [d, h, w] = self.input;
         let args = [
-            out.view::<u32>(0, n * voxels(self.output()) * self.cout / 2),
+            out.view::<u32>(0, n * o * self.cout / 2),
             part.view::<[f32; 2]>(0, n * tiles * self.cout),
-            x.view::<[u32; 2]>(0, n * voxels(self.input) * self.cin / 4),
-            stats,
-            gamma,
-            beta,
+            x.view::<[u32; 2]>(0, n * voxels(self.input) * cin / 4),
+            norm.0,
+            norm.1,
+            norm.2,
+            p,
+            skip.0,
+            skip.1,
+            skip.2,
+            wsk,
+            pool,
             self.wf.arg::<[u32; 2]>(),
             Arg::U32(d as u32),
             Arg::U32(h as u32),
@@ -302,6 +323,18 @@ impl MmaConv {
         let block = (self.warps * 32) as u32;
         dev.kernels.launch(&dev.gpu, self.kernel, (tiles as u32, n as u32, 1), (block, 1, 1), self.smem, &args)
     }
+}
+
+/// What a tensor-core conv applies to its input as it loads it
+#[derive(Clone, Copy)]
+enum Prologue<'a> {
+    /// The input as stored
+    None,
+    /// The producer's InstanceNorm, then LeakyReLU
+    Norm(&'a Norm),
+    /// The first block's output, from its conv2 output (the input), as `sn_apply_s0` computes it; the conv also writes
+    /// that output's 2x2x2 average to `pool`
+    Stage0 { norm2: &'a Norm, skip: &'a Norm, wsk: &'a Buf, pooled_input: &'a Buf, pool: &'a Buf },
 }
 
 /// The native stages 0 and 1: the first conv's weights for `sn_conv0` and the tensor-core convs
@@ -717,8 +750,8 @@ impl CropCnn {
         let (v1, v2) = (voxels(s1), voxels(s2));
         let all = Samples::all(n);
 
-        // stage 0: conv1 and the skip's pooled input from the float32 crop, conv2 with conv1's norm on load, then
-        // the block output in place of conv2's
+        // stage 0: conv1 and the skip's pooled input from the float32 crop, then conv2 with conv1's norm on load. The
+        // block's output is never stored: stage 1's first conv rebuilds it on load
         let args = [
             t0.view::<[u32; 2]>(0, n * v1 * 3),
             self.pooled.view::<u32>(0, n * v1),
@@ -730,34 +763,25 @@ impl CropCnn {
         dev.kernels.launch(&dev.gpu, "sn_conv0", (CONV0_TILES as u32, n as u32, 1), (256, 1, 1), 0, &args)?;
         self.merge(dev, &b0.norm1.stats, CONV0_TILES, 24, 0, 12, 256, n)?;
         self.merge(dev, &sk0.stats, CONV0_TILES, 24, 12, 12, 256, n)?;
-        self.mma(dev, &nat.s0c2, t0, Some(&b0.norm1), t1, &b0.norm2, n)?;
-        let args = [
-            t1.view::<[u32; 2]>(0, n * v1 * 3),
-            self.pooled.view::<u32>(0, n * v1),
-            b0.norm2.stats.view::<[f32; 2]>(0, n * 12),
-            b0.norm2.w.arg::<f32>(),
-            b0.norm2.b.arg::<f32>(),
-            sk0.stats.view::<[f32; 2]>(0, n * 12),
-            sk0.w.arg::<f32>(),
-            sk0.b.arg::<f32>(),
-            nat.skip0.arg::<f32>(),
-            Arg::U32(v1 as u32),
-        ];
-        dev.kernels.launch(&dev.gpu, "sn_apply_s0", grid(n * v1 * 3), (256, 1, 1), 0, &args)?;
+        self.mma(dev, &nat.s0c2, t0, Prologue::Norm(&b0.norm1), t1, &b0.norm2, n)?;
+
+        // stage 1 block 0: the strided conv1 on stage 0's output (rebuilt from conv2's in t1), which also writes
+        // that output's average for the skip; the skip's 1x1 conv and statistics; conv2 with conv1's norm on load;
+        // the block output in place of conv2's
+        let stage0 =
+            Prologue::Stage0 { norm2: &b0.norm2, skip: sk0, wsk: &nat.skip0, pooled_input: &self.pooled, pool: t2 };
+        self.mma(dev, &nat.s1c1, t1, stage0, t0, &b1.norm1, n)?;
         if let Some(tap) = tap.as_mut() {
+            // only a tapped forward stores stage 0's output, in place of conv2's, which nothing reads any more
+            self.apply_s0(dev, t1, b0, sk0, n)?;
             dev.gpu.sync()?;
             tap(&b0.name, t1, [n, s1[0], s1[1], s1[2], 12])?;
         }
-
-        // stage 1 block 0: the strided conv1, the skip (pool, cuDNN's 1x1 conv, its statistics), conv2 with conv1's
-        // norm on load, the block output in place of conv2's
-        self.mma(dev, &nat.s1c1, t1, None, t0, &b1.norm1, n)?;
-        self.pool(dev, t1, t2, all, s1, 12)?;
         let (proj, proj_norm) = sk1;
         let pp = plans.blocks[1].proj.as_ref().expect("stage 1 block 0 projects");
         proj.run(dev, pp, t2, t3, self.workspace.as_ref(), all)?;
         self.stats(dev, t3, proj_norm, all, v2)?;
-        self.mma(dev, &nat.s1[0], t0, Some(&b1.norm1), t2, &b1.norm2, n)?;
+        self.mma(dev, &nat.s1[0], t0, Prologue::Norm(&b1.norm1), t2, &b1.norm2, n)?;
         self.apply(dev, t2, &b1.norm2, Residual::Norm(t3, proj_norm), all, v2, true)?;
         if let Some(tap) = tap.as_mut() {
             dev.gpu.sync()?;
@@ -765,14 +789,32 @@ impl CropCnn {
         }
 
         // stage 1 block 1: identity skip
-        self.mma(dev, &nat.s1[1], t2, None, t0, &b2.norm1, n)?;
-        self.mma(dev, &nat.s1[2], t0, Some(&b2.norm1), t1, &b2.norm2, n)?;
+        self.mma(dev, &nat.s1[1], t2, Prologue::None, t0, &b2.norm1, n)?;
+        self.mma(dev, &nat.s1[2], t0, Prologue::Norm(&b2.norm1), t1, &b2.norm2, n)?;
         self.apply(dev, t1, &b2.norm2, Residual::Plain(t2), all, v2, true)?;
         if let Some(tap) = tap.as_mut() {
             dev.gpu.sync()?;
             tap(&b2.name, t1, [n, s2[0], s2[1], s2[2], 24])?;
         }
         Ok(Some(1))
+    }
+
+    /// Stage 0's output in place of its conv2 output `y` (`sn_apply_s0`)
+    fn apply_s0(&self, dev: &Device, y: &Buf, b0: &Block, sk0: &Norm, n: usize) -> Result<()> {
+        let v1 = voxels(b0.conv1.output());
+        let args = [
+            y.view::<[u32; 2]>(0, n * v1 * 3),
+            self.pooled.view::<u32>(0, n * v1),
+            b0.norm2.stats.view::<[f32; 2]>(0, n * 12),
+            b0.norm2.w.arg::<f32>(),
+            b0.norm2.b.arg::<f32>(),
+            sk0.stats.view::<[f32; 2]>(0, n * 12),
+            sk0.w.arg::<f32>(),
+            sk0.b.arg::<f32>(),
+            self.native.skip0.arg::<f32>(),
+            Arg::U32(v1 as u32),
+        ];
+        dev.kernels.launch(&dev.gpu, "sn_apply_s0", grid(n * v1 * 3), (256, 1, 1), 0, &args)
     }
 
     /// One tensor-core conv and the merge of its tile partials into `norm`'s statistics
@@ -782,7 +824,7 @@ impl CropCnn {
         dev: &Device,
         conv: &MmaConv,
         x: &Buf,
-        prologue: Option<&Norm>,
+        prologue: Prologue,
         out: &Buf,
         norm: &Norm,
         n: usize,
