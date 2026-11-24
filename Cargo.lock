@@ -1070,7 +1070,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "volkit"
 version = "0.2.0"
-source = "git+https://github.com/praveenperera/volkit?rev=4d06983ecbe0cd8a59d786ee514bf9d2894f0f06#4d06983ecbe0cd8a59d786ee514bf9d2894f0f06"
+source = "git+https://github.com/praveenperera/volkit?rev=ceac04419e017b793f9b606f5069b94041d7a192#ceac04419e017b793f9b606f5069b94041d7a192"
 dependencies = [
  "bytemuck",
  "color-eyre",
