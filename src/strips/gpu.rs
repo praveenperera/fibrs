@@ -97,6 +97,11 @@ impl Weights {
         Ok(t)
     }
 
+    /// Whether the export holds tensor `name`
+    pub fn has(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
+    }
+
     /// The names of every tensor, sorted
     pub fn names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.tensors.keys().map(String::as_str).collect();

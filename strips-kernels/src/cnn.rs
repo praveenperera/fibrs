@@ -7,11 +7,15 @@
 //!   writes `rbf(gamma * (x - mean) * invstd + beta)`;
 //! - the residual add and LeakyReLU(0.01) each round to bf16 again;
 //! - AvgPool3d and the trilinear upsample sum in float32 and round once;
-//! - the context fuse's bias is added to its bf16 conv output and rounded, then added to the stage output and
-//!   rounded again.
+//! - a conv's bias (stage 0's two convs and the context fuse) is added to its bf16 output and rounded again,
+//!   `rbf(rbf(conv) + bias)`, as PyTorch's cuDNN convolution adds it; the fuse's sum is then added to the stage
+//!   output and rounded again.
 //!
-//! The stage-0 conv biases are not added: each conv feeds an InstanceNorm, which removes a per-channel constant in
-//! exact arithmetic. Statistics are deterministic: fixed-order partial sums per chunk, merged in a fixed order.
+//! The stage-0 biases feed InstanceNorms, which remove a per-channel constant in exact arithmetic, but not their
+//! rounding: on the near-constant regions of a crop (the zero padding, uniform input) `rbf(c + bias)` lands on the
+//! coarser grid of `c + bias` in the same direction at every voxel, a fixed offset per (position, channel) that
+//! survives the norm and that the trained head reads. Statistics are deterministic: fixed-order partial sums per
+//! chunk, merged in a fixed order.
 //! Index math is 32-bit: the host keeps every buffer under 2^32 elements
 
 use core::ptr::addr_of_mut;
@@ -262,6 +266,20 @@ pub fn sn_apply(
     out.write(U32x2([pack(v[0], v[1]), pack(v[2], v[3])]));
 }
 
+/// A cuDNN conv's bias in place, as PyTorch adds it to the bf16 output: `y = rbf(y + bias)`, four channels per thread
+///
+/// `y` is `[B, rows, cols]` bf16 pairs as `U32x2`, `cols % 4 == 0`; `bias` the bf16-rounded bias `[cols]`
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn sn_bias(mut y: DisjointSlice<U32x2>, bias: &[f32], cols: u32) {
+    let t = thread::index_1d_u32(lc);
+    let c = (4 * (t.get() % (cols / 4))) as usize;
+    let Some(mut out) = y.element_thread32(t) else { return };
+    let [p0, p1] = out.read().0;
+    let v = [lo(p0) + bias[c], hi(p0) + bias[c + 1], lo(p1) + bias[c + 2], hi(p1) + bias[c + 3]];
+    out.write(U32x2([pack(v[0], v[1]), pack(v[2], v[3])]));
+}
+
 /// AvgPool3d(2, 2) of a bf16 tensor: `out[b, z, y, x] = rbf(sum / 8)` over the 2x2x2 block, summed in float32 in
 /// (z, y, x) order as ATen's avg_pool3d loops
 ///
@@ -502,14 +520,14 @@ fn reduce_scatter64(v: &[f32; 64], lane: u32) -> [f32; 2] {
 /// The first block's stride-2 conv and its skip, straight from the float32 input crop
 ///
 /// - `y = conv1(bf16(x))`: 3x3x3, stride 2, 2 -> 12 channels, bf16 inputs and weights with float32 accumulation,
-///   written as bf16 `[B, 72, 64, 64, 12]` (three `U32x2` per voxel), no bias (it cancels in the InstanceNorm);
+///   plus its bias `rbf(rbf(acc) + bias)`, written as bf16 `[B, 72, 64, 64, 12]` (three `U32x2` per voxel);
 /// - `p = bf16(avgpool2(x))`, `[B, 72, 64, 64]` bf16 pairs: the skip's pooled input, summed in float32 in (z, y, x)
 ///   order as ATen's avg_pool3d;
 /// - `part[b, tile, 0..12]` the tile's `[mean, M2]` of `y`, `part[b, tile, 12..24]` of the skip's 1x1 conv
 ///   `rbf(wsk p)`, for [`sn_merge`] (count 256).
 ///
 /// `x` is the float32 `[B, 144, 128, 128]` (CT, tube) pairs; `w` the bf16-rounded conv weights `[27 taps][2][12]`
-/// as 162 `F32x4`; `wsk` the skip's `[2][12]`. Grid `(1152, B)`: block `t` owns the output tile `2 x 8 x 16` at
+/// as 162 `F32x4`; `wsk` the skip's `[2][12]`; `bias` conv1's bf16-rounded bias `[12]`. Grid `(1152, B)`: block `t` owns the output tile `2 x 8 x 16` at
 /// `(t / 32, t / 4 % 8, t % 4)` tiles; 256 threads, one output voxel each
 #[kernel]
 pub fn sn_conv0(
@@ -519,6 +537,7 @@ pub fn sn_conv0(
     x: &[F32x2],
     w: &[F32x4],
     wsk: &[f32],
+    bias: &[f32],
 ) {
     static mut HALO: SharedArray<F32x2, 2805> = SharedArray::UNINIT;
     static mut WS: SharedArray<F32x4, 162> = SharedArray::UNINIT;
@@ -537,6 +556,7 @@ pub fn sn_conv0(
         | (((b + 1) * D * H * W) as usize > x.len())
         | (w.len() < 162)
         | (wsk.len() < 24)
+        | (bias.len() < 12)
         | (((b + 1) * out_voxels * 3) as usize > y.len())
         | (((b + 1) * out_voxels) as usize > p.len())
         | ((((b * TILES + tile) + 1) * 24) as usize > part.len())
@@ -635,7 +655,8 @@ pub fn sn_conv0(
     let mut o = 0;
     while o < 12 {
         __unroll_config::<0>();
-        v[o] = rbf(acc[o]);
+        // SAFETY: o < 12 <= bias.len()
+        v[o] = rbf(rbf(acc[o]) + unsafe { *bias.get_unchecked(o) });
         // SAFETY: o + 12 < 24
         let (k0, k1) = unsafe { (*sk.add(o), *sk.add(12 + o)) };
         v[12 + o] = rbf(k1 * p1 + k0 * p0);
@@ -723,8 +744,9 @@ fn swz<const CH: u32>(px: u32, k: u32) -> u32 {
 /// the tap's offset (each 8-channel half may come from a different tap, so 24-channel inputs pack without padding),
 /// the B fragments (`wf`, host-ordered `[step][n tile][lane]` `U32x2`) from global memory one step ahead.
 ///
-/// The epilogue writes `rbf(acc)` to `out` (`[B, Do, Ho, Wo, COUT]` bf16 pairs) and the tile's `[mean, M2]` of those
-/// values per channel to `part[b, tile, c]` (two passes over the registers, fixed reduction order)
+/// The epilogue writes `rbf(acc)` to `out` (`[B, Do, Ho, Wo, COUT]` bf16 pairs), or with `BIAS` the conv's bias added
+/// as PyTorch adds it, `rbf(rbf(acc) + bias[c])`, and the tile's `[mean, M2]` of those values per channel to
+/// `part[b, tile, c]` (two passes over the registers, fixed reduction order)
 ///
 /// # Safety
 /// `smem` is the block's dynamic shared memory of [`conv_smem`] bytes; every thread of the block calls this together
@@ -742,6 +764,7 @@ unsafe fn conv3<
     const MT: usize,
     const NW: u32,
     const PRO: u32,
+    const BIAS: bool,
 >(
     smem: *mut U32x4,
     out: &mut DisjointSlice<u32>,
@@ -757,6 +780,7 @@ unsafe fn conv3<
     wsk: &[f32],
     pool: &mut DisjointSlice<U32x2>,
     wf: &[U32x2],
+    bias: &[f32],
     d: u32,
     h: u32,
     w: u32,
@@ -786,6 +810,7 @@ unsafe fn conv3<
         | ((steps * NT as u32 * 32) as usize > wf.len())
         | (((b + 1) * od * oh * ow * COUT / 2) as usize > out.len())
         | (((b * tiles + tile + 1) * COUT) as usize > part.len())
+        | (BIAS & (bias.len() < COUT as usize))
         | ((PRO != 0)
             & ((((b + 1) * cin) as usize > stats.len()) | (gamma.len() < cin as usize) | (beta.len() < cin as usize)))
         | ((PRO == 2)
@@ -967,6 +992,31 @@ unsafe fn conv3<
         st += 1;
     }
 
+    // the bias on the rounded conv output, so the rounding below (outputs and statistics) completes PyTorch's
+    // `rbf(rbf(conv) + bias)`; padded channels stay as they are
+    if BIAS {
+        let mut mt = 0;
+        while mt < MT {
+            __unroll_config::<0>();
+            let mut nt = 0;
+            while nt < NT {
+                __unroll_config::<0>();
+                let mut e = 0;
+                while e < 4 {
+                    __unroll_config::<0>();
+                    let n = nt * 8 + 2 * th as usize + e % 2;
+                    if n < COUT as usize {
+                        // SAFETY: n < COUT <= bias.len() by the check above
+                        acc[mt][nt][e] = rbf(acc[mt][nt][e]) + unsafe { *bias.get_unchecked(n) };
+                    }
+                    e += 1;
+                }
+                nt += 1;
+            }
+            mt += 1;
+        }
+    }
+
     // the bf16 outputs
     let mut mt = 0;
     while mt < MT {
@@ -1081,9 +1131,10 @@ pub const fn conv_smem(s: u32, ch: u32, cq: u32, nt: u32, td: u32, th: u32, tw: 
 /// One `sn_conv_*` kernel: [`conv3`] at fixed parameters, `out` bf16 pairs, `part` the tile partials
 macro_rules! conv_kernel {
     ($name:ident, $s:literal, $cq:literal, $ch:literal, $nt:literal, $cout:literal, $td:literal, $th:literal,
-     $tw:literal, $mt:literal, $nw:literal, $pro:literal) => {
+     $tw:literal, $mt:literal, $nw:literal, $pro:literal, $bias:literal) => {
         #[doc = concat!("[`conv3`] with stride ", $s, ", ", $cq, " input quads in ", $ch, " chunks, ", $cout,
-                                " outputs, tile ", $td, "x", $th, "x", $tw, ", ", $nw, " warps, prologue ", $pro)]
+                                " outputs, tile ", $td, "x", $th, "x", $tw, ", ", $nw, " warps, prologue ", $pro,
+                                ", bias ", $bias)]
         #[kernel]
         pub fn $name(
             mut out: DisjointSlice<u32>,
@@ -1099,6 +1150,7 @@ macro_rules! conv_kernel {
             wsk: &[f32],
             mut pool: DisjointSlice<U32x2>,
             wf: &[U32x2],
+            bias: &[f32],
             d: u32,
             h: u32,
             w: u32,
@@ -1106,24 +1158,24 @@ macro_rules! conv_kernel {
             let smem = DynamicSharedArray::<U32x4, 16>::get();
             // SAFETY: the host launches with `conv_smem` bytes of dynamic shared memory
             unsafe {
-                conv3::<$s, $cq, $ch, $nt, $cout, $td, $th, $tw, $mt, $nw, $pro>(
-                    smem, &mut out, &mut part, x, stats, gamma, beta, p, skstats, skg, skb, wsk, &mut pool, wf, d,
-                    h, w,
+                conv3::<$s, $cq, $ch, $nt, $cout, $td, $th, $tw, $mt, $nw, $pro, $bias>(
+                    smem, &mut out, &mut part, x, stats, gamma, beta, p, skstats, skg, skb, wsk, &mut pool, wf,
+                    bias, d, h, w,
                 )
             }
         }
     };
 }
 
-// s0b0 conv2: 12 -> 12 at 72x64x64, conv1's norm and LeakyReLU on load
-conv_kernel!(sn_conv_12_12_n, 1, 3, 2, 2, 12, 4, 8, 16, 4, 8, 1);
+// s0b0 conv2: 12 -> 12 at 72x64x64, conv1's norm and LeakyReLU on load, plus its bias
+conv_kernel!(sn_conv_12_12_n, 1, 3, 2, 2, 12, 4, 8, 16, 4, 8, 1, true);
 // s1b0 conv1: 12 -> 24, stride 2, on the stage-0 output rebuilt from s0b0's conv2 output, writing its average for
 // s1b0's skip
-conv_kernel!(sn_conv_12_24_s2, 2, 3, 2, 3, 24, 2, 4, 16, 1, 8, 2);
+conv_kernel!(sn_conv_12_24_s2, 2, 3, 2, 3, 24, 2, 4, 16, 1, 8, 2, false);
 // stage-1 conv2s: 24 -> 24, conv1's norm and LeakyReLU on load
-conv_kernel!(sn_conv_24_24_n, 1, 6, 3, 3, 24, 2, 8, 16, 2, 8, 1);
+conv_kernel!(sn_conv_24_24_n, 1, 6, 3, 3, 24, 2, 8, 16, 2, 8, 1, false);
 // s1b1 conv1: 24 -> 24 on s1b0's output
-conv_kernel!(sn_conv_24_24, 1, 6, 3, 3, 24, 2, 8, 16, 2, 8, 0);
+conv_kernel!(sn_conv_24_24, 1, 6, 3, 3, 24, 2, 8, 16, 2, 8, 0, false);
 
 /// The first block's output in place of its conv2 output: `y = leaky(rbf(rbf(affine(y)) + rbf(affine(sk))))`, the
 /// skip `sk = rbf(wsk p)` recomputed from the pooled input `p` (as [`sn_conv0`] computed it for its statistics)
