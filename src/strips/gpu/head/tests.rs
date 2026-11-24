@@ -100,7 +100,8 @@ fn requests(st: &SafeTensors, b: usize) -> Result<Vec<StripRequest>> {
     let (_, seed_tangent) = get(st, "seed_tangent")?;
     let (_, geometry) = get(st, "path_geometry")?;
     let (_, valid) = get(st, "path_geometry_valid")?;
-    let (_, orientation) = get(st, "orientation")?;
+    // the head dump names it as the model's input does, the recorded batches as the data loader does
+    let (_, orientation) = get(st, "orientation").or_else(|_| get(st, "crop_orientation"))?;
     let n = hmask.len() / HISTORY;
     Ok((0..b)
         .map(|i| {
@@ -402,7 +403,8 @@ fn map(path: &std::path::Path) -> Result<Mmap> {
 
 /// The head on the shared strip-model reference's decisions (`ops/vesuvius/strips-native/ref_strip.py`;
 /// `FIBRS_STRIP_REF`, default its 340-decision run) in batches of 64 on PyTorch's stock cells, against the stock
-/// (bf16, batch 4) and batch-64 PyTorch heights and log scales, with the reference's own variant distances beside
+/// (bf16, batch 4) and batch-64 PyTorch heights and log scales, with the reference's own variant distances beside;
+/// with `FIBRS_HEAD_DUMP` set, also writes the native grids there
 #[test]
 #[ignore = "needs an NVIDIA GPU and the strip-model reference (FIBRS_STRIP_REF); run through the GPU queue"]
 fn head_matches_strip_reference() -> Result<()> {
@@ -434,17 +436,20 @@ fn head_matches_strip_reference() -> Result<()> {
         }
     }
 
+    // the raw grids for signed-bias and worst-item checks (tilt.py): `h1.f32`, `logs.f32`, `[n, 36, 25]` f32
+    if let Some(dump) = std::env::var_os("FIBRS_HEAD_DUMP").map(PathBuf::from) {
+        std::fs::create_dir_all(&dump)?;
+        let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        std::fs::write(dump.join("h1.f32"), bytes(&heights))?;
+        std::fs::write(dump.join("logs.f32"), bytes(&logs))?;
+    }
+
     println!("{n} decisions, batches of {batch}: |native - torch| and torch's own variant distances");
     println!("{:<22} {:>10} {:>10} {:>10}", "", "mean", "p99", "max");
-    let mut worst = None;
     for (field, ours) in [("h1", &heights), ("logs", &logs)] {
         for variant in ["stock", "b64", "fp32"] {
             let (_, want) = get(&outputs, &format!("{variant}.{field}"))?;
-            let e = Err3::of(ours, &want);
-            println!("{:<22} {e}", format!("{field} native vs {variant}"));
-            if field == "h1" && variant == "stock" {
-                worst = Some(e);
-            }
+            println!("{:<22} {}", format!("{field} native vs {variant}"), Err3::of(ours, &want));
         }
         let (_, stock) = get(&outputs, &format!("stock.{field}"))?;
         for variant in ["b64", "fp32"] {
@@ -452,8 +457,103 @@ fn head_matches_strip_reference() -> Result<()> {
             println!("{:<22} {}", format!("{field} {variant} vs stock"), Err3::of(&other, &stock));
         }
     }
-    let e = worst.ok_or_else(|| eyre!("no stock heights"))?;
-    // fast1's distance to stock: mean 0.0106, p99 0.0625, max 0.25
-    ensure!(e.max <= 0.25 && e.p99 <= 0.0625, "heights: {e} against stock PyTorch, past fast1's distance to stock");
+
+    // bench-model's bars against the fp32 forward (PyTorch's own bf16 spread with ~15% headroom), and the worst
+    // single height no further from fp32 than stock's own worst. Against stock the worst item compounds two bf16
+    // errors: at |h| >= 16 a height step is 0.125, so native and stock rounding opposite ways reach 0.375
+    let (_, fp32) = get(&outputs, "fp32.h1")?;
+    let (_, stock) = get(&outputs, "stock.h1")?;
+    let (h, own) = (Err3::of(&heights, &fp32), Err3::of(&stock, &fp32));
+    let (_, fp32_logs) = get(&outputs, "fp32.logs")?;
+    let l = Err3::of(&logs, &fp32_logs);
+    ensure!(h.mean <= 0.012 && h.p99 <= 0.065, "heights: {h} against fp32, past bench-model's bar");
+    ensure!(h.max <= own.max, "heights: worst {} against fp32, past stock's own {}", h.max, own.max);
+    ensure!(l.mean <= 0.004 && l.p99 <= 0.015, "log scales: {l} against fp32, past bench-model's bar");
+
+    // bench-model's column-tilt bar against stock: a lateral convention bug tilted 5e-3 with every spread in bar
+    let tilt = column_tilt(&heights, &stock);
+    println!("h1 column tilt vs stock {tilt:+.3e} (bar 1.5e-3)");
+    ensure!(tilt.abs() <= 1.5e-3, "heights tilt {tilt:+.3e} across the columns against stock");
+    Ok(())
+}
+
+/// The tilt of `ours - theirs` (row-major `[n, 36, 25]` grids) across the strip's columns: the least-squares slope
+/// of the per-column mean signed difference times 24, as bench-model computes it
+fn column_tilt(ours: &[f32], theirs: &[f32]) -> f64 {
+    let mut sums = [0f64; 25];
+    for (k, (a, b)) in ours.iter().zip(theirs).enumerate() {
+        sums[k % 25] += f64::from(a - b);
+    }
+
+    let n = (ours.len() / 25) as f64;
+    let (mut num, mut den) = (0.0, 0.0);
+    for (c, sum) in sums.iter().enumerate() {
+        let x = c as f64 - 12.0;
+        num += x * sum / n;
+        den += x * x;
+    }
+    num / den * 24.0
+}
+
+/// One gpu-ab arm (`ops/vesuvius/strips-native/gpu-ab-head.toml`): the head at batch `FIBRS_HEAD_BATCH` (default
+/// 64) on the dump's decisions, `FIBRS_HEAD_REPS` (default 50) untraced forwards after 5 warmups; writes the median
+/// ms/decision and the host load to `FIBRS_HEAD_OUT/metrics.json`, the sha256 of the last forward's heights and
+/// log scales to `fp.txt`, so arms that should match bit for bit are checked, and the values themselves (every
+/// decision's heights, then every decision's log scales, little-endian f32) to `outputs.f32` for arms whose
+/// arithmetic changed (`head_gate.py`)
+#[test]
+#[ignore = "needs an NVIDIA GPU and the head dump (FIBRS_HEAD_REF); run through the GPU queue"]
+fn head_bench() -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let out = PathBuf::from(std::env::var_os("FIBRS_HEAD_OUT").ok_or_else(|| eyre!("FIBRS_HEAD_OUT is not set"))?);
+    let b: usize = std::env::var("FIBRS_HEAD_BATCH").map_or(Ok(64), |s| s.parse())?;
+    let reps: usize = std::env::var("FIBRS_HEAD_REPS").map_or(Ok(50), |s| s.parse())?;
+    let w = weights()?;
+    let dev = Device::open(0)?;
+    let inputs = Dump::open("inputs")?;
+    let inputs = inputs.tensors()?;
+    let head = Head::new(&dev, &w, b)?;
+    let requests = requests(&inputs, b)?;
+    let (cells, crop) = upload_inputs(&dev, &inputs, b)?;
+    let load = || std::fs::read_to_string("/proc/loadavg").unwrap_or_default().trim().to_string();
+    let load_start = load();
+    for _ in 0..5 {
+        head.forward(&dev, &cells, &crop, &requests)?;
+    }
+
+    let mut times = Vec::with_capacity(reps);
+    let mut results = Vec::new();
+    for _ in 0..reps {
+        let start = Instant::now();
+        results = head.forward(&dev, &cells, &crop, &requests)?;
+        times.push(start.elapsed().as_secs_f64() * 1e3);
+    }
+    let ms = median(times) / b as f64;
+    let mut hash = Sha256::new();
+    for r in &results {
+        for v in r.heights.iter().flatten().chain(r.log_scale.iter().flatten()) {
+            hash.update(v.to_le_bytes());
+        }
+    }
+    let fp = format!("{:x}", hash.finalize());
+    let values: Vec<u8> = results
+        .iter()
+        .flat_map(|r| r.heights.iter().flatten())
+        .chain(results.iter().flat_map(|r| r.log_scale.iter().flatten()))
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    std::fs::create_dir_all(&out)?;
+    std::fs::write(out.join("fp.txt"), format!("{fp}\n"))?;
+    std::fs::write(out.join("outputs.f32"), values)?;
+    let metrics = serde_json::json!({
+        "batch": b,
+        "reps": reps,
+        "ms_per_decision": ms,
+        "loadavg_start": load_start,
+        "loadavg_end": load(),
+    });
+    std::fs::write(out.join("metrics.json"), serde_json::to_string_pretty(&metrics)?)?;
+    println!("b{b}: {ms:.5} ms/decision, fingerprint {fp}");
     Ok(())
 }

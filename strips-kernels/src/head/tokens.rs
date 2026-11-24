@@ -3,14 +3,14 @@
 //!
 //! Feature sampling is villa's `sample_features` (models/follower.py): points outside the crop read zero features
 //! and zero support; inside, `grid_sample(cells.float(), bilinear, border, align_corners=True)` on the 36x32x32
-//! lattice, with PyTorch's fp32 coordinate arithmetic, corner weights and FMA accumulation order. Profile sampling
-//! is vc_reader's `sample_array` (order 1, zeros) on the fp32 input crop. One warp per sampled point or token; lane
-//! `l` carries channels `2 l, 2 l + 1`
+//! lattice, with PyTorch's fp32 coordinate arithmetic, corner weights and FMA accumulation order. The cell tokens'
+//! fixed points instead apply a precomputed sparse operator (host `gather.rs`) that merges their sub-points'
+//! corners per cell. Profile sampling is vc_reader's `sample_array` (order 1, zeros) on the fp32 input crop. One
+//! warp per sampled point or token; lane `l` carries channels `2 l, 2 l + 1`
 //!
 //! The per-decision request record (`REQ` floats, laid out by the host's `head.rs`) holds the history, seed, path
 //! geometry and orientation
 
-use cuda_device::float::{add_rn_f32, mul_rn_f32};
 use cuda_device::thread::{__unroll_config, blockIdx_x, blockIdx_y, gridDim_y, threadIdx_x};
 use cuda_device::{DisjointSlice, kernel, launch_contract};
 
@@ -220,13 +220,17 @@ unsafe fn sample_crop(crop: *const f32, d: f32, h: f32, w: f32) -> (f32, f32) {
     (v0, v1)
 }
 
-/// The cell tokens' projection inputs: per layout point (`points[4 i..4 i + 4]` = first sub-point, sub-point count
-/// `m`, token, point within the token) the mean over its sub-points (`subs`, crop-local xyz) of the sampled features
-/// and support, written at columns `65 p..65 p + 65` of the token's row: tokens below 1404 in `xs` (`[B * 1404,
-/// 576]`), the 18 tube tokens in `xt` (`[B * 18, 960]`), bf16. A single sub-point is taken as is; more are each
-/// multiplied by `1 / m` and summed in order, as PyTorch's weighted mean
+/// Decisions per warp in `sm_cell_tokens`: each operator entry is read once for all of them, and their cell loads
+/// are independent
+const CELL_DECISIONS: u32 = 4;
+
+/// The cell tokens' projection inputs from the fixed sampling operator (host `gather.rs`): per layout point
+/// (`points[4 i..4 i + 4]` = first entry, entry count, `token * 16 + point within the token`, support as f32 bits)
+/// the weighted sum of its entries' cells (`entries[2 e..2 e + 2]` = lattice cell, weight as f32 bits) and its
+/// support, written at columns `65 p..65 p + 65` of the token's row: tokens below 1404 in `xs` (`[B * 1404, 576]`),
+/// the 18 tube tokens in `xt` (`[B * 18, 960]`), bf16
 ///
-/// Grid `(ceil(npoints / 4), B)`, block 128: one warp per point
+/// Grid `(ceil(npoints / 4), ceil(batch / 4))`, block 128: one warp per point and 4 decisions
 #[kernel]
 #[launch_contract(domain = 2, block = (128, 1, 1))]
 pub fn sm_cell_tokens(
@@ -234,11 +238,11 @@ pub fn sm_cell_tokens(
     mut xt: DisjointSlice<u16>,
     cells: &[u32],
     points: &[u32],
-    subs: &[f32],
+    entries: &[u32],
     npoints: u32,
+    batch: u32,
 ) {
-    let b = blockIdx_y() as usize;
-    let nb = gridDim_y() as usize;
+    let nb = batch as usize;
     require(
         (cells.len() >= nb * CELLS)
             & (xs.len() >= nb * (SECTORS * K_SECTOR) as usize)
@@ -246,55 +250,72 @@ pub fn sm_cell_tokens(
             & (points.len() >= npoints as usize * 4),
     );
     let i = blockIdx_x() * 4 + threadIdx_x() / 32;
-    if i >= npoints {
+    let b0 = blockIdx_y() * CELL_DECISIONS;
+    if (i >= npoints) | (b0 >= batch) {
         return;
     }
     let lane = threadIdx_x() % 32;
-    let nsub = (subs.len() / 3) as u32;
+    let nent = (entries.len() / 2) as u32;
     // SAFETY: i < npoints, inside the checked table
-    let (first, m, token, p) = unsafe {
+    let (first, count, slot, support) = unsafe {
         let d = points.as_ptr().add(i as usize * 4);
-        (*d, *d.add(1), *d.add(2), *d.add(3))
+        (*d, *d.add(1), *d.add(2), f32::from_bits(*d.add(3)))
     };
-    // a table row past the sub-points reads none of them
-    let m = m.min(nsub.saturating_sub(first));
-    let cp = cells.as_ptr().wrapping_add(b * CELLS);
-    let w = 1.0f32 / m.max(1) as f32;
-    let (mut v0, mut v1, mut s) = (0.0f32, 0.0f32, 0.0f32);
-    let mut k = 0;
-    while k < m {
-        // SAFETY: first + k < nsub
-        let (x, y, z) = unsafe {
-            let q = subs.as_ptr().add((first + k) as usize * 3);
-            (*q, *q.add(1), *q.add(2))
-        };
-        // SAFETY: cp is decision b's lattice, inside the checked cells
-        let (a0, a1, sup) = unsafe { sample_cells(cp, x, y, z, lane) };
-        let sup = if sup { 1.0 } else { 0.0 };
-        if m == 1 {
-            (v0, v1, s) = (a0, a1, sup);
-        } else {
-            v0 = add_rn_f32(v0, mul_rn_f32(a0, w));
-            v1 = add_rn_f32(v1, mul_rn_f32(a1, w));
-            s = add_rn_f32(s, mul_rn_f32(sup, w));
-        }
-        k += 1;
+    // a table row past the entries reads none of them
+    let count = count.min(nent.saturating_sub(first));
+    // decisions past the batch reread the last one and are never stored
+    let mut base = [0usize; CELL_DECISIONS as usize];
+    let mut d = 0;
+    while d < CELL_DECISIONS as usize {
+        __unroll_config::<0>();
+        base[d] = (b0 as usize + d).min(nb - 1) * CELLS + lane as usize;
+        d += 1;
     }
-    let (row, ld) = if token < SECTORS {
-        ((b * SECTORS as usize + token as usize) * K_SECTOR as usize, K_SECTOR)
-    } else {
-        ((b * TUBES as usize + (token - SECTORS).min(TUBES - 1) as usize) * K_TUBE as usize, K_TUBE)
-    };
-    let col = (p * 65).min(ld - 65) as usize;
-    let out = if token < SECTORS { xs.as_mut_ptr() } else { xt.as_mut_ptr() };
-    // SAFETY: the row lies inside the checked output and col + 65 <= ld; each column is this lane's alone
-    unsafe {
-        let o = out.add(row + col);
-        *o.add(2 * lane as usize) = bf16_bits(v0);
-        *o.add(2 * lane as usize + 1) = bf16_bits(v1);
-        if lane == 0 {
-            *o.add(64) = bf16_bits(s);
+    let mut v = [[0.0f32; 2]; CELL_DECISIONS as usize];
+    let mut e = 0;
+    while e < count {
+        // SAFETY: first + e < nent
+        let (cell, w) = unsafe {
+            let q = entries.as_ptr().add((first + e) as usize * 2);
+            (*q, f32::from_bits(*q.add(1)))
+        };
+        // a cell index past the lattice reads its last cell
+        let at = (cell.min(CD * CH * CW - 1) * CP) as usize;
+        let mut d = 0;
+        while d < CELL_DECISIONS as usize {
+            __unroll_config::<0>();
+            // SAFETY: base[d] + at lies inside decision b0 + d's (or the batch's last) lattice
+            let p = unsafe { *cells.as_ptr().add(base[d] + at) };
+            v[d][0] = lo_f32(p) * w + v[d][0];
+            v[d][1] = hi_f32(p) * w + v[d][1];
+            d += 1;
         }
+        e += 1;
+    }
+    let (token, p) = (slot / 16, slot % 16);
+    let (ld, out) = if token < SECTORS { (K_SECTOR, xs.as_mut_ptr()) } else { (K_TUBE, xt.as_mut_ptr()) };
+    let col = (p * 65).min(ld - 65) as usize;
+    let mut d = 0;
+    while d < CELL_DECISIONS as usize {
+        __unroll_config::<0>();
+        let b = b0 as usize + d;
+        if b < nb {
+            let row = if token < SECTORS {
+                (b * SECTORS as usize + token as usize) * K_SECTOR as usize
+            } else {
+                (b * TUBES as usize + (token - SECTORS).min(TUBES - 1) as usize) * K_TUBE as usize
+            };
+            // SAFETY: the row lies inside the checked output and col + 65 <= ld; each column is this lane's alone
+            unsafe {
+                let o = out.add(row + col);
+                *o.add(2 * lane as usize) = bf16_bits(v[d][0]);
+                *o.add(2 * lane as usize + 1) = bf16_bits(v[d][1]);
+                if lane == 0 {
+                    *o.add(64) = bf16_bits(support);
+                }
+            }
+        }
+        d += 1;
     }
 }
 

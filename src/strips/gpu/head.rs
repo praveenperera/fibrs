@@ -8,11 +8,14 @@
 //! bf16 or fp32 and writes fp32; the context and first strip pass keep a bf16 residual stream, the refinement pass
 //! an fp32 one; feature sampling runs in fp32 on the bf16 cells
 
+mod gather;
 mod layout;
 #[cfg(test)]
 mod tests;
 
-use color_eyre::eyre::{Result, WrapErr, ensure};
+use std::sync::Mutex;
+
+use color_eyre::eyre::{Result, WrapErr, ensure, eyre};
 use volkit::gpu::{Arg, Buf};
 
 use super::{Device, Weights};
@@ -50,6 +53,8 @@ const K_QUERY: usize = 128;
 const K_ORIENT: usize = 64;
 const K_REFINE: usize = 192;
 const K_PROFILE: usize = 128;
+/// Decisions per warp of `sm_cell_tokens` (`strips-kernels` `head::tokens::CELL_DECISIONS`)
+const CELL_DECISIONS: u32 = 4;
 /// Epilogue activations and token modes of `sm_linear` and `sm_linear_tok`
 const ACT_NONE: u32 = 0;
 const ACT_GELU: u32 = 1;
@@ -130,22 +135,29 @@ struct Params {
 
 /// The fixed sampling tables
 struct Tables {
-    /// Per cell-token point: first sub-point, sub-point count, token, point within the token
+    /// The cell tokens' sampling operator (`gather.rs`): per point its entries, output slot and support
     points: Buf,
     npoints: usize,
-    /// Sub-points, crop-local xyz
-    subs: Buf,
+    /// Per operator entry: lattice cell, weight (f32 bits)
+    entries: Buf,
     /// Strip anchors `[450, 3]`
     anchors: Buf,
     /// Strip columns v (25), rows f (36), profile offsets (25)
     grid: Buf,
-    /// The key mask every batch starts from: cells and strip tokens valid, padding invalid
-    keymask: Vec<u8>,
+}
+
+/// Host memory one forward reuses: the packed decision records and the downloaded heights and log scales
+struct Staging {
+    records: Vec<f32>,
+    heights: Vec<f32>,
+    logs: Vec<f32>,
 }
 
 /// Activations, sized for the largest batch. The projection inputs' pad columns stay zero from allocation
 pub(crate) struct Buffers {
     pub(crate) req: Buf,
+    /// One byte per key and decision `[B, 2048]`: the cells and strip tokens valid and the padding invalid from
+    /// allocation on, the reference and geometry keys rewritten by their token kernels every batch
     pub(crate) keymask: Buf,
     pub(crate) xs: Buf,
     pub(crate) xt: Buf,
@@ -187,6 +199,8 @@ pub struct Head {
     params: Params,
     tables: Tables,
     pub(crate) bufs: Buffers,
+    /// Held for a whole forward, which also keeps two forwards from sharing the device buffers at once
+    staging: Mutex<Staging>,
     max_batch: usize,
 }
 
@@ -272,12 +286,7 @@ impl Head {
         };
 
         let cells = layout::cells();
-        let mut points = Vec::with_capacity(cells.points.len() * 4);
-        let mut subs: Vec<f32> = Vec::new();
-        for pt in &cells.points {
-            points.extend([(subs.len() / 3) as u32, pt.subs.len() as u32, pt.token, pt.index]);
-            subs.extend(pt.subs.iter().flatten());
-        }
+        let op = gather::gather(&cells);
         let strip = layout::strip();
         let grid: Vec<f32> = strip.v.iter().chain(&strip.f).chain(&strip.offsets).copied().collect();
         ensure!(grid.len() == 86 && strip.anchors.len() == STRIPS, "the strip grid's shape");
@@ -285,12 +294,11 @@ impl Head {
         keymask[..CELLS].fill(1);
         keymask[CONTEXT..CONTEXT + STRIPS].fill(1);
         let tables = Tables {
-            points: dev.gpu.upload(&points)?,
-            npoints: cells.points.len(),
-            subs: dev.gpu.upload(&subs)?,
+            points: dev.gpu.upload(op.points.as_flattened())?,
+            npoints: op.points.len(),
+            entries: dev.gpu.upload(op.entries.as_flattened())?,
             anchors: dev.gpu.upload(&strip.anchors.concat())?,
             grid: dev.gpu.upload(&grid)?,
-            keymask,
         };
 
         let b = max_batch;
@@ -298,7 +306,7 @@ impl Head {
         let kv = || (0..LAYERS).map(|_| zeros(b * 4 * LDK * 32 * 2)).collect::<Result<Vec<_>>>();
         let bufs = Buffers {
             req: zeros(b * REQ * 4)?,
-            keymask: dev.gpu.upload(&tables.keymask.repeat(b))?,
+            keymask: dev.gpu.upload(&keymask.repeat(b))?,
             xs: zeros(b * layout::SECTOR_TOKENS * K_SECTOR * 2)?,
             xt: zeros(b * layout::TUBE_TOKENS * K_TUBE * 2)?,
             xr: zeros(b * REFS * K_REF * 2)?,
@@ -323,7 +331,12 @@ impl Head {
             ls_hid: zeros(b * STRIPS * 64 * 2)?,
             logs: zeros(b * STRIPS * 2 * 4)?,
         };
-        let head = Self { params, tables, bufs, max_batch };
+        let staging = Staging {
+            records: vec![0.0; b * REQ],
+            heights: Vec::with_capacity(b * STRIPS * 2),
+            logs: Vec::with_capacity(b * STRIPS * 2),
+        };
+        let head = Self { params, tables, bufs, staging: Mutex::new(staging), max_batch };
 
         // cell_position(cell_xyz / 16) through the same kernels: the centres / 16 as bf16 rows of 64
         let mut xyz = vec![0u16; CELLS * 64];
@@ -372,12 +385,12 @@ impl Head {
         ensure!(cells.bytes() >= b * 36 * 32 * 32 * 64 * 2, "cells hold fewer than {b} decisions");
         ensure!(crop.bytes() >= b * 144 * 128 * 128 * 2 * 4, "the crop holds fewer than {b} decisions");
         let (p, t, x) = (&self.params, &self.tables, &self.bufs);
-        let mut records = vec![0f32; b * REQ];
+        let mut staging = self.staging.lock().map_err(|_| eyre!("a forward on this head panicked"))?;
+        let Staging { records, heights, logs } = &mut *staging;
         for (r, q) in records.as_chunks_mut::<REQ>().0.iter_mut().zip(requests) {
             pack(r, q);
         }
-        dev.gpu.upload_into(&x.req, 0, &records)?;
-        dev.gpu.upload_into(&x.keymask, 0, &t.keymask.repeat(b))?;
+        dev.gpu.upload_into(&x.req, 0, &records[..b * REQ])?;
         let bu = b as u32;
 
         // tokens
@@ -386,7 +399,7 @@ impl Head {
         k.launch(
             &dev.gpu,
             "sm_cell_tokens",
-            warps(t.npoints),
+            (t.npoints.div_ceil(4) as u32, bu.div_ceil(CELL_DECISIONS), 1),
             (128, 1, 1),
             0,
             &[
@@ -394,8 +407,9 @@ impl Head {
                 x.xt.arg::<u16>(),
                 cells.arg::<u32>(),
                 t.points.arg::<u32>(),
-                t.subs.arg::<f32>(),
+                t.entries.arg::<u32>(),
                 Arg::U32(t.npoints as u32),
+                Arg::U32(bu),
             ],
         )?;
         let inv_log2049 = 1.0f32 / (2049f64.ln() as f32);
@@ -518,8 +532,8 @@ impl Head {
         self.linear_f32(dev, (&x.ls_hid, 64), ms, &p.log_scale.l2, &x.logs, 1.0)?;
         trace("decoded2", self)?;
 
-        let heights: Vec<f32> = dev.gpu.download_range(&x.h1, 0, ms * 2)?;
-        let logs: Vec<f32> = dev.gpu.download_range(&x.logs, 0, ms * 2)?;
+        dev.gpu.download_range_into(&x.h1, 0, ms * 2, heights)?;
+        dev.gpu.download_range_into(&x.logs, 0, ms * 2, logs)?;
         Ok(heights
             .as_chunks::<{ STRIPS * 2 }>()
             .0
