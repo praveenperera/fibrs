@@ -53,6 +53,10 @@ const K_QUERY: usize = 128;
 const K_ORIENT: usize = 64;
 const K_REFINE: usize = 192;
 const K_PROFILE: usize = 128;
+/// Dynamic shared memory of the weight-stationary kernels (`strips-kernels` `head::ws::smem_bytes`) at depth 128
+/// and 256, past the 48 KiB launch default
+const WS_SMEM_128: u32 = 52224;
+const WS_SMEM_256: u32 = 101376;
 /// Decisions per warp of `sm_cell_tokens` (`strips-kernels` `head::tokens::CELL_DECISIONS`)
 const CELL_DECISIONS: u32 = 4;
 /// Epilogue activations and token modes of `sm_linear` and `sm_linear_tok`
@@ -336,6 +340,14 @@ impl Head {
             heights: Vec::with_capacity(b * STRIPS * 2),
             logs: Vec::with_capacity(b * STRIPS * 2),
         };
+        for (kernel, bytes) in [
+            ("sm_ws_linear", WS_SMEM_128),
+            ("sm_ws_qkv", WS_SMEM_128),
+            ("sm_ws_res128", WS_SMEM_128),
+            ("sm_ws_res256", WS_SMEM_256),
+        ] {
+            dev.kernels.set_max_dynamic_smem(kernel, bytes)?;
+        }
         let head = Self { params, tables, bufs, staging: Mutex::new(staging), max_batch };
 
         // cell_position(cell_xyz / 16) through the same kernels: the centres / 16 as bf16 rows of 64
@@ -462,18 +474,16 @@ impl Head {
 
         // the context pass: layers 0-2 in full, layer 3 only its keys and values
         let m = b * CONTEXT;
+        // each layer's norm1 comes from the previous layer's last residual Linear, the first from the tokens
+        self.layernorm(dev, Stream::Bf16(&x.seq), m, &p.layers[0].norm1, Some(&x.ln), None)?;
         for (i, layer) in p.layers.iter().enumerate() {
-            self.layernorm(dev, Stream::Bf16(&x.seq), m, &layer.norm1, Some(&x.ln), None)?;
-            let n0 = if i == LAYERS - 1 { WIDTH } else { 0 };
-            self.qkv(dev, m, CONTEXT, 0, n0, &layer.qkv, i)?;
+            let s0 = if i == LAYERS - 1 { 1 } else { 0 };
+            self.qkv(dev, m, CONTEXT, 0, s0, &layer.qkv, i)?;
             if i == LAYERS - 1 {
                 break;
             }
             self.attention(dev, b, CONTEXT, CONTEXT, i)?;
-            self.residual(dev, Stream::Bf16(&x.seq), (&x.att, WIDTH), m, &layer.out, None)?;
-            self.layernorm(dev, Stream::Bf16(&x.seq), m, &layer.norm2, Some(&x.ln), None)?;
-            self.linear(dev, (&x.ln, WIDTH), m, &layer.ffn0, (&x.ffh, 2 * WIDTH), ACT_GELU)?;
-            self.residual(dev, Stream::Bf16(&x.seq), (&x.ffh, 2 * WIDTH), m, &layer.ffn2, None)?;
+            self.layer_mlp(dev, Stream::Bf16(&x.seq), m, layer, Some(&p.layers[i + 1].norm1))?;
             trace(["ctx0", "ctx1", "ctx2"][i], self)?;
         }
         trace("context", self)?;
@@ -498,7 +508,7 @@ impl Head {
         trace("tokens1", self)?;
 
         // first strip pass, bf16 residual; the final norm writes the refinement pass's f32 stream
-        self.strip_pass(dev, b, Stream::Bf16(&x.strip1), &mut *trace, 1)?;
+        self.strip_pass(dev, b, Stream::Bf16(&x.strip1), None, &mut *trace, 1)?;
         self.layernorm(dev, Stream::Bf16(&x.strip1), ms, &p.norm, Some(&x.ln), Some(&x.strip2))?;
         self.heights(dev, ms, &x.h0)?;
         trace("decoded1", self)?;
@@ -520,13 +530,13 @@ impl Head {
             ],
         )?;
         self.linear(dev, (&x.xf, K_REFINE), ms, &p.refinement.l0, (&x.hid, WIDTH), ACT_SILU)?;
-        self.residual(dev, Stream::F32(&x.strip2), (&x.hid, WIDTH), ms, &p.refinement.l2, Some(&p.stage))?;
+        self.residual(dev, &x.strip2, (&x.hid, WIDTH), ms, &p.refinement.l2, Some(&p.stage))?;
         self.linear(dev, (&x.xp, K_PROFILE), ms, &p.profile.l0, (&x.hid, WIDTH), ACT_SILU)?;
-        self.residual(dev, Stream::F32(&x.strip2), (&x.hid, WIDTH), ms, &p.profile.l2, None)?;
+        self.residual(dev, &x.strip2, (&x.hid, WIDTH), ms, &p.profile.l2, None)?;
         trace("tokens2", self)?;
 
-        self.strip_pass(dev, b, Stream::F32(&x.strip2), &mut *trace, 2)?;
-        self.layernorm(dev, Stream::F32(&x.strip2), ms, &p.norm, Some(&x.ln), None)?;
+        // the last layer's residual Linear writes the final norm
+        self.strip_pass(dev, b, Stream::F32(&x.strip2), Some(&p.norm), &mut *trace, 2)?;
         self.heights(dev, ms, &x.h1)?;
         self.linear(dev, (&x.ln, WIDTH), ms, &p.log_scale.l0, (&x.ls_hid, 64), ACT_SILU)?;
         self.linear_f32(dev, (&x.ls_hid, 64), ms, &p.log_scale.l2, &x.logs, 1.0)?;
@@ -544,28 +554,112 @@ impl Head {
     }
 
     /// One strip pass's four layers over the strip tokens in `stream`, each reading its context keys and values
-    /// plus the strip tokens' own
+    /// plus the strip tokens' own; `last` is the LayerNorm the last layer writes into `ln`, if any
     fn strip_pass(
         &self,
         dev: &Device,
         b: usize,
         stream: Stream,
+        last: Option<&Norm>,
         trace: &mut dyn FnMut(&str, &Self) -> Result<()>,
         pass: usize,
     ) -> Result<()> {
         let x = &self.bufs;
         let ms = b * STRIPS;
-        for (i, layer) in self.params.layers.iter().enumerate() {
-            self.layernorm(dev, stream, ms, &layer.norm1, Some(&x.ln), None)?;
+        let layers = &self.params.layers;
+        self.layernorm(dev, stream, ms, &layers[0].norm1, Some(&x.ln), None)?;
+        for (i, layer) in layers.iter().enumerate() {
             self.qkv(dev, ms, STRIPS, CONTEXT, 0, &layer.qkv, i)?;
             self.attention(dev, b, STRIPS, CONTEXT + STRIPS, i)?;
-            self.residual(dev, stream, (&x.att, WIDTH), ms, &layer.out, None)?;
-            self.layernorm(dev, stream, ms, &layer.norm2, Some(&x.ln), None)?;
-            self.linear(dev, (&x.ln, WIDTH), ms, &layer.ffn0, (&x.ffh, 2 * WIDTH), ACT_GELU)?;
-            self.residual(dev, stream, (&x.ffh, 2 * WIDTH), ms, &layer.ffn2, None)?;
+            let next = layers.get(i + 1).map_or(last, |l| Some(&l.norm1));
+            self.layer_mlp(dev, stream, ms, layer, next)?;
             trace(["p1l0", "p1l1", "p1l2", "p1l3", "p2l0", "p2l1", "p2l2", "p2l3"][(pass - 1) * 4 + i], self)?;
         }
         Ok(())
+    }
+
+    /// A layer after its attention: the output projection into `stream`, norm2, the FFN back into `stream`, and
+    /// `next` (the next layer's norm1, or a final norm) of the new rows into `ln`
+    fn layer_mlp(&self, dev: &Device, stream: Stream, m: usize, layer: &Layer, next: Option<&Norm>) -> Result<()> {
+        let x = &self.bufs;
+        self.ws_residual(dev, stream, (&x.att, WIDTH), m, &layer.out, Some(&layer.norm2))?;
+        self.ws_linear(dev, m, &layer.ffn0, (&x.ffh, 2 * WIDTH), ACT_GELU)?;
+        self.ws_residual(dev, stream, (&x.ffh, 2 * WIDTH), m, &layer.ffn2, next)
+    }
+
+    /// Blocks per weight slice of a persistent kernel: one block per multiprocessor across the slices, at most one
+    /// per 64-row tile
+    fn ws_blocks(dev: &Device, m: usize, slices: usize) -> u32 {
+        (dev.sms as usize).div_ceil(slices).min(m.div_ceil(64)).max(1) as u32
+    }
+
+    /// `act(bf16(ln @ w^T + b))` of `m` rows of `ln` into `out` (row stride `ldo`), depth 128
+    fn ws_linear(&self, dev: &Device, m: usize, l: &Linear, (out, ldo): (&Buf, usize), act: u32) -> Result<()> {
+        ensure!(l.kp == WIDTH && l.n.is_multiple_of(WIDTH), "sm_ws_linear: depth {} and {} outputs", l.kp, l.n);
+        let slices = l.n / WIDTH;
+        dev.kernels.launch(
+            &dev.gpu,
+            "sm_ws_linear",
+            (Self::ws_blocks(dev, m, slices), slices as u32, 1),
+            (256, 1, 1),
+            WS_SMEM_128,
+            &[
+                out.arg::<u32>(),
+                self.bufs.ln.arg::<u16>(),
+                l.w.arg::<u16>(),
+                l.b.arg::<f32>(),
+                Arg::U32(m as u32),
+                Arg::U32(l.n as u32),
+                Arg::U32(WIDTH as u32),
+                Arg::U32(ldo as u32),
+                Arg::U32(act),
+            ],
+        )
+    }
+
+    /// The residual Linear of depth 128 or 256 from `a` into `stream`, then `norm` of the new rows into `ln`
+    fn ws_residual(
+        &self,
+        dev: &Device,
+        stream: Stream,
+        (a, lda): (&Buf, usize),
+        m: usize,
+        l: &Linear,
+        norm: Option<&Norm>,
+    ) -> Result<()> {
+        let (kernel, smem) = match l.kp {
+            128 => ("sm_ws_res128", WS_SMEM_128),
+            256 => ("sm_ws_res256", WS_SMEM_256),
+            k => color_eyre::eyre::bail!("no weight-stationary residual Linear of depth {k}"),
+        };
+        ensure!(l.n == WIDTH, "{kernel}: {} outputs", l.n);
+        let (rb, rf) = match stream {
+            Stream::Bf16(s) => (s.arg::<u32>(), Arg::EMPTY),
+            Stream::F32(s) => (Arg::EMPTY, s.arg::<f32>()),
+        };
+        let (ln, g, nb) = norm.map_or((Arg::EMPTY, Arg::EMPTY, Arg::EMPTY), |n| {
+            (self.bufs.ln.arg::<u32>(), n.g.arg::<f32>(), n.b.arg::<f32>())
+        });
+        dev.kernels.launch(
+            &dev.gpu,
+            kernel,
+            (Self::ws_blocks(dev, m, 1), 1, 1),
+            (256, 1, 1),
+            smem,
+            &[
+                rb,
+                rf,
+                ln,
+                a.arg::<u16>(),
+                l.w.arg::<u16>(),
+                l.b.arg::<f32>(),
+                Arg::EMPTY,
+                g,
+                nb,
+                Arg::U32(m as u32),
+                Arg::U32(lda as u32),
+            ],
+        )
     }
 
     /// The strip heights of the normalized states in `ln`: `8 * bf16(strip_height(x))` into `out` `[m, 2]`
@@ -639,7 +733,7 @@ impl Head {
     fn residual(
         &self,
         dev: &Device,
-        stream: Stream,
+        res: &Buf,
         (a, lda): (&Buf, usize),
         m: usize,
         l: &Linear,
@@ -653,18 +747,9 @@ impl Head {
             Arg::U32(lda as u32),
             Arg::U32(WIDTH as u32),
         ];
-        match stream {
-            Stream::Bf16(res) => {
-                ensure!(vec.is_none(), "a bf16 residual takes no vector");
-                let args: Vec<Arg> = [res.arg::<u32>()].into_iter().chain(common).chain(sizes).collect();
-                dev.kernels.launch(&dev.gpu, "sm_linear_res", grid(m, l.n), (128, 1, 1), 0, &args)
-            }
-            Stream::F32(res) => {
-                let vec = vec.map_or(Arg::EMPTY, Buf::arg::<f32>);
-                let args: Vec<Arg> = [res.arg::<f32>()].into_iter().chain(common).chain([vec]).chain(sizes).collect();
-                dev.kernels.launch(&dev.gpu, "sm_linear_resf", grid(m, l.n), (128, 1, 1), 0, &args)
-            }
-        }
+        let vec = vec.map_or(Arg::EMPTY, Buf::arg::<f32>);
+        let args: Vec<Arg> = [res.arg::<f32>()].into_iter().chain(common).chain([vec]).chain(sizes).collect();
+        dev.kernels.launch(&dev.gpu, "sm_linear_resf", grid(m, l.n), (128, 1, 1), 0, &args)
     }
 
     /// A token family's last Linear into its rows of the context sequence (or the strip tokens)
@@ -712,16 +797,17 @@ impl Head {
     }
 
     /// The qkv projection of `m` rows of `ln` (`ntok` per decision) into q and rows `koff..` of layer `layer`'s keys
-    /// and values; columns from `n0`
+    /// and values; slices (q, k, v) from `s0`
     #[allow(clippy::too_many_arguments)]
-    fn qkv(&self, dev: &Device, m: usize, ntok: usize, koff: usize, n0: usize, l: &Linear, layer: usize) -> Result<()> {
+    fn qkv(&self, dev: &Device, m: usize, ntok: usize, koff: usize, s0: usize, l: &Linear, layer: usize) -> Result<()> {
         let x = &self.bufs;
+        let slices = 3 - s0;
         dev.kernels.launch(
             &dev.gpu,
-            "sm_linear_qkv",
-            (m.div_ceil(64) as u32, ((3 * WIDTH - n0) / 64) as u32, 1),
-            (128, 1, 1),
-            0,
+            "sm_ws_qkv",
+            (Self::ws_blocks(dev, m, slices), slices as u32, 1),
+            (256, 1, 1),
+            WS_SMEM_128,
             &[
                 x.q.arg::<u32>(),
                 x.k[layer].arg::<u32>(),
@@ -733,7 +819,7 @@ impl Head {
                 Arg::U32(ntok as u32),
                 Arg::U32(LDK as u32),
                 Arg::U32(koff as u32),
-                Arg::U32(n0 as u32),
+                Arg::U32(s0 as u32),
             ],
         )
     }

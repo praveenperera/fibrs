@@ -27,6 +27,8 @@ pub struct Device {
     pub kernels: Module,
     /// volkit's GPU: context, stream, buffers and volkit's own kernels
     pub gpu: Gpu,
+    /// Its streaming multiprocessors, which size the persistent kernels' grids
+    pub sms: u32,
 }
 
 impl Device {
@@ -36,7 +38,12 @@ impl Device {
         let kernels = gpu.load_module(PTX).wrap_err("load the strips kernels")?;
         let dnn = Dnn::new(&gpu).wrap_err("create the cuDNN handle")?;
         let blas = Blas::new(&gpu).wrap_err("create the cuBLAS handle")?;
-        Ok(Self { dnn, blas, kernels, gpu })
+        let sms = cudarc::driver::CudaContext::new(ordinal)
+            .and_then(|c| {
+                c.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            })
+            .wrap_err("read the GPU's multiprocessor count")?;
+        Ok(Self { dnn, blas, kernels, gpu, sms: sms as u32 })
     }
 }
 

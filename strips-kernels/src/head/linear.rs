@@ -140,7 +140,7 @@ fn each_pair(acc: &[[f32; 4]; NJ], m0: u32, n0: u32, m: u32, n: u32, bias: &[f32
 
 /// `act` of a bf16 value, rounded to bf16, as PyTorch's CUDA GELU (exact) and SiLU compute them in fp32
 #[inline(always)]
-fn activate(y: f32, act: u32) -> f32 {
+pub(super) fn activate(y: f32, act: u32) -> f32 {
     match act {
         ACT_GELU => round_bf16(y * 0.5 * (1.0 + math::erff(y * core::f32::consts::FRAC_1_SQRT_2))),
         ACT_SILU => round_bf16(y / (1.0 + math::expf(-y))),
@@ -224,60 +224,8 @@ pub fn sm_linear(
     });
 }
 
-/// A residual branch's output projection added to a bf16 residual stream in place: `res = bf16(res + bf16(a @
-/// w^T + bias))`, `res` `[m, ldo]` bf16 as `u32` pairs
-///
-/// Grid `(ceil(m / 64), ceil(n / 64))`, block 128
-#[kernel]
-#[launch_contract(domain = 2, block = (128, 1, 1))]
-#[allow(clippy::too_many_arguments)]
-pub fn sm_linear_res(
-    mut res: DisjointSlice<u32>,
-    a: &[Bf16],
-    w: &[Bf16],
-    bias: &[f32],
-    m: u32,
-    n: u32,
-    kp: u32,
-    lda: u32,
-    ldo: u32,
-) {
-    let (as_, ws) = tiles!();
-    let (m0, n0) = (blockIdx_x() * T as u32, blockIdx_y() * T as u32);
-    require(
-        gemm_ok(a, w, bias, m, n, kp, lda)
-            & (m0 < m)
-            & (n0 < n)
-            & (ldo % 2 == 0)
-            & (n <= ldo)
-            & (m as usize * ldo as usize / 2 <= res.len()),
-    );
-    // SAFETY: as in sm_linear
-    let acc = unsafe {
-        gemm_tile(
-            as_,
-            ws,
-            a.as_ptr().wrapping_add(m0 as usize * lda as usize),
-            lda,
-            (m - m0).min(T as u32),
-            w.as_ptr().wrapping_add(n0 as usize * kp as usize),
-            kp,
-            (n - n0).min(T as u32),
-        )
-    };
-    let rp = res.as_mut_ptr();
-    each_pair(&acc, m0, n0, m, n, bias, |row, col, y0, y1| {
-        // SAFETY: as in sm_linear; the pair is read and written only by this thread
-        unsafe {
-            let at = rp.add((row as usize * ldo as usize + col as usize) / 2);
-            let r = *at;
-            *at = pack_bf16(lo_f32(r) + y0, hi_f32(r) + y1);
-        }
-    });
-}
-
-/// The same added to an fp32 residual stream in place, then `vec` per column when it isn't empty: `res = (res +
-/// bf16(a @ w^T + bias)) + vec`, `res` `[m, ldo]` fp32
+/// A residual branch's output projection added to an fp32 residual stream in place, then `vec` per column when it
+/// isn't empty: `res = (res + bf16(a @ w^T + bias)) + vec`, `res` `[m, ldo]` fp32
 ///
 /// Grid `(ceil(m / 64), ceil(n / 64))`, block 128
 #[kernel]
@@ -383,78 +331,6 @@ pub fn sm_linear_f32(
             let at = op.add(row as usize * ldo as usize + col as usize);
             *at = scale * y0;
             *at.add(1) = scale * y1;
-        }
-    });
-}
-
-/// The qkv projection (`w` `[384, 128]`) of `m = B * ntok` rows of width 128, split into heads: column `c` is q, k or
-/// v (`c / 128`), head `(c % 128) / 32`, dim `c % 32`. q goes to `[B, 4, ntok, 32]`, k and v to rows `koff + token`
-/// of `[B, 4, ldk, 32]`, all bf16 as `u32` pairs. Columns from `n0` on are computed (128: k and v only, and `q` may
-/// be empty)
-///
-/// Grid `(ceil(m / 64), (384 - n0) / 64)`, block 128
-#[kernel]
-#[launch_contract(domain = 2, block = (128, 1, 1))]
-#[allow(clippy::too_many_arguments)]
-pub fn sm_linear_qkv(
-    mut q: DisjointSlice<u32>,
-    mut k: DisjointSlice<u32>,
-    mut v: DisjointSlice<u32>,
-    a: &[Bf16],
-    w: &[Bf16],
-    bias: &[f32],
-    m: u32,
-    ntok: u32,
-    ldk: u32,
-    koff: u32,
-    n0: u32,
-) {
-    let (as_, ws) = tiles!();
-    let (m0, nb) = (blockIdx_x() * T as u32, n0 + blockIdx_y() * T as u32);
-    let decisions = (m / ntok.max(1)) as usize;
-    require(
-        gemm_ok(a, w, bias, m, 384, 128, 128)
-            & (m0 < m)
-            & (nb < 384)
-            & (n0 % T as u32 == 0)
-            & (ntok > 0)
-            & (m % ntok.max(1) == 0)
-            & (koff + ntok <= ldk)
-            & ((n0 >= 128) | (decisions * 4 * ntok as usize * 16 <= q.len()))
-            & (decisions * 4 * ldk as usize * 16 <= k.len())
-            & (decisions * 4 * ldk as usize * 16 <= v.len()),
-    );
-    // SAFETY: as in sm_linear
-    let acc = unsafe {
-        gemm_tile(
-            as_,
-            ws,
-            a.as_ptr().wrapping_add(m0 as usize * 128),
-            128,
-            (m - m0).min(T as u32),
-            w.as_ptr().wrapping_add(nb as usize * 128),
-            128,
-            (384 - nb).min(T as u32),
-        )
-    };
-    let (qp, kp, vp) = (q.as_mut_ptr(), k.as_mut_ptr(), v.as_mut_ptr());
-    each_pair(&acc, m0, nb, m, 384, bias, |row, col, y0, y1| {
-        let (b, tok) = (row / ntok, row % ntok);
-        let (which, h, d) = (col / 128, (col % 128) / 32, col % 32);
-        let p = pack_bf16(y0, y1);
-        // SAFETY: b < decisions, h < 4, tok < ntok, koff + tok < ldk and d + 1 < 32, inside the checked buffers;
-        // each pair is this thread's alone. which is 0 only when n0 < 128, when q was checked
-        unsafe {
-            if which == 0 {
-                *qp.add((((b * 4 + h) * ntok + tok) * 16 + d / 2) as usize) = p;
-            } else {
-                let at = (((b * 4 + h) as usize * ldk as usize) + (koff + tok) as usize) * 16 + d as usize / 2;
-                if which == 1 {
-                    *kp.add(at) = p;
-                } else {
-                    *vp.add(at) = p;
-                }
-            }
         }
     });
 }

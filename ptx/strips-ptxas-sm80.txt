@@ -3,69 +3,79 @@ ptxas info    : Compiling entry function 'sp_probe' for 'sm_80'
 ptxas info    : Function properties for sp_probe
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 12 registers, used 0 barriers, 392 bytes cmem[0]
-ptxas info    : Compile time = 1.948 ms
+ptxas info    : Compile time = 1.960 ms
+ptxas info    : Compiling entry function 'sm_ws_res256' for 'sm_80'
+ptxas info    : Function properties for sm_ws_res256
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 99 registers, used 1 barriers, 504 bytes cmem[0]
+ptxas info    : Compile time = 49.317 ms
+ptxas info    : Compiling entry function 'sm_ws_res128' for 'sm_80'
+ptxas info    : Function properties for sm_ws_res128
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 76 registers, used 1 barriers, 504 bytes cmem[0]
+ptxas info    : Compile time = 128.687 ms
+ptxas info    : Compiling entry function 'sm_ws_qkv' for 'sm_80'
+ptxas info    : Function properties for sm_ws_qkv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 78 registers, used 1 barriers, 468 bytes cmem[0]
+ptxas info    : Compile time = 31.485 ms
+ptxas info    : Compiling entry function 'sm_ws_linear' for 'sm_80'
+ptxas info    : Function properties for sm_ws_linear
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 436 bytes cmem[0]
+ptxas info    : Compile time = 68.764 ms
 ptxas info    : Compiling entry function 'sm_refine_tokens' for 'sm_80'
 ptxas info    : Function properties for sm_refine_tokens
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 40 registers, used 0 barriers, 448 bytes cmem[0]
-ptxas info    : Compile time = 19.961 ms
+ptxas info    : Compile time = 21.187 ms
 ptxas info    : Compiling entry function 'sm_ref_tokens' for 'sm_80'
 ptxas info    : Function properties for sm_ref_tokens
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 32 registers, used 0 barriers, 420 bytes cmem[0]
-ptxas info    : Compile time = 8.695 ms
+ptxas info    : Compile time = 11.659 ms
 ptxas info    : Compiling entry function 'sm_query_tokens' for 'sm_80'
 ptxas info    : Function properties for sm_query_tokens
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 28 registers, used 0 barriers, 432 bytes cmem[0]
-ptxas info    : Compile time = 7.446 ms
+ptxas info    : Compile time = 9.973 ms
 ptxas info    : Compiling entry function 'sm_linear_tok' for 'sm_80'
 ptxas info    : Function properties for sm_linear_tok
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 62 registers, used 1 barriers, 18432 bytes smem, 500 bytes cmem[0]
-ptxas info    : Compile time = 24.848 ms
+ptxas info    : Compile time = 31.157 ms
 ptxas info    : Compiling entry function 'sm_linear_resf' for 'sm_80'
 ptxas info    : Function properties for sm_linear_resf
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 64 registers, used 1 barriers, 18432 bytes smem, 452 bytes cmem[0]
-ptxas info    : Compile time = 15.522 ms
-ptxas info    : Compiling entry function 'sm_linear_res' for 'sm_80'
-ptxas info    : Function properties for sm_linear_res
-    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 64 registers, used 1 barriers, 18432 bytes smem, 436 bytes cmem[0]
-ptxas info    : Compile time = 13.044 ms
-ptxas info    : Compiling entry function 'sm_linear_qkv' for 'sm_80'
-ptxas info    : Function properties for sm_linear_qkv
-    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-ptxas info    : Used 62 registers, used 1 barriers, 18432 bytes smem, 468 bytes cmem[0]
-ptxas info    : Compile time = 21.768 ms
+ptxas info    : Compile time = 19.234 ms
 ptxas info    : Compiling entry function 'sm_linear_f32' for 'sm_80'
 ptxas info    : Function properties for sm_linear_f32
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 64 registers, used 1 barriers, 18432 bytes smem, 440 bytes cmem[0]
-ptxas info    : Compile time = 12.885 ms
+ptxas info    : Compile time = 26.893 ms
 ptxas info    : Compiling entry function 'sm_linear' for 'sm_80'
 ptxas info    : Function properties for sm_linear
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 62 registers, used 1 barriers, 18432 bytes smem, 440 bytes cmem[0]
-ptxas info    : Compile time = 46.939 ms
+ptxas info    : Compile time = 69.689 ms
 ptxas info    : Compiling entry function 'sm_layernorm' for 'sm_80'
 ptxas info    : Function properties for sm_layernorm
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 29 registers, used 0 barriers, 452 bytes cmem[0]
-ptxas info    : Compile time = 3.131 ms
+ptxas info    : Compile time = 3.255 ms
 ptxas info    : Compiling entry function 'sm_geom_tokens' for 'sm_80'
 ptxas info    : Function properties for sm_geom_tokens
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 28 registers, used 0 barriers, 404 bytes cmem[0]
-ptxas info    : Compile time = 3.593 ms
+ptxas info    : Compile time = 3.750 ms
 ptxas info    : Compiling entry function 'sm_cell_tokens' for 'sm_80'
 ptxas info    : Function properties for sm_cell_tokens
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 40 registers, used 0 barriers, 440 bytes cmem[0]
-ptxas info    : Compile time = 8.393 ms
+ptxas info    : Compile time = 8.538 ms
 ptxas info    : Compiling entry function 'sm_attn' for 'sm_80'
 ptxas info    : Function properties for sm_attn
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 96 registers, used 1 barriers, 15360 bytes smem, 448 bytes cmem[0]
-ptxas info    : Compile time = 26.893 ms
+ptxas info    : Compile time = 27.469 ms
