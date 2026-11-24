@@ -100,7 +100,8 @@ fn requests(st: &SafeTensors, b: usize) -> Result<Vec<StripRequest>> {
     let (_, seed_tangent) = get(st, "seed_tangent")?;
     let (_, geometry) = get(st, "path_geometry")?;
     let (_, valid) = get(st, "path_geometry_valid")?;
-    let (_, orientation) = get(st, "orientation")?;
+    // the head dump names it as the model's input does, the recorded batches as the data loader does
+    let (_, orientation) = get(st, "orientation").or_else(|_| get(st, "crop_orientation"))?;
     let n = hmask.len() / HISTORY;
     Ok((0..b)
         .map(|i| {
