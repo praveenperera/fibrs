@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.6.0] - Unreleased
+## [0.6.0] - 2026-11-24
 
 fibrs 0.6.0 runs `fibrs predict` on Apple silicon Macs, on the GPU through volkit 0.2.0's Metal backend, with no
 PyTorch and nothing else to install, and adds `fibrs strips`, villa's sheet-strip inference run natively on NVIDIA
@@ -521,6 +521,7 @@ The first release.
   Python module, and a CLI archive for each with `scripts/install-dropin.sh`
 - `--version` prints `0.2.0`, the original's version, as a drop-in has to
 
+[0.6.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.6.0
 [0.5.0]: https://github.com/praveenperera/fibrs/releases/tag/v0.5.0
 [0.4.2]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.2
 [0.4.1]: https://github.com/praveenperera/fibrs/releases/tag/v0.4.1

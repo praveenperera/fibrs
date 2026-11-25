@@ -376,7 +376,7 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fibrs"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blosc-src",
  "clap",
@@ -1072,7 +1072,8 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "volkit"
 version = "0.2.0"
-source = "git+https://github.com/praveenperera/volkit?rev=5ab3cedaba06730dd37bf85071e3c99a662a71a9#5ab3cedaba06730dd37bf85071e3c99a662a71a9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4a313bee5514b47bef7c4164c898b8d8e1b7f63d7c3c35baf243dddad97dc97"
 dependencies = [
  "bytemuck",
  "color-eyre",
