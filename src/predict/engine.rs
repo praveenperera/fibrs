@@ -1,13 +1,14 @@
 //! The network: AFV v2 on volkit's `AfvV2`, which runs the normalisation, the network, the softmax, the blend
 //! and the column's finalise on the GPU, in the reference's float32 arithmetic
 //!
-//! volkit is CUDA-only and is built in for Linux and Windows x86_64 only; elsewhere `fibrs predict` plans
-//! (`--dry-run`) but refuses to run
+//! The engine is CUDA on Linux and Windows x86_64 and Metal on macOS arm64 (`fibrs_engine`, set by build.rs);
+//! elsewhere `fibrs predict` plans (`--dry-run`) but refuses to run. The Metal engine runs fp32 only, with float32
+//! convolution operands where CUDA's fp32 contract runs TF32, so its output sits inside TF32's rounding of CUDA's
 
 use std::path::Path;
 
 use color_eyre::eyre::Result;
-#[cfg(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")))]
+#[cfg(not(fibrs_engine))]
 use color_eyre::eyre::bail;
 use serde_json::{Map, Value};
 
@@ -27,11 +28,21 @@ impl Precision {
     pub fn parse(name: &str) -> Result<Self, String> {
         match name {
             "fp32" => Ok(Self::Fp32),
+            "bf16" if cfg!(fibrs_engine = "metal") => {
+                Err("--precision bf16 runs on CUDA only; the Metal engine runs fp32 (the default)".into())
+            }
             "bf16" => Ok(Self::Bf16),
+            "fp32-ieee" | "fp16" if cfg!(fibrs_engine = "metal") => Err(format!(
+                "--precision {name} is a PyTorch mode the native engine does not run; the Metal engine runs fp32 \
+                 only (the default)"
+            )),
             "fp32-ieee" | "fp16" => Err(format!(
                 "--precision {name} is a PyTorch mode the native engine does not run; it runs fp32 (the reference \
                  contract, the default) or bf16"
             )),
+            _ if cfg!(fibrs_engine = "metal") => {
+                Err(format!("--precision {name:?}: the Metal engine runs fp32 only (the default)"))
+            }
             _ => Err(format!("--precision {name:?}: the native engine runs fp32 (the default) or bf16")),
         }
     }
@@ -46,6 +57,11 @@ impl Precision {
     /// What the provenance records for this precision
     pub fn label(self) -> &'static str {
         match self {
+            // Metal rounds differently from CUDA's TF32, so the label tells the two apart and a resume on the
+            // other engine is refused
+            Self::Fp32 if cfg!(fibrs_engine = "metal") => {
+                "fp32 (float32 tensors, float32 convolution and GEMM math; fibrs native engine on Metal)"
+            }
             Self::Fp32 => {
                 "fp32 (float32 tensors, TF32 convolution and GEMM math, as torch's defaults; fibrs native engine)"
             }
@@ -57,9 +73,18 @@ impl Precision {
     }
 }
 
+/// `--precision`'s help, for the engine this build runs
+pub const PRECISION_HELP: &str = if cfg!(fibrs_engine = "metal") {
+    "fp32, the default and the only precision on Metal: float32 tensors with float32 convolutions, within TF32's \
+     rounding of the NVIDIA reference (measured in docs/predict.md)"
+} else {
+    "fp32 (default): float32 tensors with TF32 tensor-core convolutions, the precision PyTorch uses for the reference \
+     by default. bf16 (opt-in): faster, small output differences (measured in docs/benchmarks.md)"
+};
+
 /// One column's outputs, `None` when no tile ran
 // built only by the GPU engine, which other targets lack
-#[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
+#[cfg_attr(not(fibrs_engine), allow(dead_code))]
 pub struct ColumnOut {
     pub semantic: Option<Vec<u8>>,
     pub tracing: Option<Vec<u8>>,
@@ -79,20 +104,43 @@ pub trait Engine {
 
 /// What the run needs to know about the opened engine
 // built only by the GPU engine, which other targets lack
-#[cfg_attr(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")), allow(dead_code))]
+#[cfg_attr(not(fibrs_engine), allow(dead_code))]
 pub struct Opened {
     pub engine: Box<dyn Engine>,
     /// The GPU's name
     pub gpu: String,
-    /// Device memory free once the engine has loaded
-    pub free_bytes: u64,
-    /// Device bytes one output voxel of a column takes at its peak
-    pub column_bytes_per_voxel: f64,
+    /// What a column may take on the device
+    pub column: ColumnMemory,
     /// Provenance fields naming the engine, its library and the weights it loaded
     pub provenance: Map<String, Value>,
     /// The cuDNN and cuBLAS files the process mapped
     pub libraries: Vec<String>,
 }
+
+/// What a column may take on the device once the engine has loaded
+#[cfg_attr(not(fibrs_engine), allow(dead_code))]
+pub struct ColumnMemory {
+    /// Device memory free once the engine has loaded
+    pub free_bytes: u64,
+    /// Device bytes one output voxel of a column takes at its peak
+    pub bytes_per_voxel: f64,
+    /// The device's limit on one buffer, where it has one below its memory
+    pub buffer_limit: Option<BufferLimit>,
+}
+
+/// A device's limit on one buffer (Metal's `maxBufferLength`), against the column's largest buffer
+// only the Metal engine has one
+#[cfg_attr(not(fibrs_engine = "metal"), allow(dead_code))]
+pub struct BufferLimit {
+    /// The most bytes one buffer holds
+    pub max_bytes: u64,
+    /// Bytes one output voxel takes in the column's largest buffer
+    pub bytes_per_voxel: f64,
+}
+
+// acc (2 x float32), wsum (float32), semantic (2 x uint8) and tracing (2 x uint8 at 1/8)
+#[cfg(fibrs_engine)]
+const COLUMN_BYTES_PER_VOXEL: f64 = 8.0 + 4.0 + 2.0 + 0.25;
 
 /// Most tiles one `add` takes
 pub const MAX_BATCH: usize = 16;
@@ -101,26 +149,43 @@ pub const MAX_BATCH: usize = 16;
 /// refuses a column of more than `u32::MAX / 2` voxels when it begins it
 pub const MAX_COLUMN_VOXELS: usize = u32::MAX as usize / 2;
 
-/// The CUDA ordinal of `--device` (`cuda`, `cuda:N` or `N`)
+/// The kind of device the engine runs on, `cuda` or `metal`, for `--device` and the provenance
+pub const DEVICE_KIND: &str = if cfg!(fibrs_engine = "metal") { "metal" } else { "cuda" };
+
+/// The engine's device as messages name it, `CUDA` or `Metal`
+const DEVICE_NAME: &str = if cfg!(fibrs_engine = "metal") { "Metal" } else { "CUDA" };
+
+/// The device ordinal of `--device`: `cuda`, `cuda:N` or `N` on CUDA builds, `metal`, `metal:N` or `N` on Metal ones
 pub fn device_index(device: &str) -> Result<usize, String> {
-    let n = if device == "cuda" { "0" } else { device.strip_prefix("cuda:").unwrap_or(device) };
-    n.parse().map_err(|_| format!("fibrs predict runs on a CUDA device (cuda, cuda:N), not {device:?}"))
+    let n = if device == DEVICE_KIND {
+        "0"
+    } else {
+        device.strip_prefix(DEVICE_KIND).and_then(|d| d.strip_prefix(':')).unwrap_or(device)
+    };
+    n.parse().map_err(|_| {
+        format!("fibrs predict runs on a {DEVICE_NAME} device ({DEVICE_KIND}, {DEVICE_KIND}:N), not {device:?}")
+    })
 }
 
-#[cfg(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64"))]
+#[cfg(fibrs_engine = "cuda")]
 pub fn open(model_dir: &Path, device: usize, precision: Precision) -> Result<Opened> {
     native::open(model_dir, device, precision)
 }
 
-#[cfg(not(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64")))]
+#[cfg(fibrs_engine = "metal")]
+pub fn open(model_dir: &Path, device: usize, precision: Precision) -> Result<Opened> {
+    metal::open(model_dir, device, precision)
+}
+
+#[cfg(not(fibrs_engine))]
 pub fn open(_model_dir: &Path, _device: usize, _precision: Precision) -> Result<Opened> {
     bail!(
-        "fibrs predict needs an NVIDIA GPU on Linux or Windows x86_64; this build has no GPU engine (--dry-run plans a run \
-         without one)"
+        "fibrs predict needs an NVIDIA GPU on Linux or Windows x86_64, or Apple silicon on macOS; this build has no GPU \
+         engine (--dry-run plans a run without one)"
     )
 }
 
-#[cfg(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64"))]
+#[cfg(fibrs_engine = "cuda")]
 mod native {
     use std::path::Path;
 
@@ -129,7 +194,7 @@ mod native {
     use volkit::dnn::Pick;
     use volkit::nnunet::afv2::{AfvPrecision, AfvV2, Options};
 
-    use super::{Buffers, ColumnOut, Engine, Opened, Origin, Precision};
+    use super::{Buffers, COLUMN_BYTES_PER_VOXEL, ColumnMemory, ColumnOut, Engine, Opened, Origin, Precision};
 
     /// The engine library this build links, for the provenance
     const LIBRARY: &str = concat!(env!("FIBRS_VOLKIT"), ", AfvV2");
@@ -175,13 +240,12 @@ mod native {
         // the convolution algorithms cuDNN chose, one per distinct convolution in forward order: they set the
         // rounding, so a resume whose choices differ (another cache, cuDNN or driver) is refused
         provenance.insert("cudnn_algos".into(), json!(load.algos));
-        // acc (2 x float32), wsum (float32), semantic (2 x uint8) and tracing (2 x uint8 at 1/8)
-        let column_bytes_per_voxel = 8.0 + 4.0 + 2.0 + 0.25;
+        // a CUDA allocation is bounded only by the free memory
+        let column = ColumnMemory { free_bytes: free, bytes_per_voxel: COLUMN_BYTES_PER_VOXEL, buffer_limit: None };
         Ok(Opened {
             gpu: load.gpu.clone(),
             engine: Box::new(Native(net)),
-            free_bytes: free,
-            column_bytes_per_voxel,
+            column,
             provenance,
             libraries: super::libs::mapped(),
         })
@@ -221,6 +285,61 @@ mod native {
         ctx.bind_to_thread()?;
         let (free, _total) = cudarc::driver::result::mem_get_info()?;
         Ok(free as u64)
+    }
+}
+
+#[cfg(fibrs_engine = "metal")]
+mod metal {
+    use std::path::Path;
+
+    use color_eyre::eyre::{Result, WrapErr};
+    use serde_json::{Map, json};
+    use volkit::nnunet::afv2::{AfvPrecision, AfvV2, Options};
+
+    use super::{
+        BufferLimit, Buffers, COLUMN_BYTES_PER_VOXEL, ColumnMemory, ColumnOut, Engine, Opened, Origin, Precision,
+    };
+
+    /// The engine library this build links, for the provenance
+    const LIBRARY: &str = concat!(env!("FIBRS_VOLKIT"), ", AfvV2 on Metal");
+
+    struct Metal(AfvV2);
+
+    impl Engine for Metal {
+        fn begin(&mut self, shape: [usize; 3], y0: usize, x0: usize) -> Result<()> {
+            self.0.begin(shape, y0, x0)
+        }
+
+        fn add(&mut self, tiles: &[u8], origins: &[Origin]) -> Result<()> {
+            self.0.add(tiles, origins).map(drop)
+        }
+
+        fn finish(&mut self, quantize: bool, (semantic, tracing): Buffers) -> Result<ColumnOut> {
+            let out = self.0.finish_into(quantize, semantic, tracing)?;
+            Ok(ColumnOut { semantic: out.semantic, tracing: out.tracing, uncovered: out.uncovered })
+        }
+    }
+
+    pub fn open(model_dir: &Path, device: usize, precision: Precision) -> Result<Opened> {
+        // `Precision::parse` refuses bf16 on Metal builds
+        debug_assert_eq!(precision, Precision::Fp32);
+        let opts = Options { device, precision: AfvPrecision::Fp32 };
+        let net =
+            AfvV2::open(model_dir, &opts).wrap_err_with(|| format!("load AFV v2 from {}", model_dir.display()))?;
+        let load = &net.load;
+        let mut provenance = Map::new();
+        provenance.insert("network".into(), json!(LIBRARY));
+        provenance.insert("weights".into(), json!("checkpoint_final.pth, read without torch"));
+        provenance.insert("metal_math".into(), json!("float32 matmul2d operands and accumulation, fp contraction off"));
+        // Winograd rounds differently from a direct conv, so a resume under another level list would mix outputs
+        provenance.insert("metal_winograd_levels".into(), json!(load.winograd_levels));
+        // unified memory: the column's buffers come out of the working set Metal recommends for this process, less
+        // what the model already holds
+        let free = load.working_set.saturating_sub(load.model_bytes) as u64;
+        // and each of its buffers within Metal's per-buffer limit, the accumulator (2 x float32) the largest
+        let buffer_limit = Some(BufferLimit { max_bytes: load.max_buffer as u64, bytes_per_voxel: 8.0 });
+        let column = ColumnMemory { free_bytes: free, bytes_per_voxel: COLUMN_BYTES_PER_VOXEL, buffer_limit };
+        Ok(Opened { gpu: load.gpu.clone(), engine: Box::new(Metal(net)), column, provenance, libraries: Vec::new() })
     }
 }
 

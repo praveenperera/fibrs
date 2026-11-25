@@ -62,6 +62,10 @@ jobs:
         if: runner.os == 'Linux'
         run: scripts/check-ptx.sh
 
+      - name: Strips PTX matches its sources
+        if: runner.os == 'Linux'
+        run: scripts/check-strips-ptx.sh
+
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
@@ -90,7 +94,8 @@ jobs:
         run: cargo test --release --locked
 
       # the runners have no NVIDIA driver: a real run must stop there, before it reads the (placeholder) weights,
-      # with an error, not a panic, and leave no output array behind
+      # with an error, not a panic, and leave no output array behind. On macOS the Metal engine parses the model
+      # before it opens the GPU, so there the placeholder plans stop the run
       - name: Predict without a GPU
         shell: bash
         run: |
@@ -107,7 +112,7 @@ jobs:
           ! grep -q 'panicked' predict.log
           test ! -e ci-pred/semantic
           if [ "$RUNNER_OS" = macOS ]; then
-            grep -q 'needs an NVIDIA GPU on Linux or Windows x86_64' predict.log
+            grep -q 'load AFV v2 from .*plans.json' predict.log
           else
             grep -q 'no NVIDIA driver found' predict.log
           fi

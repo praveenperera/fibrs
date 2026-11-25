@@ -4,8 +4,9 @@ A fast drop-in for `avf-spline-generator` 0.2.0, Qual's AFV fibre tracer
 ([Qualzz/AVF_SPLINE_GENERATOR](https://github.com/Qualzz/AVF_SPLINE_GENERATOR) @ `bee798f`). Same flags, same
 `.afv` output.
 
-- **`fibrs predict`** runs Qual's AFV fibre model V2 on an NVIDIA GPU, without PyTorch.
+- **`fibrs predict`** runs Qual's AFV fibre model V2 on an NVIDIA GPU or an Apple silicon Mac, without PyTorch.
 - **`fibrs join`** joins a scroll's Z bands into one `.afv`.
+- **`fibrs strips`** runs villa's sheet-strip model over an AFV's fibres on an NVIDIA GPU, without PyTorch.
 
 Fibre sets for whole scrolls, traced with fibrs:
 [praveenperera/afv-v2-fibers](https://huggingface.co/datasets/praveenperera/afv-v2-fibers).
@@ -110,9 +111,24 @@ fibrs predict --mode villa --ct scroll.zarr/0 --model-dir afv_fiber_9um_v2 --out
 fibrs predict --ct scroll.zarr/0 --z0 12032 --z1 12544 --model-dir afv_fiber_9um_v2 --out band.zarr
 ```
 
-Needs Linux or Windows x86-64, an RTX 30-series or newer GPU, cuDNN 9, cuBLAS 12, and the model from
-[Qualzz20/afv_fiber_9um_v2](https://huggingface.co/Qualzz20/afv_fiber_9um_v2).
+Needs the model from [Qualzz20/afv_fiber_9um_v2](https://huggingface.co/Qualzz20/afv_fiber_9um_v2) and either
+Linux or Windows x86-64 with an RTX 30-series or newer GPU, cuDNN 9 and cuBLAS 12, or an Apple silicon Mac on
+macOS 26 or newer.
 [Predict details](https://github.com/praveenperera/fibrs/blob/master/docs/predict.md).
+
+## Strips
+
+```sh
+fibrs strips run --afv PHerc0211_afv_v2.afv --out strips/PHerc0211 --weights fiber_strip_small_v1.safetensors \
+  --ct s3://vesuvius-challenge-open-data/PHerc0211/volumes/20250821151803-9.362um-1.2m-113keV-masked.zarr \
+  --cache-dir ctcache --umbilicus PHerc0211_umbilicus.json --voxel-size-um 9.362
+```
+
+Writes a sheet strip per fibre in the layout of villa's Python runner, about 8× faster on one RTX 5090 (2,095
+decisions/s over the whole PHerc0211 scroll). The strips match PyTorch's on the error measures, and a run's output
+doesn't depend on its batch size or worker count. Needs Linux x86-64, an RTX 30-series or newer GPU, cuDNN 9, a
+weights export and a prefetched CT cache.
+[Strips details](https://github.com/praveenperera/fibrs/blob/master/docs/strips.md).
 
 ## Build
 
