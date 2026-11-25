@@ -70,8 +70,14 @@ Zarr filters and other compressors are not supported.
 
 ## Memory
 
-fibrs uses more memory than the original: 9.0 GiB against 4.6 GiB on a 512-plane band of PHerc0826. A smaller
-`--native-cache-mib` or `--field-cache-mib` lowers that, at some cost in speed.
+fibrs uses more memory than the original: 7.1 GiB against 4.6 GiB on a 512-plane band of PHerc0826 at
+`--threads 4`. On PHerc0358's densest 1,024-plane window (z 1536–2560) at `--threads 8` it peaks at 11.2 GiB, or
+14.2 GiB with `--field-cache-mib 4096`. A smaller `--native-cache-mib` or `--field-cache-mib` lowers the peak, at
+some cost in speed.
+
+The volume traced at once (the window, or with `--tiles-yx` each tile with its halo), with each axis rounded up
+to a multiple of 32 voxels, must hold a little fewer than 2⁴¹ voxels (32,768 × 8,192 × 8,192). PHerc1545's whole
+20,961 × 7,506 × 7,506 volume is about half of that.
 
 On Linux, fibrs turns off transparent huge pages for the tracer. On a dense window that cut tracing from
 114–134 s to about 103 s. `MIMALLOC_ALLOW_THP=1` turns them back on.

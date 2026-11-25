@@ -23,6 +23,11 @@ GPUs.
   PyTorch runner, with the strips' error measures matching PyTorch's. A run's output doesn't depend on its batch size
   or worker count. Fibres whose CT chunks aren't in the disk cache are deferred and listed, and the run exits with
   code 75. See [Strips](docs/strips.md).
+- **Less memory for tracing.** The tracer stores its fields in 4³ sub-bricks within each 16³ brick, allocating only the sub-bricks that hold
+  data, so dense windows need less memory and write the same `.afv`, without slowing tracing. On PHerc0358's
+  densest 1,024-plane window with `--threads 8`, the peak fell from 17.6 GiB to 11.2 GiB, and from 20.6 GiB to
+  14.2 GiB with `--field-cache-mib 4096`. On a 512-plane band of PHerc0826 with `--threads 4` it fell from 9.1 GiB
+  to 7.1 GiB. No option or default changed.
 
 ### Upgrading
 
