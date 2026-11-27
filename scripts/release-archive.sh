@@ -4,8 +4,8 @@
 #
 #   scripts/release-archive.sh DIST_DIR TARGET
 #
-# DIST_DIR holds exactly one fibrs wheel of this version. The archive holds the binary, README.md, NOTICE, LICENSE,
-# licenses/ and scripts/install-dropin.sh under fibrs-<version>-<target>/
+# DIST_DIR holds exactly one fibrs wheel of this version. The archive holds the binary, README.md, docs/, NOTICE,
+# LICENSE, licenses/ and scripts/install-dropin.sh under fibrs-<version>-<target>/
 set -euo pipefail
 
 dist=${1:?usage: release-archive.sh DIST_DIR TARGET}
@@ -20,11 +20,12 @@ wheel=${wheels[0]}
 name="fibrs-$version-$target"
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
-mkdir -p "$stage/$name/scripts" "$stage/$name/licenses"
+mkdir -p "$stage/$name/scripts" "$stage/$name/licenses" "$stage/$name/docs"
 unzip -p "$wheel" "fibrs-$version.data/scripts/fibrs" > "$stage/$name/fibrs"
 chmod 0755 "$stage/$name/fibrs"
 cp "$root/README.md" "$root/NOTICE" "$root/LICENSE" "$stage/$name/"
 cp "$root"/licenses/*.txt "$stage/$name/licenses/"
+cp "$root"/docs/*.md "$stage/$name/docs/"
 cp "$root/scripts/install-dropin.sh" "$stage/$name/scripts/"
 tar -C "$stage" -czf "$dist/$name.tar.gz" "$name"
 

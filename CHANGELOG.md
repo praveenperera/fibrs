@@ -10,13 +10,19 @@
   voxels for prediction zarrs. Each tile's fibres are cut to its core and joined across the seams by the rule the
   v2-run pipeline uses for its Z bands: cut ends of the same family at most 1.5 voxels apart, shortest first, never
   into a loop. A `--tiles-yx 1 1` run writes the untiled run's `.afv`. Without `--tiles-yx`, runs, their output and
-  their `run.json` are unchanged. See [Tiled tracing](README.md#tiled-tracing).
+  their `run.json` are unchanged. See [Tiled tracing](docs/tracer.md#tiled-tracing).
 
 ### Fixes
 
 - **`fibrs --version` prints fibrs' version.** Run as `fibrs` or `python -m fibrs`, `--version` now prints fibrs'
   own version; it printed `0.2.0`, the version of `avf-spline-generator` it reproduces, on every release. Run as the
   drop-in `avf-spline-generator`, it still prints `0.2.0`. `fibrs predict --version` is unchanged.
+
+### Documentation
+
+- **A shorter README.** It now covers install, use, the parity checks and the headline speed. It also gives the
+  cargo install commands. The full reference moved to `docs/`: `tracer.md`, `predict.md` and `benchmarks.md`. The
+  CLI archive includes `docs/` beside the README.
 
 ## [0.4.0] - 2026-11-20
 
